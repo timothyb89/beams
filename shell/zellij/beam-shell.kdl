@@ -1,0 +1,17 @@
+// Layout used by bin/beam-shell. A main interactive pane plus a smaller
+// pane tailing ~/.beam-bootstrap.log, so bootstrap progress (and anything
+// future async steps print - teleport clone, go toolchain install, etc.)
+// stays visible without taking over the whole terminal.
+//
+// $HOME is expanded by the shell command below rather than relying on
+// zellij layout variables, since the beams user is always /home/beams but
+// this keeps it correct if that ever changes.
+layout {
+    pane split_direction="horizontal" {
+        pane
+        pane size="25%" {
+            command "bash"
+            args "-lc" "touch \"$HOME/.beam-bootstrap.log\" && tail -n +1 -f \"$HOME/.beam-bootstrap.log\""
+        }
+    }
+}

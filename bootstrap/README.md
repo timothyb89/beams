@@ -100,3 +100,20 @@ cargo build
 # run it again - everything should now report "skip" except claude-update
 ./target/debug/beam-bootstrap --repo ~/beams
 ```
+
+## bin/beam-shell
+
+A convenience entrypoint for day-to-day use, once `cargo build --release`
+has produced the binary (or `cargo build` for a debug one): unlocks the
+ssh-agent key interactively (on a plain terminal, before zellij takes over -
+password prompts don't work well inside a zellij pane), runs
+`beam-bootstrap` in the background logging to `~/.beam-bootstrap.log`, then
+attaches to (or creates) a `beam` zellij session with a layout that keeps
+that log visible in a side pane (`shell/zellij/beam-shell.kdl`):
+
+```sh
+~/bin/beam-shell
+```
+
+Safe to run repeatedly - it's just the attach-or-create flow each time, and
+`beam-bootstrap` is idempotent.

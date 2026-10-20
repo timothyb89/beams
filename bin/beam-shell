@@ -1,0 +1,44 @@
+#!/bin/bash
+# ~/bin/beam-shell
+#
+# Convenience entrypoint for working on a beam: unlocks the ssh-agent key
+# (interactively, on a plain terminal, before zellij takes over - password
+# prompts are awkward inside zellij panes), kicks off beam-bootstrap in the
+# background logging to ~/.beam-bootstrap.log, then attaches to (or creates)
+# a "beam" zellij session with a layout that keeps that log visible in a
+# side pane. Safe to run repeatedly - everything it does is idempotent.
+
+set -euo pipefail
+
+REPO="${BEAM_REPO:-$HOME/beams}"
+LOG="$HOME/.beam-bootstrap.log"
+SESSION="beam"
+ZELLIJ_LAYOUT_DIR="$REPO/shell/zellij"
+ZELLIJ_CONFIG="${XDG_CACHE_HOME:-$HOME/.cache}/beam-shell/zellij-config.kdl"
+
+# 1. unlock the ssh-agent key now, before switching over to zellij.
+# shellcheck disable=SC1091
+source "$HOME/bin/ssh-agent-init"
+
+# 2. kick off bootstrap in the background; the log pane in the zellij
+#    layout tails $LOG.
+BOOTSTRAP_BIN="$REPO/bootstrap/target/release/beam-bootstrap"
+[ -x "$BOOTSTRAP_BIN" ] || BOOTSTRAP_BIN="$REPO/bootstrap/target/debug/beam-bootstrap"
+if [ -x "$BOOTSTRAP_BIN" ]; then
+    nohup "$BOOTSTRAP_BIN" --repo "$REPO" >>"$LOG" 2>&1 &
+else
+    echo "beam-shell: beam-bootstrap binary not found under $REPO/bootstrap/target - skipping" >>"$LOG"
+fi
+
+# 3. point zellij at the repo's beam-shell layout as this session's
+#    default, via a generated config override rather than touching the
+#    user's own zellij config. `attach --create` handles attach-or-create
+#    on its own; a fresh create picks up this default layout, an existing
+#    session is just attached to as-is.
+mkdir -p "$(dirname "$ZELLIJ_CONFIG")"
+cat >"$ZELLIJ_CONFIG" <<EOF
+layout_dir "$ZELLIJ_LAYOUT_DIR"
+default_layout "beam-shell"
+EOF
+
+exec zellij --config "$ZELLIJ_CONFIG" attach "$SESSION" --create
