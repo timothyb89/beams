@@ -1,0 +1,54 @@
+# beams (client wrapper)
+
+Runs on your local workstation (not inside a beam). Spawns or reuses a
+Teleport Beam and drops you straight into it, per project.md's "secondarily"
+section. Shells out directly to `tsh beams ls/add/scp` and `tsh ssh`, always
+using your current `tsh` identity - no admin credentials, no dependency on
+`~/teleport-client-rs` (see commit history for why: its reusable surface,
+`TshExecutor`, only covers 2 of the ~5 operations needed here, and would
+pull in a heavy gRPC/TLS dependency tree for that).
+
+## `beams ssh`
+
+```sh
+beams ssh [--repo ~/beams] [--purpose default] [--region REGION] [--login beams]
+```
+
+1. Looks up the beam tracked for `--purpose` (see "State" below). If it
+   exists and has more than 12 hours of TTL left (beams can't have their
+   TTL extended), reuses it - no file copy, straight to connecting.
+2. Otherwise spawns a new beam (`tsh beams add`), refusing if already at
+   the 5-concurrent-beam limit (`tsh beams rm` something first).
+3. Assembles a staging directory of exactly what the fresh beam needs:
+   every file `git ls-files` reports as tracked in `--repo` (so it never
+   needs a hand-maintained list), plus the two things deliberately *not*
+   tracked in git but still required - the ssh private key, and a
+   prebuilt `beam-bootstrap` binary (**build this first**: `cd
+   ../bootstrap && cargo build --release` - no Rust toolchain on a fresh
+   beam, so it has to be copied over).
+4. Copies that staging directory onto the beam (`tsh beams scp -r`).
+5. Connects with `tsh ssh -t <login>@<uuid> -- ~/beams/bin/beam-shell` -
+   bypassing the `tsh beams ssh` layer (which can't take a remote command)
+   in favor of plain `tsh ssh`, per project.md. `beam-shell` unlocks the
+   ssh-agent key, kicks off `beam-bootstrap` in the background, and drops
+   you into zellij with a log pane - see `../bootstrap/README.md`.
+
+On reuse, steps 3-4 are skipped entirely - a reused beam is assumed to
+already be bootstrapped from a prior run.
+
+## State
+
+No server-side way exists to label a beam, so `~/.config/beams-client/state.json`
+tracks which beam id serves which `--purpose` locally. `default` is what
+plain `beams ssh` reuses; pass `--purpose` to track a separate beam for a
+side task (e.g. reviewing a specific PR) without it being mistaken for your
+default one. This is a simple heuristic, not a full design - revisit if
+purposes outgrow this.
+
+## Building
+
+```sh
+cd client
+cargo build --release
+./target/release/beams ssh
+```
