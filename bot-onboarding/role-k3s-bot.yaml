@@ -1,0 +1,23 @@
+# Grants the k3s-bot (see bot-k3s-bot.yaml) access to:
+# - the "k3s" Kubernetes cluster (teleport-harness's remote-docker
+#   workaround - beams can't run containers themselves)
+# - the "workstation" SSH node that hosts it
+#
+# This is cluster-level setup, applied once (not per-beam):
+#   tctl create -f role-k3s-bot.yaml
+#   tctl create -f bot-k3s-bot.yaml
+kind: role
+version: v7
+metadata:
+  name: k3s-bot
+spec:
+  allow:
+    kubernetes_labels:
+      "*": "*"
+    kubernetes_groups:
+      - system:masters
+    node_labels:
+      "*": "*"
+    logins:
+      - core
+  deny: {}

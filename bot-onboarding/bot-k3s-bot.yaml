@@ -1,0 +1,8 @@
+# See role-k3s-bot.yaml for context and the apply order.
+kind: bot
+version: v1
+metadata:
+  name: k3s-bot
+spec:
+  roles:
+    - k3s-bot

@@ -25,7 +25,30 @@ manually inside a beam you've already `ssh`'d/`tsh ssh`'d into.
 7. **install-starship** — downloads a pinned `starship` release binary from
    GitHub and verifies its checksum (not packaged for Debian either).
 8. **default-shell** — sets fish as the user's login shell (`chsh`).
-9. **claude-update** — runs `claude update`.
+9. **install-teleport-bin** — downloads `tctl`/`tbot` from
+   `cdn.teleport.dev`, matching the cluster's proxy version
+   (`tsh version -f json`), with sha256 verification, into
+   `~/.teleport-bot/bin/`.
+10. **k3s-bot-join** — requests a join token for the `k3s-bot` bot (see
+    `bot-onboarding/`, applied once, cluster-wide, separately from this
+    tool) and writes a static `~/.teleport-bot/tbot.yaml` with a Kubernetes
+    output for the `k3s` cluster and an identity output for SSH to its host
+    node. Skips requesting a new token once already joined
+    (`~/.teleport-bot/storage/key` exists).
+11. **start-tbot** — runs tbot as a `beamctl`-managed background service
+    (`beamctl show tbot`) so both outputs keep renewing for the beam's
+    lifetime.
+12. **kubeconfig-symlink** — symlinks tbot's generated
+    `~/.teleport-bot/kube/kubeconfig.yaml` into `~/.kube/config`, so
+    `kubectl` works against the k3s cluster with no extra flags.
+13. **claude-update** — runs `claude update`.
+
+SSH to the k3s host node isn't wired into `tsh`/`ssh` directly yet - use the
+identity output explicitly for now:
+
+```sh
+tsh --identity=~/.teleport-bot/identity/identity ssh core@workstation
+```
 
 If a step fails, the ones after it don't run; fix the issue and re-run the
 whole binary — earlier steps will just skip.

@@ -2,12 +2,16 @@ mod apt;
 mod claude;
 mod claude_md;
 mod default_shell;
+mod k3s_bot;
+mod kubeconfig;
 mod kubectl;
 mod link;
 mod linkutil;
 mod releaseutil;
 mod shell_config;
 mod starship;
+mod tbot_service;
+mod teleport_bin;
 mod zellij;
 
 use std::path::Path;
@@ -35,6 +39,10 @@ pub fn all() -> Vec<Box<dyn Step>> {
         Box::new(shell_config::LinkShellConfig),
         Box::new(starship::InstallStarship),
         Box::new(default_shell::SetDefaultShell),
+        Box::new(teleport_bin::InstallTeleportBin),
+        Box::new(k3s_bot::JoinK3sBot),
+        Box::new(tbot_service::StartTbotService),
+        Box::new(kubeconfig::LinkKubeconfig),
         Box::new(claude::UpdateClaude),
     ]
 }
