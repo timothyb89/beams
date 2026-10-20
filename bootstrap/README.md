@@ -5,14 +5,20 @@ dotfiles/`bin` into `$HOME`, installs some apt packages and tools, sets up
 fish/starship, and updates `claude`. Safe to re-run — every step checks
 what's already in place and skips it.
 
-No client wrapper exists yet (see `project.md`), so for now this is run
-manually inside a beam you've already `ssh`'d/`tsh ssh`'d into.
+`bin/beam-shell` runs this automatically after copying the repo onto a
+fresh beam (see its own section below), or the client wrapper in
+`../client/` runs the whole thing for you via `beams ssh`. You can also
+still run it manually inside a beam you've already `ssh`'d into.
 
 ## What it does
 
 1. **link-files** — symlinks `bin` and `.ssh` from the repo checkout into
-   `$HOME`. (`.claude` is *not* symlinked — `~/.claude` already holds real
-   beam state like session history and credentials.)
+   `$HOME`. `.ssh` is force-replaced: a fresh beam ships its own default
+   `~/.ssh` (a delegated signing agent, not a plain key), which this moves
+   aside to `~/.ssh.orig` the first time, so the repo's stable key always
+   wins. (`.claude` is *not* symlinked — `~/.claude` already holds real
+   beam state like session history and credentials, so it can't be
+   replaced wholesale the same way.)
 2. **claude-md-merge** — appends the repo's `.claude/CLAUDE.md` into
    `~/.claude/CLAUDE.md` once.
 3. **apt-install** — installs `micro`, `less`, `fish`.
@@ -87,6 +93,10 @@ cargo build --release  # release build: target/release/beam-bootstrap
   ```
 
   `status` is one of `start`, `ok`, `skip`, `error`.
+- `--only <step-id>` — run just that one step (e.g. `link-files`) instead
+  of the full sequence. `bin/beam-shell` uses this to get `~/.ssh`/`~/bin`
+  in place synchronously before anything that needs them, ahead of
+  backgrounding the full run.
 
 Exit code is `0` if every step succeeded (or was skipped), `1` if any step
 failed.

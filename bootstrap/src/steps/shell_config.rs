@@ -23,7 +23,7 @@ impl Step for LinkShellConfig {
         for (source, target) in LINKS {
             let source = repo.join(source);
             let target = config_dir.join(target);
-            if ensure_symlink(&source, &target)? {
+            if ensure_symlink(&source, &target, false)? {
                 created.push(target.display().to_string());
             }
         }

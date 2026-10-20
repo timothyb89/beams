@@ -18,6 +18,11 @@ struct Args {
     /// TTY. Useful for piping to a future client wrapper.
     #[arg(long)]
     json: bool,
+
+    /// Run only the step with this id (e.g. `link-files`), instead of the
+    /// full sequence.
+    #[arg(long)]
+    only: Option<String>,
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -35,6 +40,9 @@ fn main() {
     let repo = expand_tilde(&args.repo);
     let mut emitter = events::default_emitter(args.json);
 
-    let ok = steps::run_all(&repo, &mut *emitter);
+    let ok = match &args.only {
+        Some(step_id) => steps::run_only(&repo, &mut *emitter, step_id),
+        None => steps::run_all(&repo, &mut *emitter),
+    };
     std::process::exit(if ok { 0 } else { 1 });
 }

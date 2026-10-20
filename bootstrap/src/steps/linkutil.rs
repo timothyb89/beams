@@ -9,10 +9,17 @@ use anyhow::{bail, Context};
 /// (`link.rs`, `shell_config.rs`). Ensures `target` is a symlink to
 /// `source`, creating parent directories as needed. Returns `true` if a
 /// new symlink was created, `false` if one already existed and pointed at
-/// `source`. Refuses to touch `target` if it exists and is anything else
-/// (a real file/dir, or a symlink pointing somewhere else) rather than
-/// clobbering something unexpected.
-pub fn ensure_symlink(source: &Path, target: &Path) -> anyhow::Result<bool> {
+/// `source`.
+///
+/// If `target` exists as something else (a real file/dir, or a symlink
+/// pointing elsewhere) and `force` is `false`, this refuses to touch it
+/// rather than clobbering something unexpected - the right call for e.g.
+/// `~/.claude`, which already holds real beam-managed state. If `force` is
+/// `true`, the existing entry is moved aside to `<target>.orig` (once;
+/// fails rather than overwriting a prior `.orig`) before linking - needed
+/// for `~/.ssh`, which beams provision with their own default (and we
+/// deliberately want to replace with the repo's stable key).
+pub fn ensure_symlink(source: &Path, target: &Path, force: bool) -> anyhow::Result<bool> {
     if !source.exists() {
         bail!("expected {} in repo checkout, not found", source.display());
     }
@@ -22,8 +29,9 @@ pub fn ensure_symlink(source: &Path, target: &Path) -> anyhow::Result<bool> {
             let existing = fs::read_link(target)
                 .with_context(|| format!("reading existing symlink {}", target.display()))?;
             if existing == source {
-                Ok(false) // already linked correctly
-            } else {
+                return Ok(false); // already linked correctly
+            }
+            if !force {
                 bail!(
                     "{} is already a symlink to {} (expected {})",
                     target.display(),
@@ -31,21 +39,42 @@ pub fn ensure_symlink(source: &Path, target: &Path) -> anyhow::Result<bool> {
                     source.display()
                 );
             }
+            fs::remove_file(target)
+                .with_context(|| format!("removing stale symlink {}", target.display()))?;
+            link(source, target)?;
+            Ok(true)
         }
         Ok(_) => {
-            bail!("{} already exists and is not a symlink", target.display());
+            if !force {
+                bail!("{} already exists and is not a symlink", target.display());
+            }
+            let backup = PathBuf::from(format!("{}.orig", target.display()));
+            if backup.exists() {
+                bail!(
+                    "{} already exists - won't overwrite; move it aside manually first",
+                    backup.display()
+                );
+            }
+            fs::rename(target, &backup).with_context(|| {
+                format!("moving {} aside to {}", target.display(), backup.display())
+            })?;
+            link(source, target)?;
+            Ok(true)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-            symlink(source, target)
-                .with_context(|| format!("linking {} -> {}", target.display(), source.display()))?;
+            link(source, target)?;
             Ok(true)
         }
         Err(err) => Err(err).context(format!("checking {}", target.display())),
     }
+}
+
+fn link(source: &Path, target: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    symlink(source, target)
+        .with_context(|| format!("linking {} -> {}", target.display(), source.display()))
 }
 
 pub fn home_dir() -> anyhow::Result<PathBuf> {

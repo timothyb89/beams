@@ -51,7 +51,22 @@ pub fn all() -> Vec<Box<dyn Step>> {
 /// `emitter`. Stops at the first failing step. Returns `true` if every step
 /// succeeded (including skips).
 pub fn run_all(repo: &Path, emitter: &mut dyn Emitter) -> bool {
+    run(repo, emitter, None)
+}
+
+/// Runs just the step with the given id (used by `bin/beam-shell` to run
+/// `link-files` synchronously before anything that needs `~/.ssh`/`~/bin`
+/// in place, ahead of backgrounding the full run). Returns `true` if no
+/// step id matches, same as an empty run.
+pub fn run_only(repo: &Path, emitter: &mut dyn Emitter, step_id: &str) -> bool {
+    run(repo, emitter, Some(step_id))
+}
+
+fn run(repo: &Path, emitter: &mut dyn Emitter, only: Option<&str>) -> bool {
     for step in all() {
+        if only.is_some_and(|id| id != step.id()) {
+            continue;
+        }
         emitter.emit(Event::new(step.id(), Status::Start, None));
         match step.run(repo) {
             Ok(Some(message)) => {

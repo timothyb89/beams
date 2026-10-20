@@ -39,7 +39,7 @@ impl Step for LinkKubeconfig {
             sleep(POLL_INTERVAL);
         }
 
-        if ensure_symlink(&source, &target)? {
+        if ensure_symlink(&source, &target, false)? {
             Ok(Some(format!("linked {}", target.display())))
         } else {
             Ok(None)
