@@ -1,0 +1,26 @@
+kind: token
+version: v2
+metadata:
+  # name identifies the token. Try to ensure that this is descriptive.
+  name: workstation-host
+spec:
+  # For Machine ID and TPM joining, roles will always be "Bot" and
+  # join_method will always be "tpm".
+  roles: [Node, App]
+  join_method: tpm
+
+  # tpm specifies the TPM join method specific configuration for this token.
+  tpm:
+    # allow is a list of Rules, the presented TPM must match one allow rule to
+    # be permitted to join using this token.
+    allow:
+        # description is a human-readable description of the rule. It has no
+        # bearing on whether a TPM is allowed to join, but can be used to
+        # associate a rule with a specific host (e.g the asset tag of the server
+        # in which the TPM resides).
+      - description: "workstation-host"
+        # ek_public_hash is the SHA256 hash of the EKPub marshaled in PKIX format
+        # and encoded in hexadecimal. This value will also be checked when a TPM
+        # has submitted an EKCert, and the public key in the EKCert will be used
+        # for this check.
+        ek_public_hash: 99cbccc5b851e0ab82b673547c8b040ed23fcbccf466f320420a8ee718877e11

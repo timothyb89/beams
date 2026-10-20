@@ -1,0 +1,12 @@
+{
+    "permissions": {
+        "deny": [
+            "Read(/home/beams/.ssh)",
+            "Read(/home/beams/beams/.ssh)"
+        ],
+        "ask": [
+            "Bash(git push *)",
+            "Bash(gh pr create *)"
+        ]
+    }
+}

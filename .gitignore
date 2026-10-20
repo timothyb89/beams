@@ -1,3 +1,4 @@
 .ssh/*_id_*
+!.ssh/*_id_*.pub
 /bootstrap/target/
 

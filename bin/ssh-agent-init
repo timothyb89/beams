@@ -1,0 +1,44 @@
+#!/bin/bash
+# ~/.ssh/agent-init.sh
+# Usage: source ~/.ssh/agent-init.sh [path_to_private_key]
+
+_setup_ssh_agent() {
+    local key_file="${1:-$HOME/.ssh/beams_id_ed25519}"
+    local env_file="${XDG_RUNTIME_DIR:-$HOME/.ssh}/agent.env"
+
+    # 1. Load saved environment if SSH_AUTH_SOCK is unset or stale
+    if [ -z "$SSH_AUTH_SOCK" ] && [ -f "$env_file" ]; then
+        . "$env_file" >/dev/null 2>&1
+    fi
+
+    # 2. Test if the socket is alive and responsive
+    local agent_status=2
+    if [ -n "$SSH_AUTH_SOCK" ]; then
+        ssh-add -l >/dev/null 2>&1
+        agent_status=$?
+    fi
+
+    # 3. If unreachable (status 2), clean up and spawn a new agent
+    if [ "$agent_status" -eq 2 ]; then
+        pkill -u "$USER" -x ssh-agent 2>/dev/null
+        mkdir -p "$(dirname "$env_file")"
+        ssh-agent -s > "$env_file"
+        chmod 600 "$env_file"
+        . "$env_file" >/dev/null
+    fi
+
+    # 4. Check key presence and import if not already loaded
+    if [ -f "$key_file" ]; then
+        local key_fp
+        key_fp=$(ssh-keygen -lf "$key_file" 2>/dev/null | awk '{print $2}')
+
+        if ! ssh-add -l 2>/dev/null | grep -qF "$key_fp"; then
+            ssh-add "$key_file"
+        fi
+    else
+        echo "ssh-agent: Key not found at $key_file" >&2
+    fi
+}
+
+_setup_ssh_agent "$@"
+unset -f _setup_ssh_agent
