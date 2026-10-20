@@ -11,7 +11,7 @@ use super::Step;
 /// just grow it as needed. zellij and kubectl aren't in Debian's repos and
 /// are installed by their own dedicated steps instead (see `zellij.rs` and
 /// `kubectl.rs`).
-const PACKAGES: &[&str] = &["micro", "less"];
+const PACKAGES: &[&str] = &["micro", "less", "fish"];
 
 pub struct InstallPackages;
 

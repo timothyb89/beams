@@ -1,8 +1,13 @@
 mod apt;
 mod claude;
 mod claude_md;
+mod default_shell;
 mod kubectl;
 mod link;
+mod linkutil;
+mod releaseutil;
+mod shell_config;
+mod starship;
 mod zellij;
 
 use std::path::Path;
@@ -27,6 +32,9 @@ pub fn all() -> Vec<Box<dyn Step>> {
         Box::new(apt::InstallPackages),
         Box::new(kubectl::InstallKubectl),
         Box::new(zellij::InstallZellij),
+        Box::new(shell_config::LinkShellConfig),
+        Box::new(starship::InstallStarship),
+        Box::new(default_shell::SetDefaultShell),
         Box::new(claude::UpdateClaude),
     ]
 }

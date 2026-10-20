@@ -1,9 +1,9 @@
 # beam-bootstrap
 
 Bootstraps a Teleport Beam from a checkout of this `beams` repo: links
-dotfiles/`bin` into `$HOME`, installs some apt packages, and updates
-`claude`. Safe to re-run — every step checks what's already in place and
-skips it.
+dotfiles/`bin` into `$HOME`, installs some apt packages and tools, sets up
+fish/starship, and updates `claude`. Safe to re-run — every step checks
+what's already in place and skips it.
 
 No client wrapper exists yet (see `project.md`), so for now this is run
 manually inside a beam you've already `ssh`'d/`tsh ssh`'d into.
@@ -15,12 +15,17 @@ manually inside a beam you've already `ssh`'d/`tsh ssh`'d into.
    beam state like session history and credentials.)
 2. **claude-md-merge** — appends the repo's `.claude/CLAUDE.md` into
    `~/.claude/CLAUDE.md` once.
-3. **apt-install** — installs `micro`, `less`.
+3. **apt-install** — installs `micro`, `less`, `fish`.
 4. **install-kubectl** — adds the official Kubernetes apt repo and installs
    `kubectl` (not in Debian's default repos).
 5. **install-zellij** — downloads a pinned `zellij` release binary from
    GitHub and verifies its checksum (not packaged for Debian at all).
-6. **claude-update** — runs `claude update`.
+6. **shell-config** — symlinks `shell/fish/config.fish` and
+   `shell/starship.toml` from the repo into `~/.config/`.
+7. **install-starship** — downloads a pinned `starship` release binary from
+   GitHub and verifies its checksum (not packaged for Debian either).
+8. **default-shell** — sets fish as the user's login shell (`chsh`).
+9. **claude-update** — runs `claude update`.
 
 If a step fails, the ones after it don't run; fix the issue and re-run the
 whole binary — earlier steps will just skip.
