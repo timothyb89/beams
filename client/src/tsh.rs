@@ -172,15 +172,35 @@ pub fn prepare_git_target(login: &str, uuid: &str, remote_path: &str, branch: &s
          git symbolic-ref HEAD 'refs/heads/{branch}' && \
          git config receive.denyCurrentBranch updateInstead"
     );
+    // `ssh` (and `tsh ssh`, mimicking it) doesn't exec the trailing argv
+    // elements directly - it joins them with spaces into one line and
+    // hands *that* to the remote's shell for its own parsing. Passing
+    // `["bash", "-lc", script]` as three separate args therefore loses
+    // the boundary around `script` entirely: the remote shell sees
+    // `bash -lc mkdir -p 'beams' && ...` and parses `-lc`'s *single*
+    // argument as just the word `mkdir`, with everything else
+    // (`-p`, `'beams'`, ...) becoming unrelated positional params - this
+    // is exactly what produced the "mkdir: missing operand" failure
+    // found running this against a real beam the first time. Fixed by
+    // passing exactly one already-fully-quoted argv element, so there's
+    // nothing left for ssh to join.
+    let remote_command = format!("bash -lc {}", shell_quote(&script));
     let target = format!("{login}@{uuid}");
     let status = Command::new("tsh")
-        .args(["ssh", &target, "--", "bash", "-lc", &script])
+        .args(["ssh", &target, "--", &remote_command])
         .status()
         .context("preparing git push target on beam")?;
     if !status.success() {
         bail!("preparing git push target on beam failed ({status})");
     }
     Ok(())
+}
+
+/// Wraps `s` in single quotes for a POSIX shell, escaping any embedded
+/// single quotes the standard way (`'\''`: close the quote, an escaped
+/// literal `'`, reopen the quote).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Pushes `branch` from `repo` to `remote_path` on the beam (see
@@ -199,4 +219,38 @@ pub fn push_repo(repo: &Path, login: &str, uuid: &str, remote_path: &str, branch
         bail!("git push to beam failed ({status})");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `sh -c <shell_quote(s)>` should echo back exactly `s`, for any
+    /// `s` - the actual property `prepare_git_target` relies on to
+    /// survive `tsh`/`ssh`'s single-line rejoin of trailing argv
+    /// elements (see that function's doc comment on the bug this caught
+    /// the first time).
+    fn round_trips_through_a_real_shell(s: &str) {
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s' {}", shell_quote(s)))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), s, "shell_quote({s:?}) didn't round-trip");
+    }
+
+    #[test]
+    fn shell_quote_round_trips_plain_text() {
+        round_trips_through_a_real_shell("mkdir -p 'beams' && cd beams");
+    }
+
+    #[test]
+    fn shell_quote_round_trips_text_with_embedded_single_quotes() {
+        round_trips_through_a_real_shell("it's a 'test' with lots of ''' quotes");
+    }
+
+    #[test]
+    fn shell_quote_round_trips_an_empty_string() {
+        round_trips_through_a_real_shell("");
+    }
 }
