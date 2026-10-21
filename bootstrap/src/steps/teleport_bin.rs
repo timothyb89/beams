@@ -7,7 +7,7 @@ use anyhow::{bail, Context};
 use serde::Deserialize;
 
 use super::linkutil::home_dir;
-use super::releaseutil::{download, run, verify_checksum};
+use crate::releaseutil::{download, run, verify_checksum};
 use super::{cap, Step};
 use crate::graph::Capability;
 

@@ -4,7 +4,7 @@ use std::process::Command;
 
 use anyhow::Context;
 
-use super::releaseutil::{arch_target, download, run, verify_checksum};
+use crate::releaseutil::{arch_target, download, run, verify_checksum};
 use super::{cap, Step};
 use crate::graph::Capability;
 

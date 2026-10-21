@@ -189,9 +189,33 @@ just consequences of this design rather than separate asks.
 ## New tasks enabled by the graph (deferred-by-default templates)
 
 `clone-git-repo`/`checkout-pr-worktree` landed — see the "Migration"
-section above for status/details. Still open:
+section above for status/details.
 
-- [ ] `install-toolchain-go`, `install-toolchain-rust`.
+- [x] `install-toolchain-go` (`tasks/install_toolchain_go.rs`) —
+  official Go release, pinned version + checksum (go.dev doesn't
+  publish per-file `.sha256` sidecars like GitHub releases do - fetched
+  the real checksums from its JSON release manifest directly rather
+  than guessing). Installs to `~/.local/toolchains/go`, no `PATH`/shell
+  changes attempted.
+- [x] `install-toolchain-rust` (`tasks/install_toolchain_rust.rs`) - via
+  `rustup` (same command `bootstrap/README.md` already told a human to
+  run), installs `gcc` via apt first (cargo needs a linker). Tagged with
+  `steps::resource::APT` since it shells out to `apt-get` - the first
+  *task* (as opposed to fixed *step*) to need that tag, confirming the
+  mechanism actually works across the two.
+- [ ] **New gap found while adding these**: `Task::exclusive_resources`
+  only serializes tasks within *one* `executor::run` call - it's a
+  `Mutex` local to that call, not a cross-process lock. The fixed
+  startup sequence (`apt-install`) and a later daemon-driven manifest
+  (`install-toolchain-rust`'s `apt-get install gcc`) are two genuinely
+  separate OS processes with no shared lock at all, so they *could*
+  still race on the real apt/dpkg lock if a manifest happened to be
+  submitted while the startup sequence's own `apt-install` wave was
+  still running. Low-probability in practice (the fixed sequence
+  usually finishes within a minute or two of a beam spawning, before
+  anyone's submitted a manifest), but a real gap, not a solved problem -
+  would need a cross-process lock (e.g. a well-known flock file) to
+  close properly. Not fixed here.
 
 ## zellij layout fix (independent — doesn't need the daemon work)
 
@@ -234,22 +258,25 @@ section above for status/details. Still open:
 
 ## Repo delivery onto a beam
 
-- [ ] `tsh git ...` confirmed **not** viable for this (scoped to GitHub
+- [x] `tsh git ...` confirmed **not** viable for this (scoped to GitHub
   org access, not beam transport) — ruled out, don't revisit without new
   information.
-- [ ] Chosen direction: push over the same ssh transport the client
-  already uses to reach the beam (`tsh ssh`'s cert auth), not the repo's
-  dedicated keypair. See DESIGN.md's "Repo delivery onto a beam" for the
-  full design (non-bare repo on the beam with
-  `receive.denyCurrentBranch=updateInstead`, client adds it as a git
-  remote and pushes).
-- [ ] **Blocking question to resolve before implementing**: is `git`
-  preinstalled on a stock beam? If not, it needs to ride in via the
-  existing scp step (same as the prebuilt binary) before the first push
-  can land. Keep today's `git ls-files` + scp delivery working as a
-  fallback until this is confirmed and the push path is proven.
-- [ ] Once confirmed: switch `client/src/stage.rs` from
-  content-copying tracked files to the push-based transport.
+- [x] **Implemented and verified live against a real, freshly spawned
+  beam** (not just a design): push over git's `ext::` transport, run
+  through the same `tsh ssh` channel the client already uses - see
+  `client/src/tsh.rs`'s `prepare_git_target`/`push_repo` and DESIGN.md's
+  "Repo delivery onto a beam" for the full design, including the
+  branch-matching gotcha found while verifying this
+  (`receive.denyCurrentBranch=updateInstead` silently no-ops instead of
+  erroring if the beam's checked-out branch doesn't match what's
+  pushed). Confirmed `git` *is* preinstalled on a genuinely fresh, stock
+  beam - the blocking question below is resolved, no fallback needed.
+  `client/src/stage.rs` now only stages the ssh key + bootstrap binary,
+  down from staging the entire tracked tree.
+- [ ] **New gap found during implementation**: a *reused* beam (tracked
+  by `--purpose`, still within its TTL) never gets `push_repo` called
+  again - only a freshly spawned one does. No explicit "re-sync this
+  beam's repo" client command yet.
 
 ## k8s access workaround
 

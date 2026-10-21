@@ -19,18 +19,24 @@ beams ssh [--repo ~/beams] [--purpose default] [--region REGION] [--login beams]
    TTL extended), reuses it - no file copy, straight to connecting.
 2. Otherwise spawns a new beam (`tsh beams add`), refusing if already at
    the 5-concurrent-beam limit (`tsh beams rm` something first).
-3. Assembles a staging directory of exactly what the fresh beam needs:
-   every file `git ls-files` reports as tracked in `--repo` (so it never
-   needs a hand-maintained list), plus the two things deliberately *not*
-   tracked in git but still required - the ssh private key, and a
-   prebuilt `beam-bootstrap` binary (**build this first**: beams run
-   Linux, so if you're on macOS (or just want a statically linked build)
-   run `../bootstrap/build-cross.sh`; on Linux, `cd ../bootstrap && cargo
+3. Pushes `--repo`'s current branch onto the beam over git's `ext::`
+   transport, run through the same `tsh ssh` channel used everywhere
+   else here - no new credential, not the repo's own dedicated ssh
+   keypair (see `DESIGN.md`'s "Repo delivery onto a beam" for the full
+   design, including a real gotcha found verifying this against a live
+   beam: the beam-side repo's checked-out branch has to match what gets
+   pushed, or `receive.denyCurrentBranch=updateInstead` silently no-ops
+   instead of erroring). Only transfers committed history, like any git
+   push.
+4. Separately `scp`s the two things deliberately *not* tracked in git
+   but still required - the ssh private key, and a prebuilt
+   `beam-bootstrap` binary (**build this first**: beams run Linux, so if
+   you're on macOS (or just want a statically linked build) run
+   `../bootstrap/build-cross.sh`; on Linux, `cd ../bootstrap && cargo
    build --release` also works. No Rust toolchain on a fresh beam, so the
    binary has to be copied over either way - see `../bootstrap/README.md`.
    `stage.rs` looks for a cross-compiled build first and falls back to a
    native one, refusing to ship anything that isn't a Linux ELF binary.)
-4. Copies that staging directory onto the beam (`tsh beams scp -r`).
 5. Connects with `tsh ssh -t <login>@<uuid> -- ~/beams/bin/beam-shell` -
    bypassing the `tsh beams ssh` layer (which can't take a remote command)
    in favor of plain `tsh ssh`, per project.md. `beam-shell` unlocks the

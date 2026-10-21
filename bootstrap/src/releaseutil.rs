@@ -4,10 +4,10 @@ use std::process::Command;
 
 use anyhow::{bail, Context};
 
-/// Shared helpers for steps that install a pinned GitHub release binary
-/// (`zellij.rs`, `starship.rs`): both ship only `x86_64`/`aarch64`
-/// `*-unknown-linux-musl` release assets, so the architecture mapping is
-/// identical between them.
+/// Shared helpers for steps/tasks that install a pinned release binary -
+/// `steps::zellij`/`steps::starship`/`steps::teleport_bin`, and
+/// `tasks::install_toolchain_go`. Lives at the crate root (not nested
+/// under `steps`) since both `steps` and `tasks` need it.
 pub fn arch_target(project: &str) -> anyhow::Result<&'static str> {
     let output = Command::new("uname")
         .arg("-m")
@@ -34,7 +34,15 @@ pub fn verify_checksum(file: &Path, checksum_file: &Path, label: &str) -> anyhow
         .next()
         .context("checksum file was empty")?
         .to_string();
+    verify_checksum_str(file, &expected, label)
+}
 
+/// Same as `verify_checksum`, but against a checksum already known as a
+/// string (e.g. pinned as a source constant, or pulled from a release
+/// manifest JSON) rather than a downloaded sidecar file - not every
+/// project publishes one of those (go.dev doesn't; it only lists
+/// checksums in its own JSON release manifest).
+pub fn verify_checksum_str(file: &Path, expected: &str, label: &str) -> anyhow::Result<()> {
     let output = Command::new("sha256sum")
         .arg(file)
         .output()

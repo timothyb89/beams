@@ -13,6 +13,9 @@ const MAX_CONCURRENT_BEAMS: usize = 5;
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 const DEFAULT_LOGIN: &str = "beams";
 const DEFAULT_PURPOSE: &str = "default";
+/// Where the repo lands on the beam, relative to its `$HOME` - matches
+/// what `bin/beam-shell`, the zellij layout, etc. all assume (`~/beams`).
+const REMOTE_REPO_PATH: &str = "beams";
 
 /// Spawn or reuse a Teleport Beam and drop straight into it.
 #[derive(Parser)]
@@ -91,7 +94,12 @@ fn ssh(repo: &Path, purpose: &str, region: Option<&str>, login: &str) -> anyhow:
             );
             tsh::wait_until_ready(&fresh.id, login, READY_TIMEOUT)?;
 
-            eprintln!("beams: copying {} to {}...", repo.display(), fresh.id);
+            eprintln!("beams: pushing {} to {}...", repo.display(), fresh.id);
+            let branch = tsh::current_branch(repo)?;
+            tsh::prepare_git_target(login, &fresh.uuid, REMOTE_REPO_PATH, &branch)?;
+            tsh::push_repo(repo, login, &fresh.uuid, REMOTE_REPO_PATH, &branch)?;
+
+            eprintln!("beams: copying the ssh key and bootstrap binary to {}...", fresh.id);
             let staging = stage::build(repo)?;
             let result = tsh::scp_dir(&staging.join("beams"), &fresh.id);
             let _ = std::fs::remove_dir_all(&staging);

@@ -228,43 +228,61 @@ This is independent of the daemon work and can land on its own.
 
 ## Repo delivery onto a beam
 
-Current state: `client/src/stage.rs` computes `git ls-files` in the local
-checkout and `scp`s exactly those files — no `.git`, so a beam's copy
-isn't a real git repo (hence this session running out of a `beams.git`
-dir rather than `beams`).
-
-`tsh git ...` is not viable here — it's scoped to GitHub-org access, not
-configured for beam-to-beam or client-to-beam transport, and beams aren't
-a GitHub remote.
+**Implemented** (`client/src/tsh.rs`'s `prepare_git_target`/`push_repo`,
+wired into `main.rs`'s `ssh()`), replacing the old
+`git ls-files`-and-`scp`-every-file approach. `git` is confirmed
+preinstalled on a genuinely fresh, stock beam (checked directly before
+building this: `tsh ssh beams@<fresh-uuid> -- git --version` → 2.39.5) —
+the open question the previous version of this section flagged is
+settled, no fallback needed.
 
 Chosen approach: **push over the ssh transport the client already uses to
-reach the beam**, not a new one.
+reach the beam**, not a new one — specifically git's `ext::` transport,
+run through `tsh ssh`:
+
+```
+git push "ext::tsh ssh <login>@<uuid> -- %S '<remote_path>'" <branch>
+```
+
+with `GIT_ALLOW_PROTOCOL=ext` set on the invoking `git` process (`ext::`
+is disabled by default in modern git). `%S` is git's own placeholder,
+expanding to `git-upload-pack`/`git-receive-pack` as appropriate.
 
 - Client→beam `tsh ssh` authenticates with the client's own Teleport
   session cert — unrelated to the repo's dedicated keypair in `.ssh/`
   (that pair is for the *beam* to reach GitHub later, e.g. to clone
   `teleport`/`teleport-harness`, not for the client to reach the beam).
-  So git can reuse that same authenticated channel as its transport
-  (`GIT_SSH_COMMAND` wrapping `tsh ssh`, or whatever `tsh config`-emitted
-  ssh_config entries make a plain `ssh <beam-host>` work directly) with
-  no new auth problem.
-- On the beam: initialize `~/beams` as a normal (non-bare) repo with
+  So git reuses that same authenticated channel with no new auth problem
+  — confirmed working end to end against a real fresh beam, including an
+  incremental second push landing a second commit correctly.
+- On the beam: a normal (non-bare) repo with
   `receive.denyCurrentBranch=updateInstead`, so a push updates the
   working tree in place — no separate checkout/pull step needed.
-- Client-side: add it as a git remote, `push` whenever staging/updating a
-  beam. Replaces the `git ls-files` + content-copy step. Re-syncing after
-  local edits becomes a normal incremental push instead of a full
-  re-copy, and the beam ends up with real git history of whatever's been
-  pushed (not a flat snapshot) — directly serves "iterate on the tooling
-  easily" from a beam itself.
+  **Gotcha found while verifying this live**: that setting only updates
+  the working tree for the branch HEAD is *already* checked out on; a
+  stock beam's `git init` defaults to `master`, so pushing `main`
+  "succeeds" (creates the ref) while silently leaving the working tree
+  empty — a confusing failure mode with no error at all. Fixed by having
+  the prep step explicitly `git symbolic-ref HEAD refs/heads/<branch>`
+  using the client's own actual branch name, rather than trusting
+  whatever a bare `git init` happens to default to.
+- Client-side: `prepare_git_target` (idempotent - skips `git init` if
+  already a repo) then `push_repo`, both over the same `ext::` URL.
+  Re-syncing after local edits is just a normal incremental push, and
+  the beam ends up with real git history of whatever's been pushed (not
+  a flat snapshot) — directly serves "iterate on the tooling easily"
+  from a beam itself. Only transfers *committed* history, same as any
+  git push - uncommitted local changes don't make the trip.
 - Still `scp` the two things that were never in git: the repo's own ssh
   keypair, and the prebuilt `beam-bootstrap` binary (no Rust toolchain on
-  a stock beam either way).
-- Open question to verify before relying on this as the *first* thing
-  that happens on a fresh beam: is `git` preinstalled on a stock beam, or
-  does it need to ride in via the initial `scp` the same way the binary
-  does? Until confirmed, keep the existing scp-based delivery working as
-  a fallback rather than cutting over outright.
+  a stock beam either way) - `client/src/stage.rs` now stages only these
+  two, down from staging the entire tracked tree.
+- **Known gap, not solved here**: a reused beam (tracked by `--purpose`,
+  still within its TTL) never gets `push_repo` called again - only a
+  freshly spawned beam does, same as before this change. There's no
+  explicit "re-sync this beam's repo" client command yet; for now,
+  re-running `beams ssh` against a beam that's about to expire and
+  getting a fresh one is the only path to an updated checkout.
 
 ## New/changed tasks enabled by this
 

@@ -1,24 +1,21 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{bail, Context};
 
-/// Builds a temp directory named `beams/` containing exactly what a fresh
-/// beam needs: every git-tracked file in `repo` (so it automatically
-/// tracks the repo rather than needing a hand-maintained file list), plus
-/// the two things deliberately *not* tracked in git but still required -
-/// the ssh private key, and a prebuilt `beam-bootstrap` binary (no Rust
-/// toolchain on a fresh beam; see bootstrap/README.md).
+/// Builds a temp directory named `beams/` containing exactly the two
+/// things a fresh beam needs that git itself won't carry over: the ssh
+/// private key, and a prebuilt `beam-bootstrap` binary (no Rust
+/// toolchain on a fresh beam; see bootstrap/README.md). Everything else
+/// - every git-tracked file in `repo` - gets there via `tsh::push_repo`
+/// instead (see DESIGN.md's "Repo delivery onto a beam"); this used to
+/// stage *all* of it for one big `scp -r`, back when that was the only
+/// transport.
 pub fn build(repo: &Path) -> anyhow::Result<PathBuf> {
     let tmp = std::env::temp_dir().join(format!("beams-client-stage-{}", std::process::id()));
     let dest_root = tmp.join("beams");
     fs::create_dir_all(&dest_root).with_context(|| format!("creating {}", dest_root.display()))?;
-
-    for rel in tracked_files(repo)? {
-        copy_preserving_mode(&repo.join(&rel), &dest_root.join(&rel))?;
-    }
 
     let key = repo.join(".ssh/beams_id_ed25519");
     if key.exists() {
@@ -76,26 +73,6 @@ fn is_elf(path: &Path) -> anyhow::Result<bool> {
         return Ok(false);
     }
     Ok(magic == [0x7f, b'E', b'L', b'F'])
-}
-
-fn tracked_files(repo: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let output = Command::new("git")
-        .args(["-C"])
-        .arg(repo)
-        .args(["ls-files"])
-        .output()
-        .context("running git ls-files")?;
-    if !output.status.success() {
-        bail!(
-            "git ls-files failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(PathBuf::from)
-        .collect())
 }
 
 fn copy_preserving_mode(src: &Path, dest: &Path) -> anyhow::Result<()> {

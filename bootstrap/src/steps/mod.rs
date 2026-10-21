@@ -8,7 +8,6 @@ mod kubeconfig;
 mod kubectl;
 mod link;
 mod linkutil;
-mod releaseutil;
 mod shell_config;
 mod starship;
 mod tbot_service;

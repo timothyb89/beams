@@ -5,8 +5,9 @@ use std::process::Command;
 
 use anyhow::Context;
 
-use super::{run, Task, Template};
+use super::{Task, Template};
 use crate::graph::Capability;
+use crate::releaseutil::run;
 
 /// Clones `repo` to `dest` with a plain `git clone` - no assumptions
 /// about what kind of repo it is (GitHub, a beam, anything `git` itself

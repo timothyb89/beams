@@ -5,8 +5,9 @@ use std::process::Command;
 use anyhow::bail;
 
 use super::clone_git_repo::CloneGitRepo;
-use super::{run, Task, Template};
+use super::{Task, Template};
 use crate::graph::Capability;
+use crate::releaseutil::run;
 
 /// Fetches PR `pr`'s head ref from `base`'s `origin` remote and checks it
 /// out into a new worktree at `dest`, as a separate working directory

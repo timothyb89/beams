@@ -24,8 +24,9 @@
 
 pub mod checkout_pr_worktree;
 pub mod clone_git_repo;
+pub mod install_toolchain_go;
+pub mod install_toolchain_rust;
 
-use std::process::Command;
 
 use anyhow::{bail, Context};
 use serde::Serialize;
@@ -34,6 +35,8 @@ use serde_json::Value;
 use crate::graph::{Capability, Node};
 use checkout_pr_worktree::CheckoutPrWorktree;
 use clone_git_repo::CloneGitRepo;
+use install_toolchain_go::InstallToolchainGo;
+use install_toolchain_rust::InstallToolchainRust;
 
 /// One declared parameter of a template - just enough for a client (the
 /// TUI, eventually a GUI) to build an input field without hardcoding
@@ -151,6 +154,8 @@ pub fn templates() -> Vec<TemplateInfo> {
                 ParamSchema { name: "dest", kind: "path", required: true },
             ],
         },
+        TemplateInfo { template: InstallToolchainGo::NAME, params: &[] },
+        TemplateInfo { template: InstallToolchainRust::NAME, params: &[] },
     ]
 }
 
@@ -196,25 +201,10 @@ pub fn instantiate(name: &str, params: Value) -> anyhow::Result<Box<dyn Task>> {
                 dest: crate::pathutil::expand_tilde(&p.dest),
             }))
         }
+        InstallToolchainGo::NAME => Ok(Box::new(InstallToolchainGo)),
+        InstallToolchainRust::NAME => Ok(Box::new(InstallToolchainRust)),
         other => bail!("unknown template {other:?} (known: {})", names().join(", ")),
     }
-}
-
-/// Runs a `Command`, bailing with its stderr on a non-zero exit. Shared
-/// by the task implementations below - same pattern as
-/// `steps::releaseutil::run`, just not reachable from here (this module
-/// isn't nested under `steps`).
-pub(crate) fn run(cmd: &mut Command) -> anyhow::Result<()> {
-    let output = cmd.output().with_context(|| format!("running {cmd:?}"))?;
-    if !output.status.success() {
-        bail!(
-            "{:?} failed ({}): {}",
-            cmd,
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]
