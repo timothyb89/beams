@@ -13,7 +13,13 @@ impl Step for UpdateClaude {
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {
-        let output = Command::new("claude")
+        // The install this beam image ships is root-owned (npm global
+        // install under /usr/lib/node_modules), so a plain `claude update`
+        // fails with a permissions error telling you to use sudo - just do
+        // that. sudo resolves `claude` fine on its own since it's at a
+        // normal system path, no need to pass through $PATH explicitly.
+        let output = Command::new("sudo")
+            .arg("claude")
             .arg("update")
             .output()
             .context("running claude update")?;

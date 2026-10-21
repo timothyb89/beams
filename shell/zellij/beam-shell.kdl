@@ -1,21 +1,29 @@
-// Layout used by bin/beam-shell. A main interactive pane, a smaller pane
-// tailing ~/.beam-bootstrap.log (so bootstrap progress - and anything
-// future async steps print, teleport clone, go toolchain install, etc. -
-// stays visible without taking over the whole terminal), and a third pane
-// that ensures the ssh-agent is running and unlocks its key.
+// Layout used by bin/beam-shell. Starts from the same tab-bar/status-bar
+// chrome as zellij's own built-in "default" layout (`zellij setup
+// --dump-layout default`) - a bare custom layout replaces that chrome
+// entirely rather than inheriting it, which is why this repeats it here
+// instead of just defining the content panes on their own. In between: a
+// main pane, a smaller pane tailing ~/.beam-bootstrap.log (so bootstrap
+// progress - and anything future async steps print, teleport clone, go
+// toolchain install, etc. - stays visible without taking over the whole
+// terminal), and a third pane that ensures the ssh-agent is running and
+// unlocks its key.
 //
 // That third pane isn't focused by default - it doesn't need to be.
 // Finding/starting the agent never blocks (bin/ssh-agent-init), and the
 // password prompt for the key itself just sits there waiting in its own
 // pane until you switch over and answer it, whenever that is; nothing
-// else depends on it being unlocked immediately. Falls through to an
-// interactive shell afterward rather than exiting, so the pane stays
-// useful either way.
+// else depends on it being unlocked immediately. `close_on_exit` closes
+// the pane itself the moment ssh-agent-init finishes (unlocked, or left
+// alone if noninteractive/no key) - nothing to clean up once it's done.
 //
 // $HOME is expanded by the shell commands below rather than relying on
 // zellij layout variables, since the beams user is always /home/beams but
 // this keeps it correct if that ever changes.
 layout {
+    pane size=1 borderless=true {
+        plugin location="tab-bar"
+    }
     pane split_direction="horizontal" {
         pane
         pane split_direction="vertical" size="25%" {
@@ -23,10 +31,13 @@ layout {
                 command "bash"
                 args "-lc" "touch \"$HOME/.beam-bootstrap.log\" && tail -n +1 -f \"$HOME/.beam-bootstrap.log\""
             }
-            pane name="ssh-agent" {
+            pane name="ssh-agent" close_on_exit=true {
                 command "bash"
-                args "-lc" "\"$HOME/bin/ssh-agent-init\"; exec bash"
+                args "-lc" "\"$HOME/bin/ssh-agent-init\""
             }
         }
+    }
+    pane size=1 borderless=true {
+        plugin location="status-bar"
     }
 }
