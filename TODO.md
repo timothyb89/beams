@@ -75,11 +75,20 @@ just consequences of this design rather than separate asks.
   need a single node representation spanning both — worth settling as
   part of the daemon skeleton below, not before (no concrete need yet to
   design against).
-- [ ] Daemon skeleton: `beam-bootstrap daemon`, UDS socket at
-  `~/.beam-bootstrap/daemon.sock`, newline-delimited JSON protocol with
-  `request_id` correlation, task-status events broadcast to all
-  connected clients. `beamctl start beam-bootstrapd -- beam-bootstrap
-  daemon` to launch it, same mechanism as `tbot` today.
+- [x] Daemon skeleton: `beam-bootstrap daemon` (`src/daemon.rs`) — UDS
+  socket (`--socket`, default `~/.beam-bootstrap/daemon.sock`),
+  newline-delimited JSON, `request_id`-correlated direct replies,
+  `task_status` events broadcast to every connected client (not just the
+  requester — verified both in-process (`UnixStream::pair()` tests) and
+  against a real socket file with two concurrent client connections).
+  Supports `list_tasks`/`run_task` only, going through the same
+  `tasks::instantiate` the CLI's `run-task` uses. Refuses to start a
+  second instance against an already-listening socket. Thread-per-
+  connection + a global run-lock (std threads/mpsc, no async runtime —
+  stayed with the "boring" approach DESIGN.md calls for; a handful of
+  local connections doesn't need one). Not yet wired to anything that
+  starts it automatically (`beamctl start ...`, see next item) or to the
+  fixed startup sequence.
 - [ ] `beam-bootstrap --repo ...` (today's one-shot entrypoint) becomes:
   ensure a daemon is running, then let the daemon run the startup tasks,
   rather than running them itself inline.

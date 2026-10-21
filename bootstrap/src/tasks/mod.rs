@@ -22,8 +22,11 @@ pub mod clone_git_repo;
 use std::process::Command;
 
 use anyhow::{bail, Context};
+use serde_json::Value;
 
 use crate::graph::{Capability, Node};
+use checkout_pr_worktree::CheckoutPrWorktree;
+use clone_git_repo::CloneGitRepo;
 
 /// A task instance, produced by instantiating a template with concrete
 /// params (e.g. `clone_git_repo::CloneGitRepo { repo, dest }`).
@@ -75,6 +78,51 @@ pub trait Template: Task {
     const NAME: &'static str;
 }
 
+/// Every template's name, in a stable (if arbitrary) order - what
+/// `beam-bootstrap list-tasks` and the daemon's `list_tasks` op both
+/// enumerate.
+pub fn names() -> &'static [&'static str] {
+    &[CloneGitRepo::NAME, CheckoutPrWorktree::NAME]
+}
+
+/// Builds a task instance from a template name plus its params as JSON -
+/// the one instantiation path shared by the CLI (`run-task`, see
+/// `main.rs`) and the daemon's `run_task` op, so both go through the same
+/// params-parsing/validation rather than drifting into two copies of it.
+///
+/// Errors on an unknown template name or params that don't match what
+/// the named template expects (missing/mistyped fields).
+pub fn instantiate(name: &str, params: Value) -> anyhow::Result<Box<dyn Task>> {
+    match name {
+        CloneGitRepo::NAME => {
+            #[derive(serde::Deserialize)]
+            struct Params {
+                repo: String,
+                dest: String,
+            }
+            let p: Params = serde_json::from_value(params)
+                .with_context(|| format!("parsing params for {name:?}"))?;
+            Ok(Box::new(CloneGitRepo { repo: p.repo, dest: crate::pathutil::expand_tilde(&p.dest) }))
+        }
+        CheckoutPrWorktree::NAME => {
+            #[derive(serde::Deserialize)]
+            struct Params {
+                base: String,
+                pr: u32,
+                dest: String,
+            }
+            let p: Params = serde_json::from_value(params)
+                .with_context(|| format!("parsing params for {name:?}"))?;
+            Ok(Box::new(CheckoutPrWorktree {
+                base: crate::pathutil::expand_tilde(&p.base),
+                pr: p.pr,
+                dest: crate::pathutil::expand_tilde(&p.dest),
+            }))
+        }
+        other => bail!("unknown template {other:?} (known: {})", names().join(", ")),
+    }
+}
+
 /// Runs a `Command`, bailing with its stderr on a non-zero exit. Shared
 /// by the task implementations below - same pattern as
 /// `steps::releaseutil::run`, just not reachable from here (this module
@@ -114,5 +162,31 @@ mod tests {
             dest: PathBuf::from("/tmp/dest"),
         };
         assert!(checkout.id().starts_with(&format!("{}:", CheckoutPrWorktree::NAME)));
+    }
+
+    #[test]
+    fn instantiate_builds_the_right_task_from_json_params() {
+        let task = super::instantiate(
+            CloneGitRepo::NAME,
+            serde_json::json!({"repo": "https://example.invalid/x.git", "dest": "~/x"}),
+        )
+        .unwrap();
+        assert_eq!(task.id(), format!("{}:dest={}/x", CloneGitRepo::NAME, std::env::var("HOME").unwrap()));
+    }
+
+    #[test]
+    fn instantiate_rejects_an_unknown_template() {
+        let err = super::instantiate("not-a-real-template", serde_json::json!({}))
+            .err()
+            .expect("unknown template should be an error");
+        assert!(err.to_string().contains("not-a-real-template"));
+    }
+
+    #[test]
+    fn instantiate_rejects_params_missing_a_required_field() {
+        let err = super::instantiate(CloneGitRepo::NAME, serde_json::json!({"repo": "x"}))
+            .err()
+            .expect("missing dest should be an error");
+        assert!(err.to_string().contains(CloneGitRepo::NAME));
     }
 }

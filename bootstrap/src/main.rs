@@ -1,15 +1,15 @@
+mod daemon;
 mod events;
 mod graph;
+mod pathutil;
 mod steps;
 mod tasks;
 
-use std::path::PathBuf;
-
 use clap::{Parser, Subcommand};
+use serde_json::json;
 
-use tasks::checkout_pr_worktree::CheckoutPrWorktree;
-use tasks::clone_git_repo::CloneGitRepo;
-use tasks::{Task, Template};
+use pathutil::expand_tilde;
+use tasks::Template;
 
 /// Bootstraps a fresh (or partially set up) Teleport Beam: links this
 /// repo's dotfiles/bin into $HOME, installs apt packages, and runs
@@ -49,6 +49,18 @@ enum Command {
         #[command(subcommand)]
         task: TaskCommand,
     },
+    /// Run the long-lived daemon: listens on a UDS socket for
+    /// `list_tasks`/`run_task` requests (see `daemon`), broadcasting
+    /// task-status events to every connected client. Meant to be
+    /// supervised by `beamctl start`, not run directly for day-to-day
+    /// use yet - nothing drives this from the fixed startup sequence or
+    /// a TUI yet (see `DESIGN.md`'s migration plan).
+    Daemon {
+        /// UDS socket path to listen on. Defaults to
+        /// `~/.beam-bootstrap/daemon.sock`.
+        #[arg(long)]
+        socket: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -78,27 +90,18 @@ enum TaskCommand {
     },
 }
 
-fn expand_tilde(path: &str) -> PathBuf {
-    match path.strip_prefix("~/") {
-        Some(rest) => {
-            let home = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(home).join(rest)
-        }
-        None => PathBuf::from(path),
-    }
-}
-
 fn main() {
     let args = Args::parse();
     match args.command {
         Some(Command::ListTasks) => list_tasks(),
         Some(Command::RunTask { task }) => run_task(task),
+        Some(Command::Daemon { socket }) => run_daemon(socket),
         None => run_bootstrap(&args),
     }
 }
 
 fn list_tasks() {
-    for name in [CloneGitRepo::NAME, CheckoutPrWorktree::NAME] {
+    for name in tasks::names() {
         println!("{name}");
     }
 }
@@ -114,16 +117,27 @@ fn run_bootstrap(args: &Args) {
     std::process::exit(if ok { 0 } else { 1 });
 }
 
+/// Builds the `(template name, JSON params)` pair for a `TaskCommand` -
+/// goes through `tasks::instantiate` from there, the same path the
+/// daemon's `run_task` op uses, rather than constructing task structs
+/// directly (see that function's doc comment).
 fn run_task(command: TaskCommand) {
-    let task: Box<dyn Task> = match command {
+    let (name, params) = match command {
         TaskCommand::CloneGitRepo { repo, dest } => {
-            Box::new(CloneGitRepo { repo, dest: expand_tilde(&dest) })
+            (tasks::clone_git_repo::CloneGitRepo::NAME, json!({"repo": repo, "dest": dest}))
         }
-        TaskCommand::CheckoutPrWorktree { base, pr, dest } => Box::new(CheckoutPrWorktree {
-            base: expand_tilde(&base),
-            pr,
-            dest: expand_tilde(&dest),
-        }),
+        TaskCommand::CheckoutPrWorktree { base, pr, dest } => (
+            tasks::checkout_pr_worktree::CheckoutPrWorktree::NAME,
+            json!({"base": base, "pr": pr, "dest": dest}),
+        ),
+    };
+
+    let task = match tasks::instantiate(name, params) {
+        Ok(task) => task,
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
     };
 
     match task.run() {
@@ -133,5 +147,13 @@ fn run_task(command: TaskCommand) {
             eprintln!("error: {err}");
             std::process::exit(1);
         }
+    }
+}
+
+fn run_daemon(socket: Option<String>) {
+    let socket_path = expand_tilde(&socket.unwrap_or_else(daemon::default_socket_path));
+    if let Err(err) = daemon::serve(&socket_path) {
+        eprintln!("error: {err}");
+        std::process::exit(1);
     }
 }

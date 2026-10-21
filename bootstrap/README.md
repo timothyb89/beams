@@ -138,8 +138,8 @@ failed.
 Separate from the fixed startup sequence above: `src/tasks/` holds
 templated tasks that take runtime params instead of running
 unconditionally at startup (see `DESIGN.md`'s "Templates vs. instances").
-There's no daemon yet to drive these from a TUI/manifest - for now,
-reach them directly:
+Two ways to reach them - directly (no daemon involved), or through the
+daemon (see "Daemon" below):
 
 ```sh
 ./target/debug/beam-bootstrap list-tasks
@@ -153,6 +153,33 @@ other tasks (so run `clone-git-repo` against `--base` before
 the startup steps: re-running `clone-git-repo` against an existing
 checkout, or `checkout-pr-worktree` against an existing worktree, is a
 no-op.
+
+### Daemon
+
+`beam-bootstrap daemon` listens on a UDS socket (`--socket`, defaults to
+`~/.beam-bootstrap/daemon.sock`) for `list_tasks`/`run_task` requests as
+newline-delimited JSON - see `src/daemon.rs`'s module doc comment for the
+protocol. Meant to be supervised, e.g.:
+
+```sh
+beamctl start --name beam-bootstrapd -- ./target/debug/beam-bootstrap daemon
+```
+
+Nothing drives this from the fixed startup sequence, a TUI, or
+`client/` yet (see `DESIGN.md`'s migration plan) - today it only exists
+so `list_tasks`/`run_task` are reachable over a socket at all, same
+instantiation path as `run-task` above (`tasks::instantiate`), with
+task-status progress broadcast to every connected client, not just
+whoever asked - try it with two terminals:
+
+```sh
+# terminal 1
+./target/debug/beam-bootstrap daemon
+
+# terminal 2 - or any other UDS client, e.g. `socat - UNIX-CONNECT:...`
+echo '{"request_id":"1","op":"run_task","task":"clone-git-repo","params":{"repo":"...","dest":"..."}}' \
+  | nc -U ~/.beam-bootstrap/daemon.sock
+```
 
 ## Trying it out
 
