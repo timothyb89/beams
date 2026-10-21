@@ -14,9 +14,15 @@ still run it manually inside a beam you've already `ssh`'d into.
 
 The steps below run in dependency order, resolved from each step's
 declared capabilities (`provides`/`requires` in `src/steps/mod.rs`, see
-`DESIGN.md`) rather than a hardcoded sequence — today that still produces
-exactly the list below, but it's what lets new steps declare "runs after
-X" without everything needing to agree on one global order up front.
+`DESIGN.md`) rather than a hardcoded sequence, and **concurrently**
+wherever the graph allows it (see `DESIGN.md`'s "Concurrent execution") -
+e.g. `apt-install` and `install-teleport-bin` run at the same time, not
+one after the other just because they're both in this list. The numbered
+order below is just this doc's presentation order (and still a valid
+*serial* order, dependency-wise) - the steps that shell out to
+`apt-get`/`dpkg` (`apt-install`, `install-kubectl`) are tagged so they
+never run concurrently with *each other*, even though nothing else stops
+them from doing so.
 
 1. **link-files** — symlinks `bin` and `.ssh` from the repo checkout into
    `$HOME`. `.ssh` is force-replaced: a fresh beam ships its own default

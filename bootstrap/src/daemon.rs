@@ -57,6 +57,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::executor;
 use crate::graph;
 use crate::tasks::{self, Task};
 
@@ -272,16 +273,19 @@ fn run_manifest(hub: &Hub, request_id: Option<&str>, tasks_value: Value, reply: 
 
     // Resolved against *this manifest's own* instances only - see the
     // module doc comment on why a dependency on an earlier, separate
-    // run's capability doesn't work (and what to do instead).
-    let order = match graph::resolve_order(&instances) {
-        Ok(order) => order,
+    // run's capability doesn't work (and what to do instead). Just for
+    // the `accepted` reply's `task_ids` list below - `executor::run`
+    // (which actually runs these) resolves the same graph itself, since
+    // it needs the wave grouping `resolve_order` doesn't expose, not
+    // just a flat order.
+    let task_ids: Vec<String> = match graph::resolve_order(&instances) {
+        Ok(order) => order.into_iter().map(|i| instances[i].id()).collect(),
         Err(err) => {
             let _ = reply.send(error_reply(request_id, &err.to_string()));
             return;
         }
     };
 
-    let task_ids: Vec<String> = order.iter().map(|&i| instances[i].id()).collect();
     let manifest_id = hub.next_manifest_id();
     let _ = reply.send(
         json!({
@@ -293,30 +297,35 @@ fn run_manifest(hub: &Hub, request_id: Option<&str>, tasks_value: Value, reply: 
         .to_string(),
     );
 
-    // `resolve_order` gives indices into `instances`; consume via
-    // `Option` slots so each boxed task moves out exactly once, in the
-    // resolved order - same trick as `steps::resolved()`.
-    let mut slots: Vec<Option<Box<dyn Task>>> = instances.into_iter().map(Some).collect();
-
     // Held for the *whole* manifest's duration, not just one task at a
     // time within it - a manifest runs as one atomic unit relative to
     // other connections' `run_task`/`run_manifest` calls, which queue on
-    // this same lock (see `Hub::run_lock`'s doc comment).
+    // this same lock (see `Hub::run_lock`'s doc comment). Tasks *within*
+    // the manifest still run concurrently where the graph allows it -
+    // this lock is about manifests/standalone tasks not interleaving
+    // with each other, not about serializing within one.
     let _guard = hub.run_lock.lock().unwrap();
     hub.broadcast(&json!({"type": "manifest_status", "manifest_id": manifest_id, "status": "start"}).to_string());
 
-    for i in order {
-        let task = slots[i].take().expect("resolve_order repeats an index");
-        if let Err(message) = run_one_task(hub, task.as_ref(), Some(&manifest_id)) {
-            hub.broadcast(
-                &json!({"type": "manifest_status", "manifest_id": manifest_id, "status": "error", "message": message})
-                    .to_string(),
-            );
-            return; // stop at the first failure, same as steps::run
-        }
-    }
+    let on_event = |event: executor::Event| {
+        let line = match event {
+            executor::Event::Start { task_id } => task_status(&task_id, "start", None, Some(&manifest_id)),
+            executor::Event::Ok { task_id, message } => {
+                task_status(&task_id, "ok", Some(&message), Some(&manifest_id))
+            }
+            executor::Event::Skip { task_id } => task_status(&task_id, "skip", None, Some(&manifest_id)),
+            executor::Event::Error { task_id, message } => {
+                task_status(&task_id, "error", Some(&message), Some(&manifest_id))
+            }
+        };
+        hub.broadcast(&line);
+    };
 
-    hub.broadcast(&json!({"type": "manifest_status", "manifest_id": manifest_id, "status": "ok"}).to_string());
+    // Already validated above (same instances) - the only way this
+    // fails is a graph error, which `task_ids` already ruled out.
+    let ok = executor::run(instances, &on_event).expect("graph already validated above");
+    let status = if ok { "ok" } else { "error" };
+    hub.broadcast(&json!({"type": "manifest_status", "manifest_id": manifest_id, "status": status}).to_string());
 }
 
 /// Runs one task, broadcasting its `task_status` lifecycle (`start` then

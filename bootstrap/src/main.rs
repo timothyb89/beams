@@ -1,5 +1,6 @@
 mod daemon;
 mod events;
+mod executor;
 mod graph;
 mod pathutil;
 mod steps;
@@ -108,11 +109,11 @@ fn list_tasks() {
 
 fn run_bootstrap(args: &Args) {
     let repo = expand_tilde(&args.repo);
-    let mut emitter = events::default_emitter(args.json);
+    let emitter = events::default_emitter(args.json);
 
     let ok = match &args.only {
-        Some(step_id) => steps::run_only(&repo, &mut *emitter, step_id),
-        None => steps::run_all(&repo, &mut *emitter),
+        Some(step_id) => steps::run_only(&repo, &*emitter, step_id),
+        None => steps::run_all(&repo, &*emitter),
     };
     std::process::exit(if ok { 0 } else { 1 });
 }

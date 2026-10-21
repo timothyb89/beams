@@ -34,12 +34,32 @@ pub trait Node {
 /// Computes a run order for `nodes` satisfying every `requires`/`provides`
 /// edge, preserving the input order among nodes that are otherwise
 /// unconstrained relative to each other (so an already-correctly-ordered
-/// input list round-trips through this unchanged).
+/// input list round-trips through this unchanged). Just `resolve_levels`
+/// flattened - see that function if what you actually want is which
+/// nodes could run *concurrently*, not just some valid serial order.
 ///
 /// Returns the chosen order as indices into `nodes`. Errors on an unknown
 /// required capability (nothing provides it), two nodes claiming the same
 /// capability, or a dependency cycle.
 pub fn resolve_order<N: Node>(nodes: &[N]) -> anyhow::Result<Vec<usize>> {
+    Ok(resolve_levels(nodes)?.into_iter().flatten().collect())
+}
+
+/// Groups `nodes` into dependency "waves": level 0 is every node with no
+/// `requires` at all (or whose requirements are trivially satisfied),
+/// level 1 is everything that only depends on level 0, and so on. Nodes
+/// within the same level have no dependency relationship to each other -
+/// an executor is free to run them concurrently (see `executor::run`,
+/// which is the actual reason this is split out from a flat order: a
+/// `Node` alone doesn't know about real-world resource contention a
+/// concurrent executor also needs to respect - e.g. two steps that both
+/// shell out to `apt-get` - that's `Task::exclusive_resources`' job, one
+/// layer up from here).
+///
+/// Same preserved-input-order and error conditions as `resolve_order`
+/// (indeed, `resolve_order` is just this, flattened): within a level,
+/// nodes appear in their original input order.
+pub fn resolve_levels<N: Node>(nodes: &[N]) -> anyhow::Result<Vec<Vec<usize>>> {
     let mut provided_by: HashMap<Capability, usize> = HashMap::new();
     for (i, node) in nodes.iter().enumerate() {
         for cap in node.provides() {
@@ -70,25 +90,29 @@ pub fn resolve_order<N: Node>(nodes: &[N]) -> anyhow::Result<Vec<usize>> {
     }
 
     let mut placed = vec![false; nodes.len()];
-    let mut order = Vec::with_capacity(nodes.len());
-    while order.len() < nodes.len() {
-        let mut progressed = false;
+    let mut placed_count = 0;
+    let mut levels: Vec<Vec<usize>> = Vec::new();
+    while placed_count < nodes.len() {
+        let mut level = Vec::new();
         for (i, ready) in deps.iter().enumerate() {
             if !placed[i] && ready.iter().all(|&d| placed[d]) {
-                placed[i] = true;
-                order.push(i);
-                progressed = true;
+                level.push(i);
             }
         }
-        if !progressed {
+        if level.is_empty() {
             let stuck: Vec<String> = (0..nodes.len())
                 .filter(|&i| !placed[i])
                 .map(|i| nodes[i].node_id())
                 .collect();
             bail!("dependency cycle among: {}", stuck.join(", "));
         }
+        for &i in &level {
+            placed[i] = true;
+        }
+        placed_count += level.len();
+        levels.push(level);
     }
-    Ok(order)
+    Ok(levels)
 }
 
 #[cfg(test)]
@@ -176,6 +200,45 @@ mod tests {
         ];
         let err = resolve_order(&nodes).unwrap_err().to_string();
         assert!(err.contains("cycle"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn independent_nodes_share_one_level() {
+        // "b" and "c" both only depend on "a" - and have no relationship
+        // to each other - so they should land in the same level, free to
+        // run concurrently.
+        let nodes = [
+            Fake { id: "a", provides: &["a"], requires: &[] },
+            Fake { id: "b", provides: &["b"], requires: &["a"] },
+            Fake { id: "c", provides: &["c"], requires: &["a"] },
+        ];
+        let levels = resolve_levels(&nodes).unwrap();
+        let level_ids: Vec<Vec<&str>> =
+            levels.iter().map(|level| level.iter().map(|&i| nodes[i].id).collect()).collect();
+        assert_eq!(level_ids, vec![vec!["a"], vec!["b", "c"]]);
+    }
+
+    #[test]
+    fn fully_independent_nodes_are_all_one_level() {
+        let nodes = [
+            Fake { id: "a", provides: &[], requires: &[] },
+            Fake { id: "b", provides: &[], requires: &[] },
+            Fake { id: "c", provides: &[], requires: &[] },
+        ];
+        let levels = resolve_levels(&nodes).unwrap();
+        assert_eq!(levels.len(), 1, "no dependency relationship at all should mean one level");
+        assert_eq!(levels[0], vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn a_fully_linear_chain_is_one_node_per_level() {
+        let nodes = [
+            Fake { id: "a", provides: &["a"], requires: &[] },
+            Fake { id: "b", provides: &["b"], requires: &["a"] },
+            Fake { id: "c", provides: &["c"], requires: &["b"] },
+        ];
+        let levels = resolve_levels(&nodes).unwrap();
+        assert_eq!(levels, vec![vec![0], vec![1], vec![2]]);
     }
 
     /// A runtime-computed (owned) capability must match a statically

@@ -66,15 +66,49 @@ just consequences of this design rather than separate asks.
   daemon-backed CLI, added now so the template mechanism has a real
   caller. Runs exactly one task with no dependency resolution against
   anything else; superseded once the daemon exists.
-- [ ] **Known gap**: `graph::resolve_order<N: Node>` is monomorphic over
-  one `N` — a `Vec<Box<dyn Step>>` and a `Vec<Box<dyn Task>>` can each be
-  resolved on their own (as `steps::resolved()` already does), but can't
-  be resolved *together* in one call as-is. The daemon's actual task
-  graph (mixing fixed startup steps and templated instances, e.g.
-  `checkout-pr-worktree` depending on a `clone-git-repo` instance) will
-  need a single node representation spanning both — worth settling as
-  part of the daemon skeleton below, not before (no concrete need yet to
-  design against).
+- [x] **Former known gap, now resolved**: `Step` and `Task` couldn't be
+  resolved/run together in one graph. Didn't need merging into one
+  trait — `steps::StepAsTask` adapts a `Step` into a `Task` (wraps the
+  repo path it needs at construction), so the fixed startup sequence and
+  templated instances now share one graph/executor. See "Concurrent
+  execution" below for why this got settled now rather than later (it's
+  what made `apt-install`-concurrent-with-`clone-git-repo` possible at
+  all).
+- [x] **Concurrent execution** (see DESIGN.md's "Concurrent execution"):
+  `graph::resolve_levels` groups tasks into dependency waves instead of
+  one flat order; `executor::run` runs each wave's tasks on their own
+  threads, serializing only pairs sharing a `Task::exclusive_resources`
+  tag (added to `Step` too, via the adapter above), and stops advancing
+  to the next wave on a failure without trying to cancel in-flight work.
+  `steps::run` (the fixed startup sequence) and `daemon::run_manifest`
+  both go through this now, instead of each having their own serial
+  loop. `apt-install`/`install-kubectl` tagged with a shared `"apt"`
+  resource — the concrete case that would've broken immediately
+  otherwise (both shell out to `apt-get`/`dpkg`, no capability
+  dependency between them to have caught it). Verified: unit tests
+  (independent tasks measurably run concurrently not serially;
+  exclusive-resource tasks provably never overlap; a mid-wave failure
+  doesn't stop the rest of its own wave but does stop later waves) *and*
+  two full real runs of `beam-bootstrap --repo ~/beams` against this
+  beam's actual state — one surfaced a real pre-existing bug (below),
+  the other completed cleanly with visible concurrent waves in the
+  `--json` output and `install-kubectl` visibly waiting on the `apt`
+  lock.
+  - **Found along the way, not fixed (separate from this work)**: this
+    beam's `~/.config/fish/config.fish` was a real file (fish's own
+    auto-generated default, written before `shell-config` ever claimed
+    that path), not a symlink — `shell-config` doesn't force-replace the
+    way `link-files` does for `.ssh`. Probably related to, or the same
+    root cause as, the "starship + fish" item already below. Worked
+    around locally (moved the file aside) to finish validating; the
+    real fix still belongs with that item.
+  - Still open: the wire protocol doesn't expose wave/concurrency
+    structure to clients (`run_manifest`'s `accepted` reply still lists
+    a flat `task_ids`) - fine for now, but the eventual TUI will want to
+    render "these N are running right now" as a group, which means
+    deciding how to surface that - either in the reply shape or by
+    having the client infer it from `task_status` timing, which is
+    fragile. Decide alongside the TUI work.
 - [x] Daemon skeleton: `beam-bootstrap daemon` (`src/daemon.rs`) — UDS
   socket (`--socket`, default `~/.beam-bootstrap/daemon.sock`),
   newline-delimited JSON, `request_id`-correlated direct replies,

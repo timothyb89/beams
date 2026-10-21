@@ -3,7 +3,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context};
 
-use super::{cap, Step};
+use super::{cap, resource, Step};
 use crate::graph::Capability;
 
 /// kubectl isn't in Debian's default repos, so we add the official
@@ -22,6 +22,10 @@ impl Step for InstallKubectl {
 
     fn provides(&self) -> Vec<Capability> {
         vec![cap::KUBECTL_INSTALLED.into()]
+    }
+
+    fn exclusive_resources(&self) -> Vec<Capability> {
+        vec![resource::APT.into()]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

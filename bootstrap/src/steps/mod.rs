@@ -14,10 +14,12 @@ mod tbot_service;
 mod teleport_bin;
 mod zellij;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::events::{Emitter, Event, Status};
+use crate::executor;
 use crate::graph::{self, Capability, Node};
+use crate::tasks::Task;
 
 /// Capability names provided/required by the steps below - see
 /// `DESIGN.md`'s "Task model". Centralized so dependent steps reference
@@ -42,6 +44,20 @@ pub mod cap {
     pub const CLAUDE_UPDATED: &str = "claude-updated";
 }
 
+/// Named resources a step's `run()` holds exclusively while running - see
+/// `Step::exclusive_resources`. Distinct from `cap`: these aren't facts
+/// that become permanently true, just runtime mutual exclusion against
+/// other steps that touch the same underlying system resource.
+pub mod resource {
+    /// `apt-install` and `install-kubectl` both shell out to
+    /// `apt-get`/`dpkg`, which don't tolerate two concurrent invocations
+    /// (lock contention) - neither declares a capability dependency on
+    /// the other (there isn't one), so without this tag the concurrent
+    /// executor would happily start both at once and one would likely
+    /// fail outright.
+    pub const APT: &str = "apt";
+}
+
 /// A single idempotent bootstrap action. Steps are safe to re-run on a beam
 /// that's already partially (or fully) bootstrapped.
 ///
@@ -49,7 +65,11 @@ pub mod cap {
 /// declared by capability, not by naming another step directly (see
 /// `DESIGN.md`). Steps with no dependents/dependencies just leave both at
 /// their default empty slice.
-pub trait Step {
+///
+/// `Send` so a `Box<dyn Step>`, adapted into a `Task` via `StepAsTask`,
+/// can be handed off to whichever thread `executor::run` runs its wave
+/// on.
+pub trait Step: Send {
     fn id(&self) -> &'static str;
 
     /// Returns `Ok(Some(message))` on success, `Ok(None)` when the step had
@@ -62,6 +82,48 @@ pub trait Step {
 
     fn requires(&self) -> Vec<Capability> {
         Vec::new()
+    }
+
+    /// See `tasks::Task::exclusive_resources` - same idea, one layer
+    /// down. Checked only by the concurrent executor (`run_concurrent`
+    /// below, via `StepAsTask`), not by anything in this trait itself.
+    fn exclusive_resources(&self) -> Vec<Capability> {
+        Vec::new()
+    }
+}
+
+/// Adapts a `Step` (repo-path-parameterized, fixed at compile time) into
+/// a `tasks::Task` (no-param `run()`, built at runtime) so the fixed
+/// startup sequence can share one graph/executor with templated task
+/// instances - see `executor::run`'s module doc comment. This is what
+/// resolves the "`Step` and `Task` can't be ordered/run together" gap
+/// noted when the daemon skeleton first landed: it turns out they didn't
+/// need unifying into one trait, just a thin adapter from one to the
+/// other.
+struct StepAsTask {
+    step: Box<dyn Step>,
+    repo: PathBuf,
+}
+
+impl Task for StepAsTask {
+    fn id(&self) -> String {
+        self.step.id().to_string()
+    }
+
+    fn run(&self) -> anyhow::Result<Option<String>> {
+        self.step.run(&self.repo)
+    }
+
+    fn provides(&self) -> Vec<Capability> {
+        self.step.provides()
+    }
+
+    fn requires(&self) -> Vec<Capability> {
+        self.step.requires()
+    }
+
+    fn exclusive_resources(&self) -> Vec<Capability> {
+        self.step.exclusive_resources()
     }
 }
 
@@ -117,54 +179,139 @@ fn resolved() -> Vec<Box<dyn Step>> {
         .collect()
 }
 
-/// Runs every step in order against `repo`, emitting progress through
-/// `emitter`. Stops at the first failing step. Returns `true` if every step
-/// succeeded (including skips).
-pub fn run_all(repo: &Path, emitter: &mut dyn Emitter) -> bool {
+/// Runs every step against `repo`, emitting progress through `emitter`,
+/// exploiting concurrency wherever the capability graph allows it (see
+/// `executor::run`) - e.g. `apt-install` and `install-teleport-bin` no
+/// longer wait on each other just because they're both in one list.
+/// Stops after a wave containing any failure. Returns `true` if every
+/// step succeeded (including skips).
+pub fn run_all(repo: &Path, emitter: &dyn Emitter) -> bool {
     run(repo, emitter, None)
 }
 
-/// Runs just the step with the given id (used by `bin/beam-shell` to run
-/// `link-files` synchronously before anything that needs `~/.ssh`/`~/bin`
-/// in place, ahead of backgrounding the full run). Returns `true` if no
-/// step id matches, same as an empty run.
-pub fn run_only(repo: &Path, emitter: &mut dyn Emitter, step_id: &str) -> bool {
+/// Runs just the step with the given id, directly and synchronously - no
+/// concurrency, no waiting on a wave (used by `bin/beam-shell` to get
+/// `~/.ssh`/`~/bin` in place before anything else, which needs to happen
+/// immediately, not whenever its turn in some wave comes up). Still
+/// validates the *whole* step graph first, via `resolved()`, same as
+/// always - a broken capability declaration is a bug worth catching even
+/// when only running one step in isolation. Returns `true` if no step id
+/// matches, same as an empty run.
+pub fn run_only(repo: &Path, emitter: &dyn Emitter, step_id: &str) -> bool {
     run(repo, emitter, Some(step_id))
 }
 
-fn run(repo: &Path, emitter: &mut dyn Emitter, only: Option<&str>) -> bool {
+fn run(repo: &Path, emitter: &dyn Emitter, only: Option<&str>) -> bool {
+    match only {
+        Some(step_id) => run_single(repo, emitter, step_id),
+        None => run_concurrent(repo, emitter),
+    }
+}
+
+fn run_single(repo: &Path, emitter: &dyn Emitter, step_id: &str) -> bool {
     for step in resolved() {
-        if only.is_some_and(|id| id != step.id()) {
+        if step.id() != step_id {
             continue;
         }
         emitter.emit(Event::new(step.id(), Status::Start, None));
-        match step.run(repo) {
+        return match step.run(repo) {
             Ok(Some(message)) => {
                 emitter.emit(Event::new(step.id(), Status::Ok, Some(message)));
+                true
             }
             Ok(None) => {
                 emitter.emit(Event::new(step.id(), Status::Skip, None));
+                true
             }
             Err(err) => {
                 emitter.emit(Event::new(step.id(), Status::Error, Some(err.to_string())));
-                return false;
+                false
             }
-        }
+        };
     }
-    true
+    true // no step id matches - same as an empty run
+}
+
+fn run_concurrent(repo: &Path, emitter: &dyn Emitter) -> bool {
+    let tasks: Vec<Box<dyn Task>> = all()
+        .into_iter()
+        .map(|step| Box::new(StepAsTask { step, repo: repo.to_path_buf() }) as Box<dyn Task>)
+        .collect();
+
+    let on_event = |event: executor::Event| {
+        let translated = match event {
+            executor::Event::Start { task_id } => Event::new(&task_id, Status::Start, None),
+            executor::Event::Ok { task_id, message } => Event::new(&task_id, Status::Ok, Some(message)),
+            executor::Event::Skip { task_id } => Event::new(&task_id, Status::Skip, None),
+            executor::Event::Error { task_id, message } => {
+                Event::new(&task_id, Status::Error, Some(message))
+            }
+        };
+        emitter.emit(translated);
+    };
+
+    // `tasks` is `all()` adapted 1:1, so this validates the same graph
+    // `resolved()` already proves resolvable (see its own doc comment) -
+    // `expect` rather than propagating is consistent with that.
+    executor::run(tasks, &on_event).expect("bootstrap step dependency graph is invalid")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The capability graph must resolve to exactly the order the steps
-    /// were already hand-arranged in - no behavior change from
-    /// introducing `graph::resolve_order` on top of the existing list.
+    /// Once the executor runs independent steps concurrently, exact
+    /// positional equality with the original hand-written list is no
+    /// longer the right invariant (an unconstrained step like
+    /// `claude-update` legitimately moves earlier now, into the same
+    /// wave as other no-dependency steps - see the commit that added
+    /// this test for the full story). What still has to hold: every real
+    /// dependency edge is respected, and resolving is a reordering of
+    /// `all()`, not a filter - same 13 ids, no duplicates or omissions.
     #[test]
-    fn resolved_order_matches_original_hand_ordered_list() {
-        let expected: Vec<&str> = all().iter().map(|s| s.id()).collect();
-        let actual: Vec<&str> = resolved().iter().map(|s| s.id()).collect();
-        assert_eq!(actual, expected);
+    fn resolved_respects_every_known_dependency() {
+        let order: Vec<&str> = resolved().iter().map(|s| s.id()).collect();
+        let pos = |id: &str| order.iter().position(|&x| x == id).unwrap_or_else(|| panic!("{id} missing from resolved order"));
+
+        assert!(pos("apt-install") < pos("default-shell"), "default-shell needs fish from apt-install");
+        assert!(pos("install-teleport-bin") < pos("k3s-bot-join"));
+        assert!(pos("install-teleport-bin") < pos("start-tbot"));
+        assert!(pos("k3s-bot-join") < pos("start-tbot"));
+        assert!(pos("start-tbot") < pos("kubeconfig-symlink"));
+
+        let mut actual_ids: Vec<&str> = order.clone();
+        actual_ids.sort();
+        let mut expected_ids: Vec<&str> = all().iter().map(|s| s.id()).collect();
+        expected_ids.sort();
+        assert_eq!(actual_ids, expected_ids);
+    }
+
+    /// `apt-install` and `install-kubectl` have no capability dependency
+    /// on each other (there isn't one to declare), but both shell out to
+    /// `apt-get`/`dpkg` - without this tag, the concurrent executor would
+    /// happily run them at once and hit real lock contention. See
+    /// `resource::APT`'s doc comment.
+    #[test]
+    fn apt_touching_steps_declare_the_apt_exclusive_resource() {
+        let apt_resource: Vec<Capability> = vec![resource::APT.into()];
+        assert_eq!(apt::InstallPackages.exclusive_resources(), apt_resource);
+        assert_eq!(kubectl::InstallKubectl.exclusive_resources(), apt_resource);
+    }
+
+    /// `StepAsTask` just delegates `provides`/`requires`/
+    /// `exclusive_resources` to the wrapped `Step`, so adapting the whole
+    /// fixed list into `Task`s and resolving *that* graph should succeed
+    /// exactly like `resolved()` resolving the `Step` graph does -
+    /// doesn't call `run()` on anything (which would mean real
+    /// `apt-get`/network/filesystem side effects in a unit test).
+    #[test]
+    fn steps_adapted_to_tasks_still_resolve() {
+        let repo = PathBuf::from("/nonexistent-but-unused-by-resolve");
+        let tasks: Vec<Box<dyn Task>> = all()
+            .into_iter()
+            .map(|step| Box::new(StepAsTask { step, repo: repo.clone() }) as Box<dyn Task>)
+            .collect();
+        let levels = graph::resolve_levels(&tasks).expect("adapted graph should resolve");
+        assert_eq!(levels.iter().map(Vec::len).sum::<usize>(), tasks.len());
     }
 }

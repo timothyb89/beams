@@ -46,9 +46,13 @@ impl Event {
     }
 }
 
-/// How to render emitted events.
-pub trait Emitter {
-    fn emit(&mut self, event: Event);
+/// How to render emitted events. `&self`, not `&mut self`: both impls
+/// below are stateless (just write to stdout, which locks internally
+/// around each `println!` call), and `steps::run` now calls `emit` from
+/// several threads at once when a wave has more than one task in it -
+/// see `executor::run`.
+pub trait Emitter: Sync {
+    fn emit(&self, event: Event);
 }
 
 /// Raw JSON-lines output, one `Event` per line on stdout. This is the format
@@ -56,7 +60,7 @@ pub trait Emitter {
 pub struct Json;
 
 impl Emitter for Json {
-    fn emit(&mut self, event: Event) {
+    fn emit(&self, event: Event) {
         // Each step's lifecycle is a handful of events; losing one to a
         // serialization bug would be a real bug, so unwrap rather than
         // silently dropping output.
@@ -69,7 +73,7 @@ impl Emitter for Json {
 pub struct Pretty;
 
 impl Emitter for Pretty {
-    fn emit(&mut self, event: Event) {
+    fn emit(&self, event: Event) {
         match event.status {
             Status::Start => println!("[{}] running...", event.step),
             _ => {

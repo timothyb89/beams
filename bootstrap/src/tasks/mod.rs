@@ -5,16 +5,22 @@
 //! are derived from those params rather than being a compile-time
 //! constant.
 //!
-//! There's no daemon/manifest/socket yet to drive these (that's the next
-//! slice of the migration plan) - for now they're reachable directly via
-//! `beam-bootstrap run-task <template> ...` (see `main.rs`), which
-//! instantiates and runs exactly one task, on demand, without resolving
-//! it against any wider graph. A template that `requires` another task's
-//! capability (e.g. `checkout-pr-worktree` requiring a prior
-//! `clone-git-repo`'s `repo-cloned:<path>`) only has that requirement
-//! checked by its own `run()` - e.g. by checking the filesystem state the
-//! capability implies - not by the graph resolver, until there's an
-//! actual multi-task graph (daemon-driven) to resolve it against.
+//! Two ways these get run - see `main.rs`'s `run-task` and `daemon.rs`'s
+//! `run_task` op for the first: instantiate and run exactly *one* task
+//! on demand, without resolving it against any wider graph. A template
+//! that `requires` another task's capability (e.g. `checkout-pr-worktree`
+//! requiring a prior `clone-git-repo`'s `repo-cloned:<path>`) only has
+//! that requirement checked by its own `run()` there - e.g. by checking
+//! the filesystem state the capability implies - not by the graph
+//! resolver. That's deliberate: a bare on-demand task is meant for "I
+//! already know the prerequisite is satisfied" use.
+//!
+//! The other way - `daemon.rs`'s `run_manifest` op - *does* resolve
+//! several task instances against each other (`graph::resolve_levels`)
+//! and runs them concurrently where the graph allows via
+//! `executor::run`, which is also what the fixed startup sequence itself
+//! runs on (see `steps::StepAsTask`, the adapter that lets a `Step` join
+//! the same `Task` graph).
 
 pub mod checkout_pr_worktree;
 pub mod clone_git_repo;
@@ -34,7 +40,10 @@ use clone_git_repo::CloneGitRepo;
 /// Mirrors `steps::Step`'s shape (`id`/`run`/`provides`/`requires`) but
 /// with an owned, params-derived `id` and `Capability` values instead of
 /// compile-time `&'static str` ones - see the module doc comment.
-pub trait Task {
+///
+/// `Send` so `executor::run` can hand a task off to whichever thread
+/// ends up running its wave.
+pub trait Task: Send {
     fn id(&self) -> String;
     fn run(&self) -> anyhow::Result<Option<String>>;
 
@@ -43,6 +52,19 @@ pub trait Task {
     }
 
     fn requires(&self) -> Vec<Capability> {
+        Vec::new()
+    }
+
+    /// Named resources this task's `run()` holds exclusively while it's
+    /// executing - not a capability (a fact that becomes permanently
+    /// true), but mutual exclusion against other tasks that declare the
+    /// same resource, enforced only at runtime by `executor::run`, which
+    /// is the only thing that needs to care: two tasks with no
+    /// capability relationship can still be unsafe to run at the same
+    /// time (the canonical example here: `apt-install` and
+    /// `install-kubectl` both shell out to `apt-get`/`dpkg`, which don't
+    /// tolerate two concurrent invocations - see `steps::resource`).
+    fn exclusive_resources(&self) -> Vec<Capability> {
         Vec::new()
     }
 }

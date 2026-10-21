@@ -116,6 +116,44 @@ filesystem/package state directly, not a cache.
   zero-param templates, auto-instantiated once at daemon startup — no
   behavior change for them, just a reframing.
 
+### Concurrent execution
+
+The capability graph doubles as a schedule: `graph::resolve_levels`
+groups tasks into dependency "waves" (level 0 = no `requires` at all,
+level 1 = only depends on level 0, …) instead of one flat order, and
+`executor::run` runs every task in a wave on its own thread, only
+starting the next wave once the current one is fully done. Two tasks
+with no capability relationship — `apt-install` and `clone-git-repo`,
+say — land in the same wave and actually run at the same time, instead
+of waiting on each other just because they're both in one list.
+
+This is also what resolves the "`Step` and `Task` can't be ordered or
+run together" gap noted when the daemon skeleton first landed: rather
+than merging the two into one trait, a thin adapter
+(`steps::StepAsTask`) wraps a `Step` (repo-path-parameterized, fixed at
+compile time) as a `Task` (no-param `run()`), so the fixed startup
+sequence and templated task instances can share one graph/executor.
+`steps::run` itself now goes through `executor::run`.
+
+Real-world contention the capability graph doesn't (and shouldn't) know
+about still needs handling: `apt-install` and `install-kubectl` both
+shell out to `apt-get`/`dpkg`, which don't tolerate two concurrent
+invocations, but there's no *capability* dependency between them to
+declare — mutual exclusion isn't a "produces a fact" relationship.
+`Task::exclusive_resources` (and `Step`'s mirror of it) names a resource
+a task holds for the duration of its `run()`; the executor serializes
+any two tasks in the same wave that share one, via a lock keyed by the
+resource name, without blocking the rest of the wave. Adding a new step
+that shells out to `apt-get` means tagging it with this same resource —
+easy to forget, so it's worth checking for whenever a new task touches a
+system-level package manager, service manager, or similar shared state.
+
+A wave containing a failure doesn't start the next wave, but every other
+task already running in that wave finishes normally — cancelling
+mid-flight, real work (an apt install, a git clone) isn't generally safe,
+so "stop advancing, don't try to abort what's in flight" is the executor's
+actual failure policy.
+
 ### Deferred / optional tasks
 
 A template can be marked `deferred: true` — the daemon registers it (so

@@ -3,7 +3,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context};
 
-use super::{cap, Step};
+use super::{cap, resource, Step};
 use crate::graph::Capability;
 
 /// Packages to install on every beam, that are available from Debian's
@@ -23,6 +23,10 @@ impl Step for InstallPackages {
 
     fn provides(&self) -> Vec<Capability> {
         vec![cap::APT_PACKAGES_INSTALLED.into()]
+    }
+
+    fn exclusive_resources(&self) -> Vec<Capability> {
+        vec![resource::APT.into()]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {
