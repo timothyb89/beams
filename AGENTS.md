@@ -70,6 +70,39 @@ Plus:
   commit progress and task notes to the repo as you go, which is the
   point of this file and `TODO.md`.
 
+## Session workflow (this environment is itself an ephemeral beam)
+
+Every beam, including the one these sessions run in, is deleted ~24h
+after creation with no persistence. The git repo (pushed to `origin`) is
+the *only* thing that survives a session boundary — conversation history,
+scratch files, and anything agreed-but-unwritten are gone the moment the
+beam disappears, planned or not. That changes how work here should be
+sequenced:
+
+- **Start of session**: re-orient from the repo, not from memory of a
+  prior conversation — read `AGENTS.md` (this file), `DESIGN.md`,
+  `TODO.md`, and `git log` for recent commits before resuming work. Don't
+  assume context from an earlier chat carried over.
+- **Write decisions down before or alongside implementing them, not
+  after.** If a design discussion in conversation reaches a conclusion,
+  that conclusion isn't real until it's in `DESIGN.md`/`TODO.md` and
+  committed — a beam disappearing mid-conversation loses anything that
+  only exists as chat.
+- **Commit early and often, with discrete commits.** Don't batch a
+  session's work into one giant commit at the end — if the session ends
+  (TTL, crash, interruption) mid-task, whatever's uncommitted is lost.
+  Prefer several small, individually-sensible commits over one large one
+  held until "done."
+- **Update `TODO.md` in the same commit as the work it tracks** — check
+  off/remove finished items, add newly discovered ones. A stale TODO is
+  worse than no TODO, since the next session trusts it at face value.
+- **Push, don't just commit locally, once work is in a reviewable state**
+  — a local commit on a beam that gets recycled before it's pushed is
+  just as lost as an uncommitted change. (Still only push when actually
+  asked to, per the attribution/workflow conventions already in place —
+  the point is not to let pushing lag so far behind committing that a
+  beam's disappearance costs real work.)
+
 ## Testing
 
 - `client/src/stage.rs` has unit tests today (staging-directory assembly,
