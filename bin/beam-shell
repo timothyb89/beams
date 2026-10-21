@@ -29,17 +29,24 @@ BOOTSTRAP_BIN="$REPO/bootstrap/target/x86_64-unknown-linux-musl/release/beam-boo
 # 1. make sure ~/.ssh and ~/bin are in place before anything below needs
 #    them - ssh-agent-init's default key path, and the stable key the repo
 #    carries (link-files force-replaces beams' own default ~/.ssh with
-#    it) - and that zellij itself is installed, since step 4 below execs
-#    it immediately rather than waiting on the backgrounded full run. A
-#    beam that's already been bootstrapped once has both already, so this
-#    is just two quick idempotent checks; a genuinely fresh beam doesn't
-#    have zellij yet at all, and without this, the `exec zellij` below
-#    would race the background install and lose. Run each step
-#    synchronously rather than duplicating its logic here; the full run
-#    below (backgrounded) will just skip both the second time.
+#    it) - and that zellij and fish are both installed, since step 4 below
+#    execs zellij immediately rather than waiting on the backgrounded full
+#    run (and zellij needs fish to already exist to use it for new panes -
+#    see step 4's default_shell override). A beam that's already been
+#    bootstrapped once has all of these already, so this is just a few
+#    quick idempotent checks; a genuinely fresh beam doesn't have zellij
+#    or fish yet at all. Run each step synchronously rather than
+#    duplicating its logic here; the full run below (backgrounded) will
+#    just skip all of them the second time.
 if [ -x "$BOOTSTRAP_BIN" ]; then
     "$BOOTSTRAP_BIN" --repo "$REPO" --only link-files
     "$BOOTSTRAP_BIN" --repo "$REPO" --only install-zellij
+    "$BOOTSTRAP_BIN" --repo "$REPO" --only apt-install
+    # Doesn't help *this* zellij session (see step 4's default_shell
+    # override for why) but worth doing now anyway, so a plain `tsh ssh`
+    # straight into the beam - no beam-shell at all - gets fish on its
+    # next connection rather than waiting on the backgrounded full run.
+    "$BOOTSTRAP_BIN" --repo "$REPO" --only default-shell
 else
     echo "beam-shell: beam-bootstrap binary not found under $REPO/bootstrap/target - skipping" >>"$LOG"
 fi
@@ -78,10 +85,26 @@ fi
 #    user's own zellij config. `attach --create` handles attach-or-create
 #    on its own; a fresh create picks up this default layout, an existing
 #    session is just attached to as-is.
+#
+#    Also explicitly set default_shell to fish (once step 1 above has
+#    installed it) for the panes zellij spawns on its own (the main pane
+#    here, any new pane/tab you open later) - zellij otherwise falls back
+#    to $SHELL, which sshd/PAM set from the passwd entry at *connection*
+#    time. On a beam's very first bootstrap, that's still whatever shell
+#    was configured before this run (bash) - chsh flipping the passwd
+#    entry moments later, even synchronously and before this point,
+#    doesn't retroactively update an already-exported env var in this
+#    process. Overriding it explicitly here is what actually makes zellij
+#    use fish from this session's first pane onward, rather than only
+#    after a later reconnect.
 mkdir -p "$(dirname "$ZELLIJ_CONFIG")"
 cat >"$ZELLIJ_CONFIG" <<EOF
 layout_dir "$ZELLIJ_LAYOUT_DIR"
 default_layout "beam-shell"
 EOF
+FISH_BIN="$(command -v fish || true)"
+if [ -n "$FISH_BIN" ]; then
+    echo "default_shell \"$FISH_BIN\"" >>"$ZELLIJ_CONFIG"
+fi
 
 exec zellij --config "$ZELLIJ_CONFIG" attach "$SESSION" --create
