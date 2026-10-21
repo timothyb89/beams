@@ -27,32 +27,45 @@ layout {
         pane size=1 borderless=true {
             plugin location="tab-bar"
         }
-        pane split_direction="horizontal" {
-            pane
-            pane split_direction="vertical" size="25%" {
-                // Tails ~/.beam-bootstrap.log, so bootstrap progress -
-                // and anything future async steps print, teleport
-                // clone, go toolchain install, etc. - stays visible
-                // without taking over the whole terminal.
-                pane {
-                    command "bash"
-                    args "-lc" "touch \"$HOME/.beam-bootstrap.log\" && tail -n +1 -f \"$HOME/.beam-bootstrap.log\""
+        pane split_direction="vertical" {
+            pane split_direction="horizontal" size="70%" {
+                pane
+                pane split_direction="vertical" size="25%" {
+                    // Tails ~/.beam-bootstrap.log, so bootstrap progress -
+                    // and anything future async steps print, teleport
+                    // clone, go toolchain install, etc. - stays visible
+                    // without taking over the whole terminal.
+                    pane {
+                        command "bash"
+                        args "-lc" "touch \"$HOME/.beam-bootstrap.log\" && tail -n +1 -f \"$HOME/.beam-bootstrap.log\""
+                    }
+                    // Ensures the ssh-agent is running and unlocks its key.
+                    // Not focused by default - it doesn't need to be.
+                    // Finding/starting the agent never blocks
+                    // (bin/ssh-agent-init), and the password prompt for the
+                    // key itself just sits there waiting in its own pane
+                    // until you switch over and answer it, whenever that
+                    // is; nothing else depends on it being unlocked
+                    // immediately. `close_on_exit` closes the pane itself
+                    // the moment ssh-agent-init finishes (unlocked, or left
+                    // alone if noninteractive/no key) - nothing to clean up
+                    // once it's done.
+                    pane name="ssh-agent" close_on_exit=true {
+                        command "bash"
+                        args "-lc" "\"$HOME/bin/ssh-agent-init\""
+                    }
                 }
-                // Ensures the ssh-agent is running and unlocks its key.
-                // Not focused by default - it doesn't need to be.
-                // Finding/starting the agent never blocks
-                // (bin/ssh-agent-init), and the password prompt for the
-                // key itself just sits there waiting in its own pane
-                // until you switch over and answer it, whenever that
-                // is; nothing else depends on it being unlocked
-                // immediately. `close_on_exit` closes the pane itself
-                // the moment ssh-agent-init finishes (unlocked, or left
-                // alone if noninteractive/no key) - nothing to clean up
-                // once it's done.
-                pane name="ssh-agent" close_on_exit=true {
-                    command "bash"
-                    args "-lc" "\"$HOME/bin/ssh-agent-init\""
-                }
+            }
+            // Right-hand side panel: `beam-bootstrap tui` (see
+            // bootstrap/src/tui/), talking to the daemon
+            // bin/beam-shell starts synchronously (step 1, before this
+            // layout even launches) over its default UDS socket. Uses
+            // $BEAM_BOOTSTRAP_BIN (exported by bin/beam-shell) rather
+            // than re-deriving the cross-compiled-vs-native binary path
+            // fallback chain here too.
+            pane size="30%" {
+                command "bash"
+                args "-lc" "\"$BEAM_BOOTSTRAP_BIN\" tui"
             }
         }
         pane size=1 borderless=true {

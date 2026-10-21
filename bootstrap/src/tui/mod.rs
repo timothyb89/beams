@@ -22,8 +22,19 @@ use client::DaemonClient;
 /// - just enough to animate the running-task spinner.
 const TICK: Duration = Duration::from_millis(120);
 
+/// How long to keep retrying the initial connection before giving up.
+/// Matters when this is baked into a zellij pane that starts around the
+/// same time as the daemon itself (see `bin/beam-shell`/
+/// `shell/zellij/beam-shell.kdl`) - `start-bootstrap-daemon` runs
+/// synchronously before zellij launches specifically to avoid this race,
+/// but retrying here is cheap insurance against the daemon just being
+/// slow to bind its socket, rather than a hard requirement on exact
+/// ordering elsewhere.
+const CONNECT_RETRY_FOR: Duration = Duration::from_secs(5);
+const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
 pub fn run(socket_path: &Path) -> anyhow::Result<()> {
-    let mut client = DaemonClient::connect(socket_path)
+    let mut client = connect_with_retry(socket_path)
         .with_context(|| format!("connecting to daemon at {}", socket_path.display()))?;
 
     let mut terminal = ratatui::try_init().context("initializing terminal")?;
@@ -33,6 +44,20 @@ pub fn run(socket_path: &Path) -> anyhow::Result<()> {
     let result = run_loop(&mut terminal, &mut client);
     let _ = ratatui::try_restore();
     result
+}
+
+fn connect_with_retry(socket_path: &Path) -> anyhow::Result<DaemonClient> {
+    let deadline = std::time::Instant::now() + CONNECT_RETRY_FOR;
+    loop {
+        match DaemonClient::connect(socket_path) {
+            Ok(client) => return Ok(client),
+            Err(err) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(CONNECT_RETRY_INTERVAL);
+                let _ = err; // superseded by the next attempt, or the final one below
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 fn run_loop(terminal: &mut DefaultTerminal, client: &mut DaemonClient) -> anyhow::Result<()> {

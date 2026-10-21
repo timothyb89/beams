@@ -60,6 +60,13 @@ them from doing so.
     `~/.teleport-bot/kube/kubeconfig.yaml` into `~/.kube/config`, so
     `kubectl` works against the k3s cluster with no extra flags.
 13. **claude-update** — runs `claude update`.
+14. **start-bootstrap-daemon** — starts `beam-bootstrap daemon` (see
+    "Daemon" below) as a `beamctl`-managed background service, same
+    pattern as `start-tbot`. No dependencies on anything else here, so
+    it comes up as early as possible - `bin/beam-shell` also runs this
+    one synchronously (like `link-files`/`install-zellij`/etc.) before
+    launching zellij, since the `tui` pane in its layout needs something
+    to connect to right away.
 
 SSH to the k3s host node isn't wired into `tsh`/`ssh` directly yet - use the
 identity output explicitly for now:

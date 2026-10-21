@@ -208,12 +208,23 @@ section above for status/details. Still open:
   tabs via `zellij -s test-layout action new-tab`, and `action
   dump-layout` showed the first tab keeping its full 3-pane structure
   while both new tabs got the plain single-pane template.
-- [ ] `beam-bootstrap tui` (now built, see "Migration" below) still
-  needs to actually be spawned into a beam-shell session - the plan is
-  imperatively (`zellij action new-pane --direction right`) into an
-  already-open session rather than baked into the layout file, so it
-  doesn't hit the same per-tab-replay problem this fix addressed. Not
-  wired into `bin/beam-shell` yet.
+- [x] `beam-bootstrap tui` is now wired into `bin/beam-shell`'s session:
+  baked directly into the first tab's explicit layout (as a right-hand
+  pane, `size="30%"`) rather than via `zellij action new-pane` - safe to
+  do now that the first tab has its own explicit block, separate from
+  `new_tab_template`, so it only ever applies once, not per-tab. A new
+  fixed step, `start-bootstrap-daemon` (mirrors `start-tbot`'s
+  beamctl-service pattern), runs synchronously in `bin/beam-shell`
+  before zellij launches, same as `link-files`/`install-zellij`/etc., so
+  the daemon the tui pane connects to is already up by the time zellij
+  starts (the tui's own connect also retries for 5s regardless, as
+  insurance, not as the primary mechanism). Verified live: ran the new
+  step for real on this beam (now a genuine `beamctl` service,
+  `beam-bootstrapd`), then rendered the actual updated layout file in a
+  throwaway zellij session (not the real `beam-shell`/`SESSION="beam"`
+  path, to avoid touching this environment's own live session) and
+  confirmed the tui panel renders correctly alongside the existing
+  log-tail structure.
 
 ## Bug: starship + fish
 

@@ -1,6 +1,7 @@
 mod apt;
 mod claude;
 mod claude_md;
+mod daemon_service;
 mod default_shell;
 mod k3s_bot;
 mod kubeconfig;
@@ -42,6 +43,7 @@ pub mod cap {
     pub const TBOT_SERVICE_RUNNING: &str = "tbot-service-running";
     pub const KUBECONFIG_LINKED: &str = "kubeconfig-linked";
     pub const CLAUDE_UPDATED: &str = "claude-updated";
+    pub const BOOTSTRAP_DAEMON_RUNNING: &str = "bootstrap-daemon-running";
 }
 
 /// Named resources a step's `run()` holds exclusively while running - see
@@ -160,6 +162,7 @@ fn all() -> Vec<Box<dyn Step>> {
         Box::new(tbot_service::StartTbotService),
         Box::new(kubeconfig::LinkKubeconfig),
         Box::new(claude::UpdateClaude),
+        Box::new(daemon_service::StartBootstrapDaemon),
     ]
 }
 

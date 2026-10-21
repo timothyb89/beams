@@ -5,10 +5,11 @@
 # running (never blocks - see step 2 below), kicks off beam-bootstrap in
 # the background logging to ~/.beam-bootstrap.log, then attaches to (or
 # creates) a "beam" zellij session with a layout that keeps that log
-# visible in a side pane, alongside another pane that handles the actual
-# interactive key unlock whenever you get to it - see
-# shell/zellij/beam-shell.kdl. Safe to run repeatedly - everything it does
-# is idempotent.
+# visible in a side pane, a pane that handles the actual interactive key
+# unlock whenever you get to it, and a right-hand pane running
+# `beam-bootstrap tui` against the daemon this script also starts
+# synchronously (step 1) - see shell/zellij/beam-shell.kdl. Safe to run
+# repeatedly - everything it does is idempotent.
 
 set -euo pipefail
 
@@ -25,6 +26,11 @@ ZELLIJ_CONFIG="${XDG_CACHE_HOME:-$HOME/.cache}/beam-shell/zellij-config.kdl"
 BOOTSTRAP_BIN="$REPO/bootstrap/target/x86_64-unknown-linux-musl/release/beam-bootstrap"
 [ -x "$BOOTSTRAP_BIN" ] || BOOTSTRAP_BIN="$REPO/bootstrap/target/release/beam-bootstrap"
 [ -x "$BOOTSTRAP_BIN" ] || BOOTSTRAP_BIN="$REPO/bootstrap/target/debug/beam-bootstrap"
+# Exported so shell/zellij/beam-shell.kdl's tui pane can run the same
+# binary without re-deriving this fallback chain itself (and without a
+# zellij layout variable, same rationale as that file's own note on
+# expanding $HOME in shell commands rather than relying on one).
+export BEAM_BOOTSTRAP_BIN="$BOOTSTRAP_BIN"
 
 # 1. make sure ~/.ssh and ~/bin are in place before anything below needs
 #    them - ssh-agent-init's default key path, and the stable key the repo
@@ -47,6 +53,15 @@ if [ -x "$BOOTSTRAP_BIN" ]; then
     # straight into the beam - no beam-shell at all - gets fish on its
     # next connection rather than waiting on the backgrounded full run.
     "$BOOTSTRAP_BIN" --repo "$REPO" --only default-shell
+    # Also synchronous, for the same reason as the others: the zellij
+    # layout's tui pane (see shell/zellij/beam-shell.kdl) connects to
+    # this daemon the moment zellij starts in step 4 below, so it needs
+    # to already be listening by then, not just "eventually" via the
+    # backgrounded full run in step 3. (`tui`'s own connect retries
+    # briefly regardless - see `tui::connect_with_retry` - this is about
+    # not relying on that race resolving in our favor, not a strict
+    # requirement for it to work at all.)
+    "$BOOTSTRAP_BIN" --repo "$REPO" --only start-bootstrap-daemon
 else
     echo "beam-shell: beam-bootstrap binary not found under $REPO/bootstrap/target - skipping" >>"$LOG"
 fi
