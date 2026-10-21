@@ -28,11 +28,40 @@ pub mod clone_git_repo;
 use std::process::Command;
 
 use anyhow::{bail, Context};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::graph::{Capability, Node};
 use checkout_pr_worktree::CheckoutPrWorktree;
 use clone_git_repo::CloneGitRepo;
+
+/// One declared parameter of a template - just enough for a client (the
+/// TUI, eventually a GUI) to build an input field without hardcoding
+/// per-template knowledge: a name, a free-text type hint (not a closed
+/// enum - a new template can introduce a new hint as needed, a client
+/// that doesn't recognize one can still fall back to a plain text
+/// field), and whether it's required.
+///
+/// Hand-written and kept right next to each template's own params
+/// struct inside `instantiate` below, not derived from it - there's no
+/// reflection/schema-derive crate in this dependency tree, and adding
+/// one for two templates' worth of fields isn't worth it yet. Keeping
+/// the two side by side in the same `match` arm is what keeps them from
+/// drifting apart as templates change.
+#[derive(Serialize, Clone, Copy)]
+pub struct ParamSchema {
+    pub name: &'static str,
+    pub kind: &'static str,
+    pub required: bool,
+}
+
+/// A template's name plus its param schema - what `list_tasks` (the
+/// daemon op) and `beam-bootstrap list-tasks` (the CLI) both enumerate.
+#[derive(Serialize)]
+pub struct TemplateInfo {
+    pub template: &'static str,
+    pub params: &'static [ParamSchema],
+}
 
 /// A task instance, produced by instantiating a template with concrete
 /// params (e.g. `clone_git_repo::CloneGitRepo { repo, dest }`).
@@ -100,23 +129,48 @@ pub trait Template: Task {
     const NAME: &'static str;
 }
 
-/// Every template's name, in a stable (if arbitrary) order - what
-/// `beam-bootstrap list-tasks` and the daemon's `list_tasks` op both
-/// enumerate.
-pub fn names() -> &'static [&'static str] {
-    &[CloneGitRepo::NAME, CheckoutPrWorktree::NAME]
+/// Every template's name + param schema, in a stable (if arbitrary)
+/// order - what `beam-bootstrap list-tasks` and the daemon's
+/// `list_tasks` op both enumerate. Schemas here must match
+/// `instantiate`'s `Params` structs below - see `ParamSchema`'s doc
+/// comment on why that's a manual, not derived, invariant.
+pub fn templates() -> Vec<TemplateInfo> {
+    vec![
+        TemplateInfo {
+            template: CloneGitRepo::NAME,
+            params: &[
+                ParamSchema { name: "repo", kind: "string", required: true },
+                ParamSchema { name: "dest", kind: "path", required: true },
+            ],
+        },
+        TemplateInfo {
+            template: CheckoutPrWorktree::NAME,
+            params: &[
+                ParamSchema { name: "base", kind: "path", required: true },
+                ParamSchema { name: "pr", kind: "number", required: true },
+                ParamSchema { name: "dest", kind: "path", required: true },
+            ],
+        },
+    ]
+}
+
+/// Just the names, for call sites that don't need the param schema too.
+pub fn names() -> Vec<&'static str> {
+    templates().into_iter().map(|t| t.template).collect()
 }
 
 /// Builds a task instance from a template name plus its params as JSON -
 /// the one instantiation path shared by the CLI (`run-task`, see
-/// `main.rs`) and the daemon's `run_task` op, so both go through the same
-/// params-parsing/validation rather than drifting into two copies of it.
+/// `main.rs`) and the daemon's `run_task`/`run_manifest` ops, so both go
+/// through the same params-parsing/validation rather than drifting into
+/// two copies of it.
 ///
 /// Errors on an unknown template name or params that don't match what
 /// the named template expects (missing/mistyped fields).
 pub fn instantiate(name: &str, params: Value) -> anyhow::Result<Box<dyn Task>> {
     match name {
         CloneGitRepo::NAME => {
+            // Keep in sync with `templates()`'s schema for this name.
             #[derive(serde::Deserialize)]
             struct Params {
                 repo: String,
@@ -127,6 +181,7 @@ pub fn instantiate(name: &str, params: Value) -> anyhow::Result<Box<dyn Task>> {
             Ok(Box::new(CloneGitRepo { repo: p.repo, dest: crate::pathutil::expand_tilde(&p.dest) }))
         }
         CheckoutPrWorktree::NAME => {
+            // Keep in sync with `templates()`'s schema for this name.
             #[derive(serde::Deserialize)]
             struct Params {
                 base: String,
@@ -202,6 +257,26 @@ mod tests {
             .err()
             .expect("unknown template should be an error");
         assert!(err.to_string().contains("not-a-real-template"));
+    }
+
+    /// `templates()`'s hand-written schema and `instantiate`'s actual
+    /// `Params` structs are two separate declarations by design (see
+    /// `ParamSchema`'s doc comment) - this is what catches them drifting
+    /// apart: build each template's params using *only* the fields its
+    /// schema claims to need, and confirm `instantiate` actually accepts
+    /// that.
+    #[test]
+    fn template_schemas_match_what_instantiate_actually_accepts() {
+        for info in super::templates() {
+            let mut obj = serde_json::Map::new();
+            for p in info.params {
+                let value = if p.kind == "number" { serde_json::json!(1) } else { serde_json::json!("x") };
+                obj.insert(p.name.to_string(), value);
+            }
+            super::instantiate(info.template, serde_json::Value::Object(obj)).unwrap_or_else(|e| {
+                panic!("{}: schema in templates() doesn't match instantiate(): {e}", info.template)
+            });
+        }
     }
 
     #[test]

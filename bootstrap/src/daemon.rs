@@ -25,24 +25,39 @@
 //! ]}
 //! ```
 //!
+//! `list_tasks`'s reply carries each template's param schema too (`tasks:
+//! [{"template": "clone-git-repo", "params": [{"name": "repo", "kind":
+//! "string", "required": true}, ...]}, ...]`, see `tasks::TemplateInfo`)
+//! - enough for a client to build an input field per param without
+//! hardcoding per-template knowledge.
+//!
 //! `run_manifest` is `run_task` generalized to several task instances at
 //! once (see DESIGN.md's "Seeding manifest") - the entries are resolved
-//! against each other via `graph::resolve_order` (so listing them out of
-//! dependency order, as above, is fine) and run in that order, stopping
-//! at the first failure, same semantics as the fixed startup sequence
-//! (`steps::run`). A manifest entry can only depend on a capability
-//! provided by *another entry in the same manifest* - not on one left
-//! over from a previous, separate run. Because every task here is
-//! idempotent, the fix is simply to list the full chain every time (e.g.
-//! always include `clone-git-repo` alongside a `checkout-pr-worktree`
-//! that needs it): the redundant entry just skips if its work is already
-//! done.
+//! against each other into dependency waves (`executor::plan`, the same
+//! thing `executor::run` uses to actually run them - see DESIGN.md's
+//! "Concurrent execution"), so listing them out of dependency order, as
+//! above, is fine, and independent entries run concurrently rather than
+//! waiting on each other. Its `accepted` reply's `waves` field is that
+//! plan: a list of task-id lists, one per wave, in the order they'll
+//! run. Stops at the first wave containing a failure (not the first
+//! failing *task* - the rest of that wave still finishes), same
+//! semantics as the fixed startup sequence (`steps::run`). A manifest
+//! entry can only depend on a capability provided by *another entry in
+//! the same manifest* - not on one left over from a previous, separate
+//! run. Because every task here is idempotent, the fix is simply to
+//! list the full chain every time (e.g. always include `clone-git-repo`
+//! alongside a `checkout-pr-worktree` that needs it): the redundant
+//! entry just skips if its work is already done.
 //!
 //! Direct replies (only to the requester) carry the same `request_id`
 //! back; broadcast `task_status`/`manifest_status` events don't carry
 //! one, since they aren't a reply to anything in particular. A
-//! `task_status` broadcast carries a `manifest_id` when the task ran as
-//! part of a manifest, `null` when it ran via a standalone `run_task`.
+//! `task_status` broadcast carries a `manifest_id` and a `wave` index
+//! (into that manifest's `accepted` reply's `waves`) when the task ran
+//! as part of a manifest - both `null` when it ran via a standalone
+//! `run_task`. Every task sharing a `wave` value ran (or at least
+//! started) concurrently - that's what a client should group progress
+//! rows by, rather than inferring concurrency from event timing.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -58,7 +73,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::executor;
-use crate::graph;
 use crate::tasks::{self, Task};
 
 pub fn default_socket_path() -> String {
@@ -195,7 +209,7 @@ fn handle_line(hub: &Hub, line: &str, reply: &Sender<String>) {
     match op {
         "list_tasks" => {
             let _ = reply.send(
-                json!({"request_id": request_id, "type": "tasks", "tasks": tasks::names()})
+                json!({"request_id": request_id, "type": "tasks", "tasks": tasks::templates()})
                     .to_string(),
             );
         }
@@ -274,12 +288,11 @@ fn run_manifest(hub: &Hub, request_id: Option<&str>, tasks_value: Value, reply: 
     // Resolved against *this manifest's own* instances only - see the
     // module doc comment on why a dependency on an earlier, separate
     // run's capability doesn't work (and what to do instead). Just for
-    // the `accepted` reply's `task_ids` list below - `executor::run`
-    // (which actually runs these) resolves the same graph itself, since
-    // it needs the wave grouping `resolve_order` doesn't expose, not
-    // just a flat order.
-    let task_ids: Vec<String> = match graph::resolve_order(&instances) {
-        Ok(order) => order.into_iter().map(|i| instances[i].id()).collect(),
+    // the `accepted` reply's `waves` list below - `executor::run` (which
+    // actually runs these) resolves the same graph again itself, per
+    // `executor::plan`'s own doc comment.
+    let waves: Vec<Vec<String>> = match executor::plan(&instances) {
+        Ok(waves) => waves,
         Err(err) => {
             let _ = reply.send(error_reply(request_id, &err.to_string()));
             return;
@@ -292,7 +305,7 @@ fn run_manifest(hub: &Hub, request_id: Option<&str>, tasks_value: Value, reply: 
             "request_id": request_id,
             "type": "accepted",
             "manifest_id": manifest_id,
-            "task_ids": task_ids,
+            "waves": waves,
         })
         .to_string(),
     );
@@ -309,20 +322,24 @@ fn run_manifest(hub: &Hub, request_id: Option<&str>, tasks_value: Value, reply: 
 
     let on_event = |event: executor::Event| {
         let line = match event {
-            executor::Event::Start { task_id } => task_status(&task_id, "start", None, Some(&manifest_id)),
-            executor::Event::Ok { task_id, message } => {
-                task_status(&task_id, "ok", Some(&message), Some(&manifest_id))
+            executor::Event::Start { task_id, wave } => {
+                task_status(&task_id, "start", None, Some(&manifest_id), Some(wave))
             }
-            executor::Event::Skip { task_id } => task_status(&task_id, "skip", None, Some(&manifest_id)),
-            executor::Event::Error { task_id, message } => {
-                task_status(&task_id, "error", Some(&message), Some(&manifest_id))
+            executor::Event::Ok { task_id, wave, message } => {
+                task_status(&task_id, "ok", Some(&message), Some(&manifest_id), Some(wave))
+            }
+            executor::Event::Skip { task_id, wave } => {
+                task_status(&task_id, "skip", None, Some(&manifest_id), Some(wave))
+            }
+            executor::Event::Error { task_id, wave, message } => {
+                task_status(&task_id, "error", Some(&message), Some(&manifest_id), Some(wave))
             }
         };
         hub.broadcast(&line);
     };
 
     // Already validated above (same instances) - the only way this
-    // fails is a graph error, which `task_ids` already ruled out.
+    // fails is a graph error, which computing `waves` already ruled out.
     let ok = executor::run(instances, &on_event).expect("graph already validated above");
     let status = if ok { "ok" } else { "error" };
     hub.broadcast(&json!({"type": "manifest_status", "manifest_id": manifest_id, "status": status}).to_string());
@@ -336,31 +353,42 @@ fn run_manifest(hub: &Hub, request_id: Option<&str>, tasks_value: Value, reply: 
 /// naming the failed task) on failure, so `run_manifest` knows to stop.
 fn run_one_task(hub: &Hub, task: &dyn Task, manifest_id: Option<&str>) -> Result<(), String> {
     let task_id = task.id();
-    hub.broadcast(&task_status(&task_id, "start", None, manifest_id));
+    hub.broadcast(&task_status(&task_id, "start", None, manifest_id, None));
     match task.run() {
         Ok(Some(message)) => {
-            hub.broadcast(&task_status(&task_id, "ok", Some(&message), manifest_id));
+            hub.broadcast(&task_status(&task_id, "ok", Some(&message), manifest_id, None));
             Ok(())
         }
         Ok(None) => {
-            hub.broadcast(&task_status(&task_id, "skip", None, manifest_id));
+            hub.broadcast(&task_status(&task_id, "skip", None, manifest_id, None));
             Ok(())
         }
         Err(err) => {
             let message = err.to_string();
-            hub.broadcast(&task_status(&task_id, "error", Some(&message), manifest_id));
+            hub.broadcast(&task_status(&task_id, "error", Some(&message), manifest_id, None));
             Err(format!("task {task_id} failed: {message}"))
         }
     }
 }
 
-fn task_status(task_id: &str, status: &str, message: Option<&str>, manifest_id: Option<&str>) -> String {
+/// `wave` is `None` for a standalone `run_task` (no concurrency grouping
+/// concept there) and `Some(i)` for a `run_manifest` task, matching the
+/// index into that manifest's `accepted` reply's `waves` list - see
+/// `executor::Event`'s doc comment on why a client would want this.
+fn task_status(
+    task_id: &str,
+    status: &str,
+    message: Option<&str>,
+    manifest_id: Option<&str>,
+    wave: Option<usize>,
+) -> String {
     json!({
         "type": "task_status",
         "task_id": task_id,
         "status": status,
         "message": message,
         "manifest_id": manifest_id,
+        "wave": wave,
     })
     .to_string()
 }
@@ -406,13 +434,13 @@ mod tests {
     }
 
     #[test]
-    fn list_tasks_returns_every_template_name() {
+    fn list_tasks_returns_every_template_name_and_its_param_schema() {
         let (mut client, mut reader, _handle) = connect();
         send(&mut client, r#"{"request_id":"1","op":"list_tasks"}"#);
         let reply = recv(&mut reader);
         assert_eq!(reply["request_id"], "1");
         assert_eq!(reply["type"], "tasks");
-        assert_eq!(reply["tasks"], serde_json::json!(tasks::names()));
+        assert_eq!(reply["tasks"], serde_json::to_value(tasks::templates()).unwrap());
     }
 
     fn git(dir: &Path, args: &[&str]) {
@@ -520,12 +548,14 @@ mod tests {
 
         let accepted = recv(&mut reader);
         assert_eq!(accepted["type"], "accepted");
-        let task_ids: Vec<String> =
-            accepted["task_ids"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+        let waves = accepted["waves"].as_array().unwrap();
+        assert_eq!(waves.len(), 2, "checkout-pr-worktree depends on clone-git-repo, so they're 2 waves: {waves:?}");
+        let wave_task = |wave: &serde_json::Value, i: usize| wave[i].as_str().unwrap().to_string();
         assert!(
-            task_ids[0].starts_with("clone-git-repo:"),
-            "clone-git-repo should be reordered before checkout-pr-worktree, got {task_ids:?}"
+            wave_task(&waves[0], 0).starts_with("clone-git-repo:"),
+            "clone-git-repo should be reordered into the earlier wave, got {waves:?}"
         );
+        assert!(wave_task(&waves[1], 0).starts_with("checkout-pr-worktree:"));
         let manifest_id = accepted["manifest_id"].as_str().unwrap().to_string();
 
         let manifest_start = recv(&mut reader);
@@ -533,17 +563,19 @@ mod tests {
         assert_eq!(manifest_start["status"], "start");
         assert_eq!(manifest_start["manifest_id"], manifest_id);
 
-        for expected_task in ["clone-git-repo", "checkout-pr-worktree"] {
+        for (wave, expected_task) in [(0, "clone-git-repo"), (1, "checkout-pr-worktree")] {
             let start = recv(&mut reader);
             assert_eq!(start["type"], "task_status");
             assert_eq!(start["status"], "start");
             assert_eq!(start["manifest_id"], manifest_id);
+            assert_eq!(start["wave"], wave);
             assert!(start["task_id"].as_str().unwrap().starts_with(expected_task));
 
             let done = recv(&mut reader);
             assert_eq!(done["type"], "task_status");
             assert_eq!(done["status"], "ok");
             assert_eq!(done["manifest_id"], manifest_id);
+            assert_eq!(done["wave"], wave);
         }
 
         let manifest_done = recv(&mut reader);

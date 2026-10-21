@@ -102,13 +102,19 @@ just consequences of this design rather than separate asks.
     root cause as, the "starship + fish" item already below. Worked
     around locally (moved the file aside) to finish validating; the
     real fix still belongs with that item.
-  - Still open: the wire protocol doesn't expose wave/concurrency
-    structure to clients (`run_manifest`'s `accepted` reply still lists
-    a flat `task_ids`) - fine for now, but the eventual TUI will want to
-    render "these N are running right now" as a group, which means
-    deciding how to surface that - either in the reply shape or by
-    having the client infer it from `task_status` timing, which is
-    fragile. Decide alongside the TUI work.
+  - [x] Wave/concurrency structure now on the wire: `run_manifest`'s
+    `accepted` reply carries `waves` (list of task-id lists, one per
+    wave) instead of a flat `task_ids`; every `task_status` broadcast
+    carries a `wave` index (`null` for a standalone `run_task`). Lets a
+    client group "running right now" rows by `wave` instead of inferring
+    concurrency from event timing.
+  - [x] Param schema for templates: `tasks::TemplateInfo`/`ParamSchema`
+    (name/kind/required per param), hand-written next to each
+    template's own params struct in `instantiate` (no reflection crate
+    for two templates' worth of fields) and cross-checked by a test that
+    builds each template's params from *only* its declared schema
+    fields and confirms `instantiate` accepts them. `list_tasks`'
+    reply and `beam-bootstrap list-tasks` both show it now.
 - [x] Daemon skeleton: `beam-bootstrap daemon` (`src/daemon.rs`) — UDS
   socket (`--socket`, default `~/.beam-bootstrap/daemon.sock`),
   newline-delimited JSON, `request_id`-correlated direct replies,

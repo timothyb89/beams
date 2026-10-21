@@ -238,12 +238,17 @@ fn run_concurrent(repo: &Path, emitter: &dyn Emitter) -> bool {
         .map(|step| Box::new(StepAsTask { step, repo: repo.to_path_buf() }) as Box<dyn Task>)
         .collect();
 
+    // `wave` isn't surfaced here - the human/JSON step output has no
+    // concept of concurrency grouping, unlike the daemon's broadcasts
+    // (see `daemon::run_manifest`, which does tag `task_status` with it).
     let on_event = |event: executor::Event| {
         let translated = match event {
-            executor::Event::Start { task_id } => Event::new(&task_id, Status::Start, None),
-            executor::Event::Ok { task_id, message } => Event::new(&task_id, Status::Ok, Some(message)),
-            executor::Event::Skip { task_id } => Event::new(&task_id, Status::Skip, None),
-            executor::Event::Error { task_id, message } => {
+            executor::Event::Start { task_id, .. } => Event::new(&task_id, Status::Start, None),
+            executor::Event::Ok { task_id, message, .. } => {
+                Event::new(&task_id, Status::Ok, Some(message))
+            }
+            executor::Event::Skip { task_id, .. } => Event::new(&task_id, Status::Skip, None),
+            executor::Event::Error { task_id, message, .. } => {
                 Event::new(&task_id, Status::Error, Some(message))
             }
         };

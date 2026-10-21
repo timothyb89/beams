@@ -21,11 +21,16 @@ use crate::tasks::Task;
 /// `Ok`/`Skip`/`Error`. Emitted from whichever thread is running that
 /// task - `on_event` must tolerate being called concurrently from
 /// several threads at once (tasks in the same wave run in parallel).
+///
+/// `wave` is this task's index into the dependency waves `plan` (or
+/// `run`, internally) computed - every task sharing a `wave` value ran
+/// (or at least started) concurrently, which is what lets a client group
+/// progress rows by it instead of inferring concurrency from timing.
 pub enum Event {
-    Start { task_id: String },
-    Ok { task_id: String, message: String },
-    Skip { task_id: String },
-    Error { task_id: String, message: String },
+    Start { task_id: String, wave: usize },
+    Ok { task_id: String, wave: usize, message: String },
+    Skip { task_id: String, wave: usize },
+    Error { task_id: String, wave: usize, message: String },
 }
 
 /// Resolves `tasks` into dependency waves (`graph::resolve_levels`) and
@@ -52,7 +57,7 @@ pub fn run(tasks: Vec<Box<dyn Task>>, on_event: &(dyn Fn(Event) + Sync)) -> anyh
     let resource_locks: Mutex<HashMap<Capability, Arc<Mutex<()>>>> = Mutex::new(HashMap::new());
 
     let mut overall_ok = true;
-    for level in levels {
+    for (wave, level) in levels.into_iter().enumerate() {
         let level_ok: Mutex<bool> = Mutex::new(true);
         thread::scope(|scope| {
             for &i in &level {
@@ -80,12 +85,12 @@ pub fn run(tasks: Vec<Box<dyn Task>>, on_event: &(dyn Fn(Event) + Sync)) -> anyh
                     let _guards: Vec<_> = locks.iter().map(|l| l.lock().unwrap()).collect();
 
                     let task_id = task.id();
-                    on_event(Event::Start { task_id: task_id.clone() });
+                    on_event(Event::Start { task_id: task_id.clone(), wave });
                     match task.run() {
-                        Ok(Some(message)) => on_event(Event::Ok { task_id, message }),
-                        Ok(None) => on_event(Event::Skip { task_id }),
+                        Ok(Some(message)) => on_event(Event::Ok { task_id, wave, message }),
+                        Ok(None) => on_event(Event::Skip { task_id, wave }),
                         Err(err) => {
-                            on_event(Event::Error { task_id, message: err.to_string() });
+                            on_event(Event::Error { task_id, wave, message: err.to_string() });
                             *level_ok.lock().unwrap() = false;
                         }
                     }
@@ -99,6 +104,17 @@ pub fn run(tasks: Vec<Box<dyn Task>>, on_event: &(dyn Fn(Event) + Sync)) -> anyh
         }
     }
     Ok(overall_ok)
+}
+
+/// The dependency waves `run` would execute against `tasks`, as task ids
+/// grouped by wave - for a caller that wants to announce the plan (e.g.
+/// `daemon::run_manifest`'s `accepted` reply) before anything actually
+/// runs. `run` resolves the same graph again internally when it
+/// executes - a deliberate, cheap redundancy rather than threading a
+/// pre-computed plan through `run`'s own signature.
+pub fn plan(tasks: &[Box<dyn Task>]) -> anyhow::Result<Vec<Vec<String>>> {
+    let levels = graph::resolve_levels(tasks)?;
+    Ok(levels.into_iter().map(|level| level.into_iter().map(|i| tasks[i].id()).collect()).collect())
 }
 
 #[cfg(test)]

@@ -102,8 +102,13 @@ fn main() {
 }
 
 fn list_tasks() {
-    for name in tasks::names() {
-        println!("{name}");
+    for info in tasks::templates() {
+        let params: Vec<String> = info
+            .params
+            .iter()
+            .map(|p| format!("{}{}: {}", p.name, if p.required { "" } else { "?" }, p.kind))
+            .collect();
+        println!("{} ({})", info.template, params.join(", "));
     }
 }
 
