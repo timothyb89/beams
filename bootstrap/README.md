@@ -141,12 +141,12 @@ cargo build
 
 A convenience entrypoint for day-to-day use, once `cargo build --release`
 has produced the binary (or `cargo build` for a debug one): makes sure the
-ssh-agent is running and, since this runs on a plain terminal before zellij
-takes over, opportunistically prompts to unlock the repo's key if it isn't
-loaded yet (see "ssh-agent" below), runs `beam-bootstrap` in the background
-logging to `~/.beam-bootstrap.log`, then attaches to (or creates) a `beam`
-zellij session with a layout that keeps that log visible in a side pane
-(`shell/zellij/beam-shell.kdl`):
+ssh-agent is running (never blocks - see "ssh-agent" below), runs
+`beam-bootstrap` in the background logging to `~/.beam-bootstrap.log`,
+then attaches to (or creates) a `beam` zellij session
+(`shell/zellij/beam-shell.kdl`) with three panes: the main one, a log pane
+tailing `~/.beam-bootstrap.log`, and an `ssh-agent` pane that handles the
+actual interactive key unlock whenever you get to it:
 
 ```sh
 ~/bin/beam-shell
@@ -155,16 +155,29 @@ zellij session with a layout that keeps that log visible in a side pane
 Safe to run repeatedly - it's just the attach-or-create flow each time, and
 `beam-bootstrap` is idempotent.
 
-### ssh-agent: interactive unlock, noninteractive-safe
+### ssh-agent: async unlock, noninteractive-safe
 
 `bin/ssh-agent-init` (and its fish port, `.fish`) always finds or starts the
 agent first - safe to source from anywhere, interactive or not. It only
 attempts to unlock and `ssh-add` the key (which may prompt for a
 passphrase) when stdin/stdout are both a real tty; otherwise it leaves the
-key as-is rather than blocking on a prompt nobody can answer. `beam-shell`
-sources it before zellij takes over for exactly that reason. `config.fish`
-also sources it unconditionally on every fish start - since fish is the
-beam's default login shell, that covers both an interactive login *and* a
-noninteractive `tsh ssh ... -- cmd` exec, so commands run that way work
-against whatever the agent already holds without ever hitting a password
-prompt.
+key as-is rather than blocking on a prompt nobody can answer.
+
+`beam-shell` sources it once, with stdin redirected from `/dev/null` so
+the interactivity check reads false even though beam-shell itself is
+running on a real terminal - deliberately forcing the noninteractive
+("ensure only, never unlock") path. That's sourced (not exec'd), so the
+agent's env ends up exported in beam-shell's own process - which `exec
+zellij` then hands down to every pane zellij spawns. The zellij layout's
+dedicated `ssh-agent` pane runs `ssh-agent-init` again on its own, this
+time with no redirect: the agent's already up (inherited from beam-shell,
+so this is instant), and this pane *does* have a real tty, so the unlock
+prompt runs there - whenever you switch over to it. Nothing else needs to
+wait on that; the agent itself is already reachable to every pane from the
+moment zellij starts, unlocked or not.
+
+`config.fish` also sources it unconditionally on every fish start - since
+fish is the beam's default login shell, that covers both an interactive
+login *and* a noninteractive `tsh ssh ... -- cmd` exec, so commands run
+that way work against whatever the agent already holds without ever
+hitting a password prompt.

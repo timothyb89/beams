@@ -1,12 +1,14 @@
 #!/bin/bash
 # ~/bin/beam-shell
 #
-# Convenience entrypoint for working on a beam: unlocks the ssh-agent key
-# (interactively, on a plain terminal, before zellij takes over - password
-# prompts are awkward inside zellij panes), kicks off beam-bootstrap in the
-# background logging to ~/.beam-bootstrap.log, then attaches to (or creates)
-# a "beam" zellij session with a layout that keeps that log visible in a
-# side pane. Safe to run repeatedly - everything it does is idempotent.
+# Convenience entrypoint for working on a beam: makes sure the ssh-agent is
+# running (never blocks - see step 2 below), kicks off beam-bootstrap in
+# the background logging to ~/.beam-bootstrap.log, then attaches to (or
+# creates) a "beam" zellij session with a layout that keeps that log
+# visible in a side pane, alongside another pane that handles the actual
+# interactive key unlock whenever you get to it - see
+# shell/zellij/beam-shell.kdl. Safe to run repeatedly - everything it does
+# is idempotent.
 
 set -euo pipefail
 
@@ -42,14 +44,25 @@ else
     echo "beam-shell: beam-bootstrap binary not found under $REPO/bootstrap/target - skipping" >>"$LOG"
 fi
 
-# 2. unlock the ssh-agent key now, before switching over to zellij -
-#    password prompts don't work well inside zellij panes.
+# 2. make sure the ssh-agent itself is running - but *not* the interactive
+#    key unlock that's normally step 4 of ssh-agent-init, which belongs to
+#    the dedicated "ssh-agent" pane in the zellij layout instead (so it's
+#    available whenever you get to it, rather than blocking getting into
+#    zellij at all). Redirecting stdin from /dev/null for just this one
+#    command makes ssh-agent-init's own `[ -t 0 ]` interactivity check
+#    false, same as any other noninteractive caller - it'll still find or
+#    start the agent, just skip the unlock. Sourced (not exec'd) so the
+#    agent's env ends up exported here, in beam-shell's own process,
+#    which `exec zellij` below then hands down to every pane zellij spawns
+#    - the dedicated pane just needs to run ssh-agent-init again itself
+#    (ensure is instant once the agent's already up; unlock proceeds
+#    normally there, since that pane *does* have a real tty).
 # ssh-agent-init references $SSH_AUTH_SOCK etc. without ${VAR:-} guards,
 # fine for a normal interactive shell but not under our `set -u` - relax
 # it just for this sourced call.
 set +u
 # shellcheck disable=SC1091
-source "$HOME/bin/ssh-agent-init"
+source "$HOME/bin/ssh-agent-init" </dev/null
 set -u
 
 # 3. kick off the full bootstrap run in the background; the log pane in
