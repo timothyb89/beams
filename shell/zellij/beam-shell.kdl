@@ -2,42 +2,71 @@
 // chrome as zellij's own built-in "default" layout (`zellij setup
 // --dump-layout default`) - a bare custom layout replaces that chrome
 // entirely rather than inheriting it, which is why this repeats it here
-// instead of just defining the content panes on their own. In between: a
-// main pane, a smaller pane tailing ~/.beam-bootstrap.log (so bootstrap
-// progress - and anything future async steps print, teleport clone, go
-// toolchain install, etc. - stays visible without taking over the whole
-// terminal), and a third pane that ensures the ssh-agent is running and
-// unlocks its key.
+// instead of just defining the content panes on their own.
 //
-// That third pane isn't focused by default - it doesn't need to be.
-// Finding/starting the agent never blocks (bin/ssh-agent-init), and the
-// password prompt for the key itself just sits there waiting in its own
-// pane until you switch over and answer it, whenever that is; nothing
-// else depends on it being unlocked immediately. `close_on_exit` closes
-// the pane itself the moment ssh-agent-init finishes (unlocked, or left
-// alone if noninteractive/no key) - nothing to clean up once it's done.
+// A flat `layout { pane ... }` (no explicit `tab` block) is used by
+// zellij for BOTH the session's first tab *and*, implicitly, as the
+// template for every tab opened afterward (ctrl+t) - confirmed by
+// dumping a running session's actual layout
+// (`~/.cache/zellij/contract_version_1/session_info/<name>/session-layout.kdl`),
+// which showed this file's old flat form as the session's literal
+// `new_tab_template`. That's the bug: every new tab re-ran the
+// log-tail/ssh-agent setup pointlessly (the ssh-agent pane just exits
+// immediately once the key's already unlocked, but it's still wrong to
+// re-show it, and the log tail has nothing to do with whatever a new
+// tab is actually for).
 //
-// $HOME is expanded by the shell commands below rather than relying on
-// zellij layout variables, since the beams user is always /home/beams but
-// this keeps it correct if that ever changes.
+// Fix: give the first tab its content explicitly (`tab { ... }` below)
+// and define a separate, minimal `new_tab_template` - zellij's actual
+// mechanism for "what a new tab looks like", distinct from the first
+// tab's own layout - for everything opened afterward. New tabs get
+// zellij's stock single-pane shape (just the chrome + one pane), same
+// as `zellij setup --dump-layout default`.
 layout {
-    pane size=1 borderless=true {
-        plugin location="tab-bar"
-    }
-    pane split_direction="horizontal" {
-        pane
-        pane split_direction="vertical" size="25%" {
-            pane {
-                command "bash"
-                args "-lc" "touch \"$HOME/.beam-bootstrap.log\" && tail -n +1 -f \"$HOME/.beam-bootstrap.log\""
-            }
-            pane name="ssh-agent" close_on_exit=true {
-                command "bash"
-                args "-lc" "\"$HOME/bin/ssh-agent-init\""
+    tab name="beam-shell" {
+        pane size=1 borderless=true {
+            plugin location="tab-bar"
+        }
+        pane split_direction="horizontal" {
+            pane
+            pane split_direction="vertical" size="25%" {
+                // Tails ~/.beam-bootstrap.log, so bootstrap progress -
+                // and anything future async steps print, teleport
+                // clone, go toolchain install, etc. - stays visible
+                // without taking over the whole terminal.
+                pane {
+                    command "bash"
+                    args "-lc" "touch \"$HOME/.beam-bootstrap.log\" && tail -n +1 -f \"$HOME/.beam-bootstrap.log\""
+                }
+                // Ensures the ssh-agent is running and unlocks its key.
+                // Not focused by default - it doesn't need to be.
+                // Finding/starting the agent never blocks
+                // (bin/ssh-agent-init), and the password prompt for the
+                // key itself just sits there waiting in its own pane
+                // until you switch over and answer it, whenever that
+                // is; nothing else depends on it being unlocked
+                // immediately. `close_on_exit` closes the pane itself
+                // the moment ssh-agent-init finishes (unlocked, or left
+                // alone if noninteractive/no key) - nothing to clean up
+                // once it's done.
+                pane name="ssh-agent" close_on_exit=true {
+                    command "bash"
+                    args "-lc" "\"$HOME/bin/ssh-agent-init\""
+                }
             }
         }
+        pane size=1 borderless=true {
+            plugin location="status-bar"
+        }
     }
-    pane size=1 borderless=true {
-        plugin location="status-bar"
+
+    new_tab_template {
+        pane size=1 borderless=true {
+            plugin location="tab-bar"
+        }
+        pane
+        pane size=1 borderless=true {
+            plugin location="status-bar"
+        }
     }
 }

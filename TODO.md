@@ -178,11 +178,19 @@ section above for status/details. Still open:
 
 ## zellij layout fix (independent — doesn't need the daemon work)
 
-- [ ] Fix `shell/zellij/beam-shell.kdl` so its tab template only applies
-  to the *first* tab of a session, not every new tab — currently every
-  new tab re-shows the bootstrap-log-tail pane and an ssh-agent-unlock
-  pane that just exits immediately (key already unlocked by then). See
-  DESIGN.md's "zellij layout fix".
+- [x] Fixed `shell/zellij/beam-shell.kdl`: confirmed the root cause by
+  dumping a running session's actual layout (zellij writes one to
+  `~/.cache/zellij/contract_version_1/session_info/<name>/session-layout.kdl`)
+  — the old flat `layout { pane ... }` (no explicit `tab` block) was
+  literally being used as the session's `new_tab_template`, so every new
+  tab replayed the full log-tail/ssh-agent structure. Fix: explicit
+  `tab name="beam-shell" { ... }` for the first tab, separate minimal
+  `new_tab_template` (zellij's stock single-pane shape) for every tab
+  opened afterward. Verified live: started a throwaway `zellij -s
+  test-layout -n shell/zellij/beam-shell.kdl` session, opened two more
+  tabs via `zellij -s test-layout action new-tab`, and `action
+  dump-layout` showed the first tab keeping its full 3-pane structure
+  while both new tabs got the plain single-pane template.
 - [ ] The future bootstrap-tui pane should be spawned imperatively
   (`zellij action new-pane --direction right`) into an already-open
   session rather than baked into the layout file, so it doesn't hit the
