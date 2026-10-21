@@ -23,9 +23,13 @@ beams ssh [--repo ~/beams] [--purpose default] [--region REGION] [--login beams]
    every file `git ls-files` reports as tracked in `--repo` (so it never
    needs a hand-maintained list), plus the two things deliberately *not*
    tracked in git but still required - the ssh private key, and a
-   prebuilt `beam-bootstrap` binary (**build this first**: `cd
-   ../bootstrap && cargo build --release` - no Rust toolchain on a fresh
-   beam, so it has to be copied over).
+   prebuilt `beam-bootstrap` binary (**build this first**: beams run
+   Linux, so if you're on macOS (or just want a statically linked build)
+   run `../bootstrap/build-cross.sh`; on Linux, `cd ../bootstrap && cargo
+   build --release` also works. No Rust toolchain on a fresh beam, so the
+   binary has to be copied over either way - see `../bootstrap/README.md`.
+   `stage.rs` looks for a cross-compiled build first and falls back to a
+   native one, refusing to ship anything that isn't a Linux ELF binary.)
 4. Copies that staging directory onto the beam (`tsh beams scp -r`).
 5. Connects with `tsh ssh -t <login>@<uuid> -- ~/beams/bin/beam-shell` -
    bypassing the `tsh beams ssh` layer (which can't take a remote command)

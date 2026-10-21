@@ -63,7 +63,9 @@ whole binary — earlier steps will just skip.
 
 No Rust toolchain ships on a stock beam, so build this on a machine that has
 one (this sandbox, or your workstation) and copy the binary over, or build
-it in place after installing Rust yourself:
+it in place after installing Rust yourself.
+
+### From a Linux machine (e.g. this sandbox)
 
 ```sh
 # one-time, if this beam doesn't have Rust yet
@@ -75,6 +77,30 @@ cd bootstrap
 cargo build            # debug build: target/debug/beam-bootstrap
 cargo build --release  # release build: target/release/beam-bootstrap
 ```
+
+### Cross-compiling from macOS (or anywhere else)
+
+Beams run Linux, so building directly only works when you're already on
+Linux. From macOS - or to get a statically linked build with no glibc
+version to worry about, even from Linux - cross-compile instead:
+
+```sh
+# one-time setup
+rustup target add x86_64-unknown-linux-musl
+cargo install cargo-zigbuild
+pip3 install ziglang   # or `brew install zig` - cargo-zigbuild just needs
+                        # a `zig` toolchain available one way or the other
+
+./bootstrap/build-cross.sh
+```
+
+Produces `bootstrap/target/x86_64-unknown-linux-musl/release/beam-bootstrap`
+- a statically linked ELF binary, runnable on any Linux beam regardless of
+its glibc version. `client/src/stage.rs` looks for a build at this path
+first when assembling what to copy onto a beam, falling back to a native
+`target/release`/`target/debug` build (and refusing to ship anything that
+isn't actually a Linux ELF binary - e.g. a stray native macOS build sitting
+at the fallback path).
 
 ## Running
 
