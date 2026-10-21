@@ -200,6 +200,27 @@ echo '{"request_id":"2","op":"run_manifest","tasks":[
 ]}' | nc -U ~/.beam-bootstrap/daemon.sock
 ```
 
+## TUI
+
+`beam-bootstrap tui [--socket ...]` is a ratatui client for the daemon
+(requires one already running - it doesn't spawn its own). Top half:
+available templates (↑/↓ to pick, enter to open a param-entry form, tab
+to move between fields, enter on the last field to submit, esc to
+cancel). Bottom half: one row per task the daemon's broadcast anywhere
+mentioned - not just tasks submitted from this TUI instance - tagged
+with its wave (`[wN]`) so concurrently-running tasks are visibly grouped,
+plus an aggregate gauge (`done/total, N running`) above them. `r`
+refreshes the template list, `tab` (outside a form) switches focus
+between the template list and the task list for scrolling, `q`/`esc`
+quits.
+
+Only submits one task at a time today (`run_task`), even though the
+daemon's `run_manifest` can resolve and run several together - there's
+no multi-select-and-submit-as-a-manifest UI yet (see `TODO.md`). Every
+other client's `run_manifest` activity still shows up live, since
+`task_status` broadcasts go to every connection regardless of who
+triggered them.
+
 ## Trying it out
 
 ```sh

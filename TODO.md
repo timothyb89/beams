@@ -153,11 +153,28 @@ just consequences of this design rather than separate asks.
   manifest without hand-writing the JSON (as the README's example does).
   Worth deciding whether that's a `run-manifest --file <path>` flag, or
   waits for the TUI/`client` wiring below to be the real consumer.
-- [ ] `beam-bootstrap tui`: ratatui client, connects to the daemon's
-  socket, deferred/templated task list + param input on top (building a
-  manifest from the selection), progress bar + scrollable log on bottom
-  (rendering the `task_status`/`manifest_status` broadcasts already
-  implemented).
+- [x] `beam-bootstrap tui` (`src/tui/`): ratatui client, connects to an
+  already-running daemon (`tui::client::DaemonClient`). Top half:
+  template list + param-entry form built from `list_tasks`' schema
+  (`tui::app`). Bottom half: one row per task mentioned by *any*
+  connection's broadcasts (not just this TUI's own), tagged with its
+  wave so concurrently-running tasks group visibly, plus an aggregate
+  gauge. Verified both with unit tests on `App`'s pure state-transition/
+  JSON-building logic (no terminal needed) and live, end to end, against
+  a real daemon in a scripted tmux session: submitted a task through the
+  TUI and watched it complete, then submitted a 2-task concurrent
+  `run_manifest` from a *separate* connection and confirmed the TUI (as
+  a bystander) rendered both rows tagged `[w0]` with the gauge updating
+  correctly.
+  - **Known simplification, not a bug**: only submits one task at a
+    time (`run_task`), even though the daemon can resolve/run several
+    together via `run_manifest`. No multi-select-and-submit-as-manifest
+    UI yet — picking several templates, filling in params for each, and
+    sending them as one manifest. Worth adding once there's a concrete
+    second use case beyond "clone then checkout a PR" to shape the UX
+    against (that pair can already be done as two sequential `run_task`
+    submissions from the TUI today, just not concurrently with each
+    other since they're not in a shared capability chain anyway).
 - [ ] `beams task run <template> [params...]` — agent-friendly on-demand
   CLI entry point, no TUI required. (Distinct from the item above: this
   is a *daemon-backed* CLI, talking over the socket like the TUI would,
@@ -191,10 +208,12 @@ section above for status/details. Still open:
   tabs via `zellij -s test-layout action new-tab`, and `action
   dump-layout` showed the first tab keeping its full 3-pane structure
   while both new tabs got the plain single-pane template.
-- [ ] The future bootstrap-tui pane should be spawned imperatively
-  (`zellij action new-pane --direction right`) into an already-open
-  session rather than baked into the layout file, so it doesn't hit the
-  same problem.
+- [ ] `beam-bootstrap tui` (now built, see "Migration" below) still
+  needs to actually be spawned into a beam-shell session - the plan is
+  imperatively (`zellij action new-pane --direction right`) into an
+  already-open session rather than baked into the layout file, so it
+  doesn't hit the same per-tab-replay problem this fix addressed. Not
+  wired into `bin/beam-shell` yet.
 
 ## Bug: starship + fish
 

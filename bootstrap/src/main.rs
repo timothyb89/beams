@@ -5,6 +5,7 @@ mod graph;
 mod pathutil;
 mod steps;
 mod tasks;
+mod tui;
 
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -38,8 +39,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List available templated tasks (name only - no param schema yet,
-    /// see `tasks::Template`'s doc comment).
+    /// List available templated tasks and their param schema (see
+    /// `tasks::TemplateInfo`).
     ListTasks,
     /// Instantiate and run a single templated task on demand, outside
     /// the fixed startup sequence. A stand-in for the daemon-backed
@@ -58,6 +59,16 @@ enum Command {
     /// a TUI yet (see `DESIGN.md`'s migration plan).
     Daemon {
         /// UDS socket path to listen on. Defaults to
+        /// `~/.beam-bootstrap/daemon.sock`.
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Ratatui client for the daemon (see `tui`): deferred/templated
+    /// tasks with param input on top, concurrent per-task progress rows
+    /// plus an aggregate gauge on the bottom. Requires a daemon already
+    /// listening (`beam-bootstrap daemon`) - doesn't spawn one itself.
+    Tui {
+        /// UDS socket path to connect to. Defaults to
         /// `~/.beam-bootstrap/daemon.sock`.
         #[arg(long)]
         socket: Option<String>,
@@ -97,6 +108,7 @@ fn main() {
         Some(Command::ListTasks) => list_tasks(),
         Some(Command::RunTask { task }) => run_task(task),
         Some(Command::Daemon { socket }) => run_daemon(socket),
+        Some(Command::Tui { socket }) => run_tui(socket),
         None => run_bootstrap(&args),
     }
 }
@@ -159,6 +171,14 @@ fn run_task(command: TaskCommand) {
 fn run_daemon(socket: Option<String>) {
     let socket_path = expand_tilde(&socket.unwrap_or_else(daemon::default_socket_path));
     if let Err(err) = daemon::serve(&socket_path) {
+        eprintln!("error: {err}");
+        std::process::exit(1);
+    }
+}
+
+fn run_tui(socket: Option<String>) {
+    let socket_path = expand_tilde(&socket.unwrap_or_else(daemon::default_socket_path));
+    if let Err(err) = tui::run(&socket_path) {
         eprintln!("error: {err}");
         std::process::exit(1);
     }
