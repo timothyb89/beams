@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 
 const MIN_TTL_HOURS: i64 = 12;
 const MAX_CONCURRENT_BEAMS: usize = 5;
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 const DEFAULT_LOGIN: &str = "beams";
 const DEFAULT_PURPOSE: &str = "default";
 
@@ -83,6 +84,24 @@ fn ssh(repo: &Path, purpose: &str, region: Option<&str>, login: &str) -> anyhow:
 
             eprintln!("beams: no usable beam for purpose {purpose:?}, spawning a new one...");
             let fresh = tsh::add_beam(region)?;
+
+            eprintln!(
+                "beams: waiting for {} to accept SSH connections...",
+                fresh.id
+            );
+            tsh::wait_until_ready(&fresh.id, login, READY_TIMEOUT)?;
+
+            eprintln!("beams: copying {} to {}...", repo.display(), fresh.id);
+            let staging = stage::build(repo)?;
+            let result = tsh::scp_dir(&staging.join("beams"), &fresh.id);
+            let _ = std::fs::remove_dir_all(&staging);
+            result?;
+
+            // Only now that the beam is actually usable - track it for
+            // this purpose. Saving state before scp succeeds would leave
+            // a purpose pointing at a beam that never got bootstrapped,
+            // with nothing short of a `tsh beams rm` ever fixing it (the
+            // TTL check would keep "reusing" it indefinitely).
             state.purposes.insert(
                 purpose.to_string(),
                 state::PurposeEntry {
@@ -92,12 +111,6 @@ fn ssh(repo: &Path, purpose: &str, region: Option<&str>, login: &str) -> anyhow:
                 },
             );
             state.save()?;
-
-            eprintln!("beams: copying {} to {}...", repo.display(), fresh.id);
-            let staging = stage::build(repo)?;
-            let result = tsh::scp_dir(&staging.join("beams"), &fresh.id);
-            let _ = std::fs::remove_dir_all(&staging);
-            result?;
 
             fresh
         }

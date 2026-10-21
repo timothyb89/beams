@@ -16,7 +16,12 @@ SESSION="beam"
 ZELLIJ_LAYOUT_DIR="$REPO/shell/zellij"
 ZELLIJ_CONFIG="${XDG_CACHE_HOME:-$HOME/.cache}/beam-shell/zellij-config.kdl"
 
-BOOTSTRAP_BIN="$REPO/bootstrap/target/release/beam-bootstrap"
+# The client (client/src/stage.rs) ships a cross-compiled build at the
+# musl target path when it has one - that's the common case these days,
+# since the client usually runs on macOS. Fall back to a native build for
+# the case someone built in place on a beam directly (bootstrap/README.md).
+BOOTSTRAP_BIN="$REPO/bootstrap/target/x86_64-unknown-linux-musl/release/beam-bootstrap"
+[ -x "$BOOTSTRAP_BIN" ] || BOOTSTRAP_BIN="$REPO/bootstrap/target/release/beam-bootstrap"
 [ -x "$BOOTSTRAP_BIN" ] || BOOTSTRAP_BIN="$REPO/bootstrap/target/debug/beam-bootstrap"
 
 # 1. make sure ~/.ssh and ~/bin are in place before anything below needs

@@ -1,6 +1,7 @@
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use serde::Deserialize;
@@ -52,6 +53,35 @@ pub fn add_beam(region: Option<&str>) -> anyhow::Result<BeamInfo> {
         );
     }
     serde_json::from_slice(&output.stdout).context("parsing tsh beams add output")
+}
+
+/// Polls `tsh beams exec <beam_id> -- true` until it succeeds, or bails
+/// after `timeout`. A just-created beam's `id`/`uuid` show up in `tsh
+/// beams ls` immediately, but sshd isn't necessarily reachable yet -
+/// `scp`/`ssh` fail outright ("not ready to accept SSH connections")
+/// rather than retrying themselves, so the caller has to.
+pub fn wait_until_ready(beam_id: &str, login: &str, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut delay = Duration::from_secs(1);
+    loop {
+        let status = Command::new("tsh")
+            .args(["beams", "exec", "-l", login, beam_id, "--", "true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("running tsh beams exec")?;
+        if status.success() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "beam {beam_id} did not become ready to accept SSH connections within {:?}",
+                timeout
+            );
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(Duration::from_secs(5));
+    }
 }
 
 /// `tsh beams scp -r <local_dir> <beam_id>:` - lands at
