@@ -175,6 +175,12 @@ just consequences of this design rather than separate asks.
     against (that pair can already be done as two sequential `run_task`
     submissions from the TUI today, just not concurrently with each
     other since they're not in a shared capability chain anyway).
+  - **New gap, found restarting the daemon mid-E2E-test**: the TUI
+    doesn't reconnect if its daemon connection drops (e.g. `beamctl
+    restart beam-bootstrapd` after swapping the binary, which is what
+    happened here) - it just goes quiet, showing stale state forever.
+    Not a normal occurrence (daemon restarts aren't routine), but worth
+    a reconnect loop in `tui::client::DaemonClient` eventually.
 - [ ] `beams task run <template> [params...]` — agent-friendly on-demand
   CLI entry point, no TUI required. (Distinct from the item above: this
   is a *daemon-backed* CLI, talking over the socket like the TUI would,
