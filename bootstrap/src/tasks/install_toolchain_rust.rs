@@ -49,9 +49,17 @@ impl Task for InstallToolchainRust {
         // toolchain itself - no separate checksum step needed here, as
         // opposed to the pinned-binary-download tasks/steps elsewhere in
         // this binary that have to do that themselves.
+        //
+        // No `-s --` here, unlike the familiar `curl ... | sh -s --
+        // <args>` idiom everywhere rustup is documented - those flags
+        // tell *sh* to read the script from stdin and then separate
+        // sh's own flags from the script's. We already have the script
+        // in a file and pass it as sh's argument directly, so the
+        // script's own args just follow normally; `-s --` would
+        // otherwise become the *script's* `$1`/`$2`, which is exactly
+        // what failed running this for real the first time (rustup-init
+        // reported "unexpected argument '-s'").
         run(Command::new("sh").arg(&script).args([
-            "-s",
-            "--",
             "-y",
             "--default-toolchain",
             "stable",
