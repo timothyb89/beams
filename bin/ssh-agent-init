@@ -8,6 +8,13 @@
 # runs when stdin/stdout are both a tty - a noninteractive session just gets
 # a running agent with whatever keys it already holds, rather than hanging
 # on (or erroring out of) a password prompt nobody can answer.
+#
+# Written to be safe to `source` under `set -e` (e.g. from beam-shell):
+# every command whose nonzero exit is meant to be inspected via `$?` is the
+# direct condition of an `if`, which `set -e` never treats as a failure
+# regardless of the exit code - a bare `cmd; status=$?` would instead abort
+# the whole (sourcing) shell on the first `cmd` failure, never reaching the
+# `status=$?` line at all.
 
 _setup_ssh_agent() {
     local key_file="${1:-$HOME/.ssh/beams_id_ed25519}"
@@ -21,13 +28,19 @@ _setup_ssh_agent() {
     # 2. Test if the socket is alive and responsive
     local agent_status=2
     if [ -n "$SSH_AUTH_SOCK" ]; then
-        ssh-add -l >/dev/null 2>&1
-        agent_status=$?
+        if ssh-add -l >/dev/null 2>&1; then
+            agent_status=0
+        else
+            agent_status=$?
+        fi
     fi
 
     # 3. If unreachable (status 2), clean up and spawn a new agent
     if [ "$agent_status" -eq 2 ]; then
-        pkill -u "$USER" -x ssh-agent 2>/dev/null
+        # pkill exits nonzero when nothing matched (the common case - there
+        # was no agent to begin with) - not a real failure, so don't let
+        # set -e treat it as one.
+        pkill -u "$USER" -x ssh-agent 2>/dev/null || true
         mkdir -p "$(dirname "$env_file")"
         ssh-agent -s > "$env_file"
         chmod 600 "$env_file"
@@ -44,7 +57,10 @@ _setup_ssh_agent() {
         key_fp=$(ssh-keygen -lf "$key_file" 2>/dev/null | awk '{print $2}')
 
         if ! ssh-add -l 2>/dev/null | grep -qF "$key_fp"; then
-            ssh-add "$key_file"
+            # Guarded the same way as step 2 - a cancelled/wrong passphrase
+            # shouldn't abort the caller's whole script, just leave the
+            # key unlocked for now (same as the noninteractive case above).
+            ssh-add "$key_file" || true
         fi
     fi
     # else: noninteractive and the key isn't loaded yet - leave it locked.
