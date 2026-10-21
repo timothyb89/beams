@@ -21,8 +21,8 @@ impl Step for InstallZellij {
         "install-zellij"
     }
 
-    fn provides(&self) -> &'static [Capability] {
-        &[cap::ZELLIJ_INSTALLED]
+    fn provides(&self) -> Vec<Capability> {
+        vec![cap::ZELLIJ_INSTALLED.into()]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

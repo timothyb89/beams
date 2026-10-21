@@ -23,21 +23,23 @@ use crate::graph::{self, Capability, Node};
 /// `DESIGN.md`'s "Task model". Centralized so dependent steps reference
 /// the same constant rather than retyping a string.
 pub mod cap {
-    use super::Capability;
-
-    pub const DOTFILES_LINKED: Capability = "dotfiles-linked";
-    pub const CLAUDE_MD_MERGED: Capability = "claude-md-merged";
-    pub const APT_PACKAGES_INSTALLED: Capability = "apt-packages-installed";
-    pub const KUBECTL_INSTALLED: Capability = "kubectl-installed";
-    pub const ZELLIJ_INSTALLED: Capability = "zellij-installed";
-    pub const SHELL_CONFIG_LINKED: Capability = "shell-config-linked";
-    pub const STARSHIP_INSTALLED: Capability = "starship-installed";
-    pub const DEFAULT_SHELL_SET: Capability = "default-shell-set";
-    pub const TELEPORT_BIN_INSTALLED: Capability = "teleport-bin-installed";
-    pub const K3S_BOT_JOINED: Capability = "k3s-bot-joined";
-    pub const TBOT_SERVICE_RUNNING: Capability = "tbot-service-running";
-    pub const KUBECONFIG_LINKED: Capability = "kubeconfig-linked";
-    pub const CLAUDE_UPDATED: Capability = "claude-updated";
+    // Plain `&'static str`, not `Capability` (`Cow<'static, str>`) - call
+    // sites convert with `.into()`. Keeping these as bare strings means a
+    // step can still compare/format them as ordinary string constants
+    // without unwrapping a `Cow` first.
+    pub const DOTFILES_LINKED: &str = "dotfiles-linked";
+    pub const CLAUDE_MD_MERGED: &str = "claude-md-merged";
+    pub const APT_PACKAGES_INSTALLED: &str = "apt-packages-installed";
+    pub const KUBECTL_INSTALLED: &str = "kubectl-installed";
+    pub const ZELLIJ_INSTALLED: &str = "zellij-installed";
+    pub const SHELL_CONFIG_LINKED: &str = "shell-config-linked";
+    pub const STARSHIP_INSTALLED: &str = "starship-installed";
+    pub const DEFAULT_SHELL_SET: &str = "default-shell-set";
+    pub const TELEPORT_BIN_INSTALLED: &str = "teleport-bin-installed";
+    pub const K3S_BOT_JOINED: &str = "k3s-bot-joined";
+    pub const TBOT_SERVICE_RUNNING: &str = "tbot-service-running";
+    pub const KUBECONFIG_LINKED: &str = "kubeconfig-linked";
+    pub const CLAUDE_UPDATED: &str = "claude-updated";
 }
 
 /// A single idempotent bootstrap action. Steps are safe to re-run on a beam
@@ -54,25 +56,25 @@ pub trait Step {
     /// nothing to do (emits `Skip`), and `Err` on failure.
     fn run(&self, repo: &Path) -> anyhow::Result<Option<String>>;
 
-    fn provides(&self) -> &'static [Capability] {
-        &[]
+    fn provides(&self) -> Vec<Capability> {
+        Vec::new()
     }
 
-    fn requires(&self) -> &'static [Capability] {
-        &[]
+    fn requires(&self) -> Vec<Capability> {
+        Vec::new()
     }
 }
 
 impl Node for Box<dyn Step> {
-    fn node_id(&self) -> &str {
-        self.id()
+    fn node_id(&self) -> String {
+        self.id().to_string()
     }
 
-    fn provides(&self) -> &'static [Capability] {
+    fn provides(&self) -> Vec<Capability> {
         (**self).provides()
     }
 
-    fn requires(&self) -> &'static [Capability] {
+    fn requires(&self) -> Vec<Capability> {
         (**self).requires()
     }
 }

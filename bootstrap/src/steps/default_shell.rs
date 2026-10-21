@@ -13,13 +13,13 @@ impl Step for SetDefaultShell {
         "default-shell"
     }
 
-    fn provides(&self) -> &'static [Capability] {
-        &[cap::DEFAULT_SHELL_SET]
+    fn provides(&self) -> Vec<Capability> {
+        vec![cap::DEFAULT_SHELL_SET.into()]
     }
 
-    fn requires(&self) -> &'static [Capability] {
+    fn requires(&self) -> Vec<Capability> {
         // Needs `fish` on PATH - see the `which("fish")` call below.
-        &[cap::APT_PACKAGES_INSTALLED]
+        vec![cap::APT_PACKAGES_INSTALLED.into()]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

@@ -21,8 +21,8 @@ impl Step for InstallPackages {
         "apt-install"
     }
 
-    fn provides(&self) -> &'static [Capability] {
-        &[cap::APT_PACKAGES_INSTALLED]
+    fn provides(&self) -> Vec<Capability> {
+        vec![cap::APT_PACKAGES_INSTALLED.into()]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

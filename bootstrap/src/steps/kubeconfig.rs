@@ -24,14 +24,14 @@ impl Step for LinkKubeconfig {
         "kubeconfig-symlink"
     }
 
-    fn provides(&self) -> &'static [Capability] {
-        &[cap::KUBECONFIG_LINKED]
+    fn provides(&self) -> Vec<Capability> {
+        vec![cap::KUBECONFIG_LINKED.into()]
     }
 
-    fn requires(&self) -> &'static [Capability] {
+    fn requires(&self) -> Vec<Capability> {
         // Waits on `kube/kubeconfig.yaml`, which tbot writes shortly after
         // the service starts - see the polling loop below.
-        &[cap::TBOT_SERVICE_RUNNING]
+        vec![cap::TBOT_SERVICE_RUNNING.into()]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

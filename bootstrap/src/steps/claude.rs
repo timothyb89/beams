@@ -13,8 +13,8 @@ impl Step for UpdateClaude {
         "claude-update"
     }
 
-    fn provides(&self) -> &'static [Capability] {
-        &[cap::CLAUDE_UPDATED]
+    fn provides(&self) -> Vec<Capability> {
+        vec![cap::CLAUDE_UPDATED.into()]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

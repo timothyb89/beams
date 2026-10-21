@@ -35,13 +35,13 @@ impl Step for JoinK3sBot {
         "k3s-bot-join"
     }
 
-    fn provides(&self) -> &'static [Capability] {
-        &[cap::K3S_BOT_JOINED]
+    fn provides(&self) -> Vec<Capability> {
+        vec![cap::K3S_BOT_JOINED.into()]
     }
 
-    fn requires(&self) -> &'static [Capability] {
+    fn requires(&self) -> Vec<Capability> {
         // Runs `tctl` out of `bot_dir()/bin` - see `request_join_token`.
-        &[cap::TELEPORT_BIN_INSTALLED]
+        vec![cap::TELEPORT_BIN_INSTALLED.into()]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

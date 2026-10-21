@@ -17,8 +17,8 @@ impl Step for LinkShellConfig {
         "shell-config"
     }
 
-    fn provides(&self) -> &'static [Capability] {
-        &[cap::SHELL_CONFIG_LINKED]
+    fn provides(&self) -> Vec<Capability> {
+        vec![cap::SHELL_CONFIG_LINKED.into()]
     }
 
     fn run(&self, repo: &Path) -> anyhow::Result<Option<String>> {

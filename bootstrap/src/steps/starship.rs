@@ -21,8 +21,8 @@ impl Step for InstallStarship {
         "install-starship"
     }
 
-    fn provides(&self) -> &'static [Capability] {
-        &[cap::STARSHIP_INSTALLED]
+    fn provides(&self) -> Vec<Capability> {
+        vec![cap::STARSHIP_INSTALLED.into()]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

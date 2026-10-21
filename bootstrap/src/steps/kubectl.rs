@@ -20,8 +20,8 @@ impl Step for InstallKubectl {
         "install-kubectl"
     }
 
-    fn provides(&self) -> &'static [Capability] {
-        &[cap::KUBECTL_INSTALLED]
+    fn provides(&self) -> Vec<Capability> {
+        vec![cap::KUBECTL_INSTALLED.into()]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

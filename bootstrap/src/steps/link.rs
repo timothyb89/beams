@@ -29,8 +29,8 @@ impl Step for LinkFiles {
         "link-files"
     }
 
-    fn provides(&self) -> &'static [Capability] {
-        &[cap::DOTFILES_LINKED]
+    fn provides(&self) -> Vec<Capability> {
+        vec![cap::DOTFILES_LINKED.into()]
     }
 
     fn run(&self, repo: &Path) -> anyhow::Result<Option<String>> {

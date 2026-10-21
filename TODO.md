@@ -41,12 +41,40 @@ just consequences of this design rather than separate asks.
   existing step now declares `provides`/`requires` (see `steps::cap`)
   instead of relying purely on hand-ordering. Confirmed no behavior
   change via `steps::tests::resolved_order_matches_original_hand_ordered_list`.
-- [ ] Template/instance types: a template (param schema + id-generation
-  rule) that can be *instantiated* with concrete params into a task
-  participating in the same capability graph — see DESIGN.md's
-  "Templates vs. instances". Not started; today's steps are all
-  zero-param and fixed at compile time, so this is the part needed before
-  `clone-git-repo`/`checkout-pr-worktree`/etc. can exist.
+- [x] Template/instance types: `bootstrap/src/tasks/` — `Task` trait
+  (runtime instance: owned id + `Capability`s, mirrors `Step` but
+  params-derived) and `Template` trait (marker: `NAME` + instantiable
+  into a `Task`). `graph::Capability` is now `Cow<'static, str>` (was
+  `&'static str`) so a step's compile-time constant and a task's
+  runtime-computed string can share one graph — see
+  `graph::tests::owned_and_borrowed_capabilities_are_interchangeable`.
+  No param-schema introspection yet (deliberately — see `Template`'s doc
+  comment: nothing needs to enumerate/introspect templates until the
+  daemon/manifest work below actually exists to consume it).
+- [x] `clone-git-repo(repo, dest)` and `checkout-pr-worktree(base, pr,
+  dest)` — implemented as the first two templates
+  (`tasks::clone_git_repo`, `tasks::checkout_pr_worktree`), each with
+  tests exercising real `git` operations against local-only repos (no
+  network needed). `checkout-pr-worktree` only supports the initial
+  checkout, not updating an existing worktree to a PR's later pushes —
+  tracked as a known gap in its doc comment, not fixed.
+  `checkout-pr-worktree`'s `requires` on `clone-git-repo`'s capability is
+  **not yet checked by anything** (see next item) — only by its own
+  `run()` probing `base`'s filesystem state directly.
+- [ ] Reachable today only via `beam-bootstrap list-tasks` /
+  `run-task <template> ...` — a direct, in-process stand-in for the
+  daemon-backed CLI, added now so the template mechanism has a real
+  caller. Runs exactly one task with no dependency resolution against
+  anything else; superseded once the daemon exists.
+- [ ] **Known gap**: `graph::resolve_order<N: Node>` is monomorphic over
+  one `N` — a `Vec<Box<dyn Step>>` and a `Vec<Box<dyn Task>>` can each be
+  resolved on their own (as `steps::resolved()` already does), but can't
+  be resolved *together* in one call as-is. The daemon's actual task
+  graph (mixing fixed startup steps and templated instances, e.g.
+  `checkout-pr-worktree` depending on a `clone-git-repo` instance) will
+  need a single node representation spanning both — worth settling as
+  part of the daemon skeleton below, not before (no concrete need yet to
+  design against).
 - [ ] Daemon skeleton: `beam-bootstrap daemon`, UDS socket at
   `~/.beam-bootstrap/daemon.sock`, newline-delimited JSON protocol with
   `request_id` correlation, task-status events broadcast to all
@@ -70,9 +98,9 @@ just consequences of this design rather than separate asks.
 
 ## New tasks enabled by the graph (deferred-by-default templates)
 
-- [ ] `clone-git-repo(repo, dest)`.
-- [ ] `checkout-pr-worktree(base, pr, dest)` — requires
-  `repo-cloned:<base>`.
+`clone-git-repo`/`checkout-pr-worktree` landed — see the "Migration"
+section above for status/details. Still open:
+
 - [ ] `install-toolchain-go`, `install-toolchain-rust`.
 
 ## zellij layout fix (independent — doesn't need the daemon work)

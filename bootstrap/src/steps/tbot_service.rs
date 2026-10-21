@@ -20,14 +20,14 @@ impl Step for StartTbotService {
         "start-tbot"
     }
 
-    fn provides(&self) -> &'static [Capability] {
-        &[cap::TBOT_SERVICE_RUNNING]
+    fn provides(&self) -> Vec<Capability> {
+        vec![cap::TBOT_SERVICE_RUNNING.into()]
     }
 
-    fn requires(&self) -> &'static [Capability] {
+    fn requires(&self) -> Vec<Capability> {
         // Needs `tbot` on disk and `tbot.yaml`/the join token written by
         // the join step - see `bot_dir()` usage below.
-        &[cap::TELEPORT_BIN_INSTALLED, cap::K3S_BOT_JOINED]
+        vec![cap::TELEPORT_BIN_INSTALLED.into(), cap::K3S_BOT_JOINED.into()]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

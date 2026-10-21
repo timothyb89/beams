@@ -33,8 +33,8 @@ impl Step for InstallTeleportBin {
         "install-teleport-bin"
     }
 
-    fn provides(&self) -> &'static [Capability] {
-        &[cap::TELEPORT_BIN_INSTALLED]
+    fn provides(&self) -> Vec<Capability> {
+        vec![cap::TELEPORT_BIN_INSTALLED.into()]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

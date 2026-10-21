@@ -133,6 +133,27 @@ at the fallback path).
 Exit code is `0` if every step succeeded (or was skipped), `1` if any step
 failed.
 
+### On-demand templated tasks
+
+Separate from the fixed startup sequence above: `src/tasks/` holds
+templated tasks that take runtime params instead of running
+unconditionally at startup (see `DESIGN.md`'s "Templates vs. instances").
+There's no daemon yet to drive these from a TUI/manifest - for now,
+reach them directly:
+
+```sh
+./target/debug/beam-bootstrap list-tasks
+./target/debug/beam-bootstrap run-task clone-git-repo --repo <url-or-path> --dest ~/projects/core
+./target/debug/beam-bootstrap run-task checkout-pr-worktree --base ~/projects/core --pr 1234 --dest ~/projects/teleport-1234
+```
+
+Each runs exactly one task in-process - no dependency resolution against
+other tasks (so run `clone-git-repo` against `--base` before
+`checkout-pr-worktree` depends on it having happened). Idempotent like
+the startup steps: re-running `clone-git-repo` against an existing
+checkout, or `checkout-pr-worktree` against an existing worktree, is a
+no-op.
+
 ## Trying it out
 
 ```sh

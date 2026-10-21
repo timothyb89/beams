@@ -5,32 +5,36 @@
 //! other steps directly. This lets a step's dependents be resolved without
 //! knowing a concrete step's identity up front - the piece that matters
 //! once steps stop being a fixed, hand-ordered list (e.g. a templated task
-//! instantiated with params at runtime, whose id isn't known ahead of
-//! time, but whose *capability* is).
+//! instantiated with params at runtime, whose id and capabilities aren't
+//! known ahead of time - see `tasks`).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use anyhow::bail;
 
-/// A named precondition or outcome. Just a string today (e.g.
-/// `"apt-packages-installed"`) - no need for anything richer yet.
-pub type Capability = &'static str;
+/// A named precondition or outcome, e.g. `"apt-packages-installed"` or,
+/// for a templated task instantiated with params, something computed at
+/// runtime like `"repo-cloned:~/projects/core"`. `Cow` so a compile-time
+/// step can hand back a `&'static str` constant with no allocation, while
+/// a runtime task instance can hand back an owned, params-derived string.
+pub type Capability = Cow<'static, str>;
 
 /// Anything that can be ordered by the resolver: declares what it needs
 /// before it runs, and what it leaves true once it has. `bootstrap`'s
-/// `Step` trait implements this; a future daemon task would too.
+/// `Step` trait (fixed, compile-time steps) and `tasks::Task` trait
+/// (runtime-instantiated, templated tasks) both implement this via their
+/// `Node for Box<dyn ...>` impls.
 pub trait Node {
-    fn node_id(&self) -> &str;
-    fn provides(&self) -> &'static [Capability];
-    fn requires(&self) -> &'static [Capability];
+    fn node_id(&self) -> String;
+    fn provides(&self) -> Vec<Capability>;
+    fn requires(&self) -> Vec<Capability>;
 }
 
 /// Computes a run order for `nodes` satisfying every `requires`/`provides`
 /// edge, preserving the input order among nodes that are otherwise
 /// unconstrained relative to each other (so an already-correctly-ordered
-/// input list round-trips through this unchanged - important while this
-/// is introduced alongside the existing hand-ordered step list, which
-/// should see no behavior change).
+/// input list round-trips through this unchanged).
 ///
 /// Returns the chosen order as indices into `nodes`. Errors on an unknown
 /// required capability (nothing provides it), two nodes claiming the same
@@ -39,7 +43,7 @@ pub fn resolve_order<N: Node>(nodes: &[N]) -> anyhow::Result<Vec<usize>> {
     let mut provided_by: HashMap<Capability, usize> = HashMap::new();
     for (i, node) in nodes.iter().enumerate() {
         for cap in node.provides() {
-            if let Some(&prev) = provided_by.get(cap) {
+            if let Some(&prev) = provided_by.get(&cap) {
                 bail!(
                     "capability {cap:?} is provided by both {:?} and {:?}",
                     nodes[prev].node_id(),
@@ -54,7 +58,7 @@ pub fn resolve_order<N: Node>(nodes: &[N]) -> anyhow::Result<Vec<usize>> {
     for node in nodes {
         let mut d = Vec::new();
         for cap in node.requires() {
-            match provided_by.get(cap) {
+            match provided_by.get(&cap) {
                 Some(&idx) => d.push(idx),
                 None => bail!(
                     "{:?} requires capability {cap:?}, which no node provides",
@@ -77,7 +81,7 @@ pub fn resolve_order<N: Node>(nodes: &[N]) -> anyhow::Result<Vec<usize>> {
             }
         }
         if !progressed {
-            let stuck: Vec<&str> = (0..nodes.len())
+            let stuck: Vec<String> = (0..nodes.len())
                 .filter(|&i| !placed[i])
                 .map(|i| nodes[i].node_id())
                 .collect();
@@ -93,19 +97,19 @@ mod tests {
 
     struct Fake {
         id: &'static str,
-        provides: &'static [Capability],
-        requires: &'static [Capability],
+        provides: &'static [&'static str],
+        requires: &'static [&'static str],
     }
 
     impl Node for Fake {
-        fn node_id(&self) -> &str {
-            self.id
+        fn node_id(&self) -> String {
+            self.id.to_string()
         }
-        fn provides(&self) -> &'static [Capability] {
-            self.provides
+        fn provides(&self) -> Vec<Capability> {
+            self.provides.iter().map(|&s| Cow::Borrowed(s)).collect()
         }
-        fn requires(&self) -> &'static [Capability] {
-            self.requires
+        fn requires(&self) -> Vec<Capability> {
+            self.requires.iter().map(|&s| Cow::Borrowed(s)).collect()
         }
     }
 
@@ -172,5 +176,38 @@ mod tests {
         ];
         let err = resolve_order(&nodes).unwrap_err().to_string();
         assert!(err.contains("cycle"), "unexpected error: {err}");
+    }
+
+    /// A runtime-computed (owned) capability must match a statically
+    /// declared (borrowed) one with the same text - this is the whole
+    /// point of `Capability` being a `Cow`, exercised by a templated
+    /// task's capability lining up with a fixed step's.
+    #[test]
+    fn owned_and_borrowed_capabilities_are_interchangeable() {
+        struct Owned(String);
+        impl Node for Owned {
+            fn node_id(&self) -> String {
+                "owned".to_string()
+            }
+            fn provides(&self) -> Vec<Capability> {
+                vec![Cow::Owned(self.0.clone())]
+            }
+            fn requires(&self) -> Vec<Capability> {
+                vec![]
+            }
+        }
+
+        let provider = Owned("dest=~/projects/core".to_string());
+        let dependent = Fake {
+            id: "dependent",
+            provides: &[],
+            requires: &["dest=~/projects/core"],
+        };
+
+        // Mixed node types can't share one `resolve_order::<N>` call (it's
+        // monomorphic over one `N`), so this just checks the capability
+        // values themselves compare equal across the owned/borrowed split
+        // - the thing a mixed-node graph would actually rely on.
+        assert_eq!(provider.provides()[0], dependent.requires()[0]);
     }
 }

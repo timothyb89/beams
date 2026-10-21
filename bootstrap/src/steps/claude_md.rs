@@ -23,8 +23,8 @@ impl Step for MergeClaudeMd {
         "claude-md-merge"
     }
 
-    fn provides(&self) -> &'static [Capability] {
-        &[cap::CLAUDE_MD_MERGED]
+    fn provides(&self) -> Vec<Capability> {
+        vec![cap::CLAUDE_MD_MERGED.into()]
     }
 
     fn run(&self, repo: &Path) -> anyhow::Result<Option<String>> {
