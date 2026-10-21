@@ -21,6 +21,23 @@ impl Step for InstallPackages {
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {
+        // A fresh beam's apt index can be stale/empty - `apt-get install`
+        // then fails with "unable to locate package" for everything,
+        // indistinguishable from a real typo in PACKAGES. Always update
+        // first; it's a no-op cost-wise if the index is already current.
+        let update = Command::new("sudo")
+            .arg("apt-get")
+            .arg("update")
+            .output()
+            .context("running apt-get update")?;
+        if !update.status.success() {
+            bail!(
+                "apt-get update failed ({}): {}",
+                update.status,
+                String::from_utf8_lossy(&update.stderr).trim()
+            );
+        }
+
         let output = Command::new("sudo")
             .arg("apt-get")
             .arg("install")
