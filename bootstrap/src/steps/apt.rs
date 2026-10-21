@@ -3,7 +3,8 @@ use std::process::Command;
 
 use anyhow::{bail, Context};
 
-use super::Step;
+use super::{cap, Step};
+use crate::graph::Capability;
 
 /// Packages to install on every beam, that are available from Debian's
 /// default repos as-is. apt-get already no-ops packages that are already
@@ -18,6 +19,10 @@ pub struct InstallPackages;
 impl Step for InstallPackages {
     fn id(&self) -> &'static str {
         "apt-install"
+    }
+
+    fn provides(&self) -> &'static [Capability] {
+        &[cap::APT_PACKAGES_INSTALLED]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

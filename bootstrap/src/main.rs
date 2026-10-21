@@ -1,4 +1,5 @@
 mod events;
+mod graph;
 mod steps;
 
 use std::path::PathBuf;

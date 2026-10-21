@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use super::linkutil::{ensure_symlink, home_dir};
-use super::Step;
+use super::{cap, Step};
+use crate::graph::Capability;
 
 /// Top-level repo entries to symlink into `$HOME`, and whether an existing
 /// non-symlink entry should be force-replaced (moved aside to `.orig`
@@ -26,6 +27,10 @@ pub struct LinkFiles;
 impl Step for LinkFiles {
     fn id(&self) -> &'static str {
         "link-files"
+    }
+
+    fn provides(&self) -> &'static [Capability] {
+        &[cap::DOTFILES_LINKED]
     }
 
     fn run(&self, repo: &Path) -> anyhow::Result<Option<String>> {

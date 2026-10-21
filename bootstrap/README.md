@@ -12,6 +12,12 @@ still run it manually inside a beam you've already `ssh`'d into.
 
 ## What it does
 
+The steps below run in dependency order, resolved from each step's
+declared capabilities (`provides`/`requires` in `src/steps/mod.rs`, see
+`DESIGN.md`) rather than a hardcoded sequence — today that still produces
+exactly the list below, but it's what lets new steps declare "runs after
+X" without everything needing to agree on one global order up front.
+
 1. **link-files** — symlinks `bin` and `.ssh` from the repo checkout into
    `$HOME`. `.ssh` is force-replaced: a fresh beam ships its own default
    `~/.ssh` (a delegated signing agent, not a plain key), which this moves

@@ -3,13 +3,23 @@ use std::process::Command;
 
 use anyhow::{bail, Context};
 
-use super::Step;
+use super::{cap, Step};
+use crate::graph::Capability;
 
 pub struct SetDefaultShell;
 
 impl Step for SetDefaultShell {
     fn id(&self) -> &'static str {
         "default-shell"
+    }
+
+    fn provides(&self) -> &'static [Capability] {
+        &[cap::DEFAULT_SHELL_SET]
+    }
+
+    fn requires(&self) -> &'static [Capability] {
+        // Needs `fish` on PATH - see the `which("fish")` call below.
+        &[cap::APT_PACKAGES_INSTALLED]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

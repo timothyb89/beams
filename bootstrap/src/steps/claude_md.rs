@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use super::Step;
+use super::{cap, Step};
+use crate::graph::Capability;
 
 /// Marks the appended block so re-runs don't duplicate it, and so it's
 /// obvious in `~/.claude/CLAUDE.md` where beam-provisioned content ends and
@@ -20,6 +21,10 @@ pub struct MergeClaudeMd;
 impl Step for MergeClaudeMd {
     fn id(&self) -> &'static str {
         "claude-md-merge"
+    }
+
+    fn provides(&self) -> &'static [Capability] {
+        &[cap::CLAUDE_MD_MERGED]
     }
 
     fn run(&self, repo: &Path) -> anyhow::Result<Option<String>> {

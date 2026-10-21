@@ -6,7 +6,8 @@ use anyhow::bail;
 
 use super::k3s_bot::bot_dir;
 use super::linkutil::{ensure_symlink, home_dir};
-use super::Step;
+use super::{cap, Step};
+use crate::graph::Capability;
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -21,6 +22,16 @@ pub struct LinkKubeconfig;
 impl Step for LinkKubeconfig {
     fn id(&self) -> &'static str {
         "kubeconfig-symlink"
+    }
+
+    fn provides(&self) -> &'static [Capability] {
+        &[cap::KUBECONFIG_LINKED]
+    }
+
+    fn requires(&self) -> &'static [Capability] {
+        // Waits on `kube/kubeconfig.yaml`, which tbot writes shortly after
+        // the service starts - see the polling loop below.
+        &[cap::TBOT_SERVICE_RUNNING]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

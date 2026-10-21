@@ -5,7 +5,8 @@ use std::process::Command;
 use anyhow::Context;
 
 use super::releaseutil::{arch_target, download, run, verify_checksum};
-use super::Step;
+use super::{cap, Step};
+use crate::graph::Capability;
 
 /// starship isn't packaged for Debian - install a pinned binary release
 /// from GitHub instead. Bump this (and re-check asset names at
@@ -18,6 +19,10 @@ pub struct InstallStarship;
 impl Step for InstallStarship {
     fn id(&self) -> &'static str {
         "install-starship"
+    }
+
+    fn provides(&self) -> &'static [Capability] {
+        &[cap::STARSHIP_INSTALLED]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

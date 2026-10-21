@@ -7,6 +7,14 @@ up. Per `AGENTS.md`'s session workflow: update this in the *same commit*
 as the work it tracks — this file, not conversation history, is what the
 next session trusts.
 
+Once a whole section above is done, move it out of this file into
+`archive/<something-descriptive>.md` (one file per completed
+project/milestone, roughly) rather than leaving it to accumulate here
+indefinitely — this file should stay focused on what's still open. "Done
+so far" context blurbs for small completed items can just be trimmed or
+dropped; archiving is for a section's worth of finished work, not every
+individual checked-off line.
+
 ## Done so far (for context, not actionable)
 
 - `beam-bootstrap`: dotfile linking, apt packages, fish/starship,
@@ -28,11 +36,17 @@ Supersedes the old "bootstrap wizard" / "bidirectional progress
 reporting" items from the previous version of this file — both are now
 just consequences of this design rather than separate asks.
 
-- [ ] Introduce task-graph types in `bootstrap`: capability, template,
-  instance, dependency resolution by capability (not task ID) — see
-  DESIGN.md's "Task model". No behavior change yet: migrate every
-  existing step into a zero-param template providing the capability its
-  current idempotency check already detects.
+- [x] Capability-based dependency resolution: `bootstrap/src/graph.rs`
+  (`Node` trait, `resolve_order`), wired into `steps::resolved()`. Every
+  existing step now declares `provides`/`requires` (see `steps::cap`)
+  instead of relying purely on hand-ordering. Confirmed no behavior
+  change via `steps::tests::resolved_order_matches_original_hand_ordered_list`.
+- [ ] Template/instance types: a template (param schema + id-generation
+  rule) that can be *instantiated* with concrete params into a task
+  participating in the same capability graph — see DESIGN.md's
+  "Templates vs. instances". Not started; today's steps are all
+  zero-param and fixed at compile time, so this is the part needed before
+  `clone-git-repo`/`checkout-pr-worktree`/etc. can exist.
 - [ ] Daemon skeleton: `beam-bootstrap daemon`, UDS socket at
   `~/.beam-bootstrap/daemon.sock`, newline-delimited JSON protocol with
   `request_id` correlation, task-status events broadcast to all

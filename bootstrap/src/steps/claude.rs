@@ -3,13 +3,18 @@ use std::process::Command;
 
 use anyhow::{bail, Context};
 
-use super::Step;
+use super::{cap, Step};
+use crate::graph::Capability;
 
 pub struct UpdateClaude;
 
 impl Step for UpdateClaude {
     fn id(&self) -> &'static str {
         "claude-update"
+    }
+
+    fn provides(&self) -> &'static [Capability] {
+        &[cap::CLAUDE_UPDATED]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

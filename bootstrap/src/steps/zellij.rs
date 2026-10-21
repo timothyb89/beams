@@ -5,7 +5,8 @@ use std::process::Command;
 use anyhow::Context;
 
 use super::releaseutil::{arch_target, download, run, verify_checksum};
-use super::Step;
+use super::{cap, Step};
+use crate::graph::Capability;
 
 /// zellij isn't packaged for Debian at all - install a pinned binary
 /// release from GitHub instead. Bump this (and re-check the asset names at
@@ -18,6 +19,10 @@ pub struct InstallZellij;
 impl Step for InstallZellij {
     fn id(&self) -> &'static str {
         "install-zellij"
+    }
+
+    fn provides(&self) -> &'static [Capability] {
+        &[cap::ZELLIJ_INSTALLED]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

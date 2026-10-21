@@ -4,7 +4,8 @@ use std::process::Command;
 use anyhow::{bail, Context};
 
 use super::k3s_bot::bot_dir;
-use super::Step;
+use super::{cap, Step};
+use crate::graph::Capability;
 
 const SERVICE_NAME: &str = "tbot";
 
@@ -17,6 +18,16 @@ pub struct StartTbotService;
 impl Step for StartTbotService {
     fn id(&self) -> &'static str {
         "start-tbot"
+    }
+
+    fn provides(&self) -> &'static [Capability] {
+        &[cap::TBOT_SERVICE_RUNNING]
+    }
+
+    fn requires(&self) -> &'static [Capability] {
+        // Needs `tbot` on disk and `tbot.yaml`/the join token written by
+        // the join step - see `bot_dir()` usage below.
+        &[cap::TELEPORT_BIN_INSTALLED, cap::K3S_BOT_JOINED]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

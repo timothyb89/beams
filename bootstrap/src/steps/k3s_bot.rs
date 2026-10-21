@@ -8,7 +8,8 @@ use serde::Deserialize;
 
 use super::linkutil::home_dir;
 use super::teleport_bin::BOT_DIR;
-use super::Step;
+use super::{cap, Step};
+use crate::graph::Capability;
 
 /// Bot and target cluster/node names are static for now - see
 /// bot-onboarding/ for the role/bot resources (applied once, cluster-wide,
@@ -32,6 +33,15 @@ pub struct JoinK3sBot;
 impl Step for JoinK3sBot {
     fn id(&self) -> &'static str {
         "k3s-bot-join"
+    }
+
+    fn provides(&self) -> &'static [Capability] {
+        &[cap::K3S_BOT_JOINED]
+    }
+
+    fn requires(&self) -> &'static [Capability] {
+        // Runs `tctl` out of `bot_dir()/bin` - see `request_join_token`.
+        &[cap::TELEPORT_BIN_INSTALLED]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

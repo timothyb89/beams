@@ -3,7 +3,8 @@ use std::process::Command;
 
 use anyhow::{bail, Context};
 
-use super::Step;
+use super::{cap, Step};
+use crate::graph::Capability;
 
 /// kubectl isn't in Debian's default repos, so we add the official
 /// Kubernetes apt repo first. Bump this when a newer minor is wanted -
@@ -17,6 +18,10 @@ pub struct InstallKubectl;
 impl Step for InstallKubectl {
     fn id(&self) -> &'static str {
         "install-kubectl"
+    }
+
+    fn provides(&self) -> &'static [Capability] {
+        &[cap::KUBECTL_INSTALLED]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {

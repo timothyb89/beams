@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use super::linkutil::{ensure_symlink, home_dir};
-use super::Step;
+use super::{cap, Step};
+use crate::graph::Capability;
 
 /// (repo-relative path under `shell/`, target path relative to `~/.config`)
 const LINKS: &[(&str, &str)] = &[
@@ -14,6 +15,10 @@ pub struct LinkShellConfig;
 impl Step for LinkShellConfig {
     fn id(&self) -> &'static str {
         "shell-config"
+    }
+
+    fn provides(&self) -> &'static [Capability] {
+        &[cap::SHELL_CONFIG_LINKED]
     }
 
     fn run(&self, repo: &Path) -> anyhow::Result<Option<String>> {

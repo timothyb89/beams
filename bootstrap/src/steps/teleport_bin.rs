@@ -8,7 +8,8 @@ use serde::Deserialize;
 
 use super::linkutil::home_dir;
 use super::releaseutil::{download, run, verify_checksum};
-use super::Step;
+use super::{cap, Step};
+use crate::graph::Capability;
 
 /// Where tctl/tbot land, and everything the k3s bot steps need. Not under
 /// `~/.config` or `/usr/local` - project.md only requires it be accessible
@@ -30,6 +31,10 @@ pub struct InstallTeleportBin;
 impl Step for InstallTeleportBin {
     fn id(&self) -> &'static str {
         "install-teleport-bin"
+    }
+
+    fn provides(&self) -> &'static [Capability] {
+        &[cap::TELEPORT_BIN_INSTALLED]
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {
