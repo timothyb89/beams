@@ -157,9 +157,9 @@ no-op.
 ### Daemon
 
 `beam-bootstrap daemon` listens on a UDS socket (`--socket`, defaults to
-`~/.beam-bootstrap/daemon.sock`) for `list_tasks`/`run_task` requests as
-newline-delimited JSON - see `src/daemon.rs`'s module doc comment for the
-protocol. Meant to be supervised, e.g.:
+`~/.beam-bootstrap/daemon.sock`) for `list_tasks`/`run_task`/
+`run_manifest` requests as newline-delimited JSON - see `src/daemon.rs`'s
+module doc comment for the full protocol. Meant to be supervised, e.g.:
 
 ```sh
 beamctl start --name beam-bootstrapd -- ./target/debug/beam-bootstrap daemon
@@ -167,10 +167,10 @@ beamctl start --name beam-bootstrapd -- ./target/debug/beam-bootstrap daemon
 
 Nothing drives this from the fixed startup sequence, a TUI, or
 `client/` yet (see `DESIGN.md`'s migration plan) - today it only exists
-so `list_tasks`/`run_task` are reachable over a socket at all, same
-instantiation path as `run-task` above (`tasks::instantiate`), with
-task-status progress broadcast to every connected client, not just
-whoever asked - try it with two terminals:
+so these ops are reachable over a socket at all, same instantiation path
+as `run-task` above (`tasks::instantiate`), with task-status progress
+broadcast to every connected client, not just whoever asked - try it
+with two terminals:
 
 ```sh
 # terminal 1
@@ -179,6 +179,19 @@ whoever asked - try it with two terminals:
 # terminal 2 - or any other UDS client, e.g. `socat - UNIX-CONNECT:...`
 echo '{"request_id":"1","op":"run_task","task":"clone-git-repo","params":{"repo":"...","dest":"..."}}' \
   | nc -U ~/.beam-bootstrap/daemon.sock
+```
+
+`run_manifest` is `run_task` generalized to several task instances at
+once, resolved against each other (so they can be listed in any order)
+via the same capability graph the fixed startup sequence uses - this is
+what lets `checkout-pr-worktree` and the `clone-git-repo` it depends on
+be requested together in one call:
+
+```sh
+echo '{"request_id":"2","op":"run_manifest","tasks":[
+  {"template":"checkout-pr-worktree","params":{"base":"~/projects/core","pr":1234,"dest":"~/projects/teleport-1234"}},
+  {"template":"clone-git-repo","params":{"repo":"...","dest":"~/projects/core"}}
+]}' | nc -U ~/.beam-bootstrap/daemon.sock
 ```
 
 ## Trying it out

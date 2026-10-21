@@ -92,15 +92,39 @@ just consequences of this design rather than separate asks.
 - [ ] `beam-bootstrap --repo ...` (today's one-shot entrypoint) becomes:
   ensure a daemon is running, then let the daemon run the startup tasks,
   rather than running them itself inline.
-- [ ] Manifest format (see DESIGN.md's "Seeding manifest") — the one
-  interchange shape for template invocations, used by CLI sugar, TUI
-  forms, and (eventually) a Mac app alike. Implement the manifest schema
-  + a `run_task`/`list_tasks` socket op before building any UI on top.
+- [x] Manifest format + `run_manifest` socket op (`daemon.rs`): a list of
+  `{template, params}` entries, resolved against *each other* (not
+  against any prior run's state - see the module doc comment's note on
+  why, and the idempotent-redundant-entry workaround) via
+  `graph::resolve_order` over their instantiated `Task`s, then run in
+  that order, stopping at the first failure (same semantics as
+  `steps::run`). Verified: out-of-order entries get reordered correctly,
+  an unsatisfiable dependency is rejected before anything runs, and a
+  mid-manifest failure stops the rest - both as daemon unit tests and
+  manually against a real socket file with `checkout-pr-worktree` +
+  `clone-git-repo` requested together, in reverse order. Each task's
+  `task_status` broadcast carries a `manifest_id` when run this way
+  (`null` for a standalone `run_task`); the whole manifest holds
+  `Hub::run_lock` for its full duration, not just per task, so it runs as
+  one atomic unit relative to other connections' requests.
+- [ ] CLI/TUI sugar for `run_manifest` is still missing - `run-task`
+  (the CLI) only calls the single-task `run_task` op, not
+  `run_manifest`; there's no CLI way yet to hand the daemon a multi-task
+  manifest without hand-writing the JSON (as the README's example does).
+  Worth deciding whether that's a `run-manifest --file <path>` flag, or
+  waits for the TUI/`client` wiring below to be the real consumer.
 - [ ] `beam-bootstrap tui`: ratatui client, connects to the daemon's
-  socket, deferred/templated task list + param input on top, progress
-  bar + scrollable log on bottom.
+  socket, deferred/templated task list + param input on top (building a
+  manifest from the selection), progress bar + scrollable log on bottom
+  (rendering the `task_status`/`manifest_status` broadcasts already
+  implemented).
 - [ ] `beams task run <template> [params...]` — agent-friendly on-demand
-  CLI entry point, no TUI required.
+  CLI entry point, no TUI required. (Distinct from the item above: this
+  is a *daemon-backed* CLI, talking over the socket like the TUI would,
+  vs. today's `run-task`/`run_manifest`-via-flag question, which is
+  in-process-vs-socket-client more than daemon-vs-no-daemon - may end up
+  being the same command once the daemon is what's actually running
+  things day to day.)
 - [ ] Wire manifest seeding into `client`'s `beams ssh`/`beams new` (e.g.
   `beams new --clone <pr>` builds a manifest and hands it to a freshly
   spawned beam before its first startup pass).
