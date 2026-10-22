@@ -377,6 +377,37 @@ section above for status/details.
   investigated. Needs reproduction + root-causing before a fix; unrelated
   to the daemon/task-graph work, can land independently.
 
+## Bug: `claude-update` intermittently fails the whole fixed sequence
+
+- [x] **Root-caused, made non-blocking rather than "fixed" outright** -
+  "usually fails, but worked on this VM's init" turned out to be real:
+  `sudo claude update` failed with `sudo: claude: command not found`
+  because there's no file literally named `claude` on PATH *for any
+  user* on this beam, not a sudo-`secure_path`-specific issue (checked
+  directly: plain `which claude` as this user comes back empty too).
+  The actual npm-installed `claude` bin symlink exists, just moved aside
+  to a hidden, randomly-suffixed name (e.g. `/usr/bin/.claude-<random>`)
+  - and there's a *second*, differently-named, differently-versioned
+  copy under `/usr/lib/node_modules/@anthropic-ai/` that's what any
+  currently-running `claude` process (per `/proc/<pid>/exe`) actually
+  runs from. Reads as deliberate harness/platform behavior - isolating
+  the live session's own pinned copy from a `claude update` that could
+  yank out from under it, and/or just not leaving an agent session a
+  trivially-discoverable path to its own interpreter - not a bug in
+  `steps/claude.rs` to route around by hunting down the hidden name
+  (fragile across beams/sessions anyway, and uncomfortably close to
+  defeating a boundary the platform put there on purpose).
+  `steps/claude.rs` now checks `which claude` itself first and skips
+  (`Ok(None)`) rather than erring when it comes back empty - this
+  step's job is keeping a *separate*, human-facing `claude` current
+  when one happens to exist by its normal name, not managing whatever
+  the harness's own session is pinned to. A `claude` that *is* findable
+  but genuinely fails to update still reports that failure as before.
+  Verified live: the full (non-`--only`) sequence on this beam - where
+  `claude` isn't resolvable right now - now exits `0` instead of
+  stopping the `claude-update`/`start-bootstrap-daemon`/`install-
+  teleport-bin` wave on an error.
+
 ## Repo delivery onto a beam
 
 - [x] `tsh git ...` confirmed **not** viable for this (scoped to GitHub
