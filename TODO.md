@@ -175,12 +175,20 @@ just consequences of this design rather than separate asks.
     against (that pair can already be done as two sequential `run_task`
     submissions from the TUI today, just not concurrently with each
     other since they're not in a shared capability chain anyway).
-  - **New gap, found restarting the daemon mid-E2E-test**: the TUI
-    doesn't reconnect if its daemon connection drops (e.g. `beamctl
-    restart beam-bootstrapd` after swapping the binary, which is what
-    happened here) - it just goes quiet, showing stale state forever.
-    Not a normal occurrence (daemon restarts aren't routine), but worth
-    a reconnect loop in `tui::client::DaemonClient` eventually.
+  - [x] **Fixed**: the gap found restarting the daemon mid-E2E-test (TUI
+    went quiet forever on a dropped connection) - `DaemonClient::reconnect`
+    (`tui/client.rs`) opens a fresh socket connection + reader thread in
+    place; `run_loop` (`tui/mod.rs`) detects the drop via the event
+    channel's `TryRecvError::Disconnected`, shows it in the status line
+    (`App::mark_disconnected`), and retries `reconnect` once a second
+    (`RECONNECT_RETRY_INTERVAL`) until it succeeds, re-fetching the
+    template list on success (`App::mark_reconnected`). Rows from before
+    the drop are left as-is - reconciling what happened to in-flight
+    tasks during the gap isn't attempted. Covered by a real-socket test
+    (`tui::client::tests::reconnect_recovers_after_the_daemon_restarts`)
+    simulating an actual daemon-process restart (same UDS path, old
+    listener/connection dropped, new one bound) plus two `App` unit
+    tests for the status-line/re-fetch behavior.
 - [ ] `beams task run <template> [params...]` — agent-friendly on-demand
   CLI entry point, no TUI required. (Distinct from the item above: this
   is a *daemon-backed* CLI, talking over the socket like the TUI would,
