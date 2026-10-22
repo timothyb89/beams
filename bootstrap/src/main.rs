@@ -147,6 +147,15 @@ enum TaskCommand {
         #[arg(long)]
         dest: String,
     },
+    /// Install the Go toolchain via the official release (see
+    /// `tasks::install_toolchain_go`). No params.
+    InstallToolchainGo,
+    /// Install the Rust toolchain via rustup (see
+    /// `tasks::install_toolchain_rust`). No params.
+    InstallToolchainRust,
+    /// Install code-server and background it as a beamctl service (see
+    /// `tasks::install_code_server`). No params.
+    InstallCodeServer,
 }
 
 fn main() {
@@ -209,6 +218,15 @@ fn task_command_to_instance(command: TaskCommand) -> (&'static str, Value) {
             tasks::checkout_pr_worktree::CheckoutPrWorktree::NAME,
             json!({"base": base, "pr": pr, "dest": dest}),
         ),
+        TaskCommand::InstallToolchainGo => {
+            (tasks::install_toolchain_go::InstallToolchainGo::NAME, json!({}))
+        }
+        TaskCommand::InstallToolchainRust => {
+            (tasks::install_toolchain_rust::InstallToolchainRust::NAME, json!({}))
+        }
+        TaskCommand::InstallCodeServer => {
+            (tasks::install_code_server::InstallCodeServer::NAME, json!({}))
+        }
     }
 }
 
@@ -478,5 +496,37 @@ fn daemon_run_manifest(socket: Option<String>, file: &str) -> i32 {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Subcommand;
+
+    use super::TaskCommand;
+
+    /// `task run`/`run-task` only reach a template if `TaskCommand` has a
+    /// variant for it - easy to forget when adding a new template (it's
+    /// exactly what happened for `install-toolchain-go`/`-rust` and
+    /// `install-code-server`, all three only reachable via
+    /// `run-manifest` until this test existed to catch it). Builds the
+    /// actual subcommand list clap's derive generates for `TaskCommand`
+    /// rather than hand-maintaining a second list here, so it can't drift
+    /// from what clap really exposes.
+    #[test]
+    fn task_command_covers_every_known_template() {
+        let cmd = TaskCommand::augment_subcommands(clap::Command::new("task-run"));
+        let mut covered: Vec<String> =
+            cmd.get_subcommands().map(|c| c.get_name().to_string()).collect();
+        covered.sort();
+
+        let mut expected: Vec<String> = crate::tasks::names().iter().map(|s| s.to_string()).collect();
+        expected.sort();
+
+        assert_eq!(
+            covered, expected,
+            "TaskCommand is missing a variant for some template(s) - \
+             `task run`/`run-task` can't reach it without one"
+        );
     }
 }

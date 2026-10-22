@@ -269,6 +269,20 @@ section above for status/details.
   daemon's own unauthenticated UDS socket. Publishing itself stays a
   separate, manual `tsh beams publish $BEAM_ALIAS` step - this task only
   installs and starts it.
+- [x] **Gap found while verifying the task above, now fixed**: `task
+  run`/`run-task` (`main.rs`'s `TaskCommand` enum) only had subcommand
+  variants for `clone-git-repo`/`checkout-pr-worktree` - every zero-param
+  template (`install-toolchain-go`, `-rust`, and now `-code-server`) was
+  reachable only via `run-manifest`, not `task run` directly. Added the
+  three missing variants (each mapping to `Template::NAME` + `json!({})`
+  in `task_command_to_instance`, the shared helper both `run-task` and
+  `task run` already went through) and a unit test,
+  `task_command_covers_every_known_template`, that builds `TaskCommand`'s
+  actual clap subcommand list via `Subcommand::augment_subcommands` and
+  diffs it against `tasks::names()` - fails the build the next time a
+  template lands without a `task run` variant, same drift-guard role
+  `template_schemas_match_what_instantiate_actually_accepts` already
+  plays for `instantiate`.
 
 ## zellij layout fix (independent — doesn't need the daemon work)
 

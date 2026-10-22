@@ -44,17 +44,25 @@ today, not just a description of the design:
   / `task run-manifest --file <path>` - talks to the already-running
   daemon over its socket (`~/.beam-bootstrap/daemon.sock` by default),
   submits, then blocks printing progress until it finishes, exiting
-  0/1 accordingly. Covers every template, including the ones tagged
-  with a shared `exclusive_resources` lock (`install-toolchain-go`/
-  `-rust`) that `run-task` below can't reach. No more need to hand-roll
-  JSON at the socket for this - see `bootstrap/README.md`'s "`task` -
-  the daemon-backed CLI" section.
+  0/1 accordingly. Covers every template - a unit test
+  (`main.rs::tests::task_command_covers_every_known_template`) fails the
+  build if a new template ever lands without a `task run` subcommand for
+  it, same way `template_schemas_match_what_instantiate_actually_accepts`
+  already guards `instantiate`. No more need to hand-roll JSON at the
+  socket for this - see `bootstrap/README.md`'s "`task` - the
+  daemon-backed CLI" section.
 - **No daemon needed**: `beam-bootstrap list-tasks` /
   `run-task <template> --param value ...` runs one task in-process -
-  only reaches `clone-git-repo`/`checkout-pr-worktree` today (the two
-  templates with a `run-task` subcommand). Fine for those two; prefer
-  `task run` above for anything else, or if a daemon's already up
-  anyway (progress then shows in a connected TUI too).
+  same coverage as `task run` above (same `TaskCommand` enum drives
+  both), just without the daemon's concurrent-wave scheduling or
+  broadcast progress. Prefer `task run` above when a daemon's already up
+  anyway (progress then shows in a connected TUI too), or for anything
+  that needs its `exclusive_resources` tag actually serialized against
+  other *concurrently running* tasks - a bare `run-task` only ever runs
+  the one task you gave it, so that tag has nothing to serialize against
+  there. Real cross-process contention (e.g. `apt-get`) goes through
+  `aptlock`'s `flock(1)` regardless of which path you use, so that part's
+  covered either way.
 - **Standing permission**: run templated tasks (either path above)
   against a beam — including this session's own — without asking first.
   They're idempotent and scoped to exactly what they say (installing a
