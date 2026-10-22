@@ -39,18 +39,22 @@ the fixed startup `steps/` — see `DESIGN.md`'s "Templates vs.
 instances"). This is how to actually reach for one from an agent session,
 today, not just a description of the design:
 
+- **Daemon-backed, the normal way to reach any template now**:
+  `beam-bootstrap task list` / `task run <template> --param value ...`
+  / `task run-manifest --file <path>` - talks to the already-running
+  daemon over its socket (`~/.beam-bootstrap/daemon.sock` by default),
+  submits, then blocks printing progress until it finishes, exiting
+  0/1 accordingly. Covers every template, including the ones tagged
+  with a shared `exclusive_resources` lock (`install-toolchain-go`/
+  `-rust`) that `run-task` below can't reach. No more need to hand-roll
+  JSON at the socket for this - see `bootstrap/README.md`'s "`task` -
+  the daemon-backed CLI" section.
 - **No daemon needed**: `beam-bootstrap list-tasks` /
-  `beam-bootstrap run-task <template> --param value ...` runs one task
-  in-process. Covers `clone-git-repo`/`checkout-pr-worktree` today.
-- **Daemon-only templates** (`install-toolchain-go`,
-  `install-toolchain-rust` — anything tagged with a shared
-  `exclusive_resources` lock, or anything you want to run concurrently
-  with other tasks/broadcast progress to the TUI) only have a
-  `run_manifest` path right now, not a `run-task` subcommand — hand-roll
-  the JSON at the daemon's UDS socket (`~/.beam-bootstrap/daemon.sock`
-  by default; see `bootstrap/README.md`'s "Daemon" section for the
-  request shape). There's no `nc`/`socat` on a stock beam — a short
-  inline `python3 -c '...'` using the `socket` module round-trips fine.
+  `run-task <template> --param value ...` runs one task in-process -
+  only reaches `clone-git-repo`/`checkout-pr-worktree` today (the two
+  templates with a `run-task` subcommand). Fine for those two; prefer
+  `task run` above for anything else, or if a daemon's already up
+  anyway (progress then shows in a connected TUI too).
 - **Standing permission**: run templated tasks (either path above)
   against a beam — including this session's own — without asking first.
   They're idempotent and scoped to exactly what they say (installing a

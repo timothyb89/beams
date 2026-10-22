@@ -5,11 +5,12 @@ mod graph;
 mod pathutil;
 mod releaseutil;
 mod steps;
+mod taskcli;
 mod tasks;
 mod tui;
 
 use clap::{Parser, Subcommand};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use pathutil::expand_tilde;
 use tasks::Template;
@@ -74,6 +75,50 @@ enum Command {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// Daemon-backed task operations - the agent-friendly, no-TUI-
+    /// required entry point `DESIGN.md`'s architecture diagram calls
+    /// `beams task run ...`, and the CLI sugar for `run_manifest` that
+    /// TODO.md had as a separate, still-open item - both landed as this
+    /// one subcommand group once it became clear they're the same piece
+    /// of work. Unlike `list-tasks`/`run-task` above, these talk to an
+    /// already-running daemon over its socket rather than running
+    /// in-process, so progress is visible to - and broadcast from - any
+    /// other connected client (a TUI, another `task run` call) too.
+    Task {
+        #[command(subcommand)]
+        task: DaemonTaskCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonTaskCommand {
+    /// List available templates via the daemon (confirms one's actually
+    /// up and reachable, unlike the in-process `list-tasks` above).
+    List {
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Submit a single templated task to the daemon and block until it
+    /// reaches a terminal state, printing progress as it happens.
+    Run {
+        #[arg(long)]
+        socket: Option<String>,
+        #[command(subcommand)]
+        task: TaskCommand,
+    },
+    /// Submit a manifest - several task instances resolved against each
+    /// other, per `daemon.rs`'s module doc comment - from a JSON file
+    /// (the same `[{"template": ..., "params": {...}}, ...]` shape
+    /// `bootstrap/README.md`'s `nc -U` example hand-writes) and block
+    /// until the whole manifest finishes.
+    RunManifest {
+        #[arg(long)]
+        socket: Option<String>,
+        /// Path to a JSON file containing a `[{"template", "params"},
+        /// ...]` array.
+        #[arg(long)]
+        file: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -105,13 +150,27 @@ enum TaskCommand {
 
 fn main() {
     let args = Args::parse();
-    match args.command {
-        Some(Command::ListTasks) => list_tasks(),
+    let exit_code = match args.command {
+        Some(Command::ListTasks) => {
+            list_tasks();
+            0
+        }
         Some(Command::RunTask { task }) => run_task(task),
-        Some(Command::Daemon { socket }) => run_daemon(socket),
-        Some(Command::Tui { socket }) => run_tui(socket),
-        None => run_bootstrap(&args),
-    }
+        Some(Command::Daemon { socket }) => {
+            run_daemon(socket);
+            0 // run_daemon exits the process itself on error; reaching here means a clean shutdown
+        }
+        Some(Command::Tui { socket }) => {
+            run_tui(socket);
+            0 // ditto
+        }
+        Some(Command::Task { task }) => run_daemon_task(task),
+        None => {
+            run_bootstrap(&args);
+            0 // run_bootstrap exits the process itself; see its own doc comment
+        }
+    };
+    std::process::exit(exit_code);
 }
 
 fn list_tasks() {
@@ -137,11 +196,11 @@ fn run_bootstrap(args: &Args) {
 }
 
 /// Builds the `(template name, JSON params)` pair for a `TaskCommand` -
-/// goes through `tasks::instantiate` from there, the same path the
-/// daemon's `run_task` op uses, rather than constructing task structs
-/// directly (see that function's doc comment).
-fn run_task(command: TaskCommand) {
-    let (name, params) = match command {
+/// shared by `run_task` (in-process) and `run_daemon_task`'s `Run`
+/// variant (daemon-backed), so the two don't drift on how a `TaskCommand`
+/// maps onto `tasks::instantiate`'s actual inputs.
+fn task_command_to_instance(command: TaskCommand) -> (&'static str, Value) {
+    match command {
         TaskCommand::CloneGitRepo { repo, dest } => {
             (tasks::clone_git_repo::CloneGitRepo::NAME, json!({"repo": repo, "dest": dest}))
         }
@@ -149,22 +208,36 @@ fn run_task(command: TaskCommand) {
             tasks::checkout_pr_worktree::CheckoutPrWorktree::NAME,
             json!({"base": base, "pr": pr, "dest": dest}),
         ),
-    };
+    }
+}
+
+/// Runs a single templated task in-process - no daemon, no dependency
+/// resolution against anything else. Goes through `tasks::instantiate`,
+/// the same path the daemon's `run_task` op uses, rather than
+/// constructing task structs directly.
+fn run_task(command: TaskCommand) -> i32 {
+    let (name, params) = task_command_to_instance(command);
 
     let task = match tasks::instantiate(name, params) {
         Ok(task) => task,
         Err(err) => {
             eprintln!("error: {err}");
-            std::process::exit(1);
+            return 1;
         }
     };
 
     match task.run() {
-        Ok(Some(message)) => println!("ok: {message}"),
-        Ok(None) => println!("skip: nothing to do"),
+        Ok(Some(message)) => {
+            println!("ok: {message}");
+            0
+        }
+        Ok(None) => {
+            println!("skip: nothing to do");
+            0
+        }
         Err(err) => {
             eprintln!("error: {err}");
-            std::process::exit(1);
+            1
         }
     }
 }
@@ -182,5 +255,227 @@ fn run_tui(socket: Option<String>) {
     if let Err(err) = tui::run(&socket_path) {
         eprintln!("error: {err}");
         std::process::exit(1);
+    }
+}
+
+fn run_daemon_task(command: DaemonTaskCommand) -> i32 {
+    match command {
+        DaemonTaskCommand::List { socket } => daemon_list_tasks(socket),
+        DaemonTaskCommand::Run { socket, task } => daemon_run_task(socket, task),
+        DaemonTaskCommand::RunManifest { socket, file } => daemon_run_manifest(socket, &file),
+    }
+}
+
+/// Connects or prints a connection error and returns the exit code a
+/// caller should propagate - the one bit of boilerplate every
+/// `daemon_*` function below needs before it can do anything else.
+fn connect_or_exit_code(socket_path: &std::path::Path) -> Result<taskcli::Connection, i32> {
+    taskcli::Connection::connect(socket_path).map_err(|err| {
+        eprintln!("error: {err}");
+        1
+    })
+}
+
+fn daemon_list_tasks(socket: Option<String>) -> i32 {
+    let socket_path = expand_tilde(&socket.unwrap_or_else(daemon::default_socket_path));
+    let mut conn = match connect_or_exit_code(&socket_path) {
+        Ok(conn) => conn,
+        Err(code) => return code,
+    };
+
+    if let Err(err) = conn.send(&json!({"request_id": "1", "op": "list_tasks"})) {
+        eprintln!("error: {err}");
+        return 1;
+    }
+
+    match conn.recv() {
+        Ok(Some(value)) if value.get("type").and_then(Value::as_str) == Some("tasks") => {
+            for template in value.get("tasks").and_then(Value::as_array).into_iter().flatten() {
+                let name = template.get("template").and_then(Value::as_str).unwrap_or("?");
+                let params: Vec<String> = template
+                    .get("params")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(|p| {
+                        let name = p.get("name").and_then(Value::as_str).unwrap_or("?");
+                        let kind = p.get("kind").and_then(Value::as_str).unwrap_or("?");
+                        let required = p.get("required").and_then(Value::as_bool).unwrap_or(true);
+                        format!("{name}{}: {kind}", if required { "" } else { "?" })
+                    })
+                    .collect();
+                println!("{name} ({})", params.join(", "));
+            }
+            0
+        }
+        Ok(Some(value)) => {
+            eprintln!("error: unexpected daemon reply: {value}");
+            1
+        }
+        Ok(None) => {
+            eprintln!("error: daemon closed the connection without replying");
+            1
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            1
+        }
+    }
+}
+
+/// Submits one templated task to the daemon (same `TaskCommand` ->
+/// `tasks::instantiate` mapping `run_task` uses in-process) and blocks,
+/// printing every `task_status` broadcast for it, until it reaches a
+/// terminal state - the agent-friendly on-demand entry point
+/// `DESIGN.md`'s architecture diagram calls `beams task run ...`.
+fn daemon_run_task(socket: Option<String>, task: TaskCommand) -> i32 {
+    let socket_path = expand_tilde(&socket.unwrap_or_else(daemon::default_socket_path));
+    let (name, params) = task_command_to_instance(task);
+    let mut conn = match connect_or_exit_code(&socket_path) {
+        Ok(conn) => conn,
+        Err(code) => return code,
+    };
+
+    let request_id = "1";
+    if let Err(err) =
+        conn.send(&json!({"request_id": request_id, "op": "run_task", "task": name, "params": params}))
+    {
+        eprintln!("error: {err}");
+        return 1;
+    }
+
+    let mut task_id: Option<String> = None;
+    loop {
+        let value = match conn.recv() {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                eprintln!("error: daemon closed the connection before the task finished");
+                return 1;
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                return 1;
+            }
+        };
+
+        match value.get("type").and_then(Value::as_str) {
+            // This connection's own direct reply to the `run_task`
+            // above - carries the task_id every subsequent broadcast
+            // (from *any* connection, not just this one) will use, per
+            // `daemon.rs`'s module doc comment.
+            Some("accepted") if value.get("request_id").and_then(Value::as_str) == Some(request_id) => {
+                let id = value.get("task_id").and_then(Value::as_str).unwrap_or("?").to_string();
+                println!("submitted {id}");
+                task_id = Some(id);
+            }
+            Some("error") if value.get("request_id").and_then(Value::as_str) == Some(request_id) => {
+                let message = value.get("message").and_then(Value::as_str).unwrap_or("unknown error");
+                eprintln!("error: {message}");
+                return 1;
+            }
+            Some("task_status") => {
+                let Some(id) = value.get("task_id").and_then(Value::as_str) else { continue };
+                // Broadcasts go to every connection - only print/act on
+                // the one this call actually submitted.
+                if task_id.as_deref() != Some(id) {
+                    continue;
+                }
+                let status = value.get("status").and_then(Value::as_str).unwrap_or("?");
+                let message = value.get("message").and_then(Value::as_str);
+                match message {
+                    Some(message) => println!("{status}: {id} ({message})"),
+                    None => println!("{status}: {id}"),
+                }
+                match status {
+                    "ok" | "skip" => return 0,
+                    "error" => return 1,
+                    _ => {} // "start" - keep waiting
+                }
+            }
+            _ => {} // not something this command cares about
+        }
+    }
+}
+
+/// Submits a manifest read from `file` (the same `[{"template",
+/// "params"}, ...]` shape `bootstrap/README.md`'s `nc -U` example
+/// hand-writes) and blocks, printing every task's progress as it
+/// happens, until the whole manifest reaches a terminal state. The CLI
+/// sugar for `run_manifest` TODO.md had as a separate open item.
+fn daemon_run_manifest(socket: Option<String>, file: &str) -> i32 {
+    let socket_path = expand_tilde(&socket.unwrap_or_else(daemon::default_socket_path));
+    let contents = match std::fs::read_to_string(expand_tilde(file)) {
+        Ok(contents) => contents,
+        Err(err) => {
+            eprintln!("error: reading {file}: {err}");
+            return 1;
+        }
+    };
+    let tasks: Value = match serde_json::from_str(&contents) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("error: parsing {file} as JSON: {err}");
+            return 1;
+        }
+    };
+
+    let mut conn = match connect_or_exit_code(&socket_path) {
+        Ok(conn) => conn,
+        Err(code) => return code,
+    };
+
+    let request_id = "1";
+    if let Err(err) = conn.send(&json!({"request_id": request_id, "op": "run_manifest", "tasks": tasks})) {
+        eprintln!("error: {err}");
+        return 1;
+    }
+
+    let mut manifest_id: Option<String> = None;
+    loop {
+        let value = match conn.recv() {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                eprintln!("error: daemon closed the connection before the manifest finished");
+                return 1;
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                return 1;
+            }
+        };
+
+        match value.get("type").and_then(Value::as_str) {
+            Some("accepted") if value.get("request_id").and_then(Value::as_str) == Some(request_id) => {
+                let id = value.get("manifest_id").and_then(Value::as_str).unwrap_or("?").to_string();
+                println!("submitted manifest {id}, waves: {}", value.get("waves").cloned().unwrap_or(Value::Null));
+                manifest_id = Some(id);
+            }
+            Some("error") if value.get("request_id").and_then(Value::as_str) == Some(request_id) => {
+                let message = value.get("message").and_then(Value::as_str).unwrap_or("unknown error");
+                eprintln!("error: {message}");
+                return 1;
+            }
+            Some("task_status") => {
+                if value.get("manifest_id").and_then(Value::as_str) != manifest_id.as_deref() {
+                    continue; // some other connection's standalone task, or a different manifest
+                }
+                let task_id = value.get("task_id").and_then(Value::as_str).unwrap_or("?");
+                let status = value.get("status").and_then(Value::as_str).unwrap_or("?");
+                let message = value.get("message").and_then(Value::as_str);
+                match message {
+                    Some(message) => println!("{status}: {task_id} ({message})"),
+                    None => println!("{status}: {task_id}"),
+                }
+            }
+            Some("manifest_status") if value.get("manifest_id").and_then(Value::as_str) == manifest_id.as_deref() => {
+                match value.get("status").and_then(Value::as_str) {
+                    Some("start") => continue, // already said so via "submitted manifest ..." above
+                    Some("ok") => return 0,
+                    Some("error") => return 1,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
     }
 }

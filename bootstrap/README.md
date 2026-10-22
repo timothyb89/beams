@@ -207,6 +207,27 @@ echo '{"request_id":"2","op":"run_manifest","tasks":[
 ]}' | nc -U ~/.beam-bootstrap/daemon.sock
 ```
 
+### `task` - the daemon-backed CLI
+
+Hand-rolling JSON above is still the lowest-level way to talk to the
+socket, but `beam-bootstrap task ...` is the actual agent/scripting
+entry point now - `DESIGN.md`'s architecture diagram calls this `beams
+task run ...`; it landed as a `task` subcommand group on this binary
+rather than a new one, and covers both that and the `run_manifest` CLI
+sugar that used to be a separate open item, since they turned out to be
+the same piece of work. Unlike `run-task` above, every one of these
+talks to an already-running daemon (`--socket`, same default as
+`daemon`/`tui`) instead of running in-process - submit, then block
+printing every `task_status`/`manifest_status` broadcast for what was
+just submitted until it reaches a terminal state, exiting `0` on
+success (`ok`/`skip`) or `1` on `error`:
+
+```sh
+beam-bootstrap task list
+beam-bootstrap task run clone-git-repo --repo <url-or-path> --dest ~/projects/core
+beam-bootstrap task run-manifest --file manifest.json   # [{"template", "params"}, ...], same shape as above
+```
+
 ## TUI
 
 `beam-bootstrap tui [--socket ...]` is a ratatui client for the daemon
