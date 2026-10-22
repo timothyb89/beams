@@ -255,6 +255,23 @@ section above for status/details.
   path, to avoid touching this environment's own live session) and
   confirmed the tui panel renders correctly alongside the existing
   log-tail structure.
+- [x] Right-hand side is now a `stacked=true` pane (tui `expanded=true`,
+  log tail collapsed to its one-line title underneath) instead of a
+  separate left-side split - stock zellij stacked-pane feature, matches
+  "log viewer stacked with the TUI, collapsed by default" exactly.
+- [x] Main shell pane no longer double-prompts for the ssh key
+  passphrase alongside the dedicated `ssh-agent` pane: root cause was
+  `~/.config/fish/config.fish` (every fish shell, not just the dedicated
+  pane) sourcing `ssh-agent-init.fish`'s interactive unlock. Fixed via
+  `BEAM_SHELL_SSH_UNLOCK_DELEGATED=1` (exported by `bin/beam-shell`
+  before `exec zellij`, so every fish pane inherits it and skips its own
+  unlock) which the dedicated `ssh-agent` pane explicitly `unset`s first
+  so it's still the one place the prompt shows up.
+- [x] `beam-bootstrap tui` mouse support: scroll wheel now moves the
+  focused template-list selection / log scroll, same action as the
+  arrow keys for whatever's focused (`tui::app::handle_mouse`). Click-
+  to-focus/drag not implemented - not asked for, would need hit-testing
+  against the actual rendered layout rects.
 
 ## Bug: starship + fish
 
@@ -283,6 +300,17 @@ section above for status/details.
   by `--purpose`, still within its TTL) never gets `push_repo` called
   again - only a freshly spawned one does. No explicit "re-sync this
   beam's repo" client command yet.
+- [x] **Found and fixed**: the beam-side repo ended up with no `origin`
+  remote at all - `git init` doesn't create one, and pushing over a bare
+  `ext::` URL doesn't either (only `git clone` sets `origin`
+  automatically). `prepare_git_target` now also points the beam's
+  `origin` at `--repo`'s own real `origin` URL (`tsh::origin_url`, read
+  from the workstation's local repo) - not the `ext::` URL itself, which
+  only works from the workstation that ran the push. `None` (no local
+  `origin`) just skips it, same as before this existed. Covered by new
+  `client/src/tsh.rs` tests exercising the generated script against a
+  real local git repo (first-call `remote add` and second-call
+  `remote set-url` fallback both verified).
 
 ## k8s access workaround
 
