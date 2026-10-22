@@ -24,6 +24,7 @@
 
 pub mod checkout_pr_worktree;
 pub mod clone_git_repo;
+pub mod install_code_server;
 pub mod install_toolchain_go;
 pub mod install_toolchain_rust;
 
@@ -35,6 +36,7 @@ use serde_json::Value;
 use crate::graph::{Capability, Node};
 use checkout_pr_worktree::CheckoutPrWorktree;
 use clone_git_repo::CloneGitRepo;
+use install_code_server::InstallCodeServer;
 use install_toolchain_go::InstallToolchainGo;
 use install_toolchain_rust::InstallToolchainRust;
 
@@ -156,6 +158,7 @@ pub fn templates() -> Vec<TemplateInfo> {
         },
         TemplateInfo { template: InstallToolchainGo::NAME, params: &[] },
         TemplateInfo { template: InstallToolchainRust::NAME, params: &[] },
+        TemplateInfo { template: InstallCodeServer::NAME, params: &[] },
     ]
 }
 
@@ -203,6 +206,7 @@ pub fn instantiate(name: &str, params: Value) -> anyhow::Result<Box<dyn Task>> {
         }
         InstallToolchainGo::NAME => Ok(Box::new(InstallToolchainGo)),
         InstallToolchainRust::NAME => Ok(Box::new(InstallToolchainRust)),
+        InstallCodeServer::NAME => Ok(Box::new(InstallCodeServer)),
         other => bail!("unknown template {other:?} (known: {})", names().join(", ")),
     }
 }

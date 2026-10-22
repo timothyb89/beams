@@ -241,6 +241,34 @@ section above for status/details.
   unserialized), and live against this beam's real `apt-get` - three
   genuinely concurrent `--only apt-install` invocations, all succeeding
   cleanly through the lock.
+- [x] `install-code-server` (`tasks/install_code_server.rs`) - browser-based
+  editor hosting, closing the "Explicitly deferred" item that used to live
+  further down this file. Alternatives considered: `openvscode-server`
+  (same tarball-based install shape, smaller community, no concrete
+  reason to prefer it over code-server today); Eclipse Theia (no
+  standalone-binary release, expects Docker or a Node build - doesn't fit
+  this repo's "download a pinned static binary" pattern); `ttyd`/`gotty`
+  + neovim/helix (lightest weight, but this beam already has rich
+  terminal access over `tsh ssh` + zellij - the point of this task is a
+  *browser* UI). Went with **code-server**: self-contained release
+  tarball (bundles its own Node runtime), defaults to the Open VSX
+  extension gallery (not Microsoft's, for licensing), which has both
+  `golang.go` and `rust-lang.rust-analyzer`. No published checksum
+  sidecar for its GitHub releases (same situation `install-toolchain-go`
+  already handles for go.dev) - pinned `v4.141.0`'s amd64/arm64 tarball
+  hashes from a verified download instead. Requires
+  `install-toolchain-go`/`install-toolchain-rust` to have already run
+  (gopls/rust-analyzer need an actual toolchain to drive); declared via
+  `requires` for the daemon's manifest graph, and also self-checked in
+  `run()` directly for a bare `task run`, same pattern
+  `checkout-pr-worktree` already uses for its own prerequisite. Backgrounds
+  it as a `code-server` beamctl service bound to `127.0.0.1:8080 --auth
+  none` - loopback + port 8080 matches what `tsh beams publish` (HTTP
+  mode) actually forwards per `~/AGENTS.md`; `--auth none` is fine since
+  Teleport's app proxy is the real auth boundary, same reasoning as the
+  daemon's own unauthenticated UDS socket. Publishing itself stays a
+  separate, manual `tsh beams publish $BEAM_ALIAS` step - this task only
+  installs and starts it.
 
 ## zellij layout fix (independent — doesn't need the daemon work)
 
@@ -354,17 +382,19 @@ section above for status/details.
 ## Explicitly deferred — needs its own design pass later, not blocked on
 anything above
 
-- [ ] Web-based editor hosting (`code-server`/`openvscode-server` vs.
-  lighter terminal-based options like `ttyd` + neovim/helix) — see
-  DESIGN.md.
+- [x] **Fixed, see the "New tasks enabled by the graph" section below** -
+  web-based editor hosting via a new `install-code-server` task.
 - [ ] Client↔beam folder sharing (mutagen-style, e.g. for
   `~/projects/core`) — see DESIGN.md.
 - [ ] `russh`-based data channel / on-the-fly port-forward management —
   see DESIGN.md. Start with shelling out to `tsh proxy ssh`/`tsh ssh -L`
   instead.
 - [ ] `tsh beams publish` (HTTP/TCP app publishing from a beam) isn't
-  integrated into either binary yet — likely becomes relevant once the
-  web-editor-hosting item above is active.
+  integrated into either binary yet — now actually relevant, since
+  `install-code-server` (see the "New tasks enabled by the graph"
+  section above) gives it something real to publish. Still a manual
+  step today (`tsh beams publish $BEAM_ALIAS`), not automated by either
+  binary.
 - [ ] No cleanup/expiry helper on the client side beyond the 5-beam cap
   check at spawn time — e.g. a `beams ls`/`beams rm` convenience wrapper
   around `tsh beams ls/rm`, or a warning when a tracked purpose's beam is

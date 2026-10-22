@@ -228,6 +228,19 @@ beam-bootstrap task run clone-git-repo --repo <url-or-path> --dest ~/projects/co
 beam-bootstrap task run-manifest --file manifest.json   # [{"template", "params"}, ...], same shape as above
 ```
 
+One template worth calling out: `install-code-server` installs
+[code-server](https://github.com/coder/code-server) (browser-based VS
+Code - see `TODO.md` for the alternatives considered) and backgrounds it
+as a `code-server` beamctl service bound to `127.0.0.1:8080`. It needs
+`install-toolchain-go`/`install-toolchain-rust` to have already run
+(gopls/rust-analyzer need an actual toolchain to drive, not just the
+editor extension) - run all three via `task run`, or in one
+`run-manifest` call since the graph resolves the dependency either way.
+Reaching it is then a separate, manual step, same as any other published
+app: `tsh beams publish $BEAM_ALIAS` (per `~/AGENTS.md`'s "Publishing
+apps from beam" - port 8080 is the only one forwarded, which is why
+that's what it binds to).
+
 ## TUI
 
 `beam-bootstrap tui [--socket ...]` is a ratatui client for the daemon
