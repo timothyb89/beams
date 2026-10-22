@@ -4,6 +4,7 @@ use std::process::Command;
 use anyhow::{bail, Context};
 
 use super::{cap, resource, Step};
+use crate::aptlock;
 use crate::graph::Capability;
 
 /// kubectl isn't in Debian's default repos, so we add the official
@@ -58,10 +59,10 @@ impl Step for InstallKubectl {
             let tee = format!("echo '{repo_line}' | sudo tee {SOURCES_LIST} >/dev/null");
             run(Command::new("sh").args(["-c", &tee]))?;
 
-            run(Command::new("sudo").args(["apt-get", "update"]))?;
+            aptlock::apt_get(&["update"])?;
         }
 
-        run(Command::new("sudo").args(["apt-get", "install", "-y", "kubectl"]))?;
+        aptlock::apt_get(&["install", "-y", "kubectl"])?;
 
         Ok(Some(format!("installed kubectl ({K8S_MINOR} repo)")))
     }

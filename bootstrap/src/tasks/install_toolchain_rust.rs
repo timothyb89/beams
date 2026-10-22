@@ -2,6 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 use super::{Task, Template};
+use crate::aptlock;
 use crate::graph::Capability;
 use crate::pathutil::expand_tilde;
 use crate::releaseutil::{download, run};
@@ -31,6 +32,16 @@ impl Task for InstallToolchainRust {
         // mid-run. Coarser than ideal (blocks other apt-touching tasks
         // for the whole rustup install, not just the gcc install), but
         // simple and correct; narrow it if that ever actually matters.
+        //
+        // This only serializes other tasks in the *same*
+        // `executor::run` call, though - it doesn't protect against the
+        // fixed startup sequence's `apt-install`, a wholly separate OS
+        // process, running `apt-get` at the same moment. `aptlock::apt_get`
+        // below is what actually closes that gap (see its own doc
+        // comment); this tag is still worth keeping too, since it avoids
+        // even starting a second apt-touching task concurrently within
+        // one process, rather than starting it and then blocking inside
+        // `apt_get`'s `flock`.
         vec![crate::steps::resource::APT.into()]
     }
 
@@ -40,8 +51,8 @@ impl Task for InstallToolchainRust {
             return Ok(None);
         }
 
-        run(Command::new("sudo").args(["apt-get", "update"]))?;
-        run(Command::new("sudo").args(["apt-get", "install", "-y", "gcc"]))?;
+        aptlock::apt_get(&["update"])?;
+        aptlock::apt_get(&["install", "-y", "gcc"])?;
 
         let script = std::env::temp_dir().join(format!("beam-bootstrap-rustup-init-{}", std::process::id()));
         download("https://sh.rustup.rs", &script)?;

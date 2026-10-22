@@ -1,3 +1,4 @@
+mod aptlock;
 mod daemon;
 mod events;
 mod executor;

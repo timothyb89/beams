@@ -1,9 +1,7 @@
 use std::path::Path;
-use std::process::Command;
-
-use anyhow::{bail, Context};
 
 use super::{cap, resource, Step};
+use crate::aptlock;
 use crate::graph::Capability;
 
 /// Packages to install on every beam, that are available from Debian's
@@ -34,34 +32,11 @@ impl Step for InstallPackages {
         // then fails with "unable to locate package" for everything,
         // indistinguishable from a real typo in PACKAGES. Always update
         // first; it's a no-op cost-wise if the index is already current.
-        let update = Command::new("sudo")
-            .arg("apt-get")
-            .arg("update")
-            .output()
-            .context("running apt-get update")?;
-        if !update.status.success() {
-            bail!(
-                "apt-get update failed ({}): {}",
-                update.status,
-                String::from_utf8_lossy(&update.stderr).trim()
-            );
-        }
+        aptlock::apt_get(&["update"])?;
 
-        let output = Command::new("sudo")
-            .arg("apt-get")
-            .arg("install")
-            .arg("-y")
-            .args(PACKAGES)
-            .output()
-            .context("running apt-get install")?;
-
-        if !output.status.success() {
-            bail!(
-                "apt-get install failed ({}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
+        let mut install_args = vec!["install", "-y"];
+        install_args.extend_from_slice(PACKAGES);
+        aptlock::apt_get(&install_args)?;
 
         Ok(Some(format!("installed {}", PACKAGES.join(", "))))
     }

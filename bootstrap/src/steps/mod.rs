@@ -55,7 +55,10 @@ pub mod resource {
     /// (lock contention) - neither declares a capability dependency on
     /// the other (there isn't one), so without this tag the concurrent
     /// executor would happily start both at once and one would likely
-    /// fail outright.
+    /// fail outright. Only serializes within one `executor::run` call
+    /// (one process), though - see `crate::aptlock` for the
+    /// cross-process version of this same lock, which every actual
+    /// `apt-get` invocation goes through regardless of this tag.
     pub const APT: &str = "apt";
 }
 
