@@ -32,6 +32,45 @@ Plus:
 - `.ssh/` — the shared ephemeral key both halves use (private key
   git-ignored; only pushed to a beam, never committed).
 
+## Task runner
+
+`bootstrap/src/tasks/` holds templated, on-demand tasks (distinct from
+the fixed startup `steps/` — see `DESIGN.md`'s "Templates vs.
+instances"). This is how to actually reach for one from an agent session,
+today, not just a description of the design:
+
+- **No daemon needed**: `beam-bootstrap list-tasks` /
+  `beam-bootstrap run-task <template> --param value ...` runs one task
+  in-process. Covers `clone-git-repo`/`checkout-pr-worktree` today.
+- **Daemon-only templates** (`install-toolchain-go`,
+  `install-toolchain-rust` — anything tagged with a shared
+  `exclusive_resources` lock, or anything you want to run concurrently
+  with other tasks/broadcast progress to the TUI) only have a
+  `run_manifest` path right now, not a `run-task` subcommand — hand-roll
+  the JSON at the daemon's UDS socket (`~/.beam-bootstrap/daemon.sock`
+  by default; see `bootstrap/README.md`'s "Daemon" section for the
+  request shape). There's no `nc`/`socat` on a stock beam — a short
+  inline `python3 -c '...'` using the `socket` module round-trips fine.
+- **Standing permission**: run templated tasks (either path above)
+  against a beam — including this session's own — without asking first.
+  They're idempotent and scoped to exactly what they say (installing a
+  toolchain, cloning a repo), same trust level as any other read/build/
+  install command already run freely in this repo. This doesn't extend
+  to the *startup sequence* or daemon lifecycle itself (don't restart
+  `beam-bootstrapd`, don't re-run the fixed sequence against a beam
+  that's mid-session) — only to invoking an existing template.
+- **Standing instruction**: if the same ad hoc multi-step shell sequence
+  comes up more than once in a session (or across sessions, per
+  `TODO.md`) — installing some tool, preparing some path, anything with
+  real params and a check for "is this already done" — turn it into a
+  new task template under `bootstrap/src/tasks/` instead of continuing
+  to hand-roll it. That's the whole point of the task-graph design (see
+  `DESIGN.md`'s "Why"): one reusable definition, reachable the same way
+  by this session, a later session, the TUI, and eventually `beams task
+  run` (see `DESIGN.md`'s architecture diagram — not implemented yet,
+  tracked in `TODO.md`). Add it to `TODO.md` if you don't get to it
+  immediately, so it isn't just forgotten chat context.
+
 ## Working conventions
 
 - **Steps must stay idempotent.** Every `bootstrap` step checks what's
