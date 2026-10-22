@@ -222,19 +222,25 @@ section above for status/details.
   `steps::resource::APT` since it shells out to `apt-get` - the first
   *task* (as opposed to fixed *step*) to need that tag, confirming the
   mechanism actually works across the two.
-- [ ] **New gap found while adding these**: `Task::exclusive_resources`
-  only serializes tasks within *one* `executor::run` call - it's a
-  `Mutex` local to that call, not a cross-process lock. The fixed
-  startup sequence (`apt-install`) and a later daemon-driven manifest
-  (`install-toolchain-rust`'s `apt-get install gcc`) are two genuinely
-  separate OS processes with no shared lock at all, so they *could*
-  still race on the real apt/dpkg lock if a manifest happened to be
-  submitted while the startup sequence's own `apt-install` wave was
-  still running. Low-probability in practice (the fixed sequence
-  usually finishes within a minute or two of a beam spawning, before
-  anyone's submitted a manifest), but a real gap, not a solved problem -
-  would need a cross-process lock (e.g. a well-known flock file) to
-  close properly. Not fixed here.
+- [x] **Fixed**: the cross-process apt/dpkg race (`Task::exclusive_resources`
+  only serialized tasks within *one* `executor::run` call, not across
+  the fixed startup sequence's process and a later daemon-driven
+  manifest's). New `aptlock.rs`: every `apt-get` call site
+  (`steps::apt`, `steps::kubectl`, `tasks::install_toolchain_rust`) now
+  goes through `aptlock::apt_get`, which wraps the real invocation in
+  `flock(1)` against a well-known lock file
+  (`~/.beam-bootstrap/apt.lock`) - no new dependency, and the lock
+  releases itself the instant the wrapped process exits, crash or not.
+  (`flock`'s own arg parsing has no `--` options terminator, unlike most
+  GNU tools - learned the hard way, see the function's comment.) The
+  in-process `exclusive_resources` tags stay too, since they avoid even
+  *starting* a second apt-touching task concurrently within one process
+  rather than starting it and blocking inside the lock. Verified: a unit
+  test that 5 real concurrent `flock`-wrapped processes correctly
+  serialize a counter increment (would under-count on a lost update if
+  unserialized), and live against this beam's real `apt-get` - three
+  genuinely concurrent `--only apt-install` invocations, all succeeding
+  cleanly through the lock.
 
 ## zellij layout fix (independent — doesn't need the daemon work)
 
