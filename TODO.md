@@ -284,6 +284,43 @@ section above for status/details.
   `template_schemas_match_what_instantiate_actually_accepts` already
   plays for `instantiate`.
 
+## PATH management
+
+- [x] **Fixed**: `beam-bootstrap` itself, and the Go/code-server
+  toolchains' `bin/` dirs, weren't on PATH anywhere outside the
+  `BEAM_BOOTSTRAP_BIN`-exporting dance `bin/beam-shell`'s own zellij
+  session already did internally - a plain `tsh ssh` or a fresh shell
+  outside that one session had none of it. New `link-tool-paths` step
+  (`steps/tool_paths.rs`) symlinks whichever binary is running it to
+  `~/.local/bin/beam-bootstrap` (sidesteps re-deriving `bin/beam-shell`'s
+  own musl-release/native-release/native-debug fallback chain - whatever
+  binary is running *this step* already answers that question), and
+  creates (empty, if not already installed) `~/.local/toolchains/go/bin`
+  and `.../code-server/bin`. New `shell/fish/conf.d/beams-path.fish`
+  (linked by the existing `shell-config` step) adds all of those plus
+  `~/bin` to fish's PATH via `fish_add_path` - `~/bin` needed this too,
+  since it's only on bash's PATH via `~/.profile`'s Debian-default
+  block, which fish (the beam's actual default shell) never sources.
+  `~/.cargo/bin` isn't part of either piece - rustup's own installer
+  already wires that into both bash and fish on its own.
+
+  The empty-directories-created-ahead-of-time part is what makes the
+  "already open shell picks up a tool installed later" trick actually
+  work: `fish_add_path` silently skips a path that doesn't exist yet, so
+  without pre-creating these, the first-ever shell startup (before any
+  toolchain is installed) would never add them, and no later shell would
+  either since `fish_add_path` dedupes - the entry would just never
+  arrive. With the directory already present, `fish_add_path` stores it
+  in fish's *universal* `$fish_user_paths` variable, which fish syncs
+  live across every other already-running fish instance - confirmed
+  directly with a throwaway pty-backed interactive fish session (needed
+  `TIOCSCTTY`, not just a plain pty, for fish's job-control setup to work
+  at all - a non-interactive/no-controlling-tty fish never reaches the
+  code that notices a universal variable changed): a second process's
+  `fish_add_path` call for a brand-new directory showed up in `which`/
+  `$fish_user_paths` in the already-running session within about a
+  second, no new shell or `source` needed.
+
 ## zellij layout fix (independent — doesn't need the daemon work)
 
 - [x] Fixed `shell/zellij/beam-shell.kdl`: confirmed the root cause by

@@ -12,6 +12,7 @@ mod shell_config;
 mod starship;
 mod tbot_service;
 mod teleport_bin;
+mod tool_paths;
 mod zellij;
 
 use std::path::{Path, PathBuf};
@@ -43,6 +44,7 @@ pub mod cap {
     pub const KUBECONFIG_LINKED: &str = "kubeconfig-linked";
     pub const CLAUDE_UPDATED: &str = "claude-updated";
     pub const BOOTSTRAP_DAEMON_RUNNING: &str = "bootstrap-daemon-running";
+    pub const TOOL_PATHS_LINKED: &str = "tool-paths-linked";
 }
 
 /// Named resources a step's `run()` holds exclusively while running - see
@@ -152,6 +154,7 @@ impl Node for Box<dyn Step> {
 fn all() -> Vec<Box<dyn Step>> {
     vec![
         Box::new(link::LinkFiles),
+        Box::new(tool_paths::LinkToolPaths),
         Box::new(claude_md::MergeClaudeMd),
         Box::new(apt::InstallPackages),
         Box::new(kubectl::InstallKubectl),

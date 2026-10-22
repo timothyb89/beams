@@ -7,6 +7,7 @@ use crate::graph::Capability;
 /// (repo-relative path under `shell/`, target path relative to `~/.config`)
 const LINKS: &[(&str, &str)] = &[
     ("shell/fish/config.fish", "fish/config.fish"),
+    ("shell/fish/conf.d/beams-path.fish", "fish/conf.d/beams-path.fish"),
     ("shell/starship.toml", "starship.toml"),
 ];
 

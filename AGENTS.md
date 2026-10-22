@@ -39,6 +39,12 @@ the fixed startup `steps/` — see `DESIGN.md`'s "Templates vs.
 instances"). This is how to actually reach for one from an agent session,
 today, not just a description of the design:
 
+- `beam-bootstrap` itself is reachable by bare name below (no
+  `./target/debug/` prefix needed) once a beam's been bootstrapped at
+  least once — see `bootstrap/README.md`'s "PATH" section for the two
+  steps (`link-tool-paths`/`shell-config`) that make that, and the Go/
+  code-server toolchains, true.
+
 - **Daemon-backed, the normal way to reach any template now**:
   `beam-bootstrap task list` / `task run <template> --param value ...`
   / `task run-manifest --file <path>` - talks to the already-running

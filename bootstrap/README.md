@@ -146,6 +146,33 @@ at the fallback path).
 Exit code is `0` if every step succeeded (or was skipped), `1` if any step
 failed.
 
+### PATH
+
+Two steps make `beam-bootstrap` itself, and later the Go/code-server
+toolchains' `bin/` dirs, reachable by bare name instead of a full path:
+
+- `link-tool-paths` symlinks whichever binary ran it to
+  `~/.local/bin/beam-bootstrap`, and creates (empty, if not already
+  installed) `~/.local/toolchains/go/bin` and
+  `~/.local/toolchains/code-server/bin` ahead of their own install
+  tasks ever running.
+- `shell-config` links `shell/fish/conf.d/beams-path.fish`, which adds
+  all of those (plus `~/bin` and `~/.local/bin` itself) to fish's
+  PATH via `fish_add_path` - every example below works by bare name
+  (`beam-bootstrap task run ...`) once both have run at least once, not
+  just `./target/debug/beam-bootstrap`.
+
+Because `fish_add_path` stores these in the *universal* `$fish_user_paths`
+variable, and the directories already exist before a tool is ever
+installed into them (that's the point of creating them empty), an
+already-open interactive fish shell picks up a tool installed later -
+`install-toolchain-go`, say, run from a different shell or the daemon -
+immediately, with no new shell or reconfiguration needed. Confirmed
+directly: a second process's `fish_add_path` call becomes visible in an
+already-running interactive fish session within about a second.
+`~/.cargo/bin` isn't part of this - rustup's own installer already wires
+that into both bash and fish on its own.
+
 ### On-demand templated tasks
 
 Separate from the fixed startup sequence above: `src/tasks/` holds
