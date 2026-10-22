@@ -12,7 +12,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context;
-use ratatui::crossterm::event::{self, Event};
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use ratatui::crossterm::execute;
 use ratatui::DefaultTerminal;
 
 use app::App;
@@ -38,10 +39,16 @@ pub fn run(socket_path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("connecting to daemon at {}", socket_path.display()))?;
 
     let mut terminal = ratatui::try_init().context("initializing terminal")?;
+    // `try_init` only sets up raw mode + the alternate screen - mouse
+    // capture is a separate opt-in, enabled/disabled here so the scroll
+    // handling in `app::handle_mouse` actually gets events instead of
+    // the terminal emulator just scrolling its own history buffer.
+    execute!(std::io::stdout(), EnableMouseCapture).context("enabling mouse capture")?;
     // Runs regardless of how `run_loop` exits, so a crash or an early
     // `?` return doesn't strand the shell that started this in raw
-    // mode/an alternate screen.
+    // mode/an alternate screen/mouse capture.
     let result = run_loop(&mut terminal, &mut client);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     let _ = ratatui::try_restore();
     result
 }
@@ -76,8 +83,10 @@ fn run_loop(terminal: &mut DefaultTerminal, client: &mut DaemonClient) -> anyhow
         terminal.draw(|frame| app.draw(frame))?;
 
         if event::poll(TICK)? {
-            if let Event::Key(key) = event::read()? {
-                app.handle_key(key);
+            match event::read()? {
+                Event::Key(key) => app.handle_key(key),
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
+                _ => {}
             }
         } else {
             app.tick();

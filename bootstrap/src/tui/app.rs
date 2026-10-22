@@ -235,6 +235,28 @@ impl App {
         }
     }
 
+    /// Scroll wheel only, for now - mapped onto whichever list/log the
+    /// up/down arrow keys would already affect for the current focus
+    /// (see `handle_template_list_key`/`handle_log_key`), rather than
+    /// hit-testing which pane the cursor is actually over. Click-to-focus
+    /// and drag support are a real gap, not implemented yet.
+    pub fn handle_mouse(&mut self, mouse: ratatui::crossterm::event::MouseEvent) {
+        use ratatui::crossterm::event::MouseEventKind;
+        match mouse.kind {
+            MouseEventKind::ScrollUp => match self.focus {
+                Focus::Templates => self.handle_template_list_key(ratatui::crossterm::event::KeyCode::Up),
+                Focus::Log => self.handle_log_key(ratatui::crossterm::event::KeyCode::Up),
+                Focus::Params => {}
+            },
+            MouseEventKind::ScrollDown => match self.focus {
+                Focus::Templates => self.handle_template_list_key(ratatui::crossterm::event::KeyCode::Down),
+                Focus::Log => self.handle_log_key(ratatui::crossterm::event::KeyCode::Down),
+                Focus::Params => {}
+            },
+            _ => {}
+        }
+    }
+
     fn handle_template_list_key(&mut self, code: ratatui::crossterm::event::KeyCode) {
         use ratatui::crossterm::event::KeyCode;
         match code {
