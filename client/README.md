@@ -27,7 +27,12 @@ beams ssh [--repo ~/beams] [--purpose default] [--region REGION] [--login beams]
    beam: the beam-side repo's checked-out branch has to match what gets
    pushed, or `receive.denyCurrentBranch=updateInstead` silently no-ops
    instead of erroring). Only transfers committed history, like any git
-   push.
+   push. Also points the beam's own `origin` remote at `--repo`'s real
+   `origin` (plain GitHub URL, not the `ext::` one used for this push,
+   which only works from this workstation) - without this the beam ends
+   up with no `origin` configured at all, since neither `git init` nor
+   a push over a bare URL creates one. Skipped entirely if `--repo`
+   itself has no `origin` configured.
 4. Separately `scp`s the two things deliberately *not* tracked in git
    but still required - the ssh private key, and a prebuilt
    `beam-bootstrap` binary (**build this first**: beams run Linux, so if

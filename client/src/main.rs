@@ -96,7 +96,8 @@ fn ssh(repo: &Path, purpose: &str, region: Option<&str>, login: &str) -> anyhow:
 
             eprintln!("beams: pushing {} to {}...", repo.display(), fresh.id);
             let branch = tsh::current_branch(repo)?;
-            tsh::prepare_git_target(login, &fresh.uuid, REMOTE_REPO_PATH, &branch)?;
+            let origin_url = tsh::origin_url(repo)?;
+            tsh::prepare_git_target(login, &fresh.uuid, REMOTE_REPO_PATH, &branch, origin_url.as_deref())?;
             tsh::push_repo(repo, login, &fresh.uuid, REMOTE_REPO_PATH, &branch)?;
 
             eprintln!("beams: copying the ssh key and bootstrap binary to {}...", fresh.id);

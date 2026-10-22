@@ -150,6 +150,29 @@ pub fn current_branch(repo: &Path) -> anyhow::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// The local repo's own `origin` remote URL (e.g.
+/// `git@github.com:timothyb89/beams.git`), if it has one - `None` rather
+/// than an error when it doesn't, since a repo with no `origin`
+/// configured is a plausible (if unusual) state and shouldn't block the
+/// rest of `ssh`'s spawn path over something `prepare_git_target` treats
+/// as optional anyway.
+pub fn origin_url(repo: &Path) -> anyhow::Result<Option<String>> {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .context("running git remote get-url origin")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(url))
+    }
+}
+
 /// Prepares `remote_path` (relative to `$HOME`) on the beam as a target
 /// for `push_repo`: a non-bare git repo, checked out on `branch`, with
 /// `receive.denyCurrentBranch=updateInstead` set so a push there updates
@@ -162,16 +185,30 @@ pub fn current_branch(repo: &Path) -> anyhow::Result<String> {
 /// push still "succeeds", it just creates an unchecked-out ref, which is
 /// a confusing failure mode to debug after the fact).
 ///
-/// Idempotent - skips `git init` if the directory's already a repo, so
-/// safe to call again (e.g. for a future "push again to sync" command,
-/// not just the initial copy).
-pub fn prepare_git_target(login: &str, uuid: &str, remote_path: &str, branch: &str) -> anyhow::Result<()> {
-    let script = format!(
-        "mkdir -p '{remote_path}' && cd '{remote_path}' && \
-         if [ ! -d .git ]; then git init -q; fi && \
-         git symbolic-ref HEAD 'refs/heads/{branch}' && \
-         git config receive.denyCurrentBranch updateInstead"
-    );
+/// Also points the beam's own `origin` remote at `origin_url` (the
+/// *real* GitHub remote, from `origin_url` above) when given one - the
+/// `ext::`/`tsh ssh` URL `push_repo` actually pushes over only works
+/// from the workstation that ran it (it shells out to `tsh` against a
+/// login/uuid pair that's meaningless once this process exits), so it's
+/// not something the beam could ever reuse itself. Without this, the
+/// beam ends up with no `origin` at all - `git init` doesn't create one,
+/// and nothing else ever has - leaving the one thing AGENTS.md's session
+/// workflow assumes always works (commit and push to `origin` from
+/// inside the beam) silently broken. `None` (no local `origin` to copy)
+/// just skips this - same as before this existed.
+///
+/// Idempotent - skips `git init` if the directory's already a repo, and
+/// `remote add`/`set-url` tolerates `origin` already existing from a
+/// prior call - so safe to call again (e.g. for a future "push again to
+/// sync" command, not just the initial copy).
+pub fn prepare_git_target(
+    login: &str,
+    uuid: &str,
+    remote_path: &str,
+    branch: &str,
+    origin_url: Option<&str>,
+) -> anyhow::Result<()> {
+    let script = git_target_script(remote_path, branch, origin_url);
     // `ssh` (and `tsh ssh`, mimicking it) doesn't exec the trailing argv
     // elements directly - it joins them with spaces into one line and
     // hands *that* to the remote's shell for its own parsing. Passing
@@ -194,6 +231,31 @@ pub fn prepare_git_target(login: &str, uuid: &str, remote_path: &str, branch: &s
         bail!("preparing git push target on beam failed ({status})");
     }
     Ok(())
+}
+
+/// Builds the shell script `prepare_git_target` runs on the beam -
+/// pulled out as its own pure function so the origin-remote logic (the
+/// actual thing worth testing here) can be checked against a real local
+/// git repo without going anywhere near `tsh`.
+fn git_target_script(remote_path: &str, branch: &str, origin_url: Option<&str>) -> String {
+    let origin_setup = match origin_url {
+        // `remote add` is what runs on a fresh `git init` (no `origin`
+        // yet); `remote set-url` is the idempotent path on a second call
+        // against an already-prepared target, where `add` would just
+        // fail with "remote origin already exists".
+        Some(url) => format!(
+            "git remote add origin {0} 2>/dev/null || git remote set-url origin {0}",
+            shell_quote(url)
+        ),
+        None => "true".to_string(),
+    };
+    format!(
+        "mkdir -p '{remote_path}' && cd '{remote_path}' && \
+         if [ ! -d .git ]; then git init -q; fi && \
+         git symbolic-ref HEAD 'refs/heads/{branch}' && \
+         git config receive.denyCurrentBranch updateInstead && \
+         {origin_setup}"
+    )
 }
 
 /// Wraps `s` in single quotes for a POSIX shell, escaping any embedded
@@ -252,5 +314,73 @@ mod tests {
     #[test]
     fn shell_quote_round_trips_an_empty_string() {
         round_trips_through_a_real_shell("");
+    }
+
+    /// Runs `script` via a real `sh -c` with `cwd` set to `repo` - same
+    /// shape `tsh ssh ... -- bash -lc <script>` runs it in, just without
+    /// `tsh`/`bash`/the remote hop.
+    fn run_script(script: &str, repo: &Path) -> bool {
+        Command::new("sh").arg("-c").arg(script).current_dir(repo).status().unwrap().success()
+    }
+
+    fn fresh_test_repo(name: &str) -> std::path::PathBuf {
+        let repo = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        repo
+    }
+
+    /// The actual bug this is fixing: `git init` + a push over the
+    /// `ext::` transport never leaves the beam with an `origin` remote
+    /// at all - this is what makes `git_target_script` set one, and
+    /// confirms it survives being run twice (the `remote add` /
+    /// `remote set-url` fallback `prepare_git_target`'s doc comment
+    /// describes), not just once on a pristine `git init`.
+    #[test]
+    fn git_target_script_sets_origin_remote_idempotently() {
+        let repo = fresh_test_repo("tsh-test-origin-remote");
+        let script = git_target_script(".", "main", Some("git@github.com:example/example.git"));
+
+        assert!(run_script(&script, &repo), "first run (git init + remote add) should succeed");
+        assert!(run_script(&script, &repo), "second run (remote set-url fallback) should succeed too");
+
+        assert_eq!(
+            origin_url(&repo).unwrap(),
+            Some("git@github.com:example/example.git".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn git_target_script_without_origin_url_skips_remote_setup() {
+        let script = git_target_script("beams", "main", None);
+        assert!(!script.contains("git remote"), "script shouldn't touch origin when none was given: {script}");
+    }
+
+    #[test]
+    fn origin_url_is_none_without_a_configured_remote() {
+        let repo = fresh_test_repo("tsh-test-no-origin");
+        assert!(Command::new("git").current_dir(&repo).args(["init", "-q"]).status().unwrap().success());
+
+        assert_eq!(origin_url(&repo).unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn origin_url_reads_a_configured_remote() {
+        let repo = fresh_test_repo("tsh-test-with-origin");
+        assert!(Command::new("git").current_dir(&repo).args(["init", "-q"]).status().unwrap().success());
+        assert!(Command::new("git")
+            .current_dir(&repo)
+            .args(["remote", "add", "origin", "git@github.com:example/example.git"])
+            .status()
+            .unwrap()
+            .success());
+
+        assert_eq!(origin_url(&repo).unwrap(), Some("git@github.com:example/example.git".to_string()));
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
