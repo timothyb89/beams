@@ -95,6 +95,14 @@ pub struct App {
     pub focus: Focus,
     pub status_line: String,
     pub spinner_frame: usize,
+    /// Set while the daemon connection is down (`mod.rs`'s `run_loop`
+    /// detects this via the event channel's `Disconnected` error and
+    /// drives the actual reconnect attempts/backoff - this is just the
+    /// bit of state `draw` needs to say so). Was the TUI's known gap
+    /// from the daemon-restart E2E test in TODO.md: previously the TUI
+    /// just went quiet on a dropped connection, showing stale state
+    /// forever with no indication anything was wrong.
+    pub disconnected: bool,
 
     next_request_id: u64,
     pub should_quit: bool,
@@ -117,6 +125,7 @@ impl App {
             focus: Focus::Templates,
             status_line: "connecting...".to_string(),
             spinner_frame: 0,
+            disconnected: false,
             next_request_id: 1,
             should_quit: false,
             pending_request: None,
@@ -132,6 +141,26 @@ impl App {
     pub fn request_task_list(&mut self) {
         let id = self.next_id();
         self.pending_request = Some(json!({"request_id": id, "op": "list_tasks"}));
+    }
+
+    /// The daemon connection just dropped - `run_loop` calls this the
+    /// moment the event channel reports `Disconnected`, before it starts
+    /// retrying `DaemonClient::reconnect`.
+    pub fn mark_disconnected(&mut self) {
+        self.disconnected = true;
+        self.status_line = "daemon connection lost - reconnecting...".to_string();
+    }
+
+    /// `run_loop`'s reconnect attempt just succeeded - existing rows are
+    /// left as-is (whatever happened to their tasks while disconnected
+    /// is simply unknown, same gap as any other missed broadcast) but a
+    /// fresh `list_tasks` request is still worth queuing here so the
+    /// template list reflects the daemon's current state rather than
+    /// whatever it was before the connection dropped.
+    pub fn mark_reconnected(&mut self) {
+        self.disconnected = false;
+        self.status_line = "reconnected".to_string();
+        self.request_task_list();
     }
 
     fn row_index(&self, task_id: &str) -> Option<usize> {
@@ -651,5 +680,28 @@ mod tests {
         assert!(!app.editing_params);
         assert!(app.focus == Focus::Templates);
         assert!(app.pending_request.is_none());
+    }
+
+    #[test]
+    fn mark_disconnected_sets_the_flag_and_a_visible_status() {
+        let mut app = App::new();
+        app.disconnected = false;
+        app.mark_disconnected();
+        assert!(app.disconnected);
+        assert!(app.status_line.contains("reconnecting"));
+    }
+
+    #[test]
+    fn mark_reconnected_clears_the_flag_and_requests_the_task_list_again() {
+        let mut app = App::new();
+        app.mark_disconnected();
+        app.pending_request = None; // simulate it having already been sent/dropped
+
+        app.mark_reconnected();
+
+        assert!(!app.disconnected);
+        assert_eq!(app.status_line, "reconnected");
+        let request = app.pending_request.expect("mark_reconnected should re-request the task list");
+        assert_eq!(request["op"], "list_tasks");
     }
 }

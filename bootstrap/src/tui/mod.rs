@@ -9,7 +9,8 @@ mod app;
 mod client;
 
 use std::path::Path;
-use std::time::Duration;
+use std::sync::mpsc::TryRecvError;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
@@ -33,6 +34,15 @@ const TICK: Duration = Duration::from_millis(120);
 /// ordering elsewhere.
 const CONNECT_RETRY_FOR: Duration = Duration::from_secs(5);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How often `run_loop` retries `DaemonClient::reconnect` once already
+/// connected and the connection drops (a `beamctl restart
+/// beam-bootstrapd` mid-session, the gap found during an E2E
+/// daemon-restart test - see TODO.md). Deliberately slower than
+/// `TICK` (120ms) - a 1s-interval background-connection-attempt is
+/// cheap insurance, not a tight poll, and there's no reason to hammer
+/// `connect(2)` 8 times a second while the daemon's still coming back up.
+const RECONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 pub fn run(socket_path: &Path) -> anyhow::Result<()> {
     let mut client = connect_with_retry(socket_path)
@@ -71,13 +81,44 @@ fn run_loop(terminal: &mut DefaultTerminal, client: &mut DaemonClient) -> anyhow
     let mut app = App::new();
     app.request_task_list();
 
+    // Only meaningful once `app.disconnected` - gates how often a
+    // reconnect is actually attempted (see `RECONNECT_RETRY_INTERVAL`),
+    // rather than retrying every single iteration of this loop.
+    let mut next_reconnect_attempt = Instant::now();
+
     loop {
         if let Some(request) = app.pending_request.take() {
-            client.send(&request)?;
+            // A write failure (the daemon's gone) is handled exactly
+            // like a detected read-side disconnect below - no reason to
+            // propagate it with `?` and tear down the whole TUI over a
+            // connection that reconnecting might fix seconds later.
+            if client.send(&request).is_err() {
+                app.mark_disconnected();
+            }
         }
 
-        while let Ok(value) = client.events.try_recv() {
-            app.handle_daemon_event(value);
+        loop {
+            match client.events.try_recv() {
+                Ok(value) => app.handle_daemon_event(value),
+                Err(TryRecvError::Empty) => break,
+                // The reader thread in `client.rs` only ever exits by
+                // dropping its sender - which happens exactly when the
+                // underlying socket closed (daemon restarted/exited).
+                // This is the fix for the "TUI goes quiet forever on a
+                // dropped connection" gap: mark it and let the
+                // reconnect attempt below take over.
+                Err(TryRecvError::Disconnected) => {
+                    app.mark_disconnected();
+                    break;
+                }
+            }
+        }
+
+        if app.disconnected && Instant::now() >= next_reconnect_attempt {
+            match client.reconnect() {
+                Ok(()) => app.mark_reconnected(),
+                Err(_) => next_reconnect_attempt = Instant::now() + RECONNECT_RETRY_INTERVAL,
+            }
         }
 
         terminal.draw(|frame| app.draw(frame))?;
@@ -95,9 +136,11 @@ fn run_loop(terminal: &mut DefaultTerminal, client: &mut DaemonClient) -> anyhow
         if app.should_quit {
             // Flush anything the last keypress (e.g. a submit) queued -
             // otherwise quitting right after submitting would drop the
-            // request on the floor.
+            // request on the floor. Best-effort: quitting shouldn't
+            // itself fail just because the daemon connection happened to
+            // be down at that exact moment.
             if let Some(request) = app.pending_request.take() {
-                client.send(&request)?;
+                let _ = client.send(&request);
             }
             return Ok(());
         }

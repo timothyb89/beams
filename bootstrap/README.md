@@ -218,8 +218,15 @@ mentioned - not just tasks submitted from this TUI instance - tagged
 with its wave (`[wN]`) so concurrently-running tasks are visibly grouped,
 plus an aggregate gauge (`done/total, N running`) above them. `r`
 refreshes the template list, `tab` (outside a form) switches focus
-between the template list and the task list for scrolling, `q`/`esc`
-quits.
+between the template list and the task list for scrolling, the scroll
+wheel moves whichever of those is focused the same way the arrow keys
+do, `q`/`esc` quits.
+
+If the daemon connection drops (e.g. `beamctl restart beam-bootstrapd`
+mid-session), the status line says so and the TUI retries every second
+until it's back - rows from before the drop are left as-is (whatever
+happened to those tasks while disconnected is simply unknown), but the
+template list is re-fetched the moment reconnection succeeds.
 
 Only submits one task at a time today (`run_task`), even though the
 daemon's `run_manifest` can resolve and run several together - there's
