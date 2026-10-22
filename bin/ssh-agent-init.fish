@@ -60,9 +60,17 @@ function _setup_ssh_agent
 
     # 4. Check key presence and import if not already loaded - only when
     #    interactive, so a noninteractive caller never hits a password
-    #    prompt it can't answer.
+    #    prompt it can't answer. Also skipped when
+    #    BEAM_SHELL_SSH_UNLOCK_DELEGATED is set (bin/beam-shell, for the
+    #    panes zellij spawns with fish as their default shell) - a real
+    #    tty there too, but the dedicated "ssh-agent" pane in
+    #    shell/zellij/beam-shell.kdl is the one that's supposed to prompt,
+    #    not every other pane whose shell happens to source this on
+    #    startup.
     if not test -f "$key_file"
         echo "ssh-agent: Key not found at $key_file" >&2
+    else if test -n "$BEAM_SHELL_SSH_UNLOCK_DELEGATED"
+        # no-op: unlock left to the dedicated pane
     else if isatty stdin; and isatty stdout
         set -l key_fp (ssh-keygen -lf "$key_file" 2>/dev/null | awk '{print $2}')
         if not ssh-add -l 2>/dev/null | grep -qF "$key_fp"
