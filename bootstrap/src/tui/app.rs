@@ -6,7 +6,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -68,10 +68,15 @@ pub struct TaskRow {
     pub wave: Option<u64>,
 }
 
+/// Which pane is focused for keyboard/scroll purposes - just the two
+/// permanent panes now that param entry is a modal (see `App`'s doc
+/// comment) rather than a third pane competing for the sidebar's scarce
+/// horizontal width: `editing_params` intercepts input ahead of this
+/// entirely (see `handle_key`/`handle_mouse`), so there's no "focus" state
+/// for the modal itself to be in.
 #[derive(PartialEq, Eq)]
 pub enum Focus {
     Templates,
-    Params,
     Log,
 }
 
@@ -110,6 +115,16 @@ pub struct App {
     /// `mod.rs`'s event loop right after, so `App` itself never needs a
     /// `&mut DaemonClient`.
     pub pending_request: Option<Value>,
+
+    /// The on-screen area the template list's rows were last drawn into
+    /// (including its border) - set at the end of `draw_templates` each
+    /// frame, read by `handle_mouse`'s click hit-testing. `Rect::default()`
+    /// (zero-sized) before the first `draw`, which `row_within` treats as
+    /// "never inside" - a click can't resolve to a row before anything's
+    /// been rendered.
+    templates_area: Rect,
+    /// Same idea as `templates_area`, for the task-progress list.
+    progress_area: Rect,
 }
 
 impl App {
@@ -129,6 +144,8 @@ impl App {
             next_request_id: 1,
             should_quit: false,
             pending_request: None,
+            templates_area: Rect::default(),
+            progress_area: Rect::default(),
         }
     }
 
@@ -182,6 +199,23 @@ impl App {
         }
     }
 
+    /// Refreshes an existing row's `message`/`wave` without touching its
+    /// `state` - see the "progress" branch of `handle_daemon_event`'s
+    /// doc comment on why this is a separate path from `upsert_row`.
+    fn update_progress_message(&mut self, task_id: &str, message: Option<String>, wave: Option<u64>) {
+        match self.row_index(task_id) {
+            Some(i) => {
+                if message.is_some() {
+                    self.rows[i].message = message;
+                }
+                if wave.is_some() {
+                    self.rows[i].wave = wave;
+                }
+            }
+            None => self.rows.push(TaskRow { task_id: task_id.to_string(), state: TaskState::Running, message, wave }),
+        }
+    }
+
     /// Handles one line already parsed off the daemon socket - see
     /// `daemon.rs`'s module doc comment for the shapes being matched
     /// here.
@@ -214,6 +248,17 @@ impl App {
                 let status = value.get("status").and_then(Value::as_str).unwrap_or_default();
                 let message = value.get("message").and_then(Value::as_str).map(str::to_string);
                 let wave = value.get("wave").and_then(Value::as_u64);
+                // "progress" (see `executor::Event::Progress`/
+                // `daemon.rs`'s `"progress"` task_status) isn't a
+                // lifecycle state the row transitions through like the
+                // other four - it only ever arrives while a row is
+                // already `Running`, so just refresh the message/wave
+                // without touching `state` (falling back to `Running` if
+                // somehow nothing's been seen for this task_id yet).
+                if status == "progress" {
+                    self.update_progress_message(task_id, message, wave);
+                    return;
+                }
                 let state = match status {
                     "start" => TaskState::Running,
                     "ok" => TaskState::Ok,
@@ -251,7 +296,7 @@ impl App {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Tab => {
                 self.focus = match self.focus {
-                    Focus::Templates | Focus::Params => Focus::Log,
+                    Focus::Templates => Focus::Log,
                     Focus::Log => Focus::Templates,
                 };
             }
@@ -259,29 +304,50 @@ impl App {
             _ => match self.focus {
                 Focus::Templates => self.handle_template_list_key(key.code),
                 Focus::Log => self.handle_log_key(key.code),
-                Focus::Params => {}
             },
         }
     }
 
-    /// Scroll wheel only, for now - mapped onto whichever list/log the
-    /// up/down arrow keys would already affect for the current focus
-    /// (see `handle_template_list_key`/`handle_log_key`), rather than
-    /// hit-testing which pane the cursor is actually over. Click-to-focus
-    /// and drag support are a real gap, not implemented yet.
+    /// Scroll wheel moves whichever list/log the up/down arrow keys would
+    /// already affect for the current focus (see
+    /// `handle_template_list_key`/`handle_log_key`) rather than
+    /// hit-testing the cursor's pane. A left click *does* hit-test -
+    /// against `templates_area`/`progress_area`, both set at the end of
+    /// their respective `draw_*` calls - and moves that list's selection
+    /// to the clicked row, focusing that pane; it doesn't act on the
+    /// clicked row (opening the param modal still needs `Enter`). Ignored
+    /// entirely while the param modal is open - same as `handle_key`'s
+    /// `editing_params` guard, so a click on the dimmed list behind the
+    /// modal can't change its selection out from under it.
     pub fn handle_mouse(&mut self, mouse: ratatui::crossterm::event::MouseEvent) {
-        use ratatui::crossterm::event::MouseEventKind;
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+
+        if self.editing_params {
+            return;
+        }
+
         match mouse.kind {
             MouseEventKind::ScrollUp => match self.focus {
                 Focus::Templates => self.handle_template_list_key(ratatui::crossterm::event::KeyCode::Up),
                 Focus::Log => self.handle_log_key(ratatui::crossterm::event::KeyCode::Up),
-                Focus::Params => {}
             },
             MouseEventKind::ScrollDown => match self.focus {
                 Focus::Templates => self.handle_template_list_key(ratatui::crossterm::event::KeyCode::Down),
                 Focus::Log => self.handle_log_key(ratatui::crossterm::event::KeyCode::Down),
-                Focus::Params => {}
             },
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(row) = row_within(self.templates_area, mouse.column, mouse.row) {
+                    if row < self.templates.len() {
+                        self.selected_template = row;
+                    }
+                    self.focus = Focus::Templates;
+                } else if let Some(row) = row_within(self.progress_area, mouse.column, mouse.row) {
+                    if !self.rows.is_empty() {
+                        self.log_scroll = row.min(self.rows.len() - 1);
+                    }
+                    self.focus = Focus::Log;
+                }
+            }
             _ => {}
         }
     }
@@ -304,7 +370,6 @@ impl App {
                     self.param_values = vec![String::new(); template.params.len()];
                     self.focused_param = 0;
                     self.editing_params = true;
-                    self.focus = Focus::Params;
                 }
             }
             _ => {}
@@ -383,17 +448,36 @@ impl App {
         self.status_line = format!("submitting {}...", template.template);
     }
 
+    /// Single vertical stack, no row ever split into side-by-side panes -
+    /// the sidebar this runs in (a zellij `size="30%"` pane, see
+    /// `shell/zellij/beam-shell.kdl`) is tall and narrow, so horizontal
+    /// space is the scarce resource. Param entry used to be a second pane
+    /// here, competing for half the already-narrow width; it's now
+    /// `draw_param_modal`, drawn on top of everything else only while
+    /// `editing_params`.
     pub fn draw(&mut self, frame: &mut Frame) {
-        let [top, bottom] =
-            Layout::vertical([Constraint::Percentage(35), Constraint::Percentage(65)]).areas(frame.area());
-        self.draw_top(frame, top);
-        self.draw_bottom(frame, bottom);
+        let area = frame.area();
+        let [templates_area, gauge_area, progress_area, status_area] = Layout::vertical([
+            Constraint::Percentage(40),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+
+        self.draw_templates(frame, templates_area);
+        self.draw_progress(frame, gauge_area, progress_area);
+        frame.render_widget(
+            Paragraph::new(self.status_line.as_str()).style(Style::default().fg(Color::DarkGray)),
+            status_area,
+        );
+
+        if self.editing_params {
+            self.draw_param_modal(frame, area);
+        }
     }
 
-    fn draw_top(&mut self, frame: &mut Frame, area: Rect) {
-        let [list_area, form_area] =
-            Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area);
-
+    fn draw_templates(&mut self, frame: &mut Frame, area: Rect) {
         let items: Vec<ListItem> = self
             .templates
             .iter()
@@ -404,56 +488,15 @@ impl App {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("tasks (↑/↓, enter to fill in params)")
+                    .title("tasks (↑/↓ or click, enter to fill in params)")
                     .border_style(focus_style(self.focus == Focus::Templates)),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-        frame.render_stateful_widget(list, list_area, &mut list_state);
-
-        let form_block = Block::default()
-            .borders(Borders::ALL)
-            .title("params (tab to move, enter on last field to submit, esc to cancel)")
-            .border_style(focus_style(self.focus == Focus::Params));
-        let inner = form_block.inner(form_area);
-        frame.render_widget(form_block, form_area);
-
-        if let Some(template) = self.templates.get(self.selected_template) {
-            if template.params.is_empty() {
-                frame.render_widget(Paragraph::new("(no params - press enter to run)"), inner);
-            } else {
-                let rows = Layout::vertical(
-                    template.params.iter().map(|_| Constraint::Length(1)).collect::<Vec<_>>(),
-                )
-                .split(inner);
-                for (i, (schema, area)) in template.params.iter().zip(rows.iter()).enumerate() {
-                    let value = self.param_values.get(i).map(String::as_str).unwrap_or("");
-                    let focused = self.editing_params && self.focused_param == i;
-                    let marker = if schema.required { "*" } else { " " };
-                    let line = Line::from(vec![
-                        Span::styled(
-                            format!("{marker}{:<10}", schema.name),
-                            Style::default().fg(Color::Cyan),
-                        ),
-                        Span::raw(format!(" [{}] ", schema.kind)),
-                        Span::styled(value, if focused { Style::default().add_modifier(Modifier::UNDERLINED) } else { Style::default() }),
-                        if focused { Span::raw("▏") } else { Span::raw("") },
-                    ]);
-                    frame.render_widget(Paragraph::new(line), *area);
-                }
-            }
-        } else {
-            frame.render_widget(Paragraph::new("(no templates known yet - press 'r' to refresh)"), inner);
-        }
+        frame.render_stateful_widget(list, area, &mut list_state);
+        self.templates_area = area;
     }
 
-    fn draw_bottom(&mut self, frame: &mut Frame, area: Rect) {
-        let [gauge_area, list_area, status_area] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .areas(area);
-
+    fn draw_progress(&mut self, frame: &mut Frame, gauge_area: Rect, list_area: Rect) {
         let total = self.rows.len();
         let done = self.rows.iter().filter(|r| r.state.is_terminal()).count();
         let running = self.rows.iter().filter(|r| r.state == TaskState::Running).count();
@@ -496,11 +539,52 @@ impl App {
             list_state.select(Some(selected));
         }
         frame.render_stateful_widget(list, list_area, &mut list_state);
+        self.progress_area = list_area;
+    }
 
-        frame.render_widget(
-            Paragraph::new(self.status_line.as_str()).style(Style::default().fg(Color::DarkGray)),
-            status_area,
-        );
+    /// Centered popup over everything else, replacing the old side-by-side
+    /// params pane - see `draw`'s doc comment. `Clear` blanks out whatever
+    /// `draw_templates`/`draw_progress` already painted into this `Rect`
+    /// so the popup doesn't show through it.
+    fn draw_param_modal(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(template) = self.templates.get(self.selected_template) else { return };
+        let height = (template.params.len() as u16 + 2).max(3);
+        let popup = centered_rect(area, 70, height);
+
+        frame.render_widget(Clear, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(
+                "{} params (tab to move, enter on last field to submit, esc to cancel)",
+                template.template
+            ))
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+
+        if template.params.is_empty() {
+            frame.render_widget(Paragraph::new("(no params - press enter to run)"), inner);
+            return;
+        }
+
+        let rows =
+            Layout::vertical(template.params.iter().map(|_| Constraint::Length(1)).collect::<Vec<_>>())
+                .split(inner);
+        for (i, (schema, row_area)) in template.params.iter().zip(rows.iter()).enumerate() {
+            let value = self.param_values.get(i).map(String::as_str).unwrap_or("");
+            let focused = self.focused_param == i;
+            let marker = if schema.required { "*" } else { " " };
+            let line = Line::from(vec![
+                Span::styled(format!("{marker}{:<10}", schema.name), Style::default().fg(Color::Cyan)),
+                Span::raw(format!(" [{}] ", schema.kind)),
+                Span::styled(
+                    value,
+                    if focused { Style::default().add_modifier(Modifier::UNDERLINED) } else { Style::default() },
+                ),
+                if focused { Span::raw("▏") } else { Span::raw("") },
+            ]);
+            frame.render_widget(Paragraph::new(line), *row_area);
+        }
     }
 }
 
@@ -510,6 +594,41 @@ fn focus_style(focused: bool) -> Style {
     } else {
         Style::default()
     }
+}
+
+/// A `width_percent`-wide, `height`-tall `Rect` centered within `area` -
+/// the usual ratatui modal-popup pattern (clamped to `area` so a huge
+/// `height` - e.g. a template with far too many params to ever fit -
+/// still renders something instead of panicking on an out-of-bounds
+/// `Rect`).
+fn centered_rect(area: Rect, width_percent: u16, height: u16) -> Rect {
+    let width = area.width.saturating_mul(width_percent) / 100;
+    let height = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect { x, y, width, height }
+}
+
+/// `None` if `(column, row)` falls outside `area` or on its border;
+/// otherwise `Some(index)` into whatever list was drawn there, index 0
+/// being the first row *inside* the border - matches a bordered `List`
+/// widget's own rendering (row 0 of `area` is the top border, row 1 is
+/// the first item). A zero-sized `area` (nothing drawn there yet, e.g.
+/// before the first `draw`) always returns `None`.
+fn row_within(area: Rect, column: u16, row: u16) -> Option<usize> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    if column < area.x || column >= area.x + area.width {
+        return None;
+    }
+    // Both the top and bottom border rows are excluded - `row > area.y`
+    // (not `>=`) skips the top border, and the `area.height - 1` bound
+    // below skips the bottom one.
+    if row <= area.y || row >= area.y + area.height.saturating_sub(1) {
+        return None;
+    }
+    Some((row - area.y - 1) as usize)
 }
 
 #[cfg(test)]
@@ -608,7 +727,9 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert!(app.editing_params);
         assert_eq!(app.param_values.len(), 2); // clone-git-repo has 2 params
-        assert!(app.focus == Focus::Params);
+        // Param entry is a modal now, not a separate focusable pane (see
+        // `Focus`'s doc comment) - focus stays wherever it already was.
+        assert!(app.focus == Focus::Templates);
     }
 
     #[test]
@@ -703,5 +824,118 @@ mod tests {
         assert_eq!(app.status_line, "reconnected");
         let request = app.pending_request.expect("mark_reconnected should re-request the task list");
         assert_eq!(request["op"], "list_tasks");
+    }
+
+    fn left_click(column: u16, row: u16) -> ratatui::crossterm::event::MouseEvent {
+        ratatui::crossterm::event::MouseEvent {
+            kind: ratatui::crossterm::event::MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left),
+            column,
+            row,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn row_within_excludes_borders_and_out_of_bounds_clicks() {
+        let area = Rect { x: 2, y: 5, width: 10, height: 4 }; // rows 5..9: 5=top border, 6-7=items, 8=bottom border
+        assert_eq!(row_within(area, 4, 5), None, "top border row");
+        assert_eq!(row_within(area, 4, 8), None, "bottom border row");
+        assert_eq!(row_within(area, 4, 6), Some(0), "first item row");
+        assert_eq!(row_within(area, 4, 7), Some(1), "second item row");
+        assert_eq!(row_within(area, 1, 6), None, "column just left of the area");
+        assert_eq!(row_within(Rect::default(), 0, 0), None, "zero-sized area never matches");
+    }
+
+    #[test]
+    fn clicking_a_template_row_selects_it_and_focuses_that_pane() {
+        let mut app = App::new();
+        app.handle_daemon_event(sample_templates());
+        app.focus = Focus::Log;
+        // Matches what `draw_templates` would have set: a bordered list
+        // starting at (0, 0), so row 0 is the border and row 2 is the
+        // second item.
+        app.templates_area = Rect { x: 0, y: 0, width: 40, height: 6 };
+
+        app.handle_mouse(left_click(5, 2));
+
+        assert_eq!(app.selected_template, 1);
+        assert!(app.focus == Focus::Templates);
+    }
+
+    #[test]
+    fn clicking_the_progress_list_moves_its_scroll_and_focuses_it() {
+        let mut app = App::new();
+        app.handle_daemon_event(json!({"type": "accepted", "waves": [["a"], ["b"], ["c"]]}));
+        app.focus = Focus::Templates;
+        app.progress_area = Rect { x: 0, y: 10, width: 40, height: 6 };
+
+        app.handle_mouse(left_click(5, 13)); // third row inside the border
+
+        assert_eq!(app.log_scroll, 2);
+        assert!(app.focus == Focus::Log);
+    }
+
+    #[test]
+    fn a_click_outside_either_list_changes_nothing() {
+        let mut app = App::new();
+        app.handle_daemon_event(sample_templates());
+        app.templates_area = Rect { x: 0, y: 0, width: 40, height: 6 };
+        app.progress_area = Rect { x: 0, y: 10, width: 40, height: 6 };
+        app.focus = Focus::Templates;
+
+        app.handle_mouse(left_click(5, 8)); // the gap between the two areas
+
+        assert_eq!(app.selected_template, 0);
+        assert!(app.focus == Focus::Templates);
+    }
+
+    #[test]
+    fn a_click_is_ignored_entirely_while_the_param_modal_is_open() {
+        let mut app = App::new();
+        app.handle_daemon_event(sample_templates());
+        app.templates_area = Rect { x: 0, y: 0, width: 40, height: 6 };
+        app.handle_key(key(KeyCode::Enter)); // opens the modal on template 0
+        assert!(app.editing_params);
+
+        app.handle_mouse(left_click(5, 2)); // would otherwise select template 1
+
+        assert_eq!(app.selected_template, 0, "click behind the modal shouldn't change the underlying selection");
+        assert!(app.editing_params, "click shouldn't close the modal either");
+    }
+
+    #[test]
+    fn a_progress_status_updates_the_message_without_changing_an_existing_rows_state() {
+        let mut app = App::new();
+        app.handle_daemon_event(json!({"type": "accepted", "task_id": "clone-git-repo:dest=/x"}));
+        app.handle_daemon_event(
+            json!({"type": "task_status", "task_id": "clone-git-repo:dest=/x", "status": "start"}),
+        );
+        assert!(app.rows[0].state == TaskState::Running);
+
+        app.handle_daemon_event(json!({
+            "type": "task_status",
+            "task_id": "clone-git-repo:dest=/x",
+            "status": "progress",
+            "message": "Receiving objects: 50%",
+        }));
+
+        assert!(app.rows[0].state == TaskState::Running, "progress shouldn't change state");
+        assert_eq!(app.rows[0].message.as_deref(), Some("Receiving objects: 50%"));
+        assert_eq!(app.rows.len(), 1, "should update the existing row, not duplicate it");
+    }
+
+    #[test]
+    fn a_progress_status_for_an_unknown_task_id_creates_a_running_row() {
+        let mut app = App::new();
+        app.handle_daemon_event(json!({
+            "type": "task_status",
+            "task_id": "clone-git-repo:dest=/y",
+            "status": "progress",
+            "message": "Receiving objects: 10%",
+        }));
+
+        assert_eq!(app.rows.len(), 1);
+        assert!(app.rows[0].state == TaskState::Running);
+        assert_eq!(app.rows[0].message.as_deref(), Some("Receiving objects: 10%"));
     }
 }
