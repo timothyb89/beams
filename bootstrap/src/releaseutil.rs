@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context};
 
@@ -68,6 +69,39 @@ pub fn run(cmd: &mut Command) -> anyhow::Result<()> {
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
+    }
+    Ok(())
+}
+
+/// Same contract as `run`, but for a command whose stderr is where
+/// incremental progress shows up (e.g. `git clone --progress`, which
+/// writes one line per update there when stderr isn't a tty rather than
+/// repeatedly overwriting one line with `\r`) - `on_line` is called once
+/// per line, in order, as the child produces them, *before* the overall
+/// success/failure of the call is known. The last line (if any) is also
+/// what ends up in the error message on failure, same as `run`'s
+/// `output.stderr` does.
+pub fn run_streaming(cmd: &mut Command, on_line: &dyn Fn(&str)) -> anyhow::Result<()> {
+    let mut child = cmd
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning {cmd:?}"))?;
+
+    let stderr = child.stderr.take().expect("stderr was piped above");
+    let mut last_line = String::new();
+    for line in BufReader::new(stderr).lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        on_line(&line);
+        last_line = line;
+    }
+
+    let status = child.wait().with_context(|| format!("waiting for {cmd:?}"))?;
+    if !status.success() {
+        bail!("{:?} failed ({status}): {last_line}", cmd);
     }
     Ok(())
 }

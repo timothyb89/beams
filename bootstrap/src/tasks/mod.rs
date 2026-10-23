@@ -27,6 +27,7 @@ pub mod clone_git_repo;
 pub mod install_code_server;
 pub mod install_toolchain_go;
 pub mod install_toolchain_rust;
+pub mod wait_ssh_agent_unlock;
 
 
 use anyhow::{bail, Context};
@@ -39,6 +40,15 @@ use clone_git_repo::CloneGitRepo;
 use install_code_server::InstallCodeServer;
 use install_toolchain_go::InstallToolchainGo;
 use install_toolchain_rust::InstallToolchainRust;
+use wait_ssh_agent_unlock::WaitSshAgentUnlock;
+
+/// Capability names provided/required by templates below - mirrors
+/// `steps::cap`'s role for fixed steps. Centralized so a dependent
+/// template references the same constant rather than retyping the
+/// string.
+pub mod cap {
+    pub const SSH_AGENT_UNLOCKED: &str = "ssh-agent-unlocked";
+}
 
 /// One declared parameter of a template - just enough for a client (the
 /// TUI, eventually a GUI) to build an input field without hardcoding
@@ -80,6 +90,19 @@ pub struct TemplateInfo {
 pub trait Task: Send {
     fn id(&self) -> String;
     fn run(&self) -> anyhow::Result<Option<String>>;
+
+    /// Same as `run`, but given a callback to report incremental progress
+    /// through before it finishes (e.g. a git clone's percent-complete
+    /// lines) - see `executor::Event::Progress`/`daemon.rs`'s `"progress"`
+    /// task_status for how this reaches a client. Defaults to ignoring
+    /// `progress` entirely and delegating to `run` - every task that
+    /// doesn't have anything incremental to report (which is most of
+    /// them) needs no change at all. A task that *does* have something
+    /// to report (so far, just `clone_git_repo`) overrides this instead
+    /// of `run`.
+    fn run_with_progress(&self, _progress: &dyn Fn(&str)) -> anyhow::Result<Option<String>> {
+        self.run()
+    }
 
     fn provides(&self) -> Vec<Capability> {
         Vec::new()
@@ -159,6 +182,7 @@ pub fn templates() -> Vec<TemplateInfo> {
         TemplateInfo { template: InstallToolchainGo::NAME, params: &[] },
         TemplateInfo { template: InstallToolchainRust::NAME, params: &[] },
         TemplateInfo { template: InstallCodeServer::NAME, params: &[] },
+        TemplateInfo { template: WaitSshAgentUnlock::NAME, params: &[] },
     ]
 }
 
@@ -207,6 +231,7 @@ pub fn instantiate(name: &str, params: Value) -> anyhow::Result<Box<dyn Task>> {
         InstallToolchainGo::NAME => Ok(Box::new(InstallToolchainGo)),
         InstallToolchainRust::NAME => Ok(Box::new(InstallToolchainRust)),
         InstallCodeServer::NAME => Ok(Box::new(InstallCodeServer)),
+        WaitSshAgentUnlock::NAME => Ok(Box::new(WaitSshAgentUnlock)),
         other => bail!("unknown template {other:?} (known: {})", names().join(", ")),
     }
 }

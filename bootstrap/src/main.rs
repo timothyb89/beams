@@ -156,6 +156,10 @@ enum TaskCommand {
     /// Install code-server and background it as a beamctl service (see
     /// `tasks::install_code_server`). No params.
     InstallCodeServer,
+    /// Wait for `bin/ssh-agent-init`'s interactive unlock to have added
+    /// the key to the running ssh-agent (see
+    /// `tasks::wait_ssh_agent_unlock`). No params.
+    WaitSshAgentUnlock,
 }
 
 fn main() {
@@ -227,6 +231,9 @@ fn task_command_to_instance(command: TaskCommand) -> (&'static str, Value) {
         TaskCommand::InstallCodeServer => {
             (tasks::install_code_server::InstallCodeServer::NAME, json!({}))
         }
+        TaskCommand::WaitSshAgentUnlock => {
+            (tasks::wait_ssh_agent_unlock::WaitSshAgentUnlock::NAME, json!({}))
+        }
     }
 }
 
@@ -245,7 +252,7 @@ fn run_task(command: TaskCommand) -> i32 {
         }
     };
 
-    match task.run() {
+    match task.run_with_progress(&|line| println!("  {line}")) {
         Ok(Some(message)) => {
             println!("ok: {message}");
             0

@@ -28,6 +28,12 @@ use crate::tasks::Task;
 /// progress rows by it instead of inferring concurrency from timing.
 pub enum Event {
     Start { task_id: String, wave: usize },
+    /// Incremental progress from inside a still-running task's
+    /// `run_with_progress` (e.g. a git clone's percent-complete lines) -
+    /// zero or more of these can arrive between a task's `Start` and its
+    /// terminal event. Not itself a lifecycle state the task passes
+    /// through, unlike the other three variants.
+    Progress { task_id: String, wave: usize, message: String },
     Ok { task_id: String, wave: usize, message: String },
     Skip { task_id: String, wave: usize },
     Error { task_id: String, wave: usize, message: String },
@@ -86,7 +92,10 @@ pub fn run(tasks: Vec<Box<dyn Task>>, on_event: &(dyn Fn(Event) + Sync)) -> anyh
 
                     let task_id = task.id();
                     on_event(Event::Start { task_id: task_id.clone(), wave });
-                    match task.run() {
+                    let report = |message: &str| {
+                        on_event(Event::Progress { task_id: task_id.clone(), wave, message: message.to_string() });
+                    };
+                    match task.run_with_progress(&report) {
                         Ok(Some(message)) => on_event(Event::Ok { task_id, wave, message }),
                         Ok(None) => on_event(Event::Skip { task_id, wave }),
                         Err(err) => {

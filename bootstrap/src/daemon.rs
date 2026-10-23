@@ -325,6 +325,9 @@ fn run_manifest(hub: &Hub, request_id: Option<&str>, tasks_value: Value, reply: 
             executor::Event::Start { task_id, wave } => {
                 task_status(&task_id, "start", None, Some(&manifest_id), Some(wave))
             }
+            executor::Event::Progress { task_id, wave, message } => {
+                task_status(&task_id, "progress", Some(&message), Some(&manifest_id), Some(wave))
+            }
             executor::Event::Ok { task_id, wave, message } => {
                 task_status(&task_id, "ok", Some(&message), Some(&manifest_id), Some(wave))
             }
@@ -354,7 +357,10 @@ fn run_manifest(hub: &Hub, request_id: Option<&str>, tasks_value: Value, reply: 
 fn run_one_task(hub: &Hub, task: &dyn Task, manifest_id: Option<&str>) -> Result<(), String> {
     let task_id = task.id();
     hub.broadcast(&task_status(&task_id, "start", None, manifest_id, None));
-    match task.run() {
+    let report = |message: &str| {
+        hub.broadcast(&task_status(&task_id, "progress", Some(message), manifest_id, None));
+    };
+    match task.run_with_progress(&report) {
         Ok(Some(message)) => {
             hub.broadcast(&task_status(&task_id, "ok", Some(&message), manifest_id, None));
             Ok(())
@@ -431,6 +437,21 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).expect("reading reply");
         serde_json::from_str(line.trim()).expect("reply should be valid JSON")
+    }
+
+    /// Like `recv`, but discards any number of `task_status` events with
+    /// `status: "progress"` first - `clone-git-repo` (via `git clone
+    /// --progress`) now emits zero or more of these between its `start`
+    /// and its terminal event, and these tests only care about the
+    /// terminal one, same as before progress reporting existed.
+    fn recv_skipping_progress(reader: &mut BufReader<UnixStream>) -> Value {
+        loop {
+            let value = recv(reader);
+            if value["type"] == "task_status" && value["status"] == "progress" {
+                continue;
+            }
+            return value;
+        }
     }
 
     #[test]
@@ -512,7 +533,7 @@ mod tests {
         assert_eq!(start["type"], "task_status");
         assert_eq!(start["status"], "start");
 
-        let done = recv(&mut reader);
+        let done = recv_skipping_progress(&mut reader);
         assert_eq!(done["type"], "task_status");
         assert_eq!(done["status"], "ok");
         assert!(dest.join(".git").exists());
@@ -571,7 +592,7 @@ mod tests {
             assert_eq!(start["wave"], wave);
             assert!(start["task_id"].as_str().unwrap().starts_with(expected_task));
 
-            let done = recv(&mut reader);
+            let done = recv_skipping_progress(&mut reader);
             assert_eq!(done["type"], "task_status");
             assert_eq!(done["status"], "ok");
             assert_eq!(done["manifest_id"], manifest_id);
@@ -642,7 +663,7 @@ mod tests {
 
         let clone_start = recv(&mut reader);
         assert_eq!(clone_start["status"], "start");
-        let clone_done = recv(&mut reader);
+        let clone_done = recv_skipping_progress(&mut reader);
         assert_eq!(clone_done["status"], "ok");
 
         let checkout_start = recv(&mut reader);

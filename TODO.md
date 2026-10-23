@@ -441,6 +441,70 @@ section above for status/details.
   real local git repo (first-call `remote add` and second-call
   `remote set-url` fallback both verified).
 
+## TUI/UX polish, progress reporting, default startup clones
+
+- [x] Zellij pane titles: the `tui` and log-tail panes in
+  `shell/zellij/beam-shell.kdl` now have `name="bootstrap-tui"`/
+  `name="bootstrap-log"` (the `ssh-agent` pane already had one) - the
+  stacked-pane title bar no longer shows the raw `bash -lc ...` command.
+- [x] TUI layout: `tui::app` is a single vertical column now (template
+  list, gauge + task-progress list, status line) instead of a top row
+  split 40/60 into a template-list pane and a side-by-side param-form
+  pane - matches the sidebar's actual shape (tall, narrow). Param entry
+  (`editing_params`) is a centered modal (`draw_param_modal`, ratatui's
+  `Clear`-widget popup pattern) drawn over everything else instead of a
+  permanent second pane; `Focus` dropped its `Params` variant since the
+  modal already intercepts all input ahead of focus-based dispatch.
+- [x] Mouse click on the template/progress lists: `handle_mouse` hit-
+  tests a left click against `templates_area`/`progress_area` (the areas
+  each list was last drawn into, border-excluded via a new `row_within`
+  helper) and moves that list's selection to the clicked row, focusing
+  that pane - same "select" action the scroll wheel already had, not
+  "select and act" (opening the param modal still needs `Enter`).
+  Ignored while the param modal is open, same as keyboard input.
+- [x] Granular progress reporting: `tasks::Task`/`steps::Step` both
+  gained a `run_with_progress(&self, progress: &dyn Fn(&str))` method,
+  defaulting to ignore `progress` and delegate to the existing `run` -
+  additive, no existing task/step needed to change. `executor::Event`
+  gained a `Progress` variant; `executor::run` and `daemon.rs`'s
+  `run_one_task` (the standalone-`run_task` path, which doesn't go
+  through `executor::run` at all) both now call `run_with_progress`
+  and broadcast/emit it as a new `task_status` `"progress"` status
+  between `"start"` and the terminal one. `tui::app` shows it as a live
+  message update on the task's row without changing its (already
+  `Running`) state. `clone_git_repo::CloneGitRepo` is the one concrete
+  task that overrides `run_with_progress` so far - runs `git clone
+  --progress` through a new `releaseutil::run_streaming` helper (pipes
+  stderr line-by-line to a callback, same contract as `run` otherwise)
+  so each percent-complete line reaches the TUI/CLI live instead of only
+  a single final message.
+  - **Recommendation, not implemented**: `steps::teleport_bin`,
+    `tasks::install_toolchain_go`/`install_code_server` (sizeable
+    downloads - could report byte/percent progress the same way) and
+    `steps::k3s_bot`/`tbot_service` (currently opaque single-message
+    steps - could report "waiting for join token", "tbot starting",
+    etc.) are the best next candidates now that the mechanism exists.
+    Left as a recommendation rather than done here since each is also a
+    product decision (stay a mandatory fixed `Step`, just with progress,
+    vs. become an optional/deferred `Task` too) that needs picking per
+    step, not a mechanical conversion.
+- [x] Default startup clones: new `tasks::wait_ssh_agent_unlock`
+  template (`wait-ssh-agent-unlock`, no params) polls `ssh-add -l` until
+  `bin/ssh-agent-init`'s interactive unlock (still entirely outside this
+  binary) has added the key, erroring out after a ~10 minute timeout
+  rather than hanging forever; provides `tasks::cap::SSH_AGENT_UNLOCKED`.
+  `clone_git_repo::CloneGitRepo::requires` now conditionally requires
+  that capability for an ssh-style `repo` (`git@...`/`ssh://...`) -
+  closing the gap its own doc comment used to flag. `bin/beam-shell`
+  submits a manifest (`wait-ssh-agent-unlock` + the three repos below) to
+  the already-running daemon in the background right after sourcing
+  `ssh-agent-init`, so cloning starts without blocking reaching zellij,
+  and is skippable via `BEAM_SHELL_SKIP_DEFAULT_CLONES=1` (for a future
+  per-beam launcher that wants a different repo set):
+  - `git@github.com:gravitational/core.git` → `~/projects/core`
+  - `git@github.com:timothyb89/teleport-harness.git` → `~/projects/teleport-harness`
+  - `git@github.com:timothyb89/rdocker.git` → `~/projects/rdocker`
+
 ## k8s access workaround
 
 - [ ] `k3s-bot-join` / `tbot` kube output exists purely because "beams k8s

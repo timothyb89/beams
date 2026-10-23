@@ -7,17 +7,18 @@ use anyhow::Context;
 
 use super::{Task, Template};
 use crate::graph::Capability;
-use crate::releaseutil::run;
+use crate::releaseutil::run_streaming;
 
 /// Clones `repo` to `dest` with a plain `git clone` - no assumptions
 /// about what kind of repo it is (GitHub, a beam, anything `git` itself
 /// can reach). Skips if `dest` is already a git checkout.
 ///
-/// Doesn't yet declare a `requires` on ssh-agent being unlocked for an
-/// ssh:// repo URL - there's no step/task in this binary that *provides*
-/// that capability yet (`bin/ssh-agent-init` runs outside this binary
-/// entirely, see `AGENTS.md`). Revisit once something here can represent
-/// that precondition.
+/// For an ssh-style repo URL (`git@...`/`ssh://...`), `requires` the
+/// `wait_ssh_agent_unlock` task's capability - `bin/ssh-agent-init`'s
+/// actual interactive unlock still runs entirely outside this binary
+/// (see `AGENTS.md`), but that task can at least wait for it to have
+/// happened before this one tries to use the key. An https:// or local
+/// filesystem `repo` has no such requirement.
 pub struct CloneGitRepo {
     pub repo: String,
     pub dest: PathBuf,
@@ -30,6 +31,10 @@ impl CloneGitRepo {
     pub fn capability_for(dest: &Path) -> Capability {
         Cow::Owned(format!("repo-cloned:{}", dest.display()))
     }
+
+    fn needs_ssh_agent(&self) -> bool {
+        self.repo.starts_with("git@") || self.repo.starts_with("ssh://")
+    }
 }
 
 impl Task for CloneGitRepo {
@@ -41,7 +46,19 @@ impl Task for CloneGitRepo {
         vec![Self::capability_for(&self.dest)]
     }
 
+    fn requires(&self) -> Vec<Capability> {
+        if self.needs_ssh_agent() {
+            vec![super::cap::SSH_AGENT_UNLOCKED.into()]
+        } else {
+            Vec::new()
+        }
+    }
+
     fn run(&self) -> anyhow::Result<Option<String>> {
+        self.run_with_progress(&|_| {})
+    }
+
+    fn run_with_progress(&self, progress: &dyn Fn(&str)) -> anyhow::Result<Option<String>> {
         if self.dest.join(".git").exists() {
             return Ok(None);
         }
@@ -51,7 +68,20 @@ impl Task for CloneGitRepo {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
 
-        run(Command::new("git").args(["clone", &self.repo, &self.dest.display().to_string()]))?;
+        // `--progress` makes git report percent-complete on stderr even
+        // when it isn't talking to a terminal (which it otherwise
+        // suppresses) - one line per update rather than repeatedly
+        // overwriting a single line with `\r`, so `run_streaming`'s
+        // plain line-based reader sees each one.
+        run_streaming(
+            Command::new("git").args([
+                "clone",
+                "--progress",
+                &self.repo,
+                &self.dest.display().to_string(),
+            ]),
+            progress,
+        )?;
 
         Ok(Some(format!("cloned {} into {}", self.repo, self.dest.display())))
     }
@@ -116,5 +146,47 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn run_with_progress_reports_at_least_one_line_and_matches_runs_final_message() {
+        let tmp = std::env::temp_dir().join(format!("clone-git-repo-progress-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let source = tmp.join("source");
+        let dest = tmp.join("dest");
+        make_source_repo(&source);
+
+        let task = CloneGitRepo { repo: source.display().to_string(), dest: dest.clone() };
+        let lines = std::sync::Mutex::new(Vec::<String>::new());
+        let message = task
+            .run_with_progress(&|line| lines.lock().unwrap().push(line.to_string()))
+            .expect("clone should succeed")
+            .expect("first run should report work done, not a skip");
+
+        assert_eq!(message, format!("cloned {} into {}", source.display(), dest.display()));
+        assert!(
+            !lines.lock().unwrap().is_empty(),
+            "git clone --progress should have reported at least one stderr line"
+        );
+        assert!(dest.join(".git").exists());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn requires_ssh_agent_unlocked_only_for_an_ssh_style_repo_url() {
+        let https = CloneGitRepo { repo: "https://example.invalid/x.git".into(), dest: PathBuf::from("/tmp/x") };
+        assert!(https.requires().is_empty());
+
+        let local = CloneGitRepo { repo: "/tmp/some/local/repo".into(), dest: PathBuf::from("/tmp/y") };
+        assert!(local.requires().is_empty());
+
+        let ssh_shorthand =
+            CloneGitRepo { repo: "git@github.com:org/repo.git".into(), dest: PathBuf::from("/tmp/z") };
+        assert_eq!(ssh_shorthand.requires(), vec![Capability::from(crate::tasks::cap::SSH_AGENT_UNLOCKED)]);
+
+        let ssh_url =
+            CloneGitRepo { repo: "ssh://git@github.com/org/repo.git".into(), dest: PathBuf::from("/tmp/w") };
+        assert_eq!(ssh_url.requires(), vec![Capability::from(crate::tasks::cap::SSH_AGENT_UNLOCKED)]);
     }
 }

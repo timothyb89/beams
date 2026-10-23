@@ -82,6 +82,14 @@ pub trait Step: Send {
     /// nothing to do (emits `Skip`), and `Err` on failure.
     fn run(&self, repo: &Path) -> anyhow::Result<Option<String>>;
 
+    /// See `tasks::Task::run_with_progress` - same idea, one layer down.
+    /// Defaults to ignoring `progress` and delegating to `run`; no
+    /// existing step overrides this yet, but `StepAsTask` already relays
+    /// it so one could without another adapter change.
+    fn run_with_progress(&self, repo: &Path, _progress: &dyn Fn(&str)) -> anyhow::Result<Option<String>> {
+        self.run(repo)
+    }
+
     fn provides(&self) -> Vec<Capability> {
         Vec::new()
     }
@@ -118,6 +126,10 @@ impl Task for StepAsTask {
 
     fn run(&self) -> anyhow::Result<Option<String>> {
         self.step.run(&self.repo)
+    }
+
+    fn run_with_progress(&self, progress: &dyn Fn(&str)) -> anyhow::Result<Option<String>> {
+        self.step.run_with_progress(&self.repo, progress)
     }
 
     fn provides(&self) -> Vec<Capability> {
@@ -252,6 +264,14 @@ fn run_concurrent(repo: &Path, emitter: &dyn Emitter) -> bool {
     let on_event = |event: executor::Event| {
         let translated = match event {
             executor::Event::Start { task_id, .. } => Event::new(&task_id, Status::Start, None),
+            // `events::Status` has no in-progress state - this fixed
+            // sequence's output has always just been start/terminal, and
+            // no fixed `Step` overrides `run_with_progress` yet (see that
+            // method's doc comment) to actually produce one of these.
+            // Dropped rather than forcing a new `Status` variant through
+            // `events.rs`'s human/JSON emitters for a case nothing
+            // triggers today.
+            executor::Event::Progress { .. } => return,
             executor::Event::Ok { task_id, message, .. } => {
                 Event::new(&task_id, Status::Ok, Some(message))
             }

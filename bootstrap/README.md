@@ -263,6 +263,15 @@ as a `code-server` beamctl service bound to `127.0.0.1:8080`. It needs
 (gopls/rust-analyzer need an actual toolchain to drive, not just the
 editor extension) - run all three via `task run`, or in one
 `run-manifest` call since the graph resolves the dependency either way.
+
+Another: `wait-ssh-agent-unlock` polls `ssh-add -l` until the key
+`bin/ssh-agent-init`'s interactive unlock (run entirely outside this
+binary, in its own zellij pane) adds is actually present, erroring out
+after a ~10 minute timeout rather than waiting forever. `clone-git-repo`
+requires its capability automatically for an ssh-style `repo` (`git@...`
+or `ssh://...`) - `bin/beam-shell`'s default-clones manifest is the
+main consumer, but any manifest cloning over ssh gets the same ordering
+for free.
 Reaching it is then a separate, manual step, same as any other published
 app: `tsh beams publish $BEAM_ALIAS` (per `~/AGENTS.md`'s "Publishing
 apps from beam" - port 8080 is the only one forwarded, which is why
