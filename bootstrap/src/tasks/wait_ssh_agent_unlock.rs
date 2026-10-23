@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use super::{Task, Template};
 use crate::graph::Capability;
+use crate::pathutil::expand_tilde;
 
 /// How often to poll `ssh-add -l` while waiting, and how long to wait
 /// before giving up - overridable via env vars (`BEAM_BOOTSTRAP_SSH_WAIT_*`)
@@ -43,17 +44,72 @@ impl WaitSshAgentUnlock {
     /// empty (locked, for this repo's one-key usage), and exits 2 if it
     /// can't even reach an agent (not started yet). Only the exit-0 case
     /// counts as unlocked - the other two both just mean "keep waiting".
+    ///
+    /// Critically, this always runs `ssh-add` with an explicit
+    /// `SSH_AUTH_SOCK` discovered via `discover_ssh_auth_sock` rather
+    /// than whatever this process already inherited - see that
+    /// function's doc comment for why relying on the inherited
+    /// environment here never worked at all (not "sometimes races the
+    /// unlock", just unconditionally broken): confirmed live on a real
+    /// beam, `/proc/<daemon-pid>/environ` had no SSH variables
+    /// whatsoever, so a bare `ssh-add -l` from inside the daemon reported
+    /// "no agent" forever regardless of whether a human had actually
+    /// unlocked the key in the dedicated pane.
     fn has_identity() -> bool {
-        Command::new(Self::ssh_add_bin())
-            .arg("-l")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        let mut cmd = Command::new(Self::ssh_add_bin());
+        cmd.arg("-l");
+        if let Some(sock) = discover_ssh_auth_sock() {
+            cmd.env("SSH_AUTH_SOCK", sock);
+        }
+        cmd.output().map(|o| o.status.success()).unwrap_or(false)
     }
 }
 
 fn env_duration_ms(var: &str) -> Option<Duration> {
     std::env::var(var).ok()?.parse::<u64>().ok().map(Duration::from_millis)
+}
+
+/// Where `bin/ssh-agent-init` persists the agent's env (`SSH_AUTH_SOCK`/
+/// `SSH_AGENT_PID`) once it starts one - `${XDG_RUNTIME_DIR:-$HOME/.ssh}/agent.env`,
+/// matching that script's own `env_file` exactly. Overridable via
+/// `BEAM_BOOTSTRAP_SSH_AGENT_ENV_FILE` purely for tests, same pattern as
+/// `ssh_add_bin`'s override.
+fn agent_env_path() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("BEAM_BOOTSTRAP_SSH_AGENT_ENV_FILE") {
+        return std::path::PathBuf::from(path);
+    }
+    match std::env::var("XDG_RUNTIME_DIR") {
+        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir).join("agent.env"),
+        _ => expand_tilde("~/.ssh/agent.env"),
+    }
+}
+
+/// Finds the real ssh-agent socket to talk to, regardless of what (if
+/// anything) this process's *own* environment already has. This matters
+/// because `WaitSshAgentUnlock` runs inside `beam-bootstrapd`, a
+/// long-lived daemon started once, early, by `bin/beam-shell` - before
+/// `bin/ssh-agent-init` ever runs (see that script's own step ordering)
+/// - and a process's environment is fixed at its own startup; it never
+/// picks up a later interactive shell's `source ssh-agent-init`. Without
+/// this, `ssh-add -l` run from inside the daemon would report "no agent"
+/// forever, independent of whether the key is actually unlocked.
+///
+/// Prefers an already-set `SSH_AUTH_SOCK` (e.g. a bare `run-task`/`task
+/// run` invoked directly from an interactive shell that already has one)
+/// over `agent_env_path()`'s file, so this doesn't fight a caller that
+/// already knows the right socket.
+fn discover_ssh_auth_sock() -> Option<String> {
+    if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
+        if !sock.is_empty() {
+            return Some(sock);
+        }
+    }
+
+    let contents = std::fs::read_to_string(agent_env_path()).ok()?;
+    contents.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("SSH_AUTH_SOCK=")?;
+        Some(value.split(';').next().unwrap_or(value).to_string())
+    })
 }
 
 impl Task for WaitSshAgentUnlock {
@@ -211,5 +267,53 @@ mod tests {
     #[test]
     fn provides_the_shared_capability_constant() {
         assert_eq!(WaitSshAgentUnlock.provides(), vec![Capability::from(super::super::cap::SSH_AGENT_UNLOCKED)]);
+    }
+
+    /// Regression test for the real bug found live on a beam: this
+    /// process's own `SSH_AUTH_SOCK` (if any - cleared here so the test
+    /// can't accidentally pass by inheriting *this* process's real one)
+    /// must not matter - `has_identity` has to find the socket via
+    /// `agent_env_path`'s file and pass it through explicitly, the way
+    /// `beam-bootstrapd`'s own near-empty environment needs. The fake
+    /// `ssh-add` here only succeeds if it actually received the sock
+    /// path discovered from the file as `SSH_AUTH_SOCK` - a regression
+    /// back to relying on inherited env would fail this with an empty
+    /// (unset) value instead.
+    #[test]
+    fn discovers_ssh_auth_sock_from_the_agent_env_file_not_inherited_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = scratch_dir("discovers-sock-from-file");
+
+        let saved_sock = std::env::var("SSH_AUTH_SOCK").ok();
+        std::env::remove_var("SSH_AUTH_SOCK");
+
+        let expected_sock = tmp.join("agent.sock").display().to_string();
+        let agent_env_file = tmp.join("agent.env");
+        fs::write(&agent_env_file, format!("SSH_AUTH_SOCK={expected_sock}; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=1; export SSH_AGENT_PID;\n")).unwrap();
+        std::env::set_var("BEAM_BOOTSTRAP_SSH_AGENT_ENV_FILE", &agent_env_file);
+
+        let script = tmp.join("ssh-add");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n[ \"$SSH_AUTH_SOCK\" = \"{expected_sock}\" ] && exit 0 || exit 2\n"
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+        std::env::set_var("BEAM_BOOTSTRAP_SSH_ADD_BIN", &script);
+
+        let message = WaitSshAgentUnlock.run().unwrap().unwrap();
+        assert!(message.contains("already unlocked"), "unexpected message: {message}");
+
+        std::env::remove_var("BEAM_BOOTSTRAP_SSH_ADD_BIN");
+        std::env::remove_var("BEAM_BOOTSTRAP_SSH_AGENT_ENV_FILE");
+        match saved_sock {
+            Some(sock) => std::env::set_var("SSH_AUTH_SOCK", sock),
+            None => std::env::remove_var("SSH_AUTH_SOCK"),
+        }
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
