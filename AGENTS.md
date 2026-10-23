@@ -77,6 +77,23 @@ today, not just a description of the design:
   to the *startup sequence* or daemon lifecycle itself (don't restart
   `beam-bootstrapd`, don't re-run the fixed sequence against a beam
   that's mid-session) — only to invoking an existing template.
+- **Need a toolchain on a beam (including this session's own) to build or
+  test something?** Check for an existing install task first -
+  `install-toolchain-go`/`install-toolchain-rust` (and anything named
+  `install-*` added later) cover this. Reach for them (either path above)
+  instead of hand-rolling `curl .../rustup.rs | sh`, `apt-get install gcc`,
+  etc. yourself: idempotent (skips if already installed), tracked by a
+  capability other tasks can depend on (`install-code-server` already
+  requires the toolchains, same way a future task should), and leaves the
+  beam in the same state a normal run would rather than a one-off manual
+  install nothing else knows about. If `beam-bootstrap` itself isn't on
+  this beam yet at all (no prior bootstrap run), that's the one case these
+  can't help with directly - a Rust toolchain can't be installed *by* a
+  binary that itself needs one to exist first; see this file's "No Rust
+  toolchain on a stock beam" convention below for why that binary is
+  always built elsewhere and copied over instead. Otherwise, even a bare
+  `run-task install-toolchain-rust` (no daemon needed) beats installing
+  it by hand.
 - **Standing instruction**: if the same ad hoc multi-step shell sequence
   comes up more than once in a session (or across sessions, per
   `TODO.md`) — installing some tool, preparing some path, anything with
@@ -110,7 +127,12 @@ today, not just a description of the design:
   keep that fallback/validation logic honest.
 - **No Rust toolchain on a stock beam.** `beam-bootstrap` is always built
   elsewhere and copied over (`tsh beams scp`) — never assume `cargo` is
-  available inside a beam itself.
+  available inside a beam itself. If a beam already has `beam-bootstrap`
+  (any prior bootstrap run leaves it on `PATH` — see
+  `bootstrap/README.md`'s "PATH" section) and you need `cargo`/`go` there
+  anyway (e.g. to build and test a change to this repo's own Rust code,
+  in-session), use its `install-toolchain-rust`/`install-toolchain-go`
+  task instead of installing by hand — see "Task runner" above.
 - **State that can't be derived should be tracked explicitly**: the client
   keeps `~/.config/beams-client/state.json` (purpose → beam id) because
   there's no server-side way to label a beam. Follow that pattern rather
