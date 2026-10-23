@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use super::{Task, Template};
 use crate::graph::Capability;
-use crate::pathutil::expand_tilde;
+use crate::sshagent::discover_ssh_auth_sock;
 
 /// How often to poll `ssh-add -l` while waiting, and how long to wait
 /// before giving up - overridable via env vars (`BEAM_BOOTSTRAP_SSH_WAIT_*`)
@@ -46,15 +46,11 @@ impl WaitSshAgentUnlock {
     /// counts as unlocked - the other two both just mean "keep waiting".
     ///
     /// Critically, this always runs `ssh-add` with an explicit
-    /// `SSH_AUTH_SOCK` discovered via `discover_ssh_auth_sock` rather
-    /// than whatever this process already inherited - see that
-    /// function's doc comment for why relying on the inherited
-    /// environment here never worked at all (not "sometimes races the
-    /// unlock", just unconditionally broken): confirmed live on a real
-    /// beam, `/proc/<daemon-pid>/environ` had no SSH variables
-    /// whatsoever, so a bare `ssh-add -l` from inside the daemon reported
-    /// "no agent" forever regardless of whether a human had actually
-    /// unlocked the key in the dedicated pane.
+    /// `SSH_AUTH_SOCK` from `sshagent::discover_ssh_auth_sock` rather
+    /// than whatever this process already inherited - see that module's
+    /// doc comment for why relying on the inherited environment here
+    /// never worked at all (not "sometimes races the unlock", just
+    /// unconditionally broken).
     fn has_identity() -> bool {
         let mut cmd = Command::new(Self::ssh_add_bin());
         cmd.arg("-l");
@@ -67,49 +63,6 @@ impl WaitSshAgentUnlock {
 
 fn env_duration_ms(var: &str) -> Option<Duration> {
     std::env::var(var).ok()?.parse::<u64>().ok().map(Duration::from_millis)
-}
-
-/// Where `bin/ssh-agent-init` persists the agent's env (`SSH_AUTH_SOCK`/
-/// `SSH_AGENT_PID`) once it starts one - `${XDG_RUNTIME_DIR:-$HOME/.ssh}/agent.env`,
-/// matching that script's own `env_file` exactly. Overridable via
-/// `BEAM_BOOTSTRAP_SSH_AGENT_ENV_FILE` purely for tests, same pattern as
-/// `ssh_add_bin`'s override.
-fn agent_env_path() -> std::path::PathBuf {
-    if let Ok(path) = std::env::var("BEAM_BOOTSTRAP_SSH_AGENT_ENV_FILE") {
-        return std::path::PathBuf::from(path);
-    }
-    match std::env::var("XDG_RUNTIME_DIR") {
-        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir).join("agent.env"),
-        _ => expand_tilde("~/.ssh/agent.env"),
-    }
-}
-
-/// Finds the real ssh-agent socket to talk to, regardless of what (if
-/// anything) this process's *own* environment already has. This matters
-/// because `WaitSshAgentUnlock` runs inside `beam-bootstrapd`, a
-/// long-lived daemon started once, early, by `bin/beam-shell` - before
-/// `bin/ssh-agent-init` ever runs (see that script's own step ordering)
-/// - and a process's environment is fixed at its own startup; it never
-/// picks up a later interactive shell's `source ssh-agent-init`. Without
-/// this, `ssh-add -l` run from inside the daemon would report "no agent"
-/// forever, independent of whether the key is actually unlocked.
-///
-/// Prefers an already-set `SSH_AUTH_SOCK` (e.g. a bare `run-task`/`task
-/// run` invoked directly from an interactive shell that already has one)
-/// over `agent_env_path()`'s file, so this doesn't fight a caller that
-/// already knows the right socket.
-fn discover_ssh_auth_sock() -> Option<String> {
-    if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
-        if !sock.is_empty() {
-            return Some(sock);
-        }
-    }
-
-    let contents = std::fs::read_to_string(agent_env_path()).ok()?;
-    contents.lines().find_map(|line| {
-        let value = line.trim().strip_prefix("SSH_AUTH_SOCK=")?;
-        Some(value.split(';').next().unwrap_or(value).to_string())
-    })
 }
 
 impl Task for WaitSshAgentUnlock {

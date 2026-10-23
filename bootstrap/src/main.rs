@@ -5,6 +5,7 @@ mod executor;
 mod graph;
 mod pathutil;
 mod releaseutil;
+mod sshagent;
 mod steps;
 mod taskcli;
 mod tasks;

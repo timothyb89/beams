@@ -8,6 +8,7 @@ use anyhow::Context;
 use super::{Task, Template};
 use crate::graph::Capability;
 use crate::releaseutil::run_streaming;
+use crate::sshagent::discover_ssh_auth_sock;
 
 /// Clones `repo` to `dest` with a plain `git clone` - no assumptions
 /// about what kind of repo it is (GitHub, a beam, anything `git` itself
@@ -19,6 +20,16 @@ use crate::releaseutil::run_streaming;
 /// (see `AGENTS.md`), but that task can at least wait for it to have
 /// happened before this one tries to use the key. An https:// or local
 /// filesystem `repo` has no such requirement.
+///
+/// Waiting for the unlock isn't enough on its own, though: `run()` also
+/// passes `git` an explicit `SSH_AUTH_SOCK` via `sshagent`, for the same
+/// reason `wait_ssh_agent_unlock` needs it - this runs inside
+/// `beam-bootstrapd`, whose own environment never has one (see
+/// `sshagent`'s module doc comment). Found live, one task after fixing
+/// `wait_ssh_agent_unlock` itself: it correctly reported the agent
+/// unlocked, then the clone right after it failed anyway with `git@
+/// github.com: Permission denied (publickey)` - `git`'s own `ssh`
+/// subprocess had no socket to find the now-unlocked key through either.
 pub struct CloneGitRepo {
     pub repo: String,
     pub dest: PathBuf,
@@ -73,15 +84,14 @@ impl Task for CloneGitRepo {
         // suppresses) - one line per update rather than repeatedly
         // overwriting a single line with `\r`, so `run_streaming`'s
         // plain line-based reader sees each one.
-        run_streaming(
-            Command::new("git").args([
-                "clone",
-                "--progress",
-                &self.repo,
-                &self.dest.display().to_string(),
-            ]),
-            progress,
-        )?;
+        let mut cmd = Command::new("git");
+        cmd.args(["clone", "--progress", &self.repo, &self.dest.display().to_string()]);
+        if self.needs_ssh_agent() {
+            if let Some(sock) = discover_ssh_auth_sock() {
+                cmd.env("SSH_AUTH_SOCK", sock);
+            }
+        }
+        run_streaming(&mut cmd, progress)?;
 
         Ok(Some(format!("cloned {} into {}", self.repo, self.dest.display())))
     }
