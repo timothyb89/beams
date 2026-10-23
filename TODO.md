@@ -541,6 +541,37 @@ anything above
   section above) gives it something real to publish. Still a manual
   step today (`tsh beams publish $BEAM_ALIAS`), not automated by either
   binary.
+  - **Known issue, root cause not confirmed**: code-server's websocket
+    connection fails (browser console: `WebSocket close with status
+    code 1006`) when reached through a published HTTP app, even though
+    the initial page load works. Ruled out: code-server itself (a local
+    `curl -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" ...`
+    straight to `127.0.0.1:8080` gets a clean `101 Switching Protocols`
+    on this beam); same-origin/CORS (the wss:// URL the page itself
+    generates already correctly uses the published app's own hostname,
+    computed server-side from the forwarded `Host` header - so the
+    "random suffix" in the app name isn't actually a config-coordination
+    problem, there's no separate allow-list to keep in sync with it);
+    HTTP/2-vs-websocket at the browser-facing edge (`curl -v` against
+    the public app address shows ALPN negotiating plain `http/1.1`, not
+    `h2`, so it's not the classic "h2 doesn't support Upgrade: websocket"
+    failure mode at that hop). `tsh apps ls --format json` shows the
+    published app's backend `uri` is `https://<this beam's own eth0
+    IP>:8443` with `tls.mode: verify-spiffe-id` - i.e. `tsh beams
+    publish` doesn't point Teleport at `127.0.0.1:8080` directly; there's
+    a root-owned ingress agent already listening on the beam (ports
+    8443/8444, outside this repo's code entirely - part of the beam
+    image) that mTLS-terminates via SPIFFE workload identity and
+    forwards to the real local port. Best remaining suspect: that
+    Teleport-proxy-to-beam-ingress hop (likely HTTP/2/gRPC-based, given
+    the mTLS/workload-identity setup) not tunneling a websocket Upgrade
+    across it - couldn't confirm directly, since this session's
+    delegated identity gets `access denied: identity is not allowed to
+    reissue certificates` on `tsh apps login` (can't drive the same path
+    a real browser would from here). Next step: try `tsh beams publish
+    --tcp` instead (raw TCP passthrough, no HTTP-aware reverse proxying)
+    plus `tsh proxy app` locally as a workaround/isolation test - from a
+    real (non-delegated) `tsh login` session, not this beam's own.
 - [ ] No cleanup/expiry helper on the client side beyond the 5-beam cap
   check at spawn time — e.g. a `beams ls`/`beams rm` convenience wrapper
   around `tsh beams ls/rm`, or a warning when a tracked purpose's beam is
