@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -79,11 +80,8 @@ impl Task for CloneGitRepo {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
 
-        // `--progress` makes git report percent-complete on stderr even
-        // when it isn't talking to a terminal (which it otherwise
-        // suppresses) - one line per update rather than repeatedly
-        // overwriting a single line with `\r`, so `run_streaming`'s
-        // plain line-based reader sees each one.
+        // `--progress` makes git report percent-complete even when it
+        // isn't talking to a terminal (which it otherwise suppresses).
         let mut cmd = Command::new("git");
         cmd.args(["clone", "--progress", &self.repo, &self.dest.display().to_string()]);
         if self.needs_ssh_agent() {
@@ -91,7 +89,29 @@ impl Task for CloneGitRepo {
                 cmd.env("SSH_AUTH_SOCK", sock);
             }
         }
-        run_streaming(&mut cmd, progress)?;
+        // Reduces each raw update (`run_streaming` already splits git's
+        // own `\r`-delimited ticks into one call per tick - see that
+        // function's doc comment) down to just the phase name and
+        // percentage, dropping the object-count/transfer-rate noise
+        // (e.g. "remote: Counting objects:  43% (430/1000)" becomes
+        // "Counting objects: 43%") - a line with no percentage at all
+        // (the initial "Cloning into '...'" or a final "done.") is
+        // forwarded as-is rather than dropped, since those still mark a
+        // real phase transition worth showing.
+        //
+        // `last_summary` dedupes consecutive identical summaries - a
+        // real clone of a large repo (confirmed live against
+        // gravitational/core) emits the *same* percentage several times
+        // in a row (e.g. a dozen `Receiving objects: 21%` updates back
+        // to back, since several individual objects can round to the
+        // same percent), which would otherwise mean a dozen identical
+        // broadcasts/TUI-row updates for one real change in progress.
+        let last_summary = RefCell::new(None::<String>);
+        run_streaming(&mut cmd, &|line| {
+            if let Some(message) = dedup_progress(&last_summary, line) {
+                progress(&message);
+            }
+        })?;
 
         Ok(Some(format!("cloned {} into {}", self.repo, self.dest.display())))
     }
@@ -99,6 +119,50 @@ impl Task for CloneGitRepo {
 
 impl Template for CloneGitRepo {
     const NAME: &'static str = "clone-git-repo";
+}
+
+/// Reduces one raw `git clone --progress` update to `"<phase>: <N>%"`,
+/// dropping everything else on the line (object counts, transfer rate,
+/// the `remote: ` prefix a line forwarded from the remote side carries).
+/// `None` if `line` doesn't contain a percentage at all (e.g. `"Cloning
+/// into '...'"`. `"Resolving deltas: 100% (5/5), done."` or `"done."`).
+///
+/// Finds the first run of ASCII digits immediately followed by `%`,
+/// rather than assuming a fixed line shape - git's own phase names
+/// ("Counting objects", "Compressing objects", "Receiving objects",
+/// "Resolving deltas") aren't otherwise enumerated here, so a future
+/// phase this hasn't seen yet still summarizes correctly.
+fn summarize_progress(line: &str) -> Option<String> {
+    let line = line.trim();
+    let percent_end = line.find('%')?;
+    let digits_start = line[..percent_end].rfind(|c: char| !c.is_ascii_digit()).map(|i| i + 1).unwrap_or(0);
+    let percent = &line[digits_start..percent_end];
+    if percent.is_empty() {
+        return None;
+    }
+
+    let phase = line[..digits_start].trim().trim_end_matches(':').trim();
+    let phase = phase.strip_prefix("remote:").map(str::trim).unwrap_or(phase);
+
+    Some(format!("{phase}: {percent}%"))
+}
+
+/// Summarizes `line` via `summarize_progress`, then drops it (returning
+/// `None`) if it's identical to the last *summarized* line this `last`
+/// cell has seen - see `run_with_progress`'s call site for why that
+/// matters. A line with no percentage at all is never deduped (and
+/// doesn't update `last`): those are rare, one-off phase-transition
+/// markers ("Cloning into '...'", "done."), not a repeating tick.
+fn dedup_progress(last: &RefCell<Option<String>>, line: &str) -> Option<String> {
+    let Some(summary) = summarize_progress(line) else {
+        return Some(line.to_string());
+    };
+    let mut last = last.borrow_mut();
+    if last.as_deref() == Some(summary.as_str()) {
+        return None;
+    }
+    *last = Some(summary.clone());
+    Some(summary)
 }
 
 #[cfg(test)]
@@ -198,5 +262,110 @@ mod tests {
         let ssh_url =
             CloneGitRepo { repo: "ssh://git@github.com/org/repo.git".into(), dest: PathBuf::from("/tmp/w") };
         assert_eq!(ssh_url.requires(), vec![Capability::from(crate::tasks::cap::SSH_AGENT_UNLOCKED)]);
+    }
+
+    #[test]
+    fn summarize_progress_extracts_phase_and_percent_dropping_the_rest() {
+        assert_eq!(
+            summarize_progress("remote: Counting objects:  43% (430/1000)"),
+            Some("Counting objects: 43%".to_string())
+        );
+        assert_eq!(
+            summarize_progress("Receiving objects:  43% (430/1000), 26.69 KiB | 455.00 KiB/s"),
+            Some("Receiving objects: 43%".to_string())
+        );
+        assert_eq!(
+            summarize_progress("Resolving deltas: 100% (5/5), done."),
+            Some("Resolving deltas: 100%".to_string())
+        );
+    }
+
+    #[test]
+    fn summarize_progress_is_none_for_a_line_with_no_percentage() {
+        assert_eq!(summarize_progress("Cloning into '/tmp/x'..."), None);
+        assert_eq!(summarize_progress("done."), None);
+    }
+
+    #[test]
+    fn dedup_progress_drops_a_repeated_identical_percentage() {
+        let last = RefCell::new(None);
+        assert_eq!(
+            dedup_progress(&last, "Receiving objects:  21% (1/5)"),
+            Some("Receiving objects: 21%".to_string())
+        );
+        // Same phase and percent again - e.g. a second object that
+        // happens to round to the same tick - should be dropped.
+        assert_eq!(dedup_progress(&last, "Receiving objects:  21% (2/5)"), None);
+        // A real change (percent *or* phase) should always come through.
+        assert_eq!(
+            dedup_progress(&last, "Receiving objects:  22% (3/5)"),
+            Some("Receiving objects: 22%".to_string())
+        );
+        assert_eq!(
+            dedup_progress(&last, "Resolving deltas:  22% (1/9)"),
+            Some("Resolving deltas: 22%".to_string())
+        );
+    }
+
+    #[test]
+    fn dedup_progress_never_drops_a_no_percentage_line() {
+        let last = RefCell::new(Some("Receiving objects: 50%".to_string()));
+        // Even though it doesn't match the cached summary (it can't -
+        // it's not a percentage line at all), a phase-transition marker
+        // should always be forwarded, not deduped against unrelated state.
+        assert_eq!(dedup_progress(&last, "done."), Some("done.".to_string()));
+    }
+
+    /// Regression test for the actual bug reported live: before
+    /// `run_streaming` was fixed to split on `\r` as well as `\n`, every
+    /// `\r`-delimited tick within one phase got buffered into a single
+    /// giant concatenated string instead of one call per tick - this
+    /// clones a real multi-object local repo (one commit alone doesn't
+    /// produce enough objects for git to emit more than a single
+    /// progress tick) and confirms every reported line is short and, if
+    /// it mentions a percentage at all, in the clean "<phase>: N%" shape
+    /// `summarize_progress` produces - not hundreds of ticks glued
+    /// together.
+    #[test]
+    fn progress_lines_are_individual_ticks_not_one_giant_concatenated_blob() {
+        let tmp = std::env::temp_dir().join(format!("clone-git-repo-ticks-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let source = tmp.join("source");
+        let dest = tmp.join("dest");
+        fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q", "-b", "main"]);
+        git(&source, &["config", "user.email", "test@example.com"]);
+        git(&source, &["config", "user.name", "test"]);
+        for i in 0..30 {
+            fs::write(source.join(format!("f{i}")), format!("{i}")).unwrap();
+        }
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-q", "-m", "many files"]);
+
+        let task = CloneGitRepo { repo: source.display().to_string(), dest: dest.clone() };
+        let lines = std::sync::Mutex::new(Vec::<String>::new());
+        task.run_with_progress(&|line| lines.lock().unwrap().push(line.to_string()))
+            .expect("clone should succeed")
+            .expect("first run should report work done, not a skip");
+
+        let lines = lines.lock().unwrap();
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                line.len() < 80,
+                "expected a short per-tick line, got a {}-byte blob: {line:?}",
+                line.len()
+            );
+            if line.contains('%') {
+                assert!(
+                    line.matches('%').count() == 1,
+                    "expected one summarized percentage per line, got multiple in {line:?}"
+                );
+            }
+            if let Some(previous) = i.checked_sub(1).map(|j| &lines[j]) {
+                assert_ne!(previous, line, "deduping should have dropped this repeat");
+            }
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

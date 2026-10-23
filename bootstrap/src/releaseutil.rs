@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -74,13 +74,22 @@ pub fn run(cmd: &mut Command) -> anyhow::Result<()> {
 }
 
 /// Same contract as `run`, but for a command whose stderr is where
-/// incremental progress shows up (e.g. `git clone --progress`, which
-/// writes one line per update there when stderr isn't a tty rather than
-/// repeatedly overwriting one line with `\r`) - `on_line` is called once
-/// per line, in order, as the child produces them, *before* the overall
-/// success/failure of the call is known. The last line (if any) is also
-/// what ends up in the error message on failure, same as `run`'s
-/// `output.stderr` does.
+/// incremental progress shows up (e.g. `git clone --progress`) -
+/// `on_line` is called once per update, in order, as the child produces
+/// them, *before* the overall success/failure of the call is known. The
+/// last update (if any) is also what ends up in the error message on
+/// failure, same as `run`'s `output.stderr` does.
+///
+/// Deliberately reads raw bytes and splits on *either* `\r` or `\n`,
+/// not `std::io::BufRead::lines()` (which only splits on `\n`): tools
+/// like `git --progress` report each percent-complete tick by writing
+/// `\r` and reusing the same terminal line, with a real `\n` only at the
+/// very end of a whole phase ("Receiving objects: 100% (23/23), done.")
+/// - `lines()` would buffer every `\r`-separated update from one phase
+/// into a single giant concatenated "line" instead of calling `on_line`
+/// once per update, which is exactly the bug this replaced (confirmed
+/// live: a real clone's `on_line` calls were one-per-*phase*, each a
+/// huge string of every tick glued together, not one-per-tick).
 pub fn run_streaming(cmd: &mut Command, on_line: &dyn Fn(&str)) -> anyhow::Result<()> {
     let mut child = cmd
         .stdout(Stdio::null())
@@ -88,16 +97,37 @@ pub fn run_streaming(cmd: &mut Command, on_line: &dyn Fn(&str)) -> anyhow::Resul
         .spawn()
         .with_context(|| format!("spawning {cmd:?}"))?;
 
-    let stderr = child.stderr.take().expect("stderr was piped above");
+    let mut stderr = child.stderr.take().expect("stderr was piped above");
+    let mut pending = Vec::new();
+    let mut chunk = [0u8; 4096];
     let mut last_line = String::new();
-    for line in BufReader::new(stderr).lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
-            continue;
+
+    let mut flush = |pending: &mut Vec<u8>| {
+        if pending.is_empty() {
+            return;
         }
-        on_line(&line);
-        last_line = line;
+        let text = String::from_utf8_lossy(pending).trim().to_string();
+        pending.clear();
+        if !text.is_empty() {
+            on_line(&text);
+            last_line = text;
+        }
+    };
+
+    loop {
+        let n = stderr.read(&mut chunk).with_context(|| format!("reading stderr of {cmd:?}"))?;
+        if n == 0 {
+            break;
+        }
+        for &byte in &chunk[..n] {
+            if byte == b'\r' || byte == b'\n' {
+                flush(&mut pending);
+            } else {
+                pending.push(byte);
+            }
+        }
     }
+    flush(&mut pending);
 
     let status = child.wait().with_context(|| format!("waiting for {cmd:?}"))?;
     if !status.success() {
