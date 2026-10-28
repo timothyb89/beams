@@ -1,10 +1,11 @@
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use serde::Deserialize;
+
+use crate::session;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BeamInfo {
@@ -102,16 +103,37 @@ pub fn scp_dir(local_dir: &Path, beam_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Execs (replacing this process) into `tsh ssh -t <login>@<uuid> --
-/// <command>`, bypassing the `tsh beams` layer per project.md - it takes a
-/// trailing command (and a real PTY via -t) where `tsh beams ssh` doesn't.
-/// Never returns on success; the whole point is to hand off the terminal.
-pub fn ssh_exec(login: &str, uuid: &str, command: &[String]) -> anyhow::Result<()> {
+/// Runs `tsh ssh -t <login>@<uuid> -- <command>` under the client's local
+/// PTY supervisor. This still bypasses the `tsh beams` layer per project.md
+/// (it cannot take a remote command), but unlike the old `exec(2)` handoff it
+/// leaves `beams` alive to intercept the local menu prefix and, later, service
+/// approval requests.
+pub fn ssh_interactive(
+    login: &str,
+    beam_id: &str,
+    uuid: &str,
+    command: &[String],
+    escape_key: session::EscapeKey,
+) -> anyhow::Result<u8> {
     let target = format!("{login}@{uuid}");
-    let mut cmd = Command::new("tsh");
-    cmd.args(["ssh", "-t", &target, "--"]).args(command);
-    let err = cmd.exec(); // only returns on failure to exec
-    Err(err).context("running tsh ssh")
+    let mut args = vec![
+        "ssh".to_string(),
+        "-t".to_string(),
+        target,
+        "--".to_string(),
+    ];
+    args.extend(command.iter().cloned());
+    session::run(
+        "tsh",
+        &args,
+        session::ConnectionInfo {
+            beam_id,
+            beam_uuid: uuid,
+            login,
+        },
+        escape_key,
+    )
+    .context("running managed tsh ssh session")
 }
 
 /// The `ext::` git transport URL that pushes to `remote_path` (relative

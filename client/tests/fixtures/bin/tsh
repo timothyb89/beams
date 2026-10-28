@@ -1,0 +1,20 @@
+#!/bin/sh
+
+if [ "$1" = "beams" ] && [ "$2" = "ls" ]; then
+    printf '%s\n' '[{"id":"managed-session-test","uuid":"11111111-2222-3333-4444-555555555555","owner":"test@example.com","expires":"2099-01-01T00:00:00Z"}]'
+    exit 0
+fi
+
+if [ "$1" = "ssh" ]; then
+    printf 'REMOTE READY\r\n'
+    stty size
+    IFS= read -r line
+    printf 'REMOTE ECHO: %s\r\n' "$line"
+    sleep 1
+    exit 7
+fi
+
+printf 'unexpected fake tsh invocation:' >&2
+printf ' %s' "$@" >&2
+printf '\n' >&2
+exit 99

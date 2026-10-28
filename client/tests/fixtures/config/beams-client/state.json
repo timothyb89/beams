@@ -1,0 +1,9 @@
+{
+  "purposes": {
+    "managed-session-test": {
+      "beam_id": "managed-session-test",
+      "uuid": "11111111-2222-3333-4444-555555555555",
+      "created_at": "2026-10-28T00:00:00Z"
+    }
+  }
+}

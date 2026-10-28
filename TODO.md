@@ -534,9 +534,19 @@ typed request and observe status, but only the local `beams` client may approve
 and own a folder sync, port forward, or file copy. These are deliberately not
 bootstrap `Task`s.
 
-- [ ] Phase 1: replace `beams ssh`'s direct `exec` into `tsh` with a supervised
-  local PTY, byte passthrough, resize/signal/exit handling, a configurable
-  prefix key, and a local ratatui modal.
+- [x] Phase 1: `client/src/session.rs` replaces `beams ssh`'s direct `exec`
+  into `tsh` with a supervised portable PTY. Normal input/output remains raw
+  byte passthrough; local resize, child exit codes, Ctrl-C-as-input, and handled
+  termination signals propagate; every exit path restores terminal raw/cursor
+  state. `Ctrl-]` (configurable with `--escape-key`, including `none`) opens a
+  local ratatui connection menu, and a second press sends the literal byte
+  remotely. Remote output is drained into a bounded 1 MiB newest-data buffer
+  while the menu owns the screen, then restored before a resize-driven remote
+  redraw. The menu deliberately clears the existing screen instead of nesting
+  an alternate screen over zellij. Covered by pure byte-router/buffer tests and
+  real PTY tests for binary input, exit status, and resize visibility, plus
+  `client/tests/managed-session-smoke.sh` for the outer controlling-terminal
+  path and rendered menu.
 - [ ] Phase 2: add the per-user local `beams daemon`/`beamsd`, its permissioned
   UDS, typed/versioned protocol, persistent `client_id`, service/request state
   machines, atomic state, and frontend subscriptions.

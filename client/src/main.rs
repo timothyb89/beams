@@ -1,8 +1,10 @@
 mod stage;
 mod state;
+mod session;
 mod tsh;
 
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
@@ -44,22 +46,42 @@ enum Commands {
         /// Login to connect as.
         #[arg(long, default_value = DEFAULT_LOGIN)]
         login: String,
+        /// Local prefix key that opens the Beams service menu. Press it
+        /// twice to send the literal byte to the remote session. Accepts
+        /// values such as `ctrl-]`, `ctrl-g`, `0x1d`, one ASCII
+        /// character, or `none`.
+        #[arg(long, default_value = "ctrl-]")]
+        escape_key: session::EscapeKey,
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
-    match args.command {
+    let code = match args.command {
         Commands::Ssh {
             repo,
             purpose,
             region,
             login,
-        } => ssh(&expand_tilde(&repo), &purpose, region.as_deref(), &login),
-    }
+            escape_key,
+        } => ssh(
+            &expand_tilde(&repo),
+            &purpose,
+            region.as_deref(),
+            &login,
+            escape_key,
+        )?,
+    };
+    Ok(ExitCode::from(code))
 }
 
-fn ssh(repo: &Path, purpose: &str, region: Option<&str>, login: &str) -> anyhow::Result<()> {
+fn ssh(
+    repo: &Path,
+    purpose: &str,
+    region: Option<&str>,
+    login: &str,
+    escape_key: session::EscapeKey,
+) -> anyhow::Result<u8> {
     let mut state = state::State::load()?;
     let beams = tsh::list_beams()?;
 
@@ -126,7 +148,13 @@ fn ssh(repo: &Path, purpose: &str, region: Option<&str>, login: &str) -> anyhow:
     };
 
     eprintln!("beams: connecting to {} ({})...", beam.id, beam.uuid);
-    tsh::ssh_exec(login, &beam.uuid, &["~/beams/bin/beam-shell".to_string()])
+    tsh::ssh_interactive(
+        login,
+        &beam.id,
+        &beam.uuid,
+        &["~/beams/bin/beam-shell".to_string()],
+        escape_key,
+    )
 }
 
 /// Does `beam` have more than `hours` of TTL left? Beams can't have their

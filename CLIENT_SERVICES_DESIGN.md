@@ -317,7 +317,7 @@ Use a prefix-style escape key (proposed default: `Ctrl-]`):
 
 While the palette is open, remote output is drained into a bounded buffer so a
 chatty process cannot deadlock on a full PTY or consume unbounded memory. The
-local UI enters its own alternate screen and offers:
+local UI temporarily clears and owns the current terminal screen and offers:
 
 - active services for this Beam, with owner and status;
 - create folder sync;
@@ -326,10 +326,12 @@ local UI enters its own alternate screen and offers:
 - pending remote approvals;
 - stop/restart/details actions.
 
-On close, restore the terminal and force a remote redraw via PTY resize
-(`SIGWINCH` propagation). If a full-screen application still renders badly,
-offer a configurable redraw byte (normally `Ctrl-L`) rather than always
-injecting input into the remote session.
+It deliberately does **not** enter another terminal alternate screen: the
+remote zellij process normally already owns that mode, and alternate screens
+are not safely nestable. On close, clear the palette and force a remote redraw
+via PTY resize (`SIGWINCH` propagation). If a full-screen application still
+renders badly, offer a configurable redraw byte (normally `Ctrl-L`) rather than
+always injecting input into the remote session.
 
 This is a modal takeover, not a terminal emulator. Rendering the remote screen
 into a local ratatui widget would require a VT parser, mouse-mode translation,
@@ -462,9 +464,13 @@ multiplexing.
 
 Then run an OpenSSH compatibility spike:
 
-1. Generate an isolated SSH config from `tsh config`, or use
-   `tsh proxy ssh` as `ProxyCommand`, without modifying the user's global SSH
-   config.
+1. Generate an isolated SSH config from `tsh config` when running with a normal
+   client profile, or construct its predictable Teleport `ProxyCommand`
+   directly. `tsh config` is known to reject the tbot identity-file setup used
+   inside Beams (`tsh config command is not supported with identity files`);
+   `~/.teleport-bot/identity/tim-beams.beams.sh.ssh_config` is a working
+   example whose `tbot ssh-proxy-command` can be reproduced without invoking
+   `tsh config`. Do not modify the user's global SSH config.
 2. Start one `ControlMaster`/control socket per
    `(Teleport profile, cluster, Teleport user, Beam login, Beam UUID)`.
 3. Exercise an interactive PTY, remote bridge command, `-L`, `scp`/SFTP, and

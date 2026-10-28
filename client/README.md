@@ -44,12 +44,40 @@ beams ssh [--repo ~/beams] [--purpose default] [--region REGION] [--login beams]
    native one, refusing to ship anything that isn't a Linux ELF binary.)
 5. Connects with `tsh ssh -t <login>@<uuid> -- ~/beams/bin/beam-shell` -
    bypassing the `tsh beams ssh` layer (which can't take a remote command)
-   in favor of plain `tsh ssh`, per project.md. `beam-shell` unlocks the
-   ssh-agent key, kicks off `beam-bootstrap` in the background, and drops
-   you into zellij with a log pane - see `../bootstrap/README.md`.
+   in favor of plain `tsh ssh`, per project.md. Unlike the original direct
+   `exec` handoff, `beams` now supervises `tsh` under a local PTY: terminal
+   bytes, resize events, exit status, and signals still pass through, while
+   `Ctrl-]` can temporarily open a local menu over the remote session.
+   `beam-shell` unlocks the ssh-agent key, kicks off `beam-bootstrap` in the
+   background, and drops you into zellij with a log pane - see
+   `../bootstrap/README.md`.
 
 On reuse, steps 3-4 are skipped entirely - a reused beam is assumed to
 already be bootstrapped from a prior run.
+
+## Managed SSH session and local menu
+
+During `beams ssh`, press `Ctrl-]` to open the workstation-side Beams menu.
+Press `q`, escape, or enter to close it; press `Ctrl-]` a second time to close
+the menu and send a literal `Ctrl-]` byte to the remote terminal. Configure the
+prefix with `--escape-key`:
+
+```sh
+beams ssh --escape-key ctrl-g
+beams ssh --escape-key 0x1d
+beams ssh --escape-key none   # pure passthrough; local menu disabled
+```
+
+The first implementation's menu only shows connection status. It is the PTY/UI
+foundation for the client-owned folder-sync, port-forward, copy, and approval
+controls in `../CLIENT_SERVICES_DESIGN.md`.
+
+The client does not nest another terminal alternate screen over remote zellij
+(alternate-screen state is not stackable). It drains up to 1 MiB of remote
+output while the menu is visible, restores that output on close, and briefly
+resizes/restores the child PTY to make the remote application redraw. Terminal
+raw mode and cursor visibility are restored on normal exit, errors, and handled
+termination signals.
 
 ## State
 
@@ -67,3 +95,15 @@ cd client
 cargo build --release
 ./target/release/beams ssh
 ```
+
+Tests:
+
+```sh
+cargo test
+./tests/managed-session-smoke.sh
+```
+
+The smoke test is Unix-specific (`script(1)` + a fake `tsh` fixture) and
+exercises the compiled client inside a real controlling terminal: local menu
+rendering, raw input around the prefix, PTY size propagation, deferred remote
+output, and child exit-code propagation.
