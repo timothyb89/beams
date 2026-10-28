@@ -39,6 +39,8 @@ use beams_protocol::{RequestStatus, ServiceAction, ServiceRequestKind};
 use crate::clientd::{Frontend, RequestRecord, ServerEvent, ServiceRecord};
 
 const LOOP_TICK: Duration = Duration::from_millis(25);
+const INPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
+const MAX_INPUT_SEQUENCE_LEN: usize = 64;
 const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
 const DAEMON_RECONNECT_RETRY: Duration = Duration::from_secs(1);
 const DEFERRED_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -279,7 +281,7 @@ fn drive(
     terminal_state: &mut TerminalState,
     local_daemon: &mut LocalDaemon,
 ) -> anyhow::Result<u8> {
-    let mut input_mode = InputMode::Passthrough;
+    let mut input_router = InputRouter::default();
     let mut deferred = DeferredOutput::default();
     let mut output_finished = false;
     let mut daemon_view = DaemonView::new(local_daemon);
@@ -292,20 +294,25 @@ fn drive(
             close_palette(
                 master,
                 terminal_state,
-                &mut input_mode,
+                &mut input_router.mode,
                 &mut deferred,
                 last_size,
             )?;
             return Ok((128 + signal).clamp(1, 255) as u8);
         }
 
-        drain_output(output_rx, input_mode, &mut deferred, &mut output_finished)?;
+        drain_output(
+            output_rx,
+            input_router.mode,
+            &mut deferred,
+            &mut output_finished,
+        )?;
 
         if let Some(status) = child.try_wait().context("polling tsh child")? {
             close_palette(
                 master,
                 terminal_state,
-                &mut input_mode,
+                &mut input_router.mode,
                 &mut deferred,
                 last_size,
             )?;
@@ -317,13 +324,17 @@ fn drive(
             if size != last_size {
                 master.resize(size).context("resizing local PTY")?;
                 last_size = size;
-                if input_mode == InputMode::Palette {
+                if input_router.mode == InputMode::Palette {
                     draw_palette(info, escape_key, &daemon_view)?;
                 }
             }
         }
 
-        if stdin_ready(LOOP_TICK).context("polling terminal input")? {
+        let now = Instant::now();
+        let mut actions =
+            input_router.flush_expired(escape_key, daemon_view.forward_form.is_some(), now);
+        let poll_timeout = input_router.poll_timeout(now);
+        if stdin_ready(poll_timeout).context("polling terminal input")? {
             let mut bytes = [0u8; 4096];
             let read = io::stdin()
                 .read(&mut bytes)
@@ -333,85 +344,92 @@ fn drive(
                 close_palette(
                     master,
                     terminal_state,
-                    &mut input_mode,
+                    &mut input_router.mode,
                     &mut deferred,
                     last_size,
                 )?;
                 return Ok(0);
             }
 
-            for action in route_input(
-                &mut input_mode,
+            actions.extend(input_router.route(
                 escape_key,
                 daemon_view.forward_form.is_some(),
                 &bytes[..read],
-            ) {
-                match action {
-                    InputAction::Remote(bytes) => {
-                        writer.write_all(&bytes).context("writing to local PTY")?;
-                        writer.flush().context("flushing local PTY")?;
-                    }
-                    InputAction::OpenPalette => {
-                        terminal_state.open_palette()?;
-                        draw_palette(info, escape_key, &daemon_view)?;
-                    }
-                    InputAction::ClosePalette => {
-                        close_palette(
-                            master,
-                            terminal_state,
-                            &mut input_mode,
-                            &mut deferred,
-                            last_size,
-                        )?;
-                    }
-                    InputAction::ApprovePending => {
-                        daemon_view.decide(local_daemon, true);
-                        draw_palette(info, escape_key, &daemon_view)?;
-                    }
-                    InputAction::RejectPending => {
-                        daemon_view.decide(local_daemon, false);
-                        draw_palette(info, escape_key, &daemon_view)?;
-                    }
-                    InputAction::BeginForward => {
-                        daemon_view.forward_form = Some(ForwardForm::default());
-                        draw_palette(info, escape_key, &daemon_view)?;
-                    }
-                    InputAction::FormChar(byte) => {
-                        daemon_view.form_char(byte);
-                        draw_palette(info, escape_key, &daemon_view)?;
-                    }
-                    InputAction::FormBackspace => {
-                        daemon_view.form_backspace();
-                        draw_palette(info, escape_key, &daemon_view)?;
-                    }
-                    InputAction::FormNext => {
-                        daemon_view.form_next();
-                        draw_palette(info, escape_key, &daemon_view)?;
-                    }
-                    InputAction::SubmitForm => {
-                        daemon_view.submit_forward(local_daemon);
-                        draw_palette(info, escape_key, &daemon_view)?;
-                    }
-                    InputAction::CancelForm => {
-                        daemon_view.forward_form = None;
-                        draw_palette(info, escape_key, &daemon_view)?;
-                    }
-                    InputAction::StopService => {
-                        daemon_view.control_selected(local_daemon, ServiceAction::Stop);
-                        draw_palette(info, escape_key, &daemon_view)?;
-                    }
-                    InputAction::RestartService => {
-                        daemon_view.control_selected(local_daemon, ServiceAction::Restart);
-                        draw_palette(info, escape_key, &daemon_view)?;
-                    }
-                    InputAction::NextService => {
-                        daemon_view.select_next();
-                        draw_palette(info, escape_key, &daemon_view)?;
-                    }
-                    InputAction::PreviousService => {
-                        daemon_view.select_previous();
-                        draw_palette(info, escape_key, &daemon_view)?;
-                    }
+                Instant::now(),
+            ));
+        }
+        actions.extend(input_router.flush_expired(
+            escape_key,
+            daemon_view.forward_form.is_some(),
+            Instant::now(),
+        ));
+
+        for action in actions {
+            match action {
+                InputAction::Remote(bytes) => {
+                    writer.write_all(&bytes).context("writing to local PTY")?;
+                    writer.flush().context("flushing local PTY")?;
+                }
+                InputAction::OpenPalette => {
+                    terminal_state.open_palette()?;
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::ClosePalette => {
+                    close_palette(
+                        master,
+                        terminal_state,
+                        &mut input_router.mode,
+                        &mut deferred,
+                        last_size,
+                    )?;
+                }
+                InputAction::ApprovePending => {
+                    daemon_view.decide(local_daemon, true);
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::RejectPending => {
+                    daemon_view.decide(local_daemon, false);
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::BeginForward => {
+                    daemon_view.forward_form = Some(ForwardForm::default());
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::FormChar(byte) => {
+                    daemon_view.form_char(byte);
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::FormBackspace => {
+                    daemon_view.form_backspace();
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::FormNext => {
+                    daemon_view.form_next();
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::SubmitForm => {
+                    daemon_view.submit_forward(local_daemon);
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::CancelForm => {
+                    daemon_view.forward_form = None;
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::StopService => {
+                    daemon_view.control_selected(local_daemon, ServiceAction::Stop);
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::RestartService => {
+                    daemon_view.control_selected(local_daemon, ServiceAction::Restart);
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::NextService => {
+                    daemon_view.select_next();
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::PreviousService => {
+                    daemon_view.select_previous();
+                    draw_palette(info, escape_key, &daemon_view)?;
                 }
             }
         }
@@ -770,33 +788,149 @@ enum InputAction {
     PreviousService,
 }
 
-/// Routes bytes without decoding/re-encoding terminal escape sequences. This
-/// is the property that keeps normal SSH/zellij/mouse/paste behavior
-/// transparent. The palette's intentionally tiny phase-one keymap is also raw:
-/// q/Esc/Enter close it, while a second prefix sends the literal prefix byte.
-fn route_input(
-    mode: &mut InputMode,
-    escape_key: EscapeKey,
-    form_active: bool,
-    input: &[u8],
-) -> Vec<InputAction> {
-    let mut actions = Vec::new();
-    let mut remote = Vec::new();
+/// Routes terminal input while preserving the original bytes sent to the
+/// remote PTY. Modern terminal applications such as zellij can enable the
+/// Kitty CSI-u or xterm modifyOtherKeys protocols; in those modes Ctrl-J is
+/// represented by a sequence such as `ESC [ 106 ; 5 u`, not byte `0x0a`.
+/// We decode only enough to recognize local menu keys and otherwise forward
+/// each complete sequence exactly as received.
+#[derive(Debug)]
+struct InputRouter {
+    mode: InputMode,
+    pending: Vec<u8>,
+    pending_since: Option<Instant>,
+}
 
-    let flush_remote = |actions: &mut Vec<InputAction>, remote: &mut Vec<u8>| {
-        if !remote.is_empty() {
-            actions.push(InputAction::Remote(std::mem::take(remote)));
+impl Default for InputRouter {
+    fn default() -> Self {
+        Self {
+            mode: InputMode::Passthrough,
+            pending: Vec::new(),
+            pending_since: None,
         }
-    };
+    }
+}
 
-    for &byte in input {
-        match *mode {
+impl InputRouter {
+    fn route(
+        &mut self,
+        escape_key: EscapeKey,
+        form_active: bool,
+        input: &[u8],
+        now: Instant,
+    ) -> Vec<InputAction> {
+        let mut bytes = std::mem::take(&mut self.pending);
+        self.pending_since = None;
+        bytes.extend_from_slice(input);
+
+        let mut actions = Vec::new();
+        let mut remote = Vec::new();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            match parse_terminal_key(&bytes[offset..]) {
+                TerminalKeyParse::Incomplete => {
+                    self.pending.extend_from_slice(&bytes[offset..]);
+                    self.pending_since = Some(now);
+                    break;
+                }
+                TerminalKeyParse::Sequence { len, logical } => {
+                    self.route_key(
+                        escape_key,
+                        form_active,
+                        &bytes[offset..offset + len],
+                        logical,
+                        true,
+                        &mut actions,
+                        &mut remote,
+                    );
+                    offset += len;
+                }
+                TerminalKeyParse::Byte => {
+                    let byte = bytes[offset];
+                    self.route_key(
+                        escape_key,
+                        form_active,
+                        &bytes[offset..offset + 1],
+                        Some(byte),
+                        false,
+                        &mut actions,
+                        &mut remote,
+                    );
+                    offset += 1;
+                }
+            }
+        }
+        flush_remote(&mut actions, &mut remote);
+        actions
+    }
+
+    fn flush_expired(
+        &mut self,
+        escape_key: EscapeKey,
+        form_active: bool,
+        now: Instant,
+    ) -> Vec<InputAction> {
+        if self
+            .pending_since
+            .is_none_or(|since| now.duration_since(since) < INPUT_SEQUENCE_TIMEOUT)
+        {
+            return Vec::new();
+        }
+
+        let pending = std::mem::take(&mut self.pending);
+        self.pending_since = None;
+        let mut actions = Vec::new();
+        let mut remote = Vec::new();
+        for byte in pending {
+            self.route_key(
+                escape_key,
+                form_active,
+                &[byte],
+                Some(byte),
+                false,
+                &mut actions,
+                &mut remote,
+            );
+        }
+        flush_remote(&mut actions, &mut remote);
+        actions
+    }
+
+    fn poll_timeout(&self, now: Instant) -> Duration {
+        self.pending_since
+            .map(|since| {
+                INPUT_SEQUENCE_TIMEOUT
+                    .saturating_sub(now.saturating_duration_since(since))
+                    .min(LOOP_TICK)
+            })
+            .unwrap_or(LOOP_TICK)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn route_key(
+        &mut self,
+        escape_key: EscapeKey,
+        form_active: bool,
+        encoded: &[u8],
+        logical: Option<u8>,
+        terminal_sequence: bool,
+        actions: &mut Vec<InputAction>,
+        remote: &mut Vec<u8>,
+    ) {
+        let Some(byte) = logical else {
+            if self.mode == InputMode::Passthrough {
+                remote.extend_from_slice(encoded);
+            }
+            return;
+        };
+
+        match self.mode {
             InputMode::Passthrough if escape_key.byte() == Some(byte) => {
-                flush_remote(&mut actions, &mut remote);
-                *mode = InputMode::Palette;
+                flush_remote(actions, remote);
+                self.mode = InputMode::Palette;
                 actions.push(InputAction::OpenPalette);
             }
-            InputMode::Passthrough => remote.push(byte),
+            InputMode::Passthrough => remote.extend_from_slice(encoded),
             InputMode::Palette if form_active && byte == b'\x1b' => {
                 actions.push(InputAction::CancelForm);
             }
@@ -813,12 +947,12 @@ fn route_input(
                 actions.push(InputAction::FormChar(byte));
             }
             InputMode::Palette if escape_key.byte() == Some(byte) => {
-                *mode = InputMode::Passthrough;
+                self.mode = InputMode::Passthrough;
                 actions.push(InputAction::ClosePalette);
-                remote.push(byte);
+                remote.extend_from_slice(encoded);
             }
             InputMode::Palette if matches!(byte, b'q' | b'Q' | b'\x1b' | b'\r' | b'\n') => {
-                *mode = InputMode::Passthrough;
+                self.mode = InputMode::Passthrough;
                 actions.push(InputAction::ClosePalette);
             }
             InputMode::Palette if matches!(byte, b'y' | b'Y') => {
@@ -842,12 +976,126 @@ fn route_input(
             InputMode::Palette if matches!(byte, b'k' | b'K') => {
                 actions.push(InputAction::PreviousService);
             }
+            InputMode::Palette if terminal_sequence => {
+                // Ignore unsupported enhanced keys while the local menu owns
+                // the terminal instead of leaking their bytes remotely.
+            }
             InputMode::Palette => {
                 // Future service forms will extend this tiny state machine.
             }
         }
     }
-    flush_remote(&mut actions, &mut remote);
+}
+
+fn flush_remote(actions: &mut Vec<InputAction>, remote: &mut Vec<u8>) {
+    if !remote.is_empty() {
+        actions.push(InputAction::Remote(std::mem::take(remote)));
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TerminalKeyParse {
+    Byte,
+    Incomplete,
+    Sequence { len: usize, logical: Option<u8> },
+}
+
+fn parse_terminal_key(input: &[u8]) -> TerminalKeyParse {
+    if input.first() != Some(&b'\x1b') {
+        return TerminalKeyParse::Byte;
+    }
+    if input.len() == 1 {
+        return TerminalKeyParse::Incomplete;
+    }
+    if input[1] != b'[' {
+        return TerminalKeyParse::Byte;
+    }
+
+    let Some(relative_end) = input[2..]
+        .iter()
+        .position(|byte| (0x40..=0x7e).contains(byte))
+    else {
+        return if input.len() < MAX_INPUT_SEQUENCE_LEN {
+            TerminalKeyParse::Incomplete
+        } else {
+            TerminalKeyParse::Byte
+        };
+    };
+    let end = relative_end + 2;
+    let final_byte = input[end];
+    let parameters = &input[2..end];
+    let logical = match final_byte {
+        b'u' => parse_kitty_key(parameters),
+        b'~' => parse_modify_other_keys(parameters),
+        _ => None,
+    };
+    TerminalKeyParse::Sequence {
+        len: end + 1,
+        logical,
+    }
+}
+
+fn parse_kitty_key(parameters: &[u8]) -> Option<u8> {
+    let mut fields = parameters.split(|byte| *byte == b';');
+    let codepoint = parse_parameter(fields.next()?)?;
+    let modifiers = fields.next().and_then(parse_parameter).unwrap_or(1);
+    decode_terminal_key(codepoint, modifiers)
+}
+
+fn parse_modify_other_keys(parameters: &[u8]) -> Option<u8> {
+    let mut fields = parameters.split(|byte| *byte == b';');
+    if parse_parameter(fields.next()?)? != 27 {
+        return None;
+    }
+    let modifiers = parse_parameter(fields.next()?)?;
+    let codepoint = parse_parameter(fields.next()?)?;
+    decode_terminal_key(codepoint, modifiers)
+}
+
+fn parse_parameter(parameter: &[u8]) -> Option<u32> {
+    let primary = parameter.split(|byte| *byte == b':').next()?;
+    std::str::from_utf8(primary).ok()?.parse().ok()
+}
+
+fn decode_terminal_key(codepoint: u32, modifiers: u32) -> Option<u8> {
+    let byte = u8::try_from(codepoint).ok()?;
+    let flags = modifiers.saturating_sub(1);
+    const SHIFT: u32 = 1;
+    const ALT: u32 = 2;
+    const CONTROL: u32 = 4;
+    const CAPS_LOCK: u32 = 64;
+    const NUM_LOCK: u32 = 128;
+    if flags & !(SHIFT | CONTROL | CAPS_LOCK | NUM_LOCK) != 0 || flags & ALT != 0 {
+        return None;
+    }
+    if flags & CONTROL == 0 {
+        return Some(byte);
+    }
+    match byte {
+        b'?' => Some(0x7f),
+        b'@'..=b'_' => Some(byte & 0x1f),
+        b'a'..=b'z' => Some(byte.to_ascii_uppercase() & 0x1f),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn route_input(
+    mode: &mut InputMode,
+    escape_key: EscapeKey,
+    form_active: bool,
+    input: &[u8],
+) -> Vec<InputAction> {
+    let mut router = InputRouter {
+        mode: *mode,
+        ..InputRouter::default()
+    };
+    let actions = router.route(escape_key, form_active, input, Instant::now());
+    assert!(
+        router.pending.is_empty(),
+        "test input ended in a partial sequence"
+    );
+    *mode = router.mode;
     actions
 }
 
@@ -1364,6 +1612,82 @@ mod tests {
             vec![InputAction::ClosePalette, InputAction::Remote(vec![0x1d])]
         );
         assert_eq!(mode, InputMode::Passthrough);
+    }
+
+    #[test]
+    fn enhanced_keyboard_prefix_opens_palette_and_preserves_literal_sequence() {
+        let kitty_ctrl_bracket = b"\x1b[93;5u";
+        let mut mode = InputMode::Passthrough;
+        assert_eq!(
+            route_input(&mut mode, EscapeKey::default(), false, kitty_ctrl_bracket),
+            vec![InputAction::OpenPalette]
+        );
+        assert_eq!(mode, InputMode::Palette);
+
+        assert_eq!(
+            route_input(&mut mode, EscapeKey::default(), false, kitty_ctrl_bracket),
+            vec![
+                InputAction::ClosePalette,
+                InputAction::Remote(kitty_ctrl_bracket.to_vec()),
+            ]
+        );
+        assert_eq!(mode, InputMode::Passthrough);
+    }
+
+    #[test]
+    fn kitty_and_modify_other_keys_sequences_decode_control_keys() {
+        let now = Instant::now();
+        let mut router = InputRouter::default();
+        assert_eq!(
+            router.route(EscapeKey::Byte(b'\n'), false, b"\x1b[106;5u", now,),
+            vec![InputAction::OpenPalette]
+        );
+
+        router.mode = InputMode::Passthrough;
+        assert_eq!(
+            router.route(EscapeKey::Byte(b'\n'), false, b"\x1b[27;5;106~", now,),
+            vec![InputAction::OpenPalette]
+        );
+    }
+
+    #[test]
+    fn enhanced_sequences_can_span_reads_and_unmatched_input_is_unchanged() {
+        let now = Instant::now();
+        let mut router = InputRouter::default();
+        assert_eq!(
+            router.route(EscapeKey::default(), false, b"\x1b[93;", now),
+            Vec::<InputAction>::new()
+        );
+        assert_eq!(
+            router.route(
+                EscapeKey::default(),
+                false,
+                b"5u",
+                now + Duration::from_millis(1),
+            ),
+            vec![InputAction::OpenPalette]
+        );
+
+        router.mode = InputMode::Passthrough;
+        let mouse = b"\x1b[<0;12;9M";
+        assert_eq!(
+            router.route(EscapeKey::default(), false, mouse, now),
+            vec![InputAction::Remote(mouse.to_vec())]
+        );
+    }
+
+    #[test]
+    fn incomplete_escape_is_forwarded_after_the_sequence_timeout() {
+        let now = Instant::now();
+        let mut router = InputRouter::default();
+        assert_eq!(
+            router.route(EscapeKey::default(), false, b"\x1b", now),
+            Vec::<InputAction>::new()
+        );
+        assert_eq!(
+            router.flush_expired(EscapeKey::default(), false, now + INPUT_SEQUENCE_TIMEOUT,),
+            vec![InputAction::Remote(vec![b'\x1b'])]
+        );
     }
 
     #[test]

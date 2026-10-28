@@ -44,7 +44,9 @@ while [ ! -S "$SOCKET" ]; do
 done
 
 set +e
-printf 'hello\r\035q' |
+# zellij enables enhanced keyboard reporting on capable outer terminals.
+# Exercise Ctrl-] in its Kitty CSI-u form, not only as legacy byte 0x1d.
+printf 'hello\r\033[93;5uq' |
     env \
         PATH="$CLIENT_DIR/tests/fixtures/bin:$PATH" \
         XDG_CONFIG_HOME="$TEST_DIR/config" \

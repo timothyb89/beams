@@ -302,7 +302,10 @@ The current `ssh_exec` handoff must become a supervised PTY session.
 Normal mode is byte-for-byte passthrough:
 
 - local stdin is placed in raw mode;
-- bytes go to the child PTY except for the configurable escape key;
+- bytes go to the child PTY except for the configurable escape key; the input
+  router recognizes both its legacy control byte and enhanced Kitty CSI-u /
+  xterm modifyOtherKeys representation, since remote applications such as
+  zellij can enable those protocols in the local terminal;
 - child PTY output goes directly to local stdout;
 - terminal resize events update the child PTY, which `tsh` propagates to the
   remote PTY;
@@ -311,7 +314,8 @@ Normal mode is byte-for-byte passthrough:
 Use a prefix-style escape key (proposed default: `Ctrl-]`):
 
 - one press opens the local palette;
-- pressing it twice sends a literal `Ctrl-]` to the remote side;
+- pressing it twice sends `Ctrl-]` to the remote side using the terminal's
+  original encoding;
 - the selected key and escape behavior are printed once on connect and are
   configurable.
 

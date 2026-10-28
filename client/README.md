@@ -61,7 +61,7 @@ already be bootstrapped from a prior run.
 
 During `beams ssh`, press `Ctrl-]` to open the workstation-side Beams menu.
 Press `q`, escape, or enter to close it; press `Ctrl-]` a second time to close
-the menu and send a literal `Ctrl-]` byte to the remote terminal. Configure the
+the menu and send `Ctrl-]` to the remote terminal. Configure the
 prefix with `--escape-key`:
 
 ```sh
@@ -69,6 +69,11 @@ beams ssh --escape-key ctrl-g
 beams ssh --escape-key 0x1d
 beams ssh --escape-key none   # pure passthrough; local menu disabled
 ```
+
+The input router recognizes both legacy control bytes and the Kitty CSI-u /
+xterm modifyOtherKeys sequences that full-screen applications such as zellij
+can enable in modern terminals (including iTerm2). Unmatched terminal
+sequences are still forwarded byte-for-byte.
 
 The menu shows connection/bridge state, typed remote requests, and local
 services for the current Beam. A pending port-forward proposal displays its
@@ -178,8 +183,9 @@ cargo test
 The managed-session smoke test is Unix-specific (`script(1)` + a fake `tsh`
 fixture) and
 exercises the compiled client inside a real controlling terminal: local menu
-rendering, raw input around the prefix, PTY size propagation, deferred remote
-output, and child exit-code propagation.
+rendering (including an enhanced-keyboard Ctrl-] sequence), raw input around
+the prefix, PTY size propagation, deferred remote output, and child exit-code
+propagation.
 
 The client-bridge smoke test runs both real daemons and the real
 `beam-bootstrap client-bridge`, with only the outer SSH executable replaced by

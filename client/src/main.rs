@@ -51,7 +51,7 @@ enum Commands {
         #[arg(long, default_value = DEFAULT_LOGIN)]
         login: String,
         /// Local prefix key that opens the Beams service menu. Press it
-        /// twice to send the literal byte to the remote session. Accepts
+        /// twice to send the key to the remote session. Accepts
         /// values such as `ctrl-]`, `ctrl-g`, `0x1d`, one ASCII
         /// character, or `none`.
         #[arg(long, default_value = "ctrl-]")]

@@ -539,14 +539,17 @@ bootstrap `Task`s.
   byte passthrough; local resize, child exit codes, Ctrl-C-as-input, and handled
   termination signals propagate; every exit path restores terminal raw/cursor
   state. `Ctrl-]` (configurable with `--escape-key`, including `none`) opens a
-  local ratatui connection menu, and a second press sends the literal byte
-  remotely. Remote output is drained into a bounded 1 MiB newest-data buffer
-  while the menu owns the screen, then restored before a resize-driven remote
-  redraw. The menu deliberately clears the existing screen instead of nesting
-  an alternate screen over zellij. Covered by pure byte-router/buffer tests and
-  real PTY tests for binary input, exit status, and resize visibility, plus
-  `client/tests/managed-session-smoke.sh` for the outer controlling-terminal
-  path and rendered menu.
+  local ratatui connection menu, and a second press sends the key
+  remotely. The router also recognizes Kitty CSI-u and xterm modifyOtherKeys
+  encodings of the configured key, as used when zellij enables enhanced
+  keyboard reporting in terminals such as iTerm2, while preserving unmatched
+  sequences byte-for-byte. Remote output is drained into a bounded 1 MiB
+  newest-data buffer while the menu owns the screen, then restored before a
+  resize-driven remote redraw. The menu deliberately clears the existing
+  screen instead of nesting an alternate screen over zellij. Covered by pure
+  byte-router/buffer tests and real PTY tests for binary input, exit status,
+  and resize visibility, plus `client/tests/managed-session-smoke.sh` for the
+  outer controlling-terminal path and rendered menu.
 - [x] Phase 2: `beams daemon` is the single-instance per-user workstation
   daemon, auto-started by `beams ssh` (with `--no-client-daemon` as a
   troubleshooting escape hatch). `client/src/clientd.rs` provides a mode-0600
