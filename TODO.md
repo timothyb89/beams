@@ -632,6 +632,19 @@ bootstrap `Task`s.
   lifecycle/status/conflicts/recovery. Default to `--ignore-vcs` and
   `two-way-safe`; destructive replacement and local-wins behavior stay
   explicit.
+  - [x] Typed remote requests carry the Beam path, display-only local hint,
+    mode, VCS-ignore setting, and ignore rules without granting the Beam an
+    authoritative workstation path. Both local TUIs show lifecycle/conflict
+    state and route pause/resume/terminate proposals through local approval.
+  - [x] `beamsd` owns a private Mutagen data directory and mode-0700
+    `tsh`-dispatching wrappers, checks for Mutagen 0.18+, persists a
+    deterministic session name, validates both endpoints/settings when
+    adopting, and detaches rather than terminating on daemon shutdown.
+    Client creation/control is available from the hotkey menu and
+    `beams sync create/list/pause/resume/terminate`.
+  - [ ] Finish fake-Mutagen daemon recovery tests and a disposable-Beam
+    end-to-end run covering initial sync, both directions, conflict reporting,
+    pause/resume, and daemon-restart adoption.
 - [ ] Phase 7: run the isolated OpenSSH `ControlMaster`/`tsh proxy ssh`
   compatibility spike and add a multiplexed backend only if it passes
   Teleport auth renewal, MFA, recording, reconnect, PTY, forward, copy, and

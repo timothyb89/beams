@@ -837,7 +837,10 @@ fn request_service(hub: &Hub, request_id: Option<&str>, request: &Value, reply: 
                 reply.send(error_reply(request_id, "remote_host must not be empty and remote_port must be non-zero"));
             return;
         }
-        ServiceRequestKind::FileCopy { remote_path, .. } if remote_path.is_empty() => {
+        ServiceRequestKind::FileCopy { remote_path, .. }
+        | ServiceRequestKind::FolderSync { remote_path, .. }
+            if remote_path.is_empty() =>
+        {
             let _ = reply.send(error_reply(request_id, "remote_path must not be empty"));
             return;
         }

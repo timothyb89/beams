@@ -53,6 +53,7 @@ impl RequestStatus {
 pub enum ServiceStatus {
     Starting,
     Running,
+    Paused,
     Stopping,
     Stopped,
     Degraded,
@@ -67,24 +68,24 @@ impl ServiceStatus {
             (
                 Self::Starting,
                 Self::Running | Self::Stopping | Self::Stopped | Self::Error,
-            )
-                | (
-                    Self::Running,
-                    Self::Stopping
-                        | Self::Stopped
-                        | Self::Degraded
-                        | Self::Unknown
-                        | Self::Error
-                )
-                | (
-                    Self::Degraded,
-                    Self::Running | Self::Stopping | Self::Unknown | Self::Error
-                )
-                | (
-                    Self::Unknown,
-                    Self::Running | Self::Stopping | Self::Stopped | Self::Error
-                )
-                | (Self::Stopping, Self::Stopped | Self::Error)
+            ) | (
+                Self::Running,
+                Self::Paused
+                    | Self::Stopping
+                    | Self::Stopped
+                    | Self::Degraded
+                    | Self::Unknown
+                    | Self::Error
+            ) | (
+                Self::Degraded,
+                Self::Running | Self::Paused | Self::Stopping | Self::Unknown | Self::Error
+            ) | (
+                Self::Paused,
+                Self::Running | Self::Stopping | Self::Stopped | Self::Unknown | Self::Error
+            ) | (
+                Self::Unknown,
+                Self::Running | Self::Paused | Self::Stopping | Self::Stopped | Self::Error
+            ) | (Self::Stopping, Self::Stopped | Self::Error)
                 | (Self::Stopped | Self::Error, Self::Starting)
         );
         if valid {
@@ -100,6 +101,9 @@ impl ServiceStatus {
 pub enum ServiceAction {
     Stop,
     Restart,
+    Pause,
+    Resume,
+    Terminate,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -114,6 +118,26 @@ pub enum FileCopyDirection {
 pub enum OverwritePolicy {
     Deny,
     Replace,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FolderSyncMode {
+    TwoWaySafe,
+    TwoWayResolved,
+    OneWaySafe,
+    OneWayReplica,
+}
+
+impl FolderSyncMode {
+    pub fn as_mutagen(self) -> &'static str {
+        match self {
+            Self::TwoWaySafe => "two-way-safe",
+            Self::TwoWayResolved => "two-way-resolved",
+            Self::OneWaySafe => "one-way-safe",
+            Self::OneWayReplica => "one-way-replica",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -145,6 +169,20 @@ pub enum ServiceRequestKind {
         local_path_hint: Option<String>,
         overwrite: OverwritePolicy,
     },
+    FolderSync {
+        remote_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_path_hint: Option<String>,
+        mode: FolderSyncMode,
+        #[serde(default = "default_true")]
+        ignore_vcs: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ignores: Vec<String>,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl ServiceRequestKind {
@@ -152,6 +190,7 @@ impl ServiceRequestKind {
         match self {
             Self::LocalPortForward { .. } => "local_port_forward",
             Self::FileCopy { .. } => "file_copy",
+            Self::FolderSync { .. } => "folder_sync",
         }
     }
 }
@@ -327,6 +366,25 @@ mod tests {
     }
 
     #[test]
+    fn folder_sync_request_does_not_carry_an_authoritative_local_path() {
+        let request = ServiceRequest {
+            request_id: "sync-1".to_string(),
+            kind: ServiceRequestKind::FolderSync {
+                remote_path: "/home/beams/project".to_string(),
+                local_path_hint: Some("project".to_string()),
+                mode: FolderSyncMode::TwoWaySafe,
+                ignore_vcs: true,
+                ignores: vec!["target".to_string()],
+            },
+        };
+        let value = serde_json::to_value(BeamToClient::RequestSubmitted { request }).unwrap();
+        assert_eq!(value["request"]["kind"]["kind"], "folder_sync");
+        assert_eq!(value["request"]["kind"]["mode"], "two-way-safe");
+        assert_eq!(value["request"]["kind"]["local_path_hint"], "project");
+        assert!(value["request"]["kind"].get("local_path").is_none());
+    }
+
+    #[test]
     fn only_the_client_direction_contains_request_decisions() {
         let update = ClientToBeam::RequestStatus {
             request_id: "request-1".to_string(),
@@ -367,6 +425,14 @@ mod tests {
         assert_eq!(
             ServiceStatus::Starting.transition(ServiceStatus::Stopping),
             Ok(ServiceStatus::Stopping)
+        );
+        assert_eq!(
+            ServiceStatus::Running.transition(ServiceStatus::Paused),
+            Ok(ServiceStatus::Paused)
+        );
+        assert_eq!(
+            ServiceStatus::Paused.transition(ServiceStatus::Running),
+            Ok(ServiceStatus::Running)
         );
     }
 

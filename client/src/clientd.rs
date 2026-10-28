@@ -76,6 +76,9 @@ pub struct ServiceRecord {
     /// Workstation-only approved path. Never included in Beam projections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_path: Option<String>,
+    /// Workstation-only Mutagen session identity. Never included in Beam projections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutagen_session: Option<String>,
 }
 
 fn default_login() -> String {
@@ -134,6 +137,17 @@ enum ClientMessage {
         local_path: String,
         remote_path: String,
         overwrite: beams_protocol::OverwritePolicy,
+    },
+    CreateFolderSync {
+        request_id: String,
+        beam_id: String,
+        beam_uuid: String,
+        login: String,
+        local_path: String,
+        remote_path: String,
+        mode: beams_protocol::FolderSyncMode,
+        ignore_vcs: bool,
+        ignores: Vec<String>,
     },
     ControlService {
         service_id: String,
@@ -262,18 +276,30 @@ impl PersistedState {
                 service.status,
                 ServiceStatus::Starting
                     | ServiceStatus::Running
+                    | ServiceStatus::Paused
                     | ServiceStatus::Stopping
                     | ServiceStatus::Degraded
                     | ServiceStatus::Unknown
             ) {
-                service.status = ServiceStatus::Stopped;
-                if matches!(service.spec, Some(ServiceRequestKind::FileCopy { .. })) {
-                    service.desired_running = false;
-                    service.message =
-                        Some("local daemon restarted; file copy was interrupted".to_string());
-                } else {
-                    service.message =
-                        Some("local daemon restarted; waiting to restore the forward".to_string());
+                match service.spec {
+                    Some(ServiceRequestKind::FolderSync { .. }) if service.desired_running => {
+                        service.status = ServiceStatus::Unknown;
+                        service.message = Some(
+                            "local daemon restarted; waiting to adopt Mutagen session".to_string(),
+                        );
+                    }
+                    Some(ServiceRequestKind::FileCopy { .. }) => {
+                        service.status = ServiceStatus::Stopped;
+                        service.desired_running = false;
+                        service.message =
+                            Some("local daemon restarted; file copy was interrupted".to_string());
+                    }
+                    _ => {
+                        service.status = ServiceStatus::Stopped;
+                        service.message = Some(
+                            "local daemon restarted; waiting to restore the forward".to_string(),
+                        );
+                    }
                 }
                 changed = true;
             }
@@ -290,6 +316,8 @@ struct Hub {
     bridges: Mutex<BTreeMap<String, BridgeRuntime>>,
     service_runtimes: Mutex<BTreeMap<String, ServiceRuntime>>,
     forward_program: String,
+    mutagen_program: String,
+    mutagen_root: PathBuf,
 }
 
 struct BridgeRuntime {
@@ -304,6 +332,7 @@ struct ServiceRuntime {
 enum RuntimeActions {
     Forward(SyncSender<crate::forward::Action>),
     Copy(SyncSender<crate::copy::Action>),
+    Sync(SyncSender<crate::sync::Action>),
 }
 
 impl Hub {
@@ -317,6 +346,23 @@ impl Hub {
         state_path: Option<PathBuf>,
         forward_program: String,
     ) -> Self {
+        let mutagen_root = std::env::temp_dir().join(format!("beams-mutagen-{}", Uuid::new_v4()));
+        Self::with_programs(
+            state,
+            state_path,
+            forward_program,
+            "mutagen".to_string(),
+            mutagen_root,
+        )
+    }
+
+    fn with_programs(
+        state: PersistedState,
+        state_path: Option<PathBuf>,
+        forward_program: String,
+        mutagen_program: String,
+        mutagen_root: PathBuf,
+    ) -> Self {
         Self {
             state: Mutex::new(state),
             state_path,
@@ -325,6 +371,57 @@ impl Hub {
             bridges: Mutex::new(BTreeMap::new()),
             service_runtimes: Mutex::new(BTreeMap::new()),
             forward_program,
+            mutagen_program,
+            mutagen_root,
+        }
+    }
+
+    fn recover_folder_syncs(self: &Arc<Self>) {
+        let services = self
+            .state
+            .lock()
+            .unwrap()
+            .services
+            .values()
+            .filter(|service| {
+                service.desired_running
+                    && matches!(service.spec, Some(ServiceRequestKind::FolderSync { .. }))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut service in services {
+            if self
+                .service_runtimes
+                .lock()
+                .unwrap()
+                .contains_key(&service.service_id)
+            {
+                continue;
+            }
+            service.status = ServiceStatus::Starting;
+            service.message =
+                Some("adopting Mutagen session after local daemon restart".to_string());
+            self.state
+                .lock()
+                .unwrap()
+                .services
+                .insert(service.service_id.clone(), service.clone());
+            let _ = self.save_state();
+            self.publish_service(&service);
+            let target = crate::bridge::Target {
+                beam_id: service.beam_id.clone(),
+                beam_uuid: service.beam_uuid.clone(),
+                login: service.login.clone(),
+            };
+            if let Err(err) = self.spawn_service_worker(&service, &target) {
+                handle_service_update(
+                    self,
+                    service.service_id.clone(),
+                    service.spec.clone().expect("filtered above"),
+                    ServiceStatus::Error,
+                    Some(format!("adopting folder sync: {err:#}")),
+                );
+            }
         }
     }
 
@@ -515,13 +612,23 @@ impl Hub {
             if approve
                 && matches!(
                     request.request.as_ref().map(|request| &request.kind),
-                    Some(ServiceRequestKind::FileCopy { .. })
+                    Some(
+                        ServiceRequestKind::FileCopy { .. } | ServiceRequestKind::FolderSync { .. }
+                    )
                 )
             {
                 let path = local_path
                     .as_deref()
-                    .context("file-copy approval requires a workstation path")?;
-                request.local_path = Some(normalize_local_path(path)?);
+                    .context("approval requires a workstation path")?;
+                let path = normalize_local_path(path)?;
+                if matches!(
+                    request.request.as_ref().map(|request| &request.kind),
+                    Some(ServiceRequestKind::FolderSync { .. })
+                ) && !Path::new(&path).is_dir()
+                {
+                    bail!("folder-sync workstation path must be an existing directory");
+                }
+                request.local_path = Some(path);
             }
             request.status = request
                 .status
@@ -577,7 +684,10 @@ impl Hub {
             let Some(request) = state.requests.get_mut(request_id) else {
                 return;
             };
-            if !matches!(request.status, RequestStatus::Approved | RequestStatus::Starting) {
+            if !matches!(
+                request.status,
+                RequestStatus::Approved | RequestStatus::Starting
+            ) {
                 return;
             }
             request.status = RequestStatus::Failed;
@@ -693,6 +803,71 @@ impl Hub {
         Ok(record)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn create_folder_sync(
+        self: &Arc<Self>,
+        request_id: String,
+        target: crate::bridge::Target,
+        local_path: String,
+        remote_path: String,
+        mode: beams_protocol::FolderSyncMode,
+        ignore_vcs: bool,
+        ignores: Vec<String>,
+    ) -> anyhow::Result<RequestRecord> {
+        if request_id.is_empty() || target.beam_uuid.is_empty() || target.login.is_empty() {
+            bail!("request ID, Beam UUID, and login must not be empty");
+        }
+        if remote_path.is_empty() {
+            bail!("remote path must not be empty");
+        }
+        if ignores.iter().any(|ignore| ignore.is_empty()) {
+            bail!("ignore rules must not be empty");
+        }
+        let local_path = normalize_local_path(&local_path)?;
+        if !Path::new(&local_path).is_dir() {
+            bail!("folder-sync workstation path must be an existing directory");
+        }
+        let local_label = Path::new(&local_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workstation directory")
+            .to_string();
+        let request = ServiceRequest {
+            request_id,
+            kind: ServiceRequestKind::FolderSync {
+                remote_path,
+                local_path_hint: Some(local_label),
+                mode,
+                ignore_vcs,
+                ignores,
+            },
+        };
+        let record = RequestRecord {
+            request_id: request.request_id.clone(),
+            beam_uuid: target.beam_uuid.clone(),
+            kind: request.kind.label().to_string(),
+            status: RequestStatus::Approved,
+            request: Some(request),
+            action: None,
+            message: Some("created by local user".to_string()),
+            local_path: Some(local_path),
+        };
+        self.state
+            .lock()
+            .unwrap()
+            .requests
+            .insert(record.request_id.clone(), record.clone());
+        self.save_state()?;
+        self.broadcast(ServerEvent::RequestChanged {
+            request: record.clone(),
+        });
+        if let Err(err) = self.start_service_request_with_target(&record.request_id, target) {
+            self.fail_request(&record.request_id, false, &format!("{err:#}"));
+            return Err(err);
+        }
+        Ok(record)
+    }
+
     fn start_service_request(self: &Arc<Self>, request_id: &str) -> anyhow::Result<()> {
         let beam_uuid = self
             .state
@@ -737,10 +912,16 @@ impl Hub {
                 .map_err(anyhow::Error::msg)?;
             request.message = Some("starting workstation service".to_string());
             let updated_request = request.clone();
-            let desired_running =
-                matches!(service_request.kind, ServiceRequestKind::LocalPortForward { .. });
+            let desired_running = matches!(
+                service_request.kind,
+                ServiceRequestKind::LocalPortForward { .. } | ServiceRequestKind::FolderSync { .. }
+            );
+            let service_id = Uuid::new_v4().to_string();
+            let mutagen_session =
+                matches!(service_request.kind, ServiceRequestKind::FolderSync { .. })
+                    .then(|| crate::sync::session_name(&target.beam_uuid, &service_id));
             let service = ServiceRecord {
-                service_id: Uuid::new_v4().to_string(),
+                service_id,
                 request_id: request_id.to_string(),
                 beam_id: target.beam_id.clone(),
                 beam_uuid: target.beam_uuid.clone(),
@@ -751,6 +932,7 @@ impl Hub {
                 desired_running,
                 message: Some("starting workstation service".to_string()),
                 local_path: request.local_path.clone(),
+                mutagen_session,
             };
             state
                 .services
@@ -821,23 +1003,78 @@ impl Hub {
                 let weak = Arc::downgrade(self);
                 thread::spawn(move || handle_copy_events(weak, event_rx));
             }
+            ServiceRequestKind::FolderSync { .. } => {
+                let local_path = service
+                    .local_path
+                    .as_deref()
+                    .context("folder-sync service has no approved workstation path")?;
+                let session_name = service
+                    .mutagen_session
+                    .clone()
+                    .context("folder-sync service has no persisted Mutagen session name")?;
+                let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+                let actions = crate::sync::spawn(
+                    self.mutagen_program.clone(),
+                    self.forward_program.clone(),
+                    self.mutagen_root.clone(),
+                    crate::sync::Target {
+                        beam_uuid: target.beam_uuid.clone(),
+                        login: target.login.clone(),
+                    },
+                    service.service_id.clone(),
+                    session_name,
+                    spec,
+                    PathBuf::from(local_path),
+                    event_tx,
+                );
+                self.service_runtimes.lock().unwrap().insert(
+                    service.service_id.clone(),
+                    ServiceRuntime {
+                        actions: RuntimeActions::Sync(actions),
+                    },
+                );
+                let weak = Arc::downgrade(self);
+                thread::spawn(move || handle_sync_events(weak, event_rx));
+            }
         }
         Ok(())
     }
 
-    fn control_service(&self, service_id: &str, action: ServiceAction) -> anyhow::Result<ServiceRecord> {
-        if action == ServiceAction::Restart
-            && matches!(
-                self.state
-                    .lock()
-                    .unwrap()
-                    .services
-                    .get(service_id)
-                    .and_then(|service| service.spec.as_ref()),
-                Some(ServiceRequestKind::FileCopy { .. })
+    fn control_service(
+        &self,
+        service_id: &str,
+        action: ServiceAction,
+    ) -> anyhow::Result<ServiceRecord> {
+        let spec = self
+            .state
+            .lock()
+            .unwrap()
+            .services
+            .get(service_id)
+            .and_then(|service| service.spec.clone())
+            .with_context(|| format!("unknown service {service_id:?}"))?;
+        match (&spec, action) {
+            (
+                ServiceRequestKind::LocalPortForward { .. },
+                ServiceAction::Stop | ServiceAction::Restart,
             )
-        {
-            bail!("file-copy jobs cannot be restarted; create a new job instead");
+            | (ServiceRequestKind::FileCopy { .. }, ServiceAction::Stop)
+            | (
+                ServiceRequestKind::FolderSync { .. },
+                ServiceAction::Stop
+                | ServiceAction::Pause
+                | ServiceAction::Resume
+                | ServiceAction::Terminate,
+            ) => {}
+            (ServiceRequestKind::FileCopy { .. }, _) => {
+                bail!("file-copy jobs only support cancellation")
+            }
+            (ServiceRequestKind::LocalPortForward { .. }, _) => {
+                bail!("port forwards only support stop and restart")
+            }
+            (ServiceRequestKind::FolderSync { .. }, ServiceAction::Restart) => {
+                bail!("folder syncs use pause/resume; terminated syncs must be recreated")
+            }
         }
         let actions = self
             .service_runtimes
@@ -847,8 +1084,11 @@ impl Hub {
             .map(|runtime| match &runtime.actions {
                 RuntimeActions::Forward(actions) => RuntimeActions::Forward(actions.clone()),
                 RuntimeActions::Copy(actions) => RuntimeActions::Copy(actions.clone()),
+                RuntimeActions::Sync(actions) => RuntimeActions::Sync(actions.clone()),
             })
-            .with_context(|| format!("service {service_id:?} is not owned by this daemon process"))?;
+            .with_context(|| {
+                format!("service {service_id:?} is not owned by this daemon process")
+            })?;
         let updated = {
             let mut state = self.state.lock().unwrap();
             let service = state
@@ -869,9 +1109,7 @@ impl Hub {
                 ServiceAction::Restart => {
                     if matches!(
                         service.status,
-                        ServiceStatus::Running
-                            | ServiceStatus::Degraded
-                            | ServiceStatus::Unknown
+                        ServiceStatus::Running | ServiceStatus::Degraded | ServiceStatus::Unknown
                     ) {
                         service.status = service
                             .status
@@ -880,6 +1118,30 @@ impl Hub {
                     }
                     service.desired_running = true;
                     service.message = Some("restart requested".to_string());
+                }
+                ServiceAction::Pause => {
+                    if service.status == ServiceStatus::Paused {
+                        bail!("folder sync is already paused");
+                    }
+                    service.desired_running = true;
+                    service.message = Some("pause requested".to_string());
+                }
+                ServiceAction::Resume => {
+                    if service.status != ServiceStatus::Paused {
+                        bail!("folder sync is not paused");
+                    }
+                    service.desired_running = true;
+                    service.message = Some("resume requested".to_string());
+                }
+                ServiceAction::Terminate => {
+                    if service.status != ServiceStatus::Stopping {
+                        service.status = service
+                            .status
+                            .transition(ServiceStatus::Stopping)
+                            .map_err(anyhow::Error::msg)?;
+                    }
+                    service.desired_running = false;
+                    service.message = Some("terminating".to_string());
                 }
             }
             service.clone()
@@ -896,6 +1158,26 @@ impl Hub {
                 .map_err(|err| anyhow::anyhow!("sending copy cancellation: {err}"))?,
             (RuntimeActions::Copy(_), ServiceAction::Restart) => {
                 bail!("completed or interrupted file-copy jobs cannot be restarted")
+            }
+            (RuntimeActions::Sync(actions), ServiceAction::Pause) => actions
+                .try_send(crate::sync::Action::Pause)
+                .map_err(|err| anyhow::anyhow!("sending sync pause: {err}"))?,
+            (RuntimeActions::Sync(actions), ServiceAction::Resume) => actions
+                .try_send(crate::sync::Action::Resume)
+                .map_err(|err| anyhow::anyhow!("sending sync resume: {err}"))?,
+            (RuntimeActions::Sync(actions), ServiceAction::Stop | ServiceAction::Terminate) => {
+                actions
+                    .try_send(crate::sync::Action::Terminate)
+                    .map_err(|err| anyhow::anyhow!("sending sync termination: {err}"))?
+            }
+            (RuntimeActions::Sync(_), ServiceAction::Restart)
+            | (RuntimeActions::Forward(_), ServiceAction::Pause)
+            | (RuntimeActions::Forward(_), ServiceAction::Resume)
+            | (RuntimeActions::Forward(_), ServiceAction::Terminate)
+            | (RuntimeActions::Copy(_), ServiceAction::Pause)
+            | (RuntimeActions::Copy(_), ServiceAction::Resume)
+            | (RuntimeActions::Copy(_), ServiceAction::Terminate) => {
+                unreachable!("service/action compatibility validated above")
             }
         }
         self.save_state()?;
@@ -982,10 +1264,9 @@ impl Hub {
             .unwrap()
             .values()
             .map(|runtime| match &runtime.actions {
-                RuntimeActions::Forward(actions) => {
-                    RuntimeActions::Forward(actions.clone())
-                }
+                RuntimeActions::Forward(actions) => RuntimeActions::Forward(actions.clone()),
                 RuntimeActions::Copy(actions) => RuntimeActions::Copy(actions.clone()),
+                RuntimeActions::Sync(actions) => RuntimeActions::Sync(actions.clone()),
             })
             .collect::<Vec<_>>();
         for actions in actions {
@@ -996,6 +1277,9 @@ impl Hub {
                 RuntimeActions::Copy(actions) => {
                     let _ = actions.try_send(crate::copy::Action::Stop);
                 }
+                RuntimeActions::Sync(actions) => {
+                    let _ = actions.try_send(crate::sync::Action::Detach);
+                }
             }
         }
         // Dropping every bridge command sender makes each supervisor kill and
@@ -1004,22 +1288,17 @@ impl Hub {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
-            let active = self
-                .state
-                .lock()
-                .unwrap()
-                .services
-                .values()
-                .any(|service| {
-                    matches!(
-                        service.status,
-                        ServiceStatus::Starting
-                            | ServiceStatus::Running
-                            | ServiceStatus::Stopping
-                            | ServiceStatus::Degraded
-                            | ServiceStatus::Unknown
-                    )
-                });
+            let active = self.state.lock().unwrap().services.values().any(|service| {
+                matches!(
+                    service.status,
+                    ServiceStatus::Starting
+                        | ServiceStatus::Running
+                        | ServiceStatus::Paused
+                        | ServiceStatus::Stopping
+                        | ServiceStatus::Degraded
+                        | ServiceStatus::Unknown
+                )
+            });
             if !active {
                 break;
             }
@@ -1132,9 +1411,28 @@ fn service_projection(service: &ServiceRecord) -> Option<ServiceProjection> {
                     }
                     ServiceStatus::Degraded => "file copy degraded",
                     ServiceStatus::Unknown => "file copy status unknown",
+                    ServiceStatus::Paused => "file copy paused",
                 }
                 .to_string(),
             ),
+            ServiceRequestKind::FolderSync { .. } => Some(match service.status {
+                ServiceStatus::Starting => "preparing folder sync".to_string(),
+                ServiceStatus::Running => service
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "folder sync is running".to_string()),
+                ServiceStatus::Paused => "folder sync is paused".to_string(),
+                ServiceStatus::Stopping => "terminating folder sync".to_string(),
+                ServiceStatus::Stopped => "folder sync terminated".to_string(),
+                ServiceStatus::Degraded => service
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "folder sync requires attention".to_string()),
+                ServiceStatus::Unknown => "folder sync status unknown".to_string(),
+                ServiceStatus::Error => {
+                    "folder sync failed; inspect the workstation client for details".to_string()
+                }
+            }),
         },
     })
 }
@@ -1155,6 +1453,21 @@ fn handle_service_events(hub: Weak<Hub>, events: Receiver<crate::forward::Event>
 }
 
 fn handle_copy_events(hub: Weak<Hub>, events: Receiver<crate::copy::Event>) {
+    while let Ok(event) = events.recv() {
+        let Some(hub) = hub.upgrade() else {
+            return;
+        };
+        handle_service_update(
+            &hub,
+            event.service_id,
+            event.kind,
+            event.status,
+            event.message,
+        );
+    }
+}
+
+fn handle_sync_events(hub: Weak<Hub>, events: Receiver<crate::sync::Event>) {
     while let Ok(event) = events.recv() {
         let Some(hub) = hub.upgrade() else {
             return;
@@ -1204,7 +1517,10 @@ fn handle_service_update(
         service.message = message;
         let service = service.clone();
 
-        if service.status == ServiceStatus::Running {
+        if matches!(
+            service.status,
+            ServiceStatus::Running | ServiceStatus::Paused
+        ) {
             if let Some(request) = state.requests.get_mut(&service.request_id) {
                 if request.status == RequestStatus::Starting {
                     request.status = RequestStatus::Running;
@@ -1213,7 +1529,10 @@ fn handle_service_update(
             }
         } else if service.status == ServiceStatus::Error {
             if let Some(request) = state.requests.get_mut(&service.request_id) {
-                if matches!(request.status, RequestStatus::Approved | RequestStatus::Starting) {
+                if matches!(
+                    request.status,
+                    RequestStatus::Approved | RequestStatus::Starting
+                ) {
                     request.status = RequestStatus::Failed;
                     request.message = service.message.clone();
                 }
@@ -1225,13 +1544,18 @@ fn handle_service_update(
             .values_mut()
             .filter_map(|request| {
                 let action = request.action.as_ref()?;
-                if action.service_id != service.service_id || request.status != RequestStatus::Starting {
+                if action.service_id != service.service_id
+                    || request.status != RequestStatus::Starting
+                {
                     return None;
                 }
                 let completed = matches!(
                     (action.action, service.status),
                     (ServiceAction::Stop, ServiceStatus::Stopped)
                         | (ServiceAction::Restart, ServiceStatus::Running)
+                        | (ServiceAction::Pause, ServiceStatus::Paused)
+                        | (ServiceAction::Resume, ServiceStatus::Running)
+                        | (ServiceAction::Terminate, ServiceStatus::Stopped)
                 );
                 if completed {
                     request.status = RequestStatus::Running;
@@ -1263,9 +1587,13 @@ fn handle_service_update(
     for request in completed_actions {
         hub.publish_request(&request, true);
     }
-    if matches!(service.spec, Some(ServiceRequestKind::FileCopy { .. }))
-        && matches!(service.status, ServiceStatus::Stopped | ServiceStatus::Error)
-    {
+    if matches!(
+        service.spec,
+        Some(ServiceRequestKind::FileCopy { .. } | ServiceRequestKind::FolderSync { .. })
+    ) && matches!(
+        service.status,
+        ServiceStatus::Stopped | ServiceStatus::Error
+    ) {
         hub.service_runtimes
             .lock()
             .unwrap()
@@ -1580,6 +1908,23 @@ impl Frontend {
         .context("sending file-copy decision")
     }
 
+    pub fn decide_folder_sync(
+        &mut self,
+        request_id: &str,
+        approve: bool,
+        local_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        write_json(
+            &mut self.write_half,
+            &ClientMessage::DecideRequest {
+                request_id: request_id.to_string(),
+                approve,
+                local_path: local_path.map(str::to_string),
+            },
+        )
+        .context("sending folder-sync decision")
+    }
+
     pub fn create_port_forward(
         &mut self,
         target: &crate::bridge::Target,
@@ -1624,6 +1969,35 @@ impl Frontend {
             },
         )
         .context("creating file-copy job")?;
+        Ok(request_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_folder_sync(
+        &mut self,
+        target: &crate::bridge::Target,
+        local_path: &str,
+        remote_path: &str,
+        mode: beams_protocol::FolderSyncMode,
+        ignore_vcs: bool,
+        ignores: Vec<String>,
+    ) -> anyhow::Result<String> {
+        let request_id = Uuid::new_v4().to_string();
+        write_json(
+            &mut self.write_half,
+            &ClientMessage::CreateFolderSync {
+                request_id: request_id.clone(),
+                beam_id: target.beam_id.clone(),
+                beam_uuid: target.beam_uuid.clone(),
+                login: target.login.clone(),
+                local_path: local_path.to_string(),
+                remote_path: remote_path.to_string(),
+                mode,
+                ignore_vcs,
+                ignores,
+            },
+        )
+        .context("creating folder sync")?;
         Ok(request_id)
     }
 
@@ -1715,11 +2089,19 @@ pub fn serve(socket_path: Option<PathBuf>) -> anyhow::Result<()> {
         .set_nonblocking(true)
         .context("making daemon listener nonblocking")?;
     let forward_program = std::env::var("BEAMS_TSH").unwrap_or_else(|_| "tsh".to_string());
-    let hub = Arc::new(Hub::with_state_path_and_program(
+    let mutagen_program = std::env::var("BEAMS_MUTAGEN").unwrap_or_else(|_| "mutagen".to_string());
+    let mutagen_root = state_path
+        .parent()
+        .context("daemon state path has no parent")?
+        .join("mutagen");
+    let hub = Arc::new(Hub::with_programs(
         state,
         Some(state_path),
         forward_program,
+        mutagen_program,
+        mutagen_root,
     ));
+    hub.recover_folder_syncs();
 
     let terminating = Arc::new(AtomicBool::new(false));
     for signal in [SIGHUP, SIGINT, SIGQUIT, SIGTERM] {
@@ -1878,9 +2260,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                         approve,
                         local_path,
                     } => {
-                        if let Err(err) =
-                            hub.decide_request(&request_id, approve, local_path)
-                        {
+                        if let Err(err) = hub.decide_request(&request_id, approve, local_path) {
                             let _ = tx.try_send(ServerEvent::Error {
                                 message: format!("deciding request: {err:#}"),
                             });
@@ -1914,6 +2294,36 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                             });
                         }
                     }
+                    ClientMessage::CreateFolderSync {
+                        request_id,
+                        beam_id,
+                        beam_uuid,
+                        login,
+                        local_path,
+                        remote_path,
+                        mode,
+                        ignore_vcs,
+                        ignores,
+                    } => {
+                        let target = crate::bridge::Target {
+                            beam_id,
+                            beam_uuid,
+                            login,
+                        };
+                        if let Err(err) = hub.create_folder_sync(
+                            request_id,
+                            target,
+                            local_path,
+                            remote_path,
+                            mode,
+                            ignore_vcs,
+                            ignores,
+                        ) {
+                            let _ = tx.try_send(ServerEvent::Error {
+                                message: format!("creating folder sync: {err:#}"),
+                            });
+                        }
+                    }
                     ClientMessage::CreatePortForward {
                         beam_id,
                         beam_uuid,
@@ -1927,12 +2337,9 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                             beam_uuid,
                             login,
                         };
-                        if let Err(err) = hub.create_port_forward(
-                            target,
-                            remote_host,
-                            remote_port,
-                            local_port,
-                        ) {
+                        if let Err(err) =
+                            hub.create_port_forward(target, remote_host, remote_port, local_port)
+                        {
                             let _ = tx.try_send(ServerEvent::Error {
                                 message: format!("creating port forward: {err:#}"),
                             });
@@ -2237,6 +2644,7 @@ mod tests {
                 desired_running: true,
                 message: None,
                 local_path: Some("/tmp/destination".to_string()),
+                mutagen_session: None,
             },
         );
         assert!(state.mark_process_services_stopped_after_restart());
@@ -2383,10 +2791,8 @@ mod tests {
         );
         let first = Arc::clone(&hub);
         let second = Arc::clone(&hub);
-        let a =
-            thread::spawn(move || first.decide_request("raced-request", false, None).is_ok());
-        let b =
-            thread::spawn(move || second.decide_request("raced-request", false, None).is_ok());
+        let a = thread::spawn(move || first.decide_request("raced-request", false, None).is_ok());
+        let b = thread::spawn(move || second.decide_request("raced-request", false, None).is_ok());
         let winners = usize::from(a.join().unwrap()) + usize::from(b.join().unwrap());
         assert_eq!(winners, 1);
         assert_eq!(
@@ -2599,8 +3005,7 @@ mod tests {
 
         hub.decide_request("request-forward", true, None).unwrap();
         wait_until(Duration::from_secs(3), || {
-            hub.state.lock().unwrap().requests["request-forward"].status
-                == RequestStatus::Running
+            hub.state.lock().unwrap().requests["request-forward"].status == RequestStatus::Running
         });
         let service = hub
             .state
@@ -2623,14 +3028,12 @@ mod tests {
         hub.control_service(&service.service_id, ServiceAction::Stop)
             .unwrap();
         wait_until(Duration::from_secs(2), || {
-            hub.state.lock().unwrap().services[&service.service_id].status
-                == ServiceStatus::Stopped
+            hub.state.lock().unwrap().services[&service.service_id].status == ServiceStatus::Stopped
         });
         hub.control_service(&service.service_id, ServiceAction::Restart)
             .unwrap();
         wait_until(Duration::from_secs(3), || {
-            hub.state.lock().unwrap().services[&service.service_id].status
-                == ServiceStatus::Running
+            hub.state.lock().unwrap().services[&service.service_id].status == ServiceStatus::Running
         });
 
         drop(hub);

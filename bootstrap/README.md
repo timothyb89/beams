@@ -254,6 +254,8 @@ beam-bootstrap client request upload \
   --remote-path /tmp/input.tar --local-path-hint input.tar
 beam-bootstrap client request download \
   --remote-path /tmp/result.json --local-path-hint result.json
+beam-bootstrap client request sync \
+  --remote-path ~/projects/example --local-path-hint example
 ```
 
 Approval creates a workstation-owned `tsh ssh -N -L` process bound only to
@@ -267,8 +269,13 @@ enter or confirm the real workstation path before approval, and that path is
 never projected back to the Beam. Existing destinations are denied by default;
 `--overwrite` requests explicit replacement. These commands remain attached
 through both approval and transfer completion, exiting non-zero on rejection,
-failure, cancellation, or interruption. Copies are single-file jobs; folder
-sync is a separate Mutagen-backed phase.
+failure, cancellation, or interruption. Copies are single-file jobs.
+Folder-sync requests carry the Beam directory, display-only workstation
+basename hint, Mutagen mode, VCS-ignore setting, and additional ignore rules.
+The real workstation directory is entered and approved only in the local UI.
+The default mode is `two-way-safe` with VCS metadata ignored;
+`--mode two-way-resolved`, one-way modes, and `--include-vcs` are explicit
+choices.
 
 `beams ssh` supplies `BEAMS_CLIENT_ID` and a random
 `BEAMS_SESSION_TOKEN` to its remote `beam-shell` command. A direct SSH shell,

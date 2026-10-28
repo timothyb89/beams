@@ -12,7 +12,7 @@ mod taskcli;
 mod tasks;
 mod tui;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -158,6 +158,39 @@ enum ClientServiceCommand {
         #[arg(long)]
         overwrite: bool,
     },
+    /// Request a long-running Mutagen folder sync. The workstation user
+    /// selects and confirms the local directory before creation.
+    Sync {
+        #[arg(long)]
+        remote_path: String,
+        #[arg(long)]
+        local_path_hint: Option<String>,
+        #[arg(long, value_enum, default_value_t = ClientSyncMode::TwoWaySafe)]
+        mode: ClientSyncMode,
+        #[arg(long)]
+        include_vcs: bool,
+        #[arg(long = "ignore")]
+        ignores: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ClientSyncMode {
+    TwoWaySafe,
+    TwoWayResolved,
+    OneWaySafe,
+    OneWayReplica,
+}
+
+impl From<ClientSyncMode> for beams_protocol::FolderSyncMode {
+    fn from(mode: ClientSyncMode) -> Self {
+        match mode {
+            ClientSyncMode::TwoWaySafe => Self::TwoWaySafe,
+            ClientSyncMode::TwoWayResolved => Self::TwoWayResolved,
+            ClientSyncMode::OneWaySafe => Self::OneWaySafe,
+            ClientSyncMode::OneWayReplica => Self::OneWayReplica,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -359,6 +392,19 @@ fn client_request(socket: Option<String>, service: ClientServiceCommand) -> i32 
                 },
             }
         }
+        ClientServiceCommand::Sync {
+            remote_path,
+            local_path_hint,
+            mode,
+            include_vcs,
+            ignores,
+        } => beams_protocol::ServiceRequestKind::FolderSync {
+            remote_path,
+            local_path_hint,
+            mode: mode.into(),
+            ignore_vcs: !include_vcs,
+            ignores,
+        },
     };
     let wait_for_service_completion =
         matches!(kind, beams_protocol::ServiceRequestKind::FileCopy { .. });

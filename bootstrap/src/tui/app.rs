@@ -507,6 +507,9 @@ impl App {
             }
             KeyCode::Char('s') => self.request_service_action(ServiceAction::Stop),
             KeyCode::Char('r') => self.request_service_action(ServiceAction::Restart),
+            KeyCode::Char('p') => self.request_service_action(ServiceAction::Pause),
+            KeyCode::Char('e') => self.request_service_action(ServiceAction::Resume),
+            KeyCode::Char('t') => self.request_service_action(ServiceAction::Terminate),
             _ => {}
         }
     }
@@ -517,13 +520,21 @@ impl App {
             self.status_line = "no service selected".to_string();
             return;
         };
-        if action == ServiceAction::Restart
-            && matches!(
-                &service.service.kind,
-                ServiceRequestKind::FileCopy { .. }
-            )
-        {
-            self.status_line = "file-copy jobs are terminal; request a new copy".to_string();
+        let supported = match &service.service.kind {
+            ServiceRequestKind::LocalPortForward { .. } => {
+                matches!(action, ServiceAction::Stop | ServiceAction::Restart)
+            }
+            ServiceRequestKind::FileCopy { .. } => action == ServiceAction::Stop,
+            ServiceRequestKind::FolderSync { .. } => matches!(
+                action,
+                ServiceAction::Stop
+                    | ServiceAction::Pause
+                    | ServiceAction::Resume
+                    | ServiceAction::Terminate
+            ),
+        };
+        if !supported {
+            self.status_line = "that action is not supported for the selected service".to_string();
             return;
         }
         if action == ServiceAction::Stop
@@ -559,6 +570,9 @@ impl App {
             match action {
                 ServiceAction::Stop => "stop",
                 ServiceAction::Restart => "restart",
+                ServiceAction::Pause => "pause",
+                ServiceAction::Resume => "resume",
+                ServiceAction::Terminate => "terminate",
             },
             service_id
         );
@@ -798,6 +812,17 @@ impl App {
                         remote_path,
                         overwrite
                     ),
+                    beams_protocol::ServiceRequestKind::FolderSync {
+                        remote_path,
+                        local_path_hint,
+                        mode,
+                        ..
+                    } => format!(
+                        "sync {} <-> {} ({:?})",
+                        local_path_hint.as_deref().unwrap_or("workstation directory"),
+                        remote_path,
+                        mode
+                    ),
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(
@@ -825,7 +850,7 @@ impl App {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("services (j/k select, s stop, r restart; actions require local approval)"),
+                    .title("services (s/r stop/restart, p/e pause/resume, t terminate; local approval required)"),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         frame.render_stateful_widget(list, area, &mut state);
@@ -996,6 +1021,7 @@ fn service_status_color(status: beams_protocol::ServiceStatus) -> Color {
     use beams_protocol::ServiceStatus;
     match status {
         ServiceStatus::Running => Color::Green,
+        ServiceStatus::Paused => Color::Blue,
         ServiceStatus::Starting | ServiceStatus::Stopping => Color::Yellow,
         ServiceStatus::Stopped | ServiceStatus::Unknown => Color::DarkGray,
         ServiceStatus::Degraded => Color::Magenta,

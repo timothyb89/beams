@@ -35,8 +35,8 @@ use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
 use beams_protocol::{
-    FileCopyDirection, OverwritePolicy, RequestStatus, ServiceAction, ServiceRequestKind,
-    ServiceStatus,
+    FileCopyDirection, FolderSyncMode, OverwritePolicy, RequestStatus, ServiceAction,
+    ServiceRequestKind, ServiceStatus,
 };
 
 use crate::clientd::{Frontend, RequestRecord, ServerEvent, ServiceRecord};
@@ -294,8 +294,8 @@ fn drive(
 
     loop {
         let daemon_changed = daemon_view.drain(local_daemon);
-        let approval_needs_attention = escape_key != EscapeKey::Disabled
-            && daemon_view.take_approval_attention();
+        let approval_needs_attention =
+            escape_key != EscapeKey::Disabled && daemon_view.take_approval_attention();
         if approval_needs_attention && input_router.mode == InputMode::Passthrough {
             terminal_state.open_palette()?;
             input_router.mode = InputMode::Palette;
@@ -347,8 +347,7 @@ fn drive(
         }
 
         let now = Instant::now();
-        let mut actions =
-            input_router.flush_expired(escape_key, daemon_view.form_active(), now);
+        let mut actions = input_router.flush_expired(escape_key, daemon_view.form_active(), now);
         let poll_timeout = input_router.poll_timeout(now);
         if stdin_ready(poll_timeout).context("polling terminal input")? {
             let mut bytes = [0u8; 4096];
@@ -426,6 +425,10 @@ fn drive(
                     daemon_view.copy_form = Some(CopyForm::new(FileCopyDirection::Download));
                     draw_palette(info, escape_key, &daemon_view)?;
                 }
+                InputAction::BeginSync => {
+                    daemon_view.sync_form = Some(SyncForm::default());
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
                 InputAction::FormChar(byte) => {
                     daemon_view.form_char(byte);
                     draw_palette(info, escape_key, &daemon_view)?;
@@ -446,6 +449,8 @@ fn drive(
                     daemon_view.forward_form = None;
                     daemon_view.copy_form = None;
                     daemon_view.copy_approval_form = None;
+                    daemon_view.sync_form = None;
+                    daemon_view.sync_approval_form = None;
                     draw_palette(info, escape_key, &daemon_view)?;
                 }
                 InputAction::StopService => {
@@ -454,6 +459,18 @@ fn drive(
                 }
                 InputAction::RestartService => {
                     daemon_view.control_selected(local_daemon, ServiceAction::Restart);
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::PauseService => {
+                    daemon_view.control_selected(local_daemon, ServiceAction::Pause);
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::ResumeService => {
+                    daemon_view.control_selected(local_daemon, ServiceAction::Resume);
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::TerminateService => {
+                    daemon_view.control_selected(local_daemon, ServiceAction::Terminate);
                     draw_palette(info, escape_key, &daemon_view)?;
                 }
                 InputAction::NextService => {
@@ -483,6 +500,8 @@ struct DaemonView {
     forward_form: Option<ForwardForm>,
     copy_form: Option<CopyForm>,
     copy_approval_form: Option<CopyApprovalForm>,
+    sync_form: Option<SyncForm>,
+    sync_approval_form: Option<SyncApprovalForm>,
     presented_approval_requests: BTreeSet<String>,
     message: String,
 }
@@ -519,6 +538,57 @@ struct CopyApprovalForm {
     local_path: String,
 }
 
+struct SyncForm {
+    local_path: String,
+    remote_path: String,
+    mode: FolderSyncMode,
+    ignore_vcs: bool,
+    ignores: String,
+    field: usize,
+}
+
+impl Default for SyncForm {
+    fn default() -> Self {
+        Self {
+            local_path: String::new(),
+            remote_path: String::new(),
+            mode: FolderSyncMode::TwoWaySafe,
+            ignore_vcs: true,
+            ignores: String::new(),
+            field: 0,
+        }
+    }
+}
+
+fn next_sync_mode(mode: FolderSyncMode) -> FolderSyncMode {
+    match mode {
+        FolderSyncMode::TwoWaySafe => FolderSyncMode::TwoWayResolved,
+        FolderSyncMode::TwoWayResolved => FolderSyncMode::OneWaySafe,
+        FolderSyncMode::OneWaySafe => FolderSyncMode::OneWayReplica,
+        FolderSyncMode::OneWayReplica => FolderSyncMode::TwoWaySafe,
+    }
+}
+
+fn sync_mode_warning(mode: FolderSyncMode) -> &'static str {
+    match mode {
+        FolderSyncMode::TwoWaySafe => "Conflicting edits are preserved for manual resolution.",
+        FolderSyncMode::TwoWayResolved => {
+            "Workstation content wins conflicts; remote conflicting edits may be overwritten."
+        }
+        FolderSyncMode::OneWaySafe => {
+            "Changes flow workstation → Beam; Beam-only edits are not propagated back."
+        }
+        FolderSyncMode::OneWayReplica => {
+            "Destructive: the Beam is maintained as a replica; remote changes/deletions may be overwritten."
+        }
+    }
+}
+
+struct SyncApprovalForm {
+    request_id: String,
+    local_path: String,
+}
+
 impl DaemonView {
     fn new(local_daemon: &LocalDaemon) -> Self {
         let beam_uuid = local_daemon
@@ -540,6 +610,8 @@ impl DaemonView {
                 forward_form: None,
                 copy_form: None,
                 copy_approval_form: None,
+                sync_form: None,
+                sync_approval_form: None,
                 presented_approval_requests: BTreeSet::new(),
                 message: "connected".to_string(),
             },
@@ -557,6 +629,8 @@ impl DaemonView {
                 forward_form: None,
                 copy_form: None,
                 copy_approval_form: None,
+                sync_form: None,
+                sync_approval_form: None,
                 presented_approval_requests: BTreeSet::new(),
                 message: local_daemon
                     .unavailable
@@ -681,12 +755,10 @@ impl DaemonView {
     }
 
     fn pending_request(&self) -> Option<&RequestRecord> {
-        self.request_records
-            .values()
-            .find(|request| {
-                request.status == RequestStatus::PendingApproval
-                    && self.beam_uuid.as_deref() == Some(request.beam_uuid.as_str())
-            })
+        self.request_records.values().find(|request| {
+            request.status == RequestStatus::PendingApproval
+                && self.beam_uuid.as_deref() == Some(request.beam_uuid.as_str())
+        })
     }
 
     /// Marks newly pending approvals for this session's Beam as presented.
@@ -714,6 +786,8 @@ impl DaemonView {
         self.forward_form.is_some()
             || self.copy_form.is_some()
             || self.copy_approval_form.is_some()
+            || self.sync_form.is_some()
+            || self.sync_approval_form.is_some()
     }
 
     fn approve_or_prompt(&mut self, local_daemon: &mut LocalDaemon) {
@@ -721,16 +795,24 @@ impl DaemonView {
             self.message = "no pending request to decide".to_string();
             return;
         };
-        if let Some(ServiceRequestKind::FileCopy {
-            local_path_hint, ..
-        }) = request.request.as_ref().map(|request| &request.kind)
-        {
-            self.copy_approval_form = Some(CopyApprovalForm {
-                request_id: request.request_id.clone(),
-                local_path: local_path_hint.clone().unwrap_or_default(),
-            });
-        } else {
-            self.decide(local_daemon, true);
+        match request.request.as_ref().map(|request| &request.kind) {
+            Some(ServiceRequestKind::FileCopy {
+                local_path_hint, ..
+            }) => {
+                self.copy_approval_form = Some(CopyApprovalForm {
+                    request_id: request.request_id.clone(),
+                    local_path: local_path_hint.clone().unwrap_or_default(),
+                });
+            }
+            Some(ServiceRequestKind::FolderSync {
+                local_path_hint, ..
+            }) => {
+                self.sync_approval_form = Some(SyncApprovalForm {
+                    request_id: request.request_id.clone(),
+                    local_path: local_path_hint.clone().unwrap_or_default(),
+                });
+            }
+            _ => self.decide(local_daemon, true),
         }
     }
 
@@ -779,7 +861,9 @@ impl DaemonView {
 
     fn selected_service<'a>(&'a self, local_daemon: &'a LocalDaemon) -> Option<&'a ServiceRecord> {
         let services = self.visible_services(local_daemon);
-        services.get(self.selected_service.min(services.len().saturating_sub(1))).copied()
+        services
+            .get(self.selected_service.min(services.len().saturating_sub(1)))
+            .copied()
     }
 
     fn select_next(&mut self) {
@@ -791,6 +875,27 @@ impl DaemonView {
     }
 
     fn form_char(&mut self, byte: u8) {
+        if let Some(form) = &mut self.sync_approval_form {
+            if byte.is_ascii_graphic() || byte == b' ' {
+                form.local_path.push(char::from(byte));
+            }
+            return;
+        }
+        if let Some(form) = &mut self.sync_form {
+            if form.field == 2 && byte == b' ' {
+                form.mode = next_sync_mode(form.mode);
+            } else if form.field == 3 && byte == b' ' {
+                form.ignore_vcs = !form.ignore_vcs;
+            } else if byte.is_ascii_graphic() || byte == b' ' {
+                match form.field {
+                    0 => form.local_path.push(char::from(byte)),
+                    1 => form.remote_path.push(char::from(byte)),
+                    4 => form.ignores.push(char::from(byte)),
+                    _ => {}
+                }
+            }
+            return;
+        }
         if let Some(form) = &mut self.copy_approval_form {
             if byte.is_ascii_graphic() || byte == b' ' {
                 form.local_path.push(char::from(byte));
@@ -826,6 +931,25 @@ impl DaemonView {
     }
 
     fn form_backspace(&mut self) {
+        if let Some(form) = &mut self.sync_approval_form {
+            form.local_path.pop();
+            return;
+        }
+        if let Some(form) = &mut self.sync_form {
+            match form.field {
+                0 => {
+                    form.local_path.pop();
+                }
+                1 => {
+                    form.remote_path.pop();
+                }
+                4 => {
+                    form.ignores.pop();
+                }
+                _ => {}
+            }
+            return;
+        }
         if let Some(form) = &mut self.copy_approval_form {
             form.local_path.pop();
             return;
@@ -849,6 +973,10 @@ impl DaemonView {
     }
 
     fn form_next(&mut self) {
+        if let Some(form) = &mut self.sync_form {
+            form.field = (form.field + 1) % 5;
+            return;
+        }
         if let Some(form) = &mut self.copy_form {
             form.field = (form.field + 1) % 3;
             return;
@@ -859,6 +987,59 @@ impl DaemonView {
     }
 
     fn submit_forward(&mut self, local_daemon: &mut LocalDaemon) {
+        if let Some(form) = self.sync_approval_form.take() {
+            let Some(frontend) = &mut local_daemon.frontend else {
+                self.message = "local daemon connection is unavailable".to_string();
+                self.sync_approval_form = Some(form);
+                return;
+            };
+            match frontend.decide_folder_sync(&form.request_id, true, Some(&form.local_path)) {
+                Ok(()) => self.message = format!("approving folder sync {}", form.request_id),
+                Err(err) => {
+                    self.message = format!("could not approve folder sync: {err}");
+                    self.sync_approval_form = Some(form);
+                }
+            }
+            return;
+        }
+        if let Some(form) = self.sync_form.take() {
+            if form.local_path.is_empty() || form.remote_path.is_empty() {
+                self.message = "local and remote directories are required".to_string();
+                self.sync_form = Some(form);
+                return;
+            }
+            let Some(managed) = &local_daemon.managed_bridge else {
+                self.message = "this session has no managed Beam target".to_string();
+                return;
+            };
+            let Some(frontend) = &mut local_daemon.frontend else {
+                self.message = "local daemon connection is unavailable".to_string();
+                self.sync_form = Some(form);
+                return;
+            };
+            let ignores = form
+                .ignores
+                .split(',')
+                .map(str::trim)
+                .filter(|ignore| !ignore.is_empty())
+                .map(str::to_string)
+                .collect();
+            match frontend.create_folder_sync(
+                &managed.target,
+                &form.local_path,
+                &form.remote_path,
+                form.mode,
+                form.ignore_vcs,
+                ignores,
+            ) {
+                Ok(_) => self.message = "creating folder sync".to_string(),
+                Err(err) => {
+                    self.message = format!("could not create folder sync: {err}");
+                    self.sync_form = Some(form);
+                }
+            }
+            return;
+        }
         if let Some(form) = self.copy_approval_form.take() {
             let Some(frontend) = &mut local_daemon.frontend else {
                 self.message = "local daemon connection is unavailable".to_string();
@@ -935,12 +1116,7 @@ impl DaemonView {
             self.message = "local daemon connection is unavailable".to_string();
             return;
         };
-        match frontend.create_port_forward(
-            &managed.target,
-            "127.0.0.1",
-            remote_port,
-            local_port,
-        ) {
+        match frontend.create_port_forward(&managed.target, "127.0.0.1", remote_port, local_port) {
             Ok(()) => {
                 self.message = format!(
                     "creating local port {} → 127.0.0.1:{remote_port}",
@@ -954,22 +1130,33 @@ impl DaemonView {
     }
 
     fn control_selected(&mut self, local_daemon: &mut LocalDaemon, action: ServiceAction) {
-        let Some(service) = self.selected_service(local_daemon)
-        else {
+        let Some(service) = self.selected_service(local_daemon) else {
             self.message = "no local service is selected".to_string();
             return;
         };
-        if action == ServiceAction::Restart
-            && matches!(
-                service.spec.as_ref(),
-                Some(ServiceRequestKind::FileCopy { .. })
-            )
-        {
-            self.message = "file-copy jobs are terminal; create a new job".to_string();
+        let supported = match service.spec.as_ref() {
+            Some(ServiceRequestKind::LocalPortForward { .. }) => {
+                matches!(action, ServiceAction::Stop | ServiceAction::Restart)
+            }
+            Some(ServiceRequestKind::FileCopy { .. }) => action == ServiceAction::Stop,
+            Some(ServiceRequestKind::FolderSync { .. }) => matches!(
+                action,
+                ServiceAction::Stop
+                    | ServiceAction::Pause
+                    | ServiceAction::Resume
+                    | ServiceAction::Terminate
+            ),
+            None => false,
+        };
+        if !supported {
+            self.message = "that action is not supported for the selected service".to_string();
             return;
         }
         if action == ServiceAction::Stop
-            && matches!(service.status, ServiceStatus::Stopped | ServiceStatus::Error)
+            && matches!(
+                service.status,
+                ServiceStatus::Stopped | ServiceStatus::Error
+            )
         {
             self.message = "the selected service is already terminal".to_string();
             return;
@@ -1006,6 +1193,7 @@ enum InputAction {
     BeginForward,
     BeginUpload,
     BeginDownload,
+    BeginSync,
     FormChar(u8),
     FormBackspace,
     FormNext,
@@ -1013,6 +1201,9 @@ enum InputAction {
     CancelForm,
     StopService,
     RestartService,
+    PauseService,
+    ResumeService,
+    TerminateService,
     NextService,
     PreviousService,
 }
@@ -1217,11 +1408,23 @@ impl InputRouter {
             InputMode::Palette if matches!(byte, b'd' | b'D') => {
                 actions.push(InputAction::BeginDownload);
             }
+            InputMode::Palette if matches!(byte, b'm' | b'M') => {
+                actions.push(InputAction::BeginSync);
+            }
             InputMode::Palette if matches!(byte, b's' | b'S') => {
                 actions.push(InputAction::StopService);
             }
             InputMode::Palette if matches!(byte, b'r' | b'R') => {
                 actions.push(InputAction::RestartService);
+            }
+            InputMode::Palette if matches!(byte, b'p' | b'P') => {
+                actions.push(InputAction::PauseService);
+            }
+            InputMode::Palette if matches!(byte, b'e' | b'E') => {
+                actions.push(InputAction::ResumeService);
+            }
+            InputMode::Palette if matches!(byte, b't' | b'T') => {
+                actions.push(InputAction::TerminateService);
             }
             InputMode::Palette if matches!(byte, b'j' | b'J') => {
                 actions.push(InputAction::NextService);
@@ -1639,13 +1842,8 @@ fn draw_palette(
     // starts blank. Clear the real screen to match that model before painting;
     // otherwise shorter text, modal transitions, and resizes retain stale
     // cells from the prior frame.
-    execute!(
-        io::stdout(),
-        Hide,
-        Clear(ClearType::All),
-        MoveTo(0, 0)
-    )
-    .context("clearing local menu frame")?;
+    execute!(io::stdout(), Hide, Clear(ClearType::All), MoveTo(0, 0))
+        .context("clearing local menu frame")?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("creating local menu terminal")?;
     terminal
@@ -1738,6 +1936,27 @@ fn draw_palette(
                                 overwrite
                             )));
                         }
+                        ServiceRequestKind::FolderSync {
+                            remote_path,
+                            local_path_hint,
+                            mode,
+                            ignore_vcs,
+                            ignores,
+                        } => {
+                            body_text.push(Line::from(format!(
+                                "sync {} ↔ {} ({mode:?}, VCS ignored: {ignore_vcs})",
+                                local_path_hint
+                                    .as_deref()
+                                    .unwrap_or("workstation directory"),
+                                remote_path
+                            )));
+                            if !ignores.is_empty() {
+                                body_text.push(Line::from(format!(
+                                    "ignore rules: {}",
+                                    ignores.join(", ")
+                                )));
+                            }
+                        }
                     }
                 } else if let Some(action) = &request.action {
                     body_text.push(Line::from(format!(
@@ -1789,6 +2008,18 @@ fn draw_palette(
                             local_path_hint.as_deref().unwrap_or("workstation path"),
                             remote_path
                         ),
+                        Some(ServiceRequestKind::FolderSync {
+                            remote_path,
+                            local_path_hint,
+                            mode,
+                            ..
+                        }) => format!(
+                            "sync {} ↔ {} ({mode:?})",
+                            local_path_hint
+                                .as_deref()
+                                .unwrap_or("workstation directory"),
+                            remote_path
+                        ),
                         None => service.kind.clone(),
                     };
                     body_text.push(Line::from(format!(
@@ -1827,14 +2058,14 @@ fn draw_palette(
             let service_keys = if daemon.form_active() {
                 ""
             } else {
-                "f: forward  •  u/d: upload/download  •  j/k: select  •  s/r: stop/restart  •  "
+                "f: forward  •  m: sync  •  u/d: copy  •  j/k: select  •  s/r/p/e/t: control  •  "
             };
             frame.render_widget(
                 Paragraph::new(format!(
                     "{decision_keys}{service_keys}{literal}q / Esc / Enter: close"
                 ))
-                    .alignment(Alignment::Center)
-                    .block(Block::default().borders(Borders::ALL)),
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL)),
                 footer,
             );
 
@@ -1873,13 +2104,11 @@ fn draw_palette(
                 ];
                 frame.render_widget(RatatuiClear, popup);
                 frame.render_widget(
-                    Paragraph::new(form_text)
-                        .alignment(Alignment::Left)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .title(" Create local port forward "),
-                        ),
+                    Paragraph::new(form_text).alignment(Alignment::Left).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Create local port forward "),
+                    ),
                     popup,
                 );
             }
@@ -1929,13 +2158,11 @@ fn draw_palette(
                 ];
                 frame.render_widget(RatatuiClear, popup);
                 frame.render_widget(
-                    Paragraph::new(form_text)
-                        .alignment(Alignment::Left)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .title(format!(" {:?} file ", form.direction)),
-                        ),
+                    Paragraph::new(form_text).alignment(Alignment::Left).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(format!(" {:?} file ", form.direction)),
+                    ),
                     popup,
                 );
             }
@@ -1958,13 +2185,118 @@ fn draw_palette(
                 ];
                 frame.render_widget(RatatuiClear, popup);
                 frame.render_widget(
-                    Paragraph::new(form_text)
-                        .alignment(Alignment::Left)
-                        .block(
-                            Block::default()
-                                .borders(Borders::ALL)
-                                .title(" Confirm file-copy path "),
+                    Paragraph::new(form_text).alignment(Alignment::Left).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Confirm file-copy path "),
+                    ),
+                    popup,
+                );
+            }
+            if let Some(form) = &daemon.sync_form {
+                let popup = centered_rect(area, 82, 15);
+                let selected = Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
+                let normal = Style::default();
+                let label = |field, text| {
+                    Span::styled(
+                        if form.field == field {
+                            format!("› {text}")
+                        } else {
+                            format!("  {text}")
+                        },
+                        if form.field == field {
+                            selected
+                        } else {
+                            normal
+                        },
+                    )
+                };
+                let form_text = vec![
+                    Line::from(""),
+                    Line::from(vec![
+                        label(0, "workstation directory: "),
+                        Span::raw(&form.local_path),
+                    ]),
+                    Line::from(vec![
+                        label(1, "Beam directory: "),
+                        Span::raw(&form.remote_path),
+                    ]),
+                    Line::from(vec![
+                        label(2, "mode: "),
+                        Span::raw(format!("{:?} (space cycles)", form.mode)),
+                    ]),
+                    Line::from(vec![
+                        label(3, "ignore VCS metadata: "),
+                        Span::raw(format!("{} (space toggles)", form.ignore_vcs)),
+                    ]),
+                    Line::from(vec![
+                        label(4, "ignore rules (comma-separated): "),
+                        Span::raw(&form.ignores),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        sync_mode_warning(form.mode),
+                        Style::default().fg(if form.mode == FolderSyncMode::TwoWaySafe {
+                            Color::Green
+                        } else {
+                            Color::Yellow
+                        }),
+                    )),
+                    Line::from("Both directories must already exist."),
+                    Line::from("Tab changes field  •  Enter creates  •  Esc cancels"),
+                ];
+                frame.render_widget(RatatuiClear, popup);
+                frame.render_widget(
+                    Paragraph::new(form_text).alignment(Alignment::Left).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Create Mutagen folder sync "),
+                    ),
+                    popup,
+                );
+            }
+            if let Some(form) = &daemon.sync_approval_form {
+                let mode = daemon
+                    .pending_request()
+                    .and_then(|request| request.request.as_ref())
+                    .and_then(|request| match request.kind {
+                        ServiceRequestKind::FolderSync { mode, .. } => Some(mode),
+                        _ => None,
+                    })
+                    .unwrap_or(FolderSyncMode::TwoWaySafe);
+                let popup = centered_rect(area, 82, 10);
+                let form_text = vec![
+                    Line::from(""),
+                    Line::from("The Beam supplied only a hint. Confirm the real local directory:"),
+                    Line::from(vec![
+                        Span::styled(
+                            "› workstation directory: ",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
                         ),
+                        Span::raw(&form.local_path),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        sync_mode_warning(mode),
+                        Style::default().fg(if mode == FolderSyncMode::TwoWaySafe {
+                            Color::Green
+                        } else {
+                            Color::Yellow
+                        }),
+                    )),
+                    Line::from("Enter approves  •  Esc cancels without deciding"),
+                ];
+                frame.render_widget(RatatuiClear, popup);
+                frame.render_widget(
+                    Paragraph::new(form_text).alignment(Alignment::Left).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Confirm folder-sync path "),
+                    ),
                     popup,
                 );
             }
@@ -2149,7 +2481,8 @@ mod tests {
         }
 
         assert_eq!(
-            view.pending_request().map(|request| request.request_id.as_str()),
+            view.pending_request()
+                .map(|request| request.request_id.as_str()),
             Some("this-beam-request")
         );
         assert!(view.take_approval_attention());

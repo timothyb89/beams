@@ -2,18 +2,22 @@ mod bridge;
 mod clientd;
 mod copy;
 mod forward;
+mod session;
 mod stage;
 mod state;
-mod session;
+mod sync;
 mod tsh;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{bail, Context};
-use beams_protocol::{FileCopyDirection, OverwritePolicy, ServiceStatus};
+use beams_protocol::{
+    FileCopyDirection, FolderSyncMode, OverwritePolicy, ServiceAction, ServiceRequestKind,
+    ServiceStatus,
+};
 use chrono::{DateTime, Duration, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 const MIN_TTL_HOURS: i64 = 12;
@@ -92,6 +96,59 @@ enum Commands {
         #[arg(long)]
         overwrite: bool,
     },
+    /// Create, inspect, or control Mutagen folder syncs.
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SyncCommands {
+    /// Synchronize an existing workstation directory with an existing Beam directory.
+    Create {
+        #[arg(long, default_value = DEFAULT_PURPOSE)]
+        purpose: String,
+        #[arg(long, default_value = DEFAULT_LOGIN)]
+        login: String,
+        #[arg(long, value_enum, default_value_t = SyncModeArg::TwoWaySafe)]
+        mode: SyncModeArg,
+        /// Include VCS metadata such as .git (ignored by default).
+        #[arg(long)]
+        include_vcs: bool,
+        /// Mutagen ignore rule; repeat for multiple rules.
+        #[arg(long = "ignore")]
+        ignores: Vec<String>,
+        local_path: String,
+        remote_path: String,
+    },
+    /// List folder syncs known to the local daemon.
+    List,
+    /// Pause a folder sync without deleting its Mutagen session.
+    Pause { service_id: String },
+    /// Resume a paused folder sync.
+    Resume { service_id: String },
+    /// Permanently terminate a folder sync and its Mutagen session.
+    Terminate { service_id: String },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SyncModeArg {
+    TwoWaySafe,
+    TwoWayResolved,
+    OneWaySafe,
+    OneWayReplica,
+}
+
+impl From<SyncModeArg> for FolderSyncMode {
+    fn from(value: SyncModeArg) -> Self {
+        match value {
+            SyncModeArg::TwoWaySafe => Self::TwoWaySafe,
+            SyncModeArg::TwoWayResolved => Self::TwoWayResolved,
+            SyncModeArg::OneWaySafe => Self::OneWaySafe,
+            SyncModeArg::OneWayReplica => Self::OneWayReplica,
+        }
+    }
 }
 
 fn main() -> anyhow::Result<ExitCode> {
@@ -144,8 +201,137 @@ fn main() -> anyhow::Result<ExitCode> {
             &remote_path,
             overwrite,
         )?,
+        Commands::Sync { command } => match command {
+            SyncCommands::Create {
+                purpose,
+                login,
+                mode,
+                include_vcs,
+                ignores,
+                local_path,
+                remote_path,
+            } => create_folder_sync(
+                &purpose,
+                &login,
+                &local_path,
+                &remote_path,
+                mode.into(),
+                !include_vcs,
+                ignores,
+            )?,
+            SyncCommands::List => list_folder_syncs()?,
+            SyncCommands::Pause { service_id } => {
+                control_folder_sync(&service_id, ServiceAction::Pause)?
+            }
+            SyncCommands::Resume { service_id } => {
+                control_folder_sync(&service_id, ServiceAction::Resume)?
+            }
+            SyncCommands::Terminate { service_id } => {
+                control_folder_sync(&service_id, ServiceAction::Terminate)?
+            }
+        },
     };
     Ok(ExitCode::from(code))
+}
+
+fn tracked_target(purpose: &str, login: &str) -> anyhow::Result<bridge::Target> {
+    let state = state::State::load()?;
+    let tracked = state.purposes.get(purpose).with_context(|| {
+        format!(
+            "no Beam is tracked for purpose {purpose:?}; run `beams ssh --purpose {purpose}` first"
+        )
+    })?;
+    let beam = tsh::list_beams()?
+        .into_iter()
+        .find(|beam| beam.uuid == tracked.uuid)
+        .with_context(|| format!("the Beam tracked for purpose {purpose:?} is no longer active"))?;
+    Ok(bridge::Target {
+        beam_id: beam.id,
+        beam_uuid: beam.uuid,
+        login: login.to_string(),
+    })
+}
+
+fn create_folder_sync(
+    purpose: &str,
+    login: &str,
+    local_path: &str,
+    remote_path: &str,
+    mode: FolderSyncMode,
+    ignore_vcs: bool,
+    ignores: Vec<String>,
+) -> anyhow::Result<u8> {
+    let target = tracked_target(purpose, login)?;
+    let mut frontend = clientd::connect_or_start()?;
+    let request_id =
+        frontend.create_folder_sync(&target, local_path, remote_path, mode, ignore_vcs, ignores)?;
+    eprintln!("beams: submitted folder sync {request_id}");
+    while let Ok(event) = frontend.events.recv() {
+        match event {
+            clientd::ServerEvent::ServiceChanged { service }
+                if service.request_id == request_id =>
+            {
+                if let Some(message) = &service.message {
+                    eprintln!("beams: {:?}: {message}", service.status);
+                }
+                return match service.status {
+                    ServiceStatus::Running | ServiceStatus::Paused | ServiceStatus::Degraded => {
+                        println!("{}", service.service_id);
+                        Ok(0)
+                    }
+                    ServiceStatus::Error | ServiceStatus::Stopped => Ok(1),
+                    _ => continue,
+                };
+            }
+            clientd::ServerEvent::Error { message } => bail!("{message}"),
+            _ => {}
+        }
+    }
+    bail!("local daemon disconnected before the folder sync started")
+}
+
+fn list_folder_syncs() -> anyhow::Result<u8> {
+    let frontend = clientd::connect_or_start()?;
+    while let Ok(event) = frontend.events.recv() {
+        match event {
+            clientd::ServerEvent::Snapshot { services, .. } => {
+                for service in services.into_iter().filter(|service| {
+                    matches!(service.spec, Some(ServiceRequestKind::FolderSync { .. }))
+                }) {
+                    let endpoint = match service.spec.as_ref() {
+                        Some(ServiceRequestKind::FolderSync {
+                            remote_path,
+                            local_path_hint,
+                            mode,
+                            ..
+                        }) => format!(
+                            "{} <-> {} ({mode:?})",
+                            local_path_hint
+                                .as_deref()
+                                .unwrap_or("workstation directory"),
+                            remote_path
+                        ),
+                        _ => unreachable!(),
+                    };
+                    println!(
+                        "{}\t{:?}\t{}\t{}",
+                        service.service_id, service.status, service.beam_uuid, endpoint
+                    );
+                }
+                return Ok(0);
+            }
+            clientd::ServerEvent::Error { message } => bail!("{message}"),
+            _ => {}
+        }
+    }
+    bail!("local daemon disconnected before returning its service list")
+}
+
+fn control_folder_sync(service_id: &str, action: ServiceAction) -> anyhow::Result<u8> {
+    let mut frontend = clientd::connect_or_start()?;
+    frontend.control_service(service_id, action)?;
+    eprintln!("beams: {action:?} requested for {service_id}");
+    Ok(0)
 }
 
 fn copy_file(
@@ -156,20 +342,7 @@ fn copy_file(
     remote_path: &str,
     overwrite: bool,
 ) -> anyhow::Result<u8> {
-    let state = state::State::load()?;
-    let tracked = state
-        .purposes
-        .get(purpose)
-        .with_context(|| format!("no Beam is tracked for purpose {purpose:?}; run `beams ssh --purpose {purpose}` first"))?;
-    let beam = tsh::list_beams()?
-        .into_iter()
-        .find(|beam| beam.uuid == tracked.uuid)
-        .with_context(|| format!("the Beam tracked for purpose {purpose:?} is no longer active"))?;
-    let target = bridge::Target {
-        beam_id: beam.id,
-        beam_uuid: beam.uuid,
-        login: login.to_string(),
-    };
+    let target = tracked_target(purpose, login)?;
     let mut frontend = clientd::connect_or_start()?;
     let request_id = frontend.create_file_copy(
         &target,
@@ -254,10 +427,19 @@ fn ssh(
             eprintln!("beams: pushing {} to {}...", repo.display(), fresh.id);
             let branch = tsh::current_branch(repo)?;
             let origin_url = tsh::origin_url(repo)?;
-            tsh::prepare_git_target(login, &fresh.uuid, REMOTE_REPO_PATH, &branch, origin_url.as_deref())?;
+            tsh::prepare_git_target(
+                login,
+                &fresh.uuid,
+                REMOTE_REPO_PATH,
+                &branch,
+                origin_url.as_deref(),
+            )?;
             tsh::push_repo(repo, login, &fresh.uuid, REMOTE_REPO_PATH, &branch)?;
 
-            eprintln!("beams: copying the ssh key and bootstrap binary to {}...", fresh.id);
+            eprintln!(
+                "beams: copying the ssh key and bootstrap binary to {}...",
+                fresh.id
+            );
             let staging = stage::build(repo)?;
             let result = tsh::scp_dir(&staging.join("beams"), &fresh.id);
             let _ = std::fs::remove_dir_all(&staging);
@@ -304,11 +486,7 @@ fn ssh(
                             frontend.client_id, session_token
                         );
                         (
-                            session::LocalDaemon::connected(
-                                frontend,
-                                target,
-                                session_token,
-                            ),
+                            session::LocalDaemon::connected(frontend, target, session_token),
                             command,
                         )
                     }

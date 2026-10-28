@@ -165,6 +165,8 @@ beam-bootstrap client request upload \
   --remote-path /tmp/input.tar --local-path-hint input.tar
 beam-bootstrap client request download \
   --remote-path /tmp/result.json --local-path-hint result.json
+beam-bootstrap client request sync \
+  --remote-path ~/projects/example --local-path-hint example
 ```
 
 A direct SSH shell has no managed token and receives an actionable error. A
@@ -194,6 +196,23 @@ Detailed workstation paths and transfer errors stay in local daemon state.
 The Beam receives the typed direction, Beam path, optional display-only
 basename hint, overwrite policy, and sanitized lifecycle text.
 
+Folder syncs use Mutagen 0.18 or newer. `beamsd` creates a private
+`~/.config/beams-client/mutagen` data directory and generated mode-0700
+`ssh`/`scp` wrappers that dispatch Mutagen's transport through `tsh`; it does
+not modify global SSH configuration or share the user's ordinary Mutagen
+daemon. Both endpoint directories must already exist. The default is
+`two-way-safe` with VCS metadata ignored. The local menu exposes all Mutagen
+modes and ignore rules, with explicit warnings for local-wins and one-way
+behavior.
+
+Mutagen sessions are named deterministically from the Beam UUID and service
+ID. Closing `beams ssh` leaves them running, and a handled `beamsd` shutdown
+detaches its monitor instead of terminating the session. On daemon restart,
+persisted syncs are found by name, their exact local/remote endpoints, mode,
+and ignore settings are revalidated, and matching sessions are adopted.
+Pause/resume preserves the session; terminate permanently deletes it.
+Conflicts and disconnected endpoints are reported as `Degraded`.
+
 ## One-shot copy CLI
 
 The same client-initiated copy path is available without opening the local
@@ -212,6 +231,23 @@ selected `--purpose` (normally established by `beams ssh`), but an interactive
 shell does not need to remain open. The command connects to or starts the
 local daemon, prints lifecycle updates, blocks until the transfer completes,
 and exits non-zero on failure, cancellation, or daemon disconnection.
+
+## Folder-sync CLI
+
+Create and manage the same sync services without opening the local menu:
+
+```sh
+beams sync create ./project ~/projects/project
+beams sync create --mode one-way-safe --ignore target ./project ~/projects/project
+beams sync list
+beams sync pause SERVICE_ID
+beams sync resume SERVICE_ID
+beams sync terminate SERVICE_ID
+```
+
+`sync create` prints the service ID after Mutagen reaches a running, paused,
+or degraded state. Pass `--include-vcs` to synchronize `.git` and other VCS
+metadata; otherwise Mutagen's VCS ignore is enabled.
 
 ## State
 
