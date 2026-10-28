@@ -1,4 +1,5 @@
 mod aptlock;
+mod clientbridge;
 mod daemon;
 mod events;
 mod executor;
@@ -13,6 +14,7 @@ mod tui;
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use pathutil::expand_tilde;
 use tasks::Template;
@@ -89,6 +91,52 @@ enum Command {
     Task {
         #[command(subcommand)]
         task: DaemonTaskCommand,
+    },
+    /// Bridge the workstation daemon's typed stdin/stdout protocol to
+    /// the in-VM daemon socket. Normally launched over SSH by `beamsd`.
+    ClientBridge {
+        /// UDS socket path to connect to. Defaults to
+        /// `~/.beam-bootstrap/daemon.sock`.
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Inspect managed workstation clients or request a client-owned
+    /// service from inside this Beam.
+    Client {
+        #[command(subcommand)]
+        command: ClientCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClientCommand {
+    /// List workstation clients with live bridges to this Beam.
+    List {
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Request a workstation-owned service. The local user must approve
+    /// every remotely initiated request.
+    Request {
+        #[arg(long)]
+        socket: Option<String>,
+        #[command(subcommand)]
+        service: ClientServiceCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClientServiceCommand {
+    /// Request a loopback-only local port forward to an endpoint in the
+    /// Beam. Phase 3 routes and approves/rejects the proposal; Phase 4
+    /// creates the actual SSH forward.
+    PortForward {
+        #[arg(long, default_value = "127.0.0.1")]
+        remote_host: String,
+        #[arg(long)]
+        remote_port: u16,
+        #[arg(long)]
+        local_port: Option<u16>,
     },
 }
 
@@ -180,12 +228,162 @@ fn main() {
             0 // ditto
         }
         Some(Command::Task { task }) => run_daemon_task(task),
+        Some(Command::ClientBridge { socket }) => {
+            run_client_bridge(socket);
+            0
+        }
+        Some(Command::Client { command }) => run_client_command(command),
         None => {
             run_bootstrap(&args);
             0 // run_bootstrap exits the process itself; see its own doc comment
         }
     };
     std::process::exit(exit_code);
+}
+
+fn run_client_bridge(socket: Option<String>) {
+    let socket_path = expand_tilde(&socket.unwrap_or_else(daemon::default_socket_path));
+    if let Err(err) = clientbridge::run(&socket_path) {
+        eprintln!("error: {err:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run_client_command(command: ClientCommand) -> i32 {
+    match command {
+        ClientCommand::List { socket } => client_list(socket),
+        ClientCommand::Request { socket, service } => client_request(socket, service),
+    }
+}
+
+fn client_list(socket: Option<String>) -> i32 {
+    let socket_path = expand_tilde(&socket.unwrap_or_else(daemon::default_socket_path));
+    let mut conn = match connect_or_exit_code(&socket_path) {
+        Ok(conn) => conn,
+        Err(code) => return code,
+    };
+    if let Err(err) = conn.send(&json!({"request_id": "1", "op": "list_clients"})) {
+        eprintln!("error: {err}");
+        return 1;
+    }
+    match conn.recv() {
+        Ok(Some(value)) if value.get("type").and_then(Value::as_str) == Some("clients") => {
+            let clients = value.get("clients").and_then(Value::as_array).cloned().unwrap_or_default();
+            if clients.is_empty() {
+                println!("no managed Beams clients connected");
+            } else {
+                for client in clients {
+                    println!(
+                        "{} bridge={} sessions={}",
+                        client.get("client_id").and_then(Value::as_str).unwrap_or("?"),
+                        client.get("bridge_id").and_then(Value::as_str).unwrap_or("?"),
+                        client.get("session_count").and_then(Value::as_u64).unwrap_or(0),
+                    );
+                }
+            }
+            0
+        }
+        Ok(Some(value)) => {
+            eprintln!("error: unexpected daemon reply: {value}");
+            1
+        }
+        Ok(None) => {
+            eprintln!("error: daemon closed the connection without replying");
+            1
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            1
+        }
+    }
+}
+
+fn client_request(socket: Option<String>, service: ClientServiceCommand) -> i32 {
+    let session_token = match std::env::var("BEAMS_SESSION_TOKEN") {
+        Ok(token) if !token.is_empty() => token,
+        _ => {
+            eprintln!(
+                "error: no managed Beams client is associated with this shell\n\
+                 reconnect with `beams ssh`, then retry the request"
+            );
+            return 1;
+        }
+    };
+    let client_id = std::env::var("BEAMS_CLIENT_ID").ok();
+    let kind = match service {
+        ClientServiceCommand::PortForward { remote_host, remote_port, local_port } => {
+            beams_protocol::ServiceRequestKind::LocalPortForward { remote_host, remote_port, local_port }
+        }
+    };
+    let service_request = beams_protocol::ServiceRequest { request_id: Uuid::new_v4().to_string(), kind };
+    let socket_path = expand_tilde(&socket.unwrap_or_else(daemon::default_socket_path));
+    let mut conn = match connect_or_exit_code(&socket_path) {
+        Ok(conn) => conn,
+        Err(code) => return code,
+    };
+    let request_id = "1";
+    if let Err(err) = conn.send(&json!({
+        "request_id": request_id,
+        "op": "request_service",
+        "session_token": session_token,
+        "client_id": client_id,
+        "request": service_request,
+    })) {
+        eprintln!("error: {err}");
+        return 1;
+    }
+
+    let mut accepted = false;
+    loop {
+        let value = match conn.recv() {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                eprintln!("error: daemon closed the connection before the request was decided");
+                return 1;
+            }
+            Err(err) => {
+                eprintln!("error: {err}");
+                return 1;
+            }
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("error") if value.get("request_id").and_then(Value::as_str) == Some(request_id) => {
+                eprintln!("error: {}", value.get("message").and_then(Value::as_str).unwrap_or("unknown daemon error"));
+                return 1;
+            }
+            Some("service_request_accepted") if value.get("request_id").and_then(Value::as_str) == Some(request_id) => {
+                accepted = true;
+                println!("submitted {}; waiting for local approval", service_request.request_id);
+            }
+            Some("service_request_status")
+                if value
+                    .get("request")
+                    .and_then(|request| request.get("request"))
+                    .and_then(|request| request.get("request_id"))
+                    .and_then(Value::as_str)
+                    == Some(&service_request.request_id) =>
+            {
+                let status = value
+                    .get("request")
+                    .and_then(|request| request.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                let message = value.get("request").and_then(|request| request.get("message")).and_then(Value::as_str);
+                if accepted || status != "pending_approval" {
+                    match message {
+                        Some(message) => println!("{status}: {message}"),
+                        None => println!("{status}"),
+                    }
+                }
+                match status {
+                    "approved" => return 0,
+                    "rejected" | "expired" | "failed" => return 1,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn list_tasks() {
@@ -219,22 +417,13 @@ fn task_command_to_instance(command: TaskCommand) -> (&'static str, Value) {
         TaskCommand::CloneGitRepo { repo, dest } => {
             (tasks::clone_git_repo::CloneGitRepo::NAME, json!({"repo": repo, "dest": dest}))
         }
-        TaskCommand::CheckoutPrWorktree { base, pr, dest } => (
-            tasks::checkout_pr_worktree::CheckoutPrWorktree::NAME,
-            json!({"base": base, "pr": pr, "dest": dest}),
-        ),
-        TaskCommand::InstallToolchainGo => {
-            (tasks::install_toolchain_go::InstallToolchainGo::NAME, json!({}))
+        TaskCommand::CheckoutPrWorktree { base, pr, dest } => {
+            (tasks::checkout_pr_worktree::CheckoutPrWorktree::NAME, json!({"base": base, "pr": pr, "dest": dest}))
         }
-        TaskCommand::InstallToolchainRust => {
-            (tasks::install_toolchain_rust::InstallToolchainRust::NAME, json!({}))
-        }
-        TaskCommand::InstallCodeServer => {
-            (tasks::install_code_server::InstallCodeServer::NAME, json!({}))
-        }
-        TaskCommand::WaitSshAgentUnlock => {
-            (tasks::wait_ssh_agent_unlock::WaitSshAgentUnlock::NAME, json!({}))
-        }
+        TaskCommand::InstallToolchainGo => (tasks::install_toolchain_go::InstallToolchainGo::NAME, json!({})),
+        TaskCommand::InstallToolchainRust => (tasks::install_toolchain_rust::InstallToolchainRust::NAME, json!({})),
+        TaskCommand::InstallCodeServer => (tasks::install_code_server::InstallCodeServer::NAME, json!({})),
+        TaskCommand::WaitSshAgentUnlock => (tasks::wait_ssh_agent_unlock::WaitSshAgentUnlock::NAME, json!({})),
     }
 }
 
@@ -364,9 +553,7 @@ fn daemon_run_task(socket: Option<String>, task: TaskCommand) -> i32 {
     };
 
     let request_id = "1";
-    if let Err(err) =
-        conn.send(&json!({"request_id": request_id, "op": "run_task", "task": name, "params": params}))
-    {
+    if let Err(err) = conn.send(&json!({"request_id": request_id, "op": "run_task", "task": name, "params": params})) {
         eprintln!("error: {err}");
         return 1;
     }
@@ -401,7 +588,9 @@ fn daemon_run_task(socket: Option<String>, task: TaskCommand) -> i32 {
                 return 1;
             }
             Some("task_status") => {
-                let Some(id) = value.get("task_id").and_then(Value::as_str) else { continue };
+                let Some(id) = value.get("task_id").and_then(Value::as_str) else {
+                    continue;
+                };
                 // Broadcasts go to every connection - only print/act on
                 // the one this call actually submitted.
                 if task_id.as_deref() != Some(id) {
@@ -524,8 +713,7 @@ mod tests {
     #[test]
     fn task_command_covers_every_known_template() {
         let cmd = TaskCommand::augment_subcommands(clap::Command::new("task-run"));
-        let mut covered: Vec<String> =
-            cmd.get_subcommands().map(|c| c.get_name().to_string()).collect();
+        let mut covered: Vec<String> = cmd.get_subcommands().map(|c| c.get_name().to_string()).collect();
         covered.sort();
 
         let mut expected: Vec<String> = crate::tasks::names().iter().map(|s| s.to_string()).collect();

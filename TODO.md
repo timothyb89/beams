@@ -563,6 +563,16 @@ bootstrap `Task`s.
 - [ ] Phase 3: add `beam-bootstrap client-bridge`, VM-daemon client/service
   projection, managed-session routing tokens, bridge reconnect/snapshots, and
   remote CLI requests. Direct or stale unmanaged sessions must fail clearly.
+  - [x] Shared `protocol/` crate plus the VM half: typed, versioned bridge
+    messages; `beam-bootstrap client-bridge`; daemon bridge registration,
+    exact session-token routing, request/service projections and status
+    broadcasts; and `beam-bootstrap client list` /
+    `client request port-forward`. Tests cover stable serialization,
+    one-of-many routing, rejection transitions, and direct/stale-session
+    errors. The request deliberately creates no forward yet.
+  - [ ] Workstation half: supervise one reconnecting bridge per Beam, register
+    each managed shell token, show/decide pending requests locally, expire
+    unanswered requests, and resend snapshots after either daemon restarts.
 - [ ] Phase 4: implement loopback-only local port forwards as the first full
   client- and remote-initiated service, including approval, status,
   stop/restart, ownership, and `Tasks | Services | Requests` in the remote TUI.

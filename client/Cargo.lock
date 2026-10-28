@@ -93,6 +93,7 @@ name = "beams"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "beams-protocol",
  "chrono",
  "clap",
  "crossterm",
@@ -103,6 +104,13 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "uuid",
+]
+
+[[package]]
+name = "beams-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

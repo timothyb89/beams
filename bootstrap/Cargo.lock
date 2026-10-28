@@ -108,11 +108,20 @@ name = "beam-bootstrap"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "beams-protocol",
  "clap",
  "crossterm",
  "ratatui",
  "serde",
  "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "beams-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

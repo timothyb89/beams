@@ -59,6 +59,7 @@
 //! started) concurrently - that's what a client should group progress
 //! rows by, rather than inferring concurrency from event timing.
 
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -69,7 +70,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::Context;
-use serde::Deserialize;
+use beams_protocol::{
+    BeamToClient, ClientToBeam, RequestStatus, ServiceProjection, ServiceRequest, ServiceRequestKind, PROTOCOL,
+    PROTOCOL_VERSION,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::executor;
@@ -83,11 +88,56 @@ pub fn default_socket_path() -> String {
 /// events, and a lock serializing task execution so only one task runs
 /// at a time system-wide - the same one-thing-at-a-time semantics the
 /// fixed startup sequence already has (see `steps::run`).
-#[derive(Default)]
 struct Hub {
-    subscribers: Mutex<Vec<Sender<String>>>,
+    subscribers: Mutex<Vec<(u64, Sender<String>)>>,
     run_lock: Mutex<()>,
     manifest_counter: AtomicU64,
+    connection_counter: AtomicU64,
+    bridges: Mutex<BTreeMap<String, BridgeRegistration>>,
+    client_requests: Mutex<BTreeMap<String, ClientRequestProjection>>,
+    client_services: Mutex<BTreeMap<String, OwnedServiceProjection>>,
+}
+
+impl Default for Hub {
+    fn default() -> Self {
+        Self {
+            subscribers: Mutex::new(Vec::new()),
+            run_lock: Mutex::new(()),
+            manifest_counter: AtomicU64::new(0),
+            connection_counter: AtomicU64::new(0),
+            bridges: Mutex::new(BTreeMap::new()),
+            client_requests: Mutex::new(BTreeMap::new()),
+            client_services: Mutex::new(BTreeMap::new()),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BridgeRegistration {
+    client_id: String,
+    bridge_id: String,
+    session_tokens: HashSet<String>,
+    sender: Sender<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ClientRequestProjection {
+    request: ServiceRequest,
+    owner_client_id: String,
+    bridge_id: String,
+    status: RequestStatus,
+    message: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct OwnedServiceProjection {
+    owner_client_id: String,
+    service: ServiceProjection,
+}
+
+#[derive(Default)]
+struct ConnectionContext {
+    bridge_id: Option<String>,
 }
 
 impl Hub {
@@ -95,23 +145,64 @@ impl Hub {
     /// for *both* its own direct replies and this hub's broadcasts (both
     /// end up as lines on the same socket - see the module doc comment)
     /// and the receiver its dedicated writer thread should drain.
-    fn register(&self) -> (Sender<String>, Receiver<String>) {
+    fn register(&self) -> (u64, Sender<String>, Receiver<String>) {
         let (tx, rx) = mpsc::channel();
-        self.subscribers.lock().unwrap().push(tx.clone());
-        (tx, rx)
+        let id = self.connection_counter.fetch_add(1, Ordering::Relaxed);
+        self.subscribers.lock().unwrap().push((id, tx.clone()));
+        (id, tx, rx)
+    }
+
+    fn unregister(&self, connection_id: u64) {
+        self.subscribers.lock().unwrap().retain(|(id, _)| *id != connection_id);
     }
 
     /// Sends `line` to every still-live subscriber, dropping any whose
     /// receiver has gone away (its connection closed).
     fn broadcast(&self, line: &str) {
         let mut subs = self.subscribers.lock().unwrap();
-        subs.retain(|tx| tx.send(line.to_string()).is_ok());
+        subs.retain(|(_, tx)| tx.send(line.to_string()).is_ok());
     }
 
     /// A fresh id for a `run_manifest` call - just needs to be unique
     /// within this daemon's lifetime, not globally meaningful.
     fn next_manifest_id(&self) -> String {
         format!("manifest-{}", self.manifest_counter.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn register_bridge(&self, registration: BridgeRegistration) -> Result<(), String> {
+        let client_id = registration.client_id.clone();
+        let bridge_id = registration.bridge_id.clone();
+        let mut bridges = self.bridges.lock().unwrap();
+        if bridges.contains_key(&bridge_id) {
+            return Err(format!("client bridge {bridge_id:?} is already registered"));
+        }
+        bridges.insert(bridge_id.clone(), registration);
+        drop(bridges);
+        self.broadcast(
+            &json!({
+                "type": "client_status",
+                "client_id": client_id,
+                "bridge_id": bridge_id,
+                "status": "connected",
+            })
+            .to_string(),
+        );
+        Ok(())
+    }
+
+    fn unregister_bridge(&self, bridge_id: &str) {
+        let removed = self.bridges.lock().unwrap().remove(bridge_id);
+        if let Some(registration) = removed {
+            self.broadcast(
+                &json!({
+                    "type": "client_status",
+                    "client_id": registration.client_id,
+                    "bridge_id": registration.bridge_id,
+                    "status": "disconnected",
+                })
+                .to_string(),
+            );
+        }
     }
 }
 
@@ -122,22 +213,16 @@ impl Hub {
 /// live one).
 pub fn serve(socket_path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     if socket_path.exists() {
         if UnixStream::connect(socket_path).is_ok() {
-            anyhow::bail!(
-                "a daemon is already listening on {} - not starting a second one",
-                socket_path.display()
-            );
+            anyhow::bail!("a daemon is already listening on {} - not starting a second one", socket_path.display());
         }
-        fs::remove_file(socket_path)
-            .with_context(|| format!("removing stale socket {}", socket_path.display()))?;
+        fs::remove_file(socket_path).with_context(|| format!("removing stale socket {}", socket_path.display()))?;
     }
 
-    let listener = UnixListener::bind(socket_path)
-        .with_context(|| format!("binding {}", socket_path.display()))?;
+    let listener = UnixListener::bind(socket_path).with_context(|| format!("binding {}", socket_path.display()))?;
     let hub = Arc::new(Hub::default());
 
     for stream in listener.incoming() {
@@ -158,7 +243,7 @@ pub fn serve(socket_path: &Path) -> anyhow::Result<()> {
 /// infinite `accept()` loop to manage.
 fn handle_connection(hub: &Arc<Hub>, stream: UnixStream) -> anyhow::Result<()> {
     let write_half = stream.try_clone().context("cloning connection for writing")?;
-    let (tx, rx) = hub.register();
+    let (connection_id, tx, rx) = hub.register();
 
     // Dedicated writer thread: broadcasts (from *any* connection's
     // run_task) and this connection's own direct replies both arrive as
@@ -180,14 +265,19 @@ fn handle_connection(hub: &Arc<Hub>, stream: UnixStream) -> anyhow::Result<()> {
     });
 
     let reader = BufReader::new(stream);
+    let mut context = ConnectionContext::default();
     for line in reader.lines() {
         let line = line.context("reading request")?;
         if line.trim().is_empty() {
             continue;
         }
-        handle_line(hub, &line, &tx);
+        handle_line(hub, &line, &tx, &mut context);
     }
 
+    if let Some(bridge_id) = context.bridge_id {
+        hub.unregister_bridge(&bridge_id);
+    }
+    hub.unregister(connection_id);
     drop(tx);
     let _ = writer.join();
     Ok(())
@@ -195,7 +285,7 @@ fn handle_connection(hub: &Arc<Hub>, stream: UnixStream) -> anyhow::Result<()> {
 
 /// Parses and dispatches one request line, sending its direct reply (and
 /// any `run_task` broadcasts) through `reply`.
-fn handle_line(hub: &Hub, line: &str, reply: &Sender<String>) {
+fn handle_line(hub: &Hub, line: &str, reply: &Sender<String>, context: &mut ConnectionContext) {
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(err) => {
@@ -208,10 +298,8 @@ fn handle_line(hub: &Hub, line: &str, reply: &Sender<String>) {
 
     match op {
         "list_tasks" => {
-            let _ = reply.send(
-                json!({"request_id": request_id, "type": "tasks", "tasks": tasks::templates()})
-                    .to_string(),
-            );
+            let _ =
+                reply.send(json!({"request_id": request_id, "type": "tasks", "tasks": tasks::templates()}).to_string());
         }
         "run_task" => {
             let name = request.get("task").and_then(Value::as_str).unwrap_or_default();
@@ -222,10 +310,323 @@ fn handle_line(hub: &Hub, line: &str, reply: &Sender<String>) {
             let tasks_value = request.get("tasks").cloned().unwrap_or(Value::Null);
             run_manifest(hub, request_id, tasks_value, reply);
         }
+        "register_client_bridge" => {
+            register_client_bridge(hub, request_id, &request, reply, context);
+        }
+        "client_bridge_message" => {
+            client_bridge_message(hub, request_id, &request, reply, context);
+        }
+        "list_clients" => {
+            list_clients(hub, request_id, reply);
+        }
+        "request_service" => {
+            request_service(hub, request_id, &request, reply);
+        }
         other => {
             let _ = reply.send(error_reply(request_id, &format!("unknown op {other:?}")));
         }
     }
+}
+
+fn register_client_bridge(
+    hub: &Hub,
+    request_id: Option<&str>,
+    request: &Value,
+    reply: &Sender<String>,
+    context: &mut ConnectionContext,
+) {
+    if context.bridge_id.is_some() {
+        let _ = reply.send(error_reply(request_id, "this connection is already a client bridge"));
+        return;
+    }
+    let message: ClientToBeam = match serde_json::from_value(request.get("message").cloned().unwrap_or(Value::Null)) {
+        Ok(message) => message,
+        Err(err) => {
+            let _ = reply.send(error_reply(request_id, &format!("invalid bridge hello: {err}")));
+            return;
+        }
+    };
+    let ClientToBeam::Hello { protocol, version, client_id, bridge_id, session_tokens } = message else {
+        let _ = reply.send(error_reply(request_id, "first bridge message must be hello"));
+        return;
+    };
+    if protocol != PROTOCOL || version != PROTOCOL_VERSION {
+        let _ = reply.send(error_reply(
+            request_id,
+            &format!(
+                "unsupported bridge protocol {protocol:?} version {version}; expected {PROTOCOL:?} version {PROTOCOL_VERSION}"
+            ),
+        ));
+        return;
+    }
+    if client_id.is_empty() || bridge_id.is_empty() {
+        let _ = reply.send(error_reply(request_id, "client_id and bridge_id must not be empty"));
+        return;
+    }
+    let registration = BridgeRegistration {
+        client_id,
+        bridge_id: bridge_id.clone(),
+        session_tokens: session_tokens.into_iter().filter(|token| !token.is_empty()).collect(),
+        sender: reply.clone(),
+    };
+    if let Err(err) = hub.register_bridge(registration) {
+        let _ = reply.send(error_reply(request_id, &err));
+        return;
+    }
+    context.bridge_id = Some(bridge_id.clone());
+    let _ = reply.send(
+        json!({
+            "request_id": request_id,
+            "type": "bridge_registered",
+            "message": BeamToClient::hello(bridge_id),
+        })
+        .to_string(),
+    );
+}
+
+fn client_bridge_message(
+    hub: &Hub,
+    request_id: Option<&str>,
+    request: &Value,
+    reply: &Sender<String>,
+    context: &ConnectionContext,
+) {
+    let Some(bridge_id) = context.bridge_id.as_deref() else {
+        let _ = reply.send(error_reply(request_id, "register_client_bridge must be called first"));
+        return;
+    };
+    let message: ClientToBeam = match serde_json::from_value(request.get("message").cloned().unwrap_or(Value::Null)) {
+        Ok(message) => message,
+        Err(err) => {
+            let _ = reply.send(error_reply(request_id, &format!("invalid bridge message: {err}")));
+            return;
+        }
+    };
+
+    match message {
+        ClientToBeam::Hello { .. } => {
+            let _ = reply.send(error_reply(request_id, "bridge hello was already received"));
+        }
+        ClientToBeam::AddSessionToken { session_token } => {
+            if session_token.is_empty() {
+                let _ = reply.send(error_reply(request_id, "session token must not be empty"));
+                return;
+            }
+            let mut bridges = hub.bridges.lock().unwrap();
+            let Some(bridge) = bridges.get_mut(bridge_id) else {
+                let _ = reply.send(error_reply(request_id, "bridge is no longer registered"));
+                return;
+            };
+            bridge.session_tokens.insert(session_token);
+            let _ = reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
+        }
+        ClientToBeam::RequestStatus { request_id: service_request_id, status, message } => {
+            let client_id = {
+                let bridges = hub.bridges.lock().unwrap();
+                match bridges.get(bridge_id) {
+                    Some(bridge) => bridge.client_id.clone(),
+                    None => {
+                        let _ = reply.send(error_reply(request_id, "bridge is no longer registered"));
+                        return;
+                    }
+                }
+            };
+            let projection = {
+                let mut requests = hub.client_requests.lock().unwrap();
+                let Some(projection) = requests.get_mut(&service_request_id) else {
+                    let _ =
+                        reply.send(error_reply(request_id, &format!("unknown service request {service_request_id:?}")));
+                    return;
+                };
+                if projection.owner_client_id != client_id || projection.bridge_id != bridge_id {
+                    let _ =
+                        reply.send(error_reply(request_id, "service request is owned by a different client bridge"));
+                    return;
+                }
+                match projection.status.transition(status) {
+                    Ok(next) => projection.status = next,
+                    Err(err) => {
+                        let _ = reply.send(error_reply(request_id, &err));
+                        return;
+                    }
+                }
+                projection.message = message;
+                projection.clone()
+            };
+            hub.broadcast(&json!({"type": "service_request_status", "request": projection}).to_string());
+            let _ = reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
+        }
+        ClientToBeam::ServiceSnapshot { services } => {
+            let client_id = {
+                let bridges = hub.bridges.lock().unwrap();
+                match bridges.get(bridge_id) {
+                    Some(bridge) => bridge.client_id.clone(),
+                    None => {
+                        let _ = reply.send(error_reply(request_id, "bridge is no longer registered"));
+                        return;
+                    }
+                }
+            };
+            {
+                let mut current = hub.client_services.lock().unwrap();
+                current.retain(|_, service| service.owner_client_id != client_id);
+                for service in services {
+                    current.insert(
+                        service.service_id.clone(),
+                        OwnedServiceProjection { owner_client_id: client_id.clone(), service },
+                    );
+                }
+            }
+            hub.broadcast(
+                &json!({
+                    "type": "client_services_snapshot",
+                    "client_id": client_id,
+                    "services": hub.client_services.lock().unwrap().values().cloned().collect::<Vec<_>>(),
+                })
+                .to_string(),
+            );
+            let _ = reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
+        }
+        ClientToBeam::Ping { nonce } => {
+            send_bridge_event(reply, &BeamToClient::Pong { nonce });
+        }
+    }
+}
+
+fn list_clients(hub: &Hub, request_id: Option<&str>, reply: &Sender<String>) {
+    let clients: Vec<Value> = hub
+        .bridges
+        .lock()
+        .unwrap()
+        .values()
+        .map(|bridge| {
+            json!({
+                "client_id": bridge.client_id,
+                "bridge_id": bridge.bridge_id,
+                "session_count": bridge.session_tokens.len(),
+                "status": "connected",
+            })
+        })
+        .collect();
+    let _ = reply.send(json!({"request_id": request_id, "type": "clients", "clients": clients}).to_string());
+}
+
+fn request_service(hub: &Hub, request_id: Option<&str>, request: &Value, reply: &Sender<String>) {
+    let session_token = request.get("session_token").and_then(Value::as_str).unwrap_or_default();
+    let client_hint = request.get("client_id").and_then(Value::as_str);
+    let service_request: ServiceRequest =
+        match serde_json::from_value(request.get("request").cloned().unwrap_or(Value::Null)) {
+            Ok(request) => request,
+            Err(err) => {
+                let _ = reply.send(error_reply(request_id, &format!("invalid service request: {err}")));
+                return;
+            }
+        };
+    if session_token.is_empty() {
+        let _ = reply.send(error_reply(
+            request_id,
+            "no managed Beams client is associated with this shell; reconnect with `beams ssh`, then retry the request",
+        ));
+        return;
+    }
+    if service_request.request_id.is_empty() {
+        let _ = reply.send(error_reply(request_id, "service request_id must not be empty"));
+        return;
+    }
+    match &service_request.kind {
+        ServiceRequestKind::LocalPortForward { remote_host, remote_port, .. }
+            if remote_host.is_empty() || *remote_port == 0 =>
+        {
+            let _ =
+                reply.send(error_reply(request_id, "remote_host must not be empty and remote_port must be non-zero"));
+            return;
+        }
+        _ => {}
+    }
+
+    let matching: Vec<BridgeRegistration> = hub
+        .bridges
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|bridge| bridge.session_tokens.contains(session_token))
+        .cloned()
+        .collect();
+    let bridge = match matching.as_slice() {
+        [bridge] => bridge.clone(),
+        [] => {
+            let client_connected = client_hint.is_some_and(|client_id| {
+                hub.bridges.lock().unwrap().values().any(|bridge| bridge.client_id == client_id)
+            });
+            let message = if client_connected {
+                format!(
+                    "the managed Beams session token for client {} is stale; reconnect with `beams ssh`, then retry the request",
+                    client_hint.unwrap_or("?")
+                )
+            } else {
+                "no managed Beams client is associated with this shell; reconnect with `beams ssh`, then retry the request".to_string()
+            };
+            let _ = reply.send(error_reply(request_id, &message));
+            return;
+        }
+        _ => {
+            let _ = reply.send(error_reply(
+                request_id,
+                "managed session token is registered by more than one client bridge; reconnect with `beams ssh`",
+            ));
+            return;
+        }
+    };
+
+    {
+        let mut requests = hub.client_requests.lock().unwrap();
+        if requests.contains_key(&service_request.request_id) {
+            let _ = reply.send(error_reply(
+                request_id,
+                &format!("service request {:?} already exists", service_request.request_id),
+            ));
+            return;
+        }
+        requests.insert(
+            service_request.request_id.clone(),
+            ClientRequestProjection {
+                request: service_request.clone(),
+                owner_client_id: bridge.client_id.clone(),
+                bridge_id: bridge.bridge_id.clone(),
+                status: RequestStatus::PendingApproval,
+                message: None,
+            },
+        );
+    }
+
+    if !send_bridge_event(&bridge.sender, &BeamToClient::RequestSubmitted { request: service_request.clone() }) {
+        hub.client_requests.lock().unwrap().remove(&service_request.request_id);
+        let _ =
+            reply.send(error_reply(request_id, "the managed Beams client disconnected while submitting the request"));
+        return;
+    }
+
+    let projection = hub
+        .client_requests
+        .lock()
+        .unwrap()
+        .get(&service_request.request_id)
+        .cloned()
+        .expect("request was just inserted");
+    hub.broadcast(&json!({"type": "service_request_status", "request": projection}).to_string());
+    let _ = reply.send(
+        json!({
+            "request_id": request_id,
+            "type": "service_request_accepted",
+            "service_request_id": service_request.request_id,
+            "client_id": bridge.client_id,
+        })
+        .to_string(),
+    );
+}
+
+fn send_bridge_event(sender: &Sender<String>, message: &BeamToClient) -> bool {
+    sender.send(json!({"type": "client_bridge_event", "message": message}).to_string()).is_ok()
 }
 
 fn run_task(hub: &Hub, request_id: Option<&str>, name: &str, params: Value, reply: &Sender<String>) {
@@ -419,10 +820,13 @@ mod tests {
     /// several broadcasts land in one read()) its predecessor had
     /// already buffered but not yet handed back via `read_line`.
     fn connect() -> (UnixStream, BufReader<UnixStream>, thread::JoinHandle<()>) {
+        connect_to(Arc::new(Hub::default()))
+    }
+
+    fn connect_to(hub: Arc<Hub>) -> (UnixStream, BufReader<UnixStream>, thread::JoinHandle<()>) {
         let (server_end, client_end) = UnixStream::pair().expect("creating socket pair");
         client_end.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let read_half = client_end.try_clone().expect("cloning client end for reading");
-        let hub = Arc::new(Hub::default());
         let handle = thread::spawn(move || {
             let _ = handle_connection(&hub, server_end);
         });
@@ -437,6 +841,37 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).expect("reading reply");
         serde_json::from_str(line.trim()).expect("reply should be valid JSON")
+    }
+
+    fn recv_type(reader: &mut BufReader<UnixStream>, expected: &str) -> Value {
+        loop {
+            let value = recv(reader);
+            if value.get("type").and_then(Value::as_str) == Some(expected) {
+                return value;
+            }
+        }
+    }
+
+    fn register_bridge(
+        hub: Arc<Hub>,
+        client_id: &str,
+        bridge_id: &str,
+        token: &str,
+    ) -> (UnixStream, BufReader<UnixStream>, thread::JoinHandle<()>) {
+        let (mut stream, mut reader, handle) = connect_to(hub);
+        let hello = ClientToBeam::hello(client_id.to_string(), bridge_id.to_string(), vec![token.to_string()]);
+        send(
+            &mut stream,
+            &json!({
+                "request_id": "register",
+                "op": "register_client_bridge",
+                "message": hello,
+            })
+            .to_string(),
+        );
+        let registered = recv_type(&mut reader, "bridge_registered");
+        assert_eq!(registered["request_id"], "register");
+        (stream, reader, handle)
     }
 
     /// Like `recv`, but discards any number of `task_status` events with
@@ -470,11 +905,7 @@ mod tests {
             .args(args)
             .output()
             .unwrap_or_else(|e| panic!("running git {args:?}: {e}"));
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert!(output.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
     /// A minimal local repo with one commit - usable as a `clone-git-repo`
@@ -688,5 +1119,175 @@ mod tests {
         let reply = recv(&mut reader);
         assert_eq!(reply["type"], "error");
         assert_eq!(reply["request_id"], "9");
+    }
+
+    #[test]
+    fn managed_session_token_routes_a_request_to_exactly_one_bridge() {
+        let hub = Arc::new(Hub::default());
+        let (_bridge_a, mut bridge_a_reader, _a_handle) =
+            register_bridge(Arc::clone(&hub), "client-a", "bridge-a", "token-a");
+        let (_bridge_b, mut bridge_b_reader, _b_handle) =
+            register_bridge(Arc::clone(&hub), "client-b", "bridge-b", "token-b");
+        let (mut requester, mut requester_reader, _requester_handle) = connect_to(Arc::clone(&hub));
+
+        let service_request = ServiceRequest {
+            request_id: "service-request-1".to_string(),
+            kind: ServiceRequestKind::LocalPortForward {
+                remote_host: "127.0.0.1".to_string(),
+                remote_port: 8080,
+                local_port: Some(18080),
+            },
+        };
+        send(
+            &mut requester,
+            &json!({
+                "request_id": "submit",
+                "op": "request_service",
+                "session_token": "token-b",
+                "client_id": "client-b",
+                "request": service_request,
+            })
+            .to_string(),
+        );
+
+        let bridge_event = recv_type(&mut bridge_b_reader, "client_bridge_event");
+        let routed: BeamToClient = serde_json::from_value(bridge_event["message"].clone()).unwrap();
+        assert!(matches!(
+            routed,
+            BeamToClient::RequestSubmitted {
+                request: ServiceRequest { request_id, .. }
+            } if request_id == "service-request-1"
+        ));
+
+        let pending = recv_type(&mut requester_reader, "service_request_status");
+        assert_eq!(pending["request"]["owner_client_id"], "client-b");
+        assert_eq!(pending["request"]["status"], "pending_approval");
+        let accepted = recv_type(&mut requester_reader, "service_request_accepted");
+        assert_eq!(accepted["client_id"], "client-b");
+
+        bridge_a_reader.get_mut().set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        loop {
+            let mut line = String::new();
+            match bridge_a_reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let value: Value = serde_json::from_str(line.trim()).unwrap();
+                    assert_ne!(
+                        value.get("type").and_then(Value::as_str),
+                        Some("client_bridge_event"),
+                        "request intended for client-b leaked to client-a"
+                    );
+                }
+                Err(err) if matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    break;
+                }
+                Err(err) => panic!("reading non-target bridge: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn bridge_decision_is_validated_and_broadcast_back_to_the_remote_requester() {
+        let hub = Arc::new(Hub::default());
+        let (mut bridge, mut bridge_reader, _bridge_handle) =
+            register_bridge(Arc::clone(&hub), "client-a", "bridge-a", "token-a");
+        let (mut requester, mut requester_reader, _requester_handle) = connect_to(Arc::clone(&hub));
+        send(
+            &mut requester,
+            &json!({
+                "request_id": "submit",
+                "op": "request_service",
+                "session_token": "token-a",
+                "request": {
+                    "request_id": "service-request-2",
+                    "kind": {
+                        "kind": "local_port_forward",
+                        "remote_host": "localhost",
+                        "remote_port": 3000
+                    }
+                },
+            })
+            .to_string(),
+        );
+        let _ = recv_type(&mut bridge_reader, "client_bridge_event");
+        let _ = recv_type(&mut requester_reader, "service_request_accepted");
+
+        send(
+            &mut bridge,
+            &json!({
+                "request_id": "decision",
+                "op": "client_bridge_message",
+                "message": ClientToBeam::RequestStatus {
+                    request_id: "service-request-2".to_string(),
+                    status: RequestStatus::Rejected,
+                    message: Some("rejected by local user".to_string()),
+                },
+            })
+            .to_string(),
+        );
+
+        let rejected = loop {
+            let value = recv_type(&mut requester_reader, "service_request_status");
+            if value["request"]["status"] == "rejected" {
+                break value;
+            }
+        };
+        assert_eq!(rejected["request"]["message"], "rejected by local user");
+        let decision_reply = recv_type(&mut bridge_reader, "bridge_message_accepted");
+        assert_eq!(decision_reply["request_id"], "decision");
+
+        send(
+            &mut bridge,
+            &json!({
+                "request_id": "invalid-decision",
+                "op": "client_bridge_message",
+                "message": ClientToBeam::RequestStatus {
+                    request_id: "service-request-2".to_string(),
+                    status: RequestStatus::Approved,
+                    message: None,
+                },
+            })
+            .to_string(),
+        );
+        let error = recv_type(&mut bridge_reader, "error");
+        assert!(error["message"].as_str().unwrap().contains("invalid request transition"));
+    }
+
+    #[test]
+    fn unmanaged_and_stale_sessions_fail_without_routing_a_request() {
+        let hub = Arc::new(Hub::default());
+        let (_bridge, _bridge_reader, _bridge_handle) =
+            register_bridge(Arc::clone(&hub), "client-a", "bridge-a", "current-token");
+        let (mut requester, mut reader, _handle) = connect_to(hub);
+
+        for (token, client_id, expected) in [
+            ("", None, "no managed Beams client"),
+            ("old-token", Some("client-a"), "session token for client client-a is stale"),
+        ] {
+            send(
+                &mut requester,
+                &json!({
+                    "request_id": token,
+                    "op": "request_service",
+                    "session_token": token,
+                    "client_id": client_id,
+                    "request": {
+                        "request_id": format!("request-{token}"),
+                        "kind": {
+                            "kind": "local_port_forward",
+                            "remote_host": "127.0.0.1",
+                            "remote_port": 8080
+                        }
+                    },
+                })
+                .to_string(),
+            );
+            let error = recv_type(&mut reader, "error");
+            assert!(
+                error["message"].as_str().unwrap().contains(expected),
+                "{} did not contain {expected:?}",
+                error["message"]
+            );
+        }
     }
 }

@@ -197,9 +197,10 @@ no-op.
 ### Daemon
 
 `beam-bootstrap daemon` listens on a UDS socket (`--socket`, defaults to
-`~/.beam-bootstrap/daemon.sock`) for `list_tasks`/`run_task`/
-`run_manifest` requests as newline-delimited JSON - see `src/daemon.rs`'s
-module doc comment for the full protocol. Meant to be supervised, e.g.:
+`~/.beam-bootstrap/daemon.sock`) for task operations and the managed-client
+bridge operations described below, all as newline-delimited JSON - see
+`src/daemon.rs`'s module doc comment for the task protocol. Meant to be
+supervised, e.g.:
 
 ```sh
 beamctl start --name beam-bootstrapd -- ./target/debug/beam-bootstrap daemon
@@ -233,6 +234,42 @@ echo '{"request_id":"2","op":"run_manifest","tasks":[
   {"template":"clone-git-repo","params":{"repo":"...","dest":"~/projects/core"}}
 ]}' | nc -U ~/.beam-bootstrap/daemon.sock
 ```
+
+### Managed client bridge and remote requests
+
+`beam-bootstrap client-bridge` is the stdin/stdout adapter launched over SSH
+by the workstation `beams` daemon. It accepts only the typed
+`beams-client-services` protocol, registers the workstation's client/bridge
+IDs and managed-shell tokens with `beam-bootstrapd`, and forwards proposals
+and status updates. It does not create services or approve requests itself.
+
+Inside a managed shell, the client list and the first request type are:
+
+```sh
+beam-bootstrap client list
+beam-bootstrap client request port-forward --remote-port 8080
+beam-bootstrap client request port-forward \
+  --remote-host 127.0.0.1 --remote-port 8080 --local-port 18080
+```
+
+The port-forward command currently proves the Phase 3 request/decision round
+trip only; Phase 4 will create the real loopback listener and SSH forwarding
+process after approval. Every remotely submitted request begins as
+`pending_approval`.
+
+`beams ssh` supplies `BEAMS_CLIENT_ID` and a random
+`BEAMS_SESSION_TOKEN` to its remote `beam-shell` command. A direct SSH shell,
+or a managed shell whose bridge has gone stale, fails before routing a
+request:
+
+```text
+no managed Beams client is associated with this shell
+reconnect with `beams ssh`, then retry the request
+```
+
+The token selects exactly one registered client bridge; it is a routing aid,
+not the approval boundary. The workstation user's local daemon remains the
+only component allowed to approve a request.
 
 ### `task` - the daemon-backed CLI
 
