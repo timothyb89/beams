@@ -12,7 +12,7 @@
 //! - remote output is drained and bounded while that palette is visible;
 //! - terminal modes are restored on every normal/error/signal exit path.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
 use std::str::FromStr;
@@ -43,6 +43,7 @@ use crate::clientd::{Frontend, RequestRecord, ServerEvent, ServiceRecord};
 
 const LOOP_TICK: Duration = Duration::from_millis(25);
 const INPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
+const APPROVAL_TAKEOVER_GUARD: Duration = Duration::from_millis(300);
 const MAX_INPUT_SEQUENCE_LEN: usize = 64;
 const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
 const REDRAW_RESIZE_DELAY: Duration = Duration::from_millis(40);
@@ -289,9 +290,18 @@ fn drive(
     let mut deferred = DeferredOutput::default();
     let mut output_finished = false;
     let mut daemon_view = DaemonView::new(local_daemon);
+    let mut approval_takeover_guard = None;
 
     loop {
-        if daemon_view.drain(local_daemon) && input_router.mode == InputMode::Palette {
+        let daemon_changed = daemon_view.drain(local_daemon);
+        let approval_needs_attention = escape_key != EscapeKey::Disabled
+            && daemon_view.take_approval_attention();
+        if approval_needs_attention && input_router.mode == InputMode::Passthrough {
+            terminal_state.open_palette()?;
+            input_router.mode = InputMode::Palette;
+            approval_takeover_guard = Some(Instant::now() + APPROVAL_TAKEOVER_GUARD);
+            draw_palette(info, escape_key, &daemon_view)?;
+        } else if daemon_changed && input_router.mode == InputMode::Palette {
             draw_palette(info, escape_key, &daemon_view)?;
         }
 
@@ -369,6 +379,11 @@ fn drive(
             daemon_view.form_active(),
             Instant::now(),
         ));
+        let now = Instant::now();
+        actions = guard_approval_takeover_input(actions, approval_takeover_guard, now);
+        if approval_takeover_guard.is_some_and(|until| now >= until) {
+            approval_takeover_guard = None;
+        }
 
         for action in actions {
             match action {
@@ -377,10 +392,12 @@ fn drive(
                     writer.flush().context("flushing local PTY")?;
                 }
                 InputAction::OpenPalette => {
+                    approval_takeover_guard = None;
                     terminal_state.open_palette()?;
                     draw_palette(info, escape_key, &daemon_view)?;
                 }
                 InputAction::ClosePalette => {
+                    approval_takeover_guard = None;
                     close_palette(
                         master,
                         terminal_state,
@@ -453,6 +470,7 @@ fn drive(
 }
 
 struct DaemonView {
+    beam_uuid: Option<String>,
     client_id: Option<String>,
     connected: bool,
     frontends: usize,
@@ -465,6 +483,7 @@ struct DaemonView {
     forward_form: Option<ForwardForm>,
     copy_form: Option<CopyForm>,
     copy_approval_form: Option<CopyApprovalForm>,
+    presented_approval_requests: BTreeSet<String>,
     message: String,
 }
 
@@ -502,8 +521,13 @@ struct CopyApprovalForm {
 
 impl DaemonView {
     fn new(local_daemon: &LocalDaemon) -> Self {
+        let beam_uuid = local_daemon
+            .managed_bridge
+            .as_ref()
+            .map(|managed| managed.target.beam_uuid.clone());
         match &local_daemon.frontend {
             Some(frontend) => Self {
+                beam_uuid,
                 client_id: Some(frontend.client_id.clone()),
                 connected: true,
                 frontends: 1,
@@ -516,9 +540,11 @@ impl DaemonView {
                 forward_form: None,
                 copy_form: None,
                 copy_approval_form: None,
+                presented_approval_requests: BTreeSet::new(),
                 message: "connected".to_string(),
             },
             None => Self {
+                beam_uuid,
                 client_id: None,
                 connected: false,
                 frontends: 0,
@@ -531,6 +557,7 @@ impl DaemonView {
                 forward_form: None,
                 copy_form: None,
                 copy_approval_form: None,
+                presented_approval_requests: BTreeSet::new(),
                 message: local_daemon
                     .unavailable
                     .clone()
@@ -656,7 +683,31 @@ impl DaemonView {
     fn pending_request(&self) -> Option<&RequestRecord> {
         self.request_records
             .values()
-            .find(|request| request.status == RequestStatus::PendingApproval)
+            .find(|request| {
+                request.status == RequestStatus::PendingApproval
+                    && self.beam_uuid.as_deref() == Some(request.beam_uuid.as_str())
+            })
+    }
+
+    /// Marks newly pending approvals for this session's Beam as presented.
+    /// The caller uses the true return value to preempt normal SSH output once;
+    /// closing the menu without deciding must not make it repeatedly reopen.
+    fn take_approval_attention(&mut self) -> bool {
+        let new_requests = self
+            .request_records
+            .values()
+            .filter(|request| {
+                request.status == RequestStatus::PendingApproval
+                    && self.beam_uuid.as_deref() == Some(request.beam_uuid.as_str())
+                    && !self
+                        .presented_approval_requests
+                        .contains(&request.request_id)
+            })
+            .map(|request| request.request_id.clone())
+            .collect::<Vec<_>>();
+        let changed = !new_requests.is_empty();
+        self.presented_approval_requests.extend(new_requests);
+        changed
     }
 
     fn form_active(&self) -> bool {
@@ -945,7 +996,7 @@ enum InputMode {
     Palette,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum InputAction {
     Remote(Vec<u8>),
     OpenPalette,
@@ -964,6 +1015,24 @@ enum InputAction {
     RestartService,
     NextService,
     PreviousService,
+}
+
+fn guard_approval_takeover_input(
+    actions: Vec<InputAction>,
+    guard_until: Option<Instant>,
+    now: Instant,
+) -> Vec<InputAction> {
+    if guard_until.is_some_and(|until| now < until) {
+        // A request can arrive while the user is typing into the remote shell.
+        // Do not let already-buffered keys accidentally approve or manipulate
+        // the newly opened local UI. Closing the takeover remains immediate.
+        actions
+            .into_iter()
+            .filter(|action| matches!(action, InputAction::ClosePalette))
+            .collect()
+    } else {
+        actions
+    }
 }
 
 /// Routes terminal input while preserving the original bytes sent to the
@@ -2042,6 +2111,87 @@ mod tests {
             vec![InputAction::ApprovePending, InputAction::RejectPending]
         );
         assert_eq!(mode, InputMode::Palette);
+    }
+
+    #[test]
+    fn approval_takeover_is_once_per_request_and_scoped_to_this_beam() {
+        let local_daemon = LocalDaemon {
+            frontend: None,
+            unavailable: None,
+            managed_bridge: Some(ManagedBridge {
+                target: crate::bridge::Target {
+                    beam_id: "beam-a".to_string(),
+                    beam_uuid: "beam-a-uuid".to_string(),
+                    login: "beams".to_string(),
+                },
+                session_token: "token".to_string(),
+            }),
+            reconnect_after: Instant::now(),
+        };
+        let mut view = DaemonView::new(&local_daemon);
+        for (request_id, beam_uuid) in [
+            ("other-beam-request", "beam-b-uuid"),
+            ("this-beam-request", "beam-a-uuid"),
+        ] {
+            view.request_records.insert(
+                request_id.to_string(),
+                RequestRecord {
+                    request_id: request_id.to_string(),
+                    beam_uuid: beam_uuid.to_string(),
+                    kind: "local_port_forward".to_string(),
+                    status: RequestStatus::PendingApproval,
+                    request: None,
+                    action: None,
+                    message: None,
+                    local_path: None,
+                },
+            );
+        }
+
+        assert_eq!(
+            view.pending_request().map(|request| request.request_id.as_str()),
+            Some("this-beam-request")
+        );
+        assert!(view.take_approval_attention());
+        assert!(!view.take_approval_attention());
+
+        view.request_records.insert(
+            "second-this-beam-request".to_string(),
+            RequestRecord {
+                request_id: "second-this-beam-request".to_string(),
+                beam_uuid: "beam-a-uuid".to_string(),
+                kind: "local_port_forward".to_string(),
+                status: RequestStatus::PendingApproval,
+                request: None,
+                action: None,
+                message: None,
+                local_path: None,
+            },
+        );
+        assert!(view.take_approval_attention());
+    }
+
+    #[test]
+    fn approval_takeover_guard_drops_buffered_actions_but_allows_close() {
+        let now = Instant::now();
+        let actions = vec![
+            InputAction::ApprovePending,
+            InputAction::BeginForward,
+            InputAction::ClosePalette,
+            InputAction::Remote(b"remote".to_vec()),
+        ];
+        assert_eq!(
+            guard_approval_takeover_input(
+                actions.clone(),
+                Some(now + APPROVAL_TAKEOVER_GUARD),
+                now,
+            ),
+            vec![InputAction::ClosePalette]
+        );
+        assert_eq!(
+            guard_approval_takeover_input(actions.clone(), Some(now), now),
+            actions
+        );
     }
 
     #[test]

@@ -319,6 +319,14 @@ Use a prefix-style escape key (proposed default: `Ctrl-]`):
 - the selected key and escape behavior are printed once on connect and are
   configurable.
 
+A newly pending remote approval for the current Beam also opens the palette
+automatically. This is a once-per-request attention event rather than a loop:
+closing the palette without deciding leaves it closed. The takeover briefly
+ignores already-buffered non-close input so text intended for the remote shell
+cannot accidentally approve a request. Requests for other Beams are not shown
+or surfaced by this session, and disabling the escape key disables automatic
+takeover as part of strict passthrough mode.
+
 While the palette is open, remote output is drained into a bounded buffer so a
 chatty process cannot deadlock on a full PTY or consume unbounded memory. The
 local UI temporarily clears and owns the current terminal screen and offers:

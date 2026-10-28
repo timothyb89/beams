@@ -75,6 +75,16 @@ xterm modifyOtherKeys sequences that full-screen applications such as zellij
 can enable in modern terminals (including iTerm2). Unmatched terminal
 sequences are still forwarded byte-for-byte.
 
+When a new remote approval request for the current Beam arrives, the local
+menu opens automatically over the SSH session; the user does not need to press
+the escape key first. Each request triggers this takeover at most once, so
+closing the menu without deciding does not cause a reopening loop. A short input
+guard prevents keys already buffered for the remote shell from accidentally
+acting on the newly opened approval UI (escape/close remains immediate).
+Requests belonging to other managed Beams do not take over this session.
+`--escape-key none` retains strict passthrough and disables automatic takeover
+along with the manual menu.
+
 The menu shows connection/bridge state, typed remote requests, and local
 services for the current Beam. A pending port-forward proposal displays its
 requested local port (or automatic selection) and Beam endpoint; `y` approves

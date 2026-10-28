@@ -548,9 +548,13 @@ bootstrap `Task`s.
   two-step resize-driven remote redraw. Distinct resize notifications avoid
   coalescing, every local frame clears stale cells before repainting, and
   service forms render in a cleared modal. Daemon events repaint an open menu
-  immediately so service/request status remains live. The menu deliberately
-  clears the existing screen instead of nesting an alternate screen over
-  zellij. Covered by pure byte-router/buffer tests and real PTY tests for
+  immediately so service/request status remains live. A new remote approval
+  for this session's Beam preemptively opens the menu once, with a short guard
+  that drops keys already buffered for the remote shell; other Beams' requests
+  stay scoped to their own sessions, and `--escape-key none` remains strict
+  passthrough. The menu deliberately clears the existing screen instead of
+  nesting an alternate screen over zellij. Covered by pure byte-router/buffer
+  tests and real PTY tests for
   binary input, exit status, and resize visibility, plus
   `client/tests/managed-session-smoke.sh` for the outer controlling-terminal
   path and rendered menu.
