@@ -115,6 +115,7 @@ pub fn ssh_interactive(
     command: &[String],
     escape_key: session::EscapeKey,
     local_daemon: session::LocalDaemon,
+    terminal_overlay: bool,
 ) -> anyhow::Result<u8> {
     let target = format!("{login}@{uuid}");
     let mut args = vec![
@@ -134,6 +135,7 @@ pub fn ssh_interactive(
         },
         escape_key,
         local_daemon,
+        terminal_overlay,
     )
     .context("running managed tsh ssh session")
 }

@@ -6,6 +6,7 @@ mod session;
 mod stage;
 mod state;
 mod sync;
+mod terminal_model;
 mod tsh;
 
 use std::path::{Path, PathBuf};
@@ -66,6 +67,10 @@ enum Commands {
         /// daemon. SSH still works, but service controls are unavailable.
         #[arg(long)]
         no_client_daemon: bool,
+        /// Experimental: keep a shadow terminal model and paint the local
+        /// menu over the captured remote screen instead of a blank takeover.
+        #[arg(long)]
+        terminal_overlay: bool,
     },
     /// Run the workstation-side service daemon in the foreground. Normal
     /// `beams ssh` invocations start it automatically as needed.
@@ -161,6 +166,7 @@ fn main() -> anyhow::Result<ExitCode> {
             login,
             escape_key,
             no_client_daemon,
+            terminal_overlay,
         } => ssh(
             &expand_tilde(&repo),
             &purpose,
@@ -168,6 +174,7 @@ fn main() -> anyhow::Result<ExitCode> {
             &login,
             escape_key,
             no_client_daemon,
+            terminal_overlay,
         )?,
         Commands::Daemon { socket } => {
             clientd::serve(socket)?;
@@ -393,6 +400,7 @@ fn ssh(
     login: &str,
     escape_key: session::EscapeKey,
     no_client_daemon: bool,
+    terminal_overlay: bool,
 ) -> anyhow::Result<u8> {
     let mut state = state::State::load()?;
     let beams = tsh::list_beams()?;
@@ -519,6 +527,7 @@ fn ssh(
         &[remote_command],
         escape_key,
         local_daemon,
+        terminal_overlay,
     )
 }
 

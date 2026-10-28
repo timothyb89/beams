@@ -6,6 +6,11 @@ if [ "$1" = "beams" ] && [ "$2" = "ls" ]; then
 fi
 
 if [ "$1" = "ssh" ]; then
+    # Exercise terminal state that the managed-session relay must preserve:
+    # title/clipboard OSCs plus bracketed paste and SGR mouse modes.
+    printf '\033]2;REMOTE TITLE\007'
+    printf '\033]52;c;SGVsbG8=\007'
+    printf '\033[?1006h\033[?2004h'
     printf 'REMOTE READY\r\n'
     stty size
     trap 'printf "REMOTE RESIZE: "; stty size' WINCH

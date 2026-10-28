@@ -40,6 +40,7 @@ use beams_protocol::{
 };
 
 use crate::clientd::{Frontend, RequestRecord, ServerEvent, ServiceRecord};
+use crate::terminal_model::TerminalModel;
 
 const LOOP_TICK: Duration = Duration::from_millis(25);
 const INPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
@@ -202,6 +203,7 @@ pub fn run(
     info: ConnectionInfo<'_>,
     escape_key: EscapeKey,
     mut local_daemon: LocalDaemon,
+    overlay_enabled: bool,
 ) -> anyhow::Result<u8> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("interactive `beams ssh` requires a terminal on stdin and stdout");
@@ -239,6 +241,7 @@ pub fn run(
     }
 
     let mut terminal_state = TerminalState::enter_raw().context("enabling raw terminal mode")?;
+    let mut terminal_model = TerminalModel::new(initial_size);
     let drive_result = drive(
         &*master,
         &mut *writer,
@@ -250,6 +253,8 @@ pub fn run(
         initial_size,
         &mut terminal_state,
         &mut local_daemon,
+        &mut terminal_model,
+        overlay_enabled,
     );
 
     // Restore the local terminal before waiting/printing any error. The child
@@ -285,12 +290,25 @@ fn drive(
     mut last_size: PtySize,
     terminal_state: &mut TerminalState,
     local_daemon: &mut LocalDaemon,
+    terminal_model: &mut TerminalModel,
+    overlay_enabled: bool,
 ) -> anyhow::Result<u8> {
     let mut input_router = InputRouter::default();
     let mut deferred = DeferredOutput::default();
     let mut output_finished = false;
     let mut daemon_view = DaemonView::new(local_daemon);
     let mut approval_takeover_guard = None;
+    macro_rules! redraw_palette {
+        () => {
+            draw_palette(
+                info,
+                escape_key,
+                &daemon_view,
+                terminal_model,
+                overlay_enabled,
+            )?
+        };
+    }
 
     loop {
         let daemon_changed = daemon_view.drain(local_daemon);
@@ -300,9 +318,9 @@ fn drive(
             terminal_state.open_palette()?;
             input_router.mode = InputMode::Palette;
             approval_takeover_guard = Some(Instant::now() + APPROVAL_TAKEOVER_GUARD);
-            draw_palette(info, escape_key, &daemon_view)?;
+            redraw_palette!();
         } else if daemon_changed && input_router.mode == InputMode::Palette {
-            draw_palette(info, escape_key, &daemon_view)?;
+            redraw_palette!();
         }
 
         if let Ok(signal) = signal_rx.try_recv() {
@@ -313,16 +331,27 @@ fn drive(
                 &mut input_router.mode,
                 &mut deferred,
                 last_size,
+                terminal_model,
+                overlay_enabled,
             )?;
             return Ok((128 + signal).clamp(1, 255) as u8);
         }
 
-        drain_output(
+        let output_changed = drain_output(
             output_rx,
             input_router.mode,
             &mut deferred,
             &mut output_finished,
+            terminal_model,
+            overlay_enabled,
         )?;
+        // OSC and unsupported-sequence callbacks are collected for the
+        // overlay/native-frontend work. The passthrough path deliberately
+        // leaves their original bytes untouched for the real terminal.
+        let _terminal_events = terminal_model.take_events();
+        if output_changed && overlay_enabled && input_router.mode == InputMode::Palette {
+            redraw_palette!();
+        }
 
         if let Some(status) = child.try_wait().context("polling tsh child")? {
             close_palette(
@@ -331,17 +360,20 @@ fn drive(
                 &mut input_router.mode,
                 &mut deferred,
                 last_size,
+                terminal_model,
+                overlay_enabled,
             )?;
-            finish_output(output_rx, &mut output_finished)?;
+            finish_output(output_rx, &mut output_finished, terminal_model)?;
             return Ok(exit_code(&status));
         }
 
         if let Ok(size) = current_size() {
             if size != last_size {
                 master.resize(size).context("resizing local PTY")?;
+                terminal_model.resize(size);
                 last_size = size;
                 if input_router.mode == InputMode::Palette {
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
             }
         }
@@ -362,6 +394,8 @@ fn drive(
                     &mut input_router.mode,
                     &mut deferred,
                     last_size,
+                    terminal_model,
+                    overlay_enabled,
                 )?;
                 return Ok(0);
             }
@@ -393,7 +427,7 @@ fn drive(
                 InputAction::OpenPalette => {
                     approval_takeover_guard = None;
                     terminal_state.open_palette()?;
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::ClosePalette => {
                     approval_takeover_guard = None;
@@ -403,47 +437,49 @@ fn drive(
                         &mut input_router.mode,
                         &mut deferred,
                         last_size,
+                        terminal_model,
+                        overlay_enabled,
                     )?;
                 }
                 InputAction::ApprovePending => {
                     daemon_view.approve_or_prompt(local_daemon);
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::RejectPending => {
                     daemon_view.decide(local_daemon, false);
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::BeginForward => {
                     daemon_view.forward_form = Some(ForwardForm::default());
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::BeginUpload => {
                     daemon_view.copy_form = Some(CopyForm::new(FileCopyDirection::Upload));
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::BeginDownload => {
                     daemon_view.copy_form = Some(CopyForm::new(FileCopyDirection::Download));
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::BeginSync => {
                     daemon_view.sync_form = Some(SyncForm::default());
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::FormChar(byte) => {
                     daemon_view.form_char(byte);
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::FormBackspace => {
                     daemon_view.form_backspace();
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::FormNext => {
                     daemon_view.form_next();
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::SubmitForm => {
                     daemon_view.submit_forward(local_daemon);
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::CancelForm => {
                     daemon_view.forward_form = None;
@@ -451,35 +487,35 @@ fn drive(
                     daemon_view.copy_approval_form = None;
                     daemon_view.sync_form = None;
                     daemon_view.sync_approval_form = None;
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::StopService => {
                     daemon_view.control_selected(local_daemon, ServiceAction::Stop);
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::RestartService => {
                     daemon_view.control_selected(local_daemon, ServiceAction::Restart);
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::PauseService => {
                     daemon_view.control_selected(local_daemon, ServiceAction::Pause);
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::ResumeService => {
                     daemon_view.control_selected(local_daemon, ServiceAction::Resume);
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::TerminateService => {
                     daemon_view.control_selected(local_daemon, ServiceAction::Terminate);
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::NextService => {
                     daemon_view.select_next();
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
                 InputAction::PreviousService => {
                     daemon_view.select_previous();
-                    draw_palette(info, escape_key, &daemon_view)?;
+                    redraw_palette!();
                 }
             }
         }
@@ -1556,6 +1592,7 @@ fn route_input(
 struct DeferredOutput {
     bytes: VecDeque<u8>,
     truncated: bool,
+    pending_osc: Vec<u8>,
 }
 
 impl DeferredOutput {
@@ -1604,6 +1641,53 @@ impl DeferredOutput {
         self.truncated = false;
         Ok(())
     }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.truncated = false;
+        self.pending_osc.clear();
+    }
+
+    fn extract_osc(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut completed = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            if self.pending_osc.is_empty() {
+                if bytes[index] == b'\x1b' && bytes.get(index + 1) == Some(&b']') {
+                    self.pending_osc.extend_from_slice(&bytes[index..index + 2]);
+                    index += 2;
+                } else if bytes[index] == b'\x1b' && index + 1 == bytes.len() {
+                    self.pending_osc.push(bytes[index]);
+                    index += 1;
+                } else {
+                    index += 1;
+                }
+                continue;
+            }
+
+            if self.pending_osc == [b'\x1b'] {
+                if bytes[index] == b']' {
+                    self.pending_osc.push(bytes[index]);
+                    index += 1;
+                    continue;
+                }
+                self.pending_osc.clear();
+                continue;
+            }
+
+            let byte = bytes[index];
+            self.pending_osc.push(byte);
+            index += 1;
+            if byte == b'\x07'
+                || (byte == b'\\'
+                    && self.pending_osc.len() >= 2
+                    && self.pending_osc[self.pending_osc.len() - 2] == b'\x1b')
+            {
+                completed.push(std::mem::take(&mut self.pending_osc));
+            }
+        }
+        completed
+    }
 }
 
 enum OutputEvent {
@@ -1644,13 +1728,26 @@ fn drain_output(
     mode: InputMode,
     deferred: &mut DeferredOutput,
     finished: &mut bool,
-) -> anyhow::Result<()> {
+    terminal_model: &mut TerminalModel,
+    overlay_enabled: bool,
+) -> anyhow::Result<bool> {
     let mut stdout = io::stdout().lock();
     let mut wrote = false;
+    let mut changed = false;
     loop {
         match rx.try_recv() {
             Ok(OutputEvent::Data(bytes)) => {
+                terminal_model.process(&bytes);
+                changed = true;
                 if mode == InputMode::Palette {
+                    if overlay_enabled {
+                        for osc in deferred.extract_osc(&bytes) {
+                            stdout
+                                .write_all(&osc)
+                                .context("writing out-of-band OSC during overlay")?;
+                            wrote = true;
+                        }
+                    }
                     deferred.push(&bytes);
                 } else {
                     stdout
@@ -1670,14 +1767,25 @@ fn drain_output(
     if wrote {
         stdout.flush().context("flushing remote PTY output")?;
     }
-    Ok(())
+    Ok(changed)
 }
 
-fn finish_output(rx: &Receiver<OutputEvent>, finished: &mut bool) -> anyhow::Result<()> {
+fn finish_output(
+    rx: &Receiver<OutputEvent>,
+    finished: &mut bool,
+    terminal_model: &mut TerminalModel,
+) -> anyhow::Result<()> {
     let deadline = Instant::now() + EXIT_OUTPUT_GRACE;
     let mut deferred = DeferredOutput::default();
     while !*finished && Instant::now() < deadline {
-        drain_output(rx, InputMode::Passthrough, &mut deferred, finished)?;
+        drain_output(
+            rx,
+            InputMode::Passthrough,
+            &mut deferred,
+            finished,
+            terminal_model,
+            false,
+        )?;
         if !*finished {
             thread::sleep(Duration::from_millis(5));
         }
@@ -1691,13 +1799,32 @@ fn close_palette(
     mode: &mut InputMode,
     deferred: &mut DeferredOutput,
     size: PtySize,
+    terminal_model: &TerminalModel,
+    overlay_enabled: bool,
 ) -> anyhow::Result<()> {
     if terminal_state.palette_open {
         terminal_state.close_palette()?;
-        deferred.flush()?;
+        if overlay_enabled {
+            deferred.clear();
+            restore_terminal_model(terminal_model)?;
+        } else {
+            deferred.flush()?;
+        }
         force_remote_redraw(master, size)?;
     }
     *mode = InputMode::Passthrough;
+    Ok(())
+}
+
+fn restore_terminal_model(model: &TerminalModel) -> anyhow::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout
+        .write_all(b"\x1b[2J\x1b[H")
+        .context("clearing terminal before restoring overlay model")?;
+    stdout
+        .write_all(model.screen().state_formatted().as_bytes())
+        .context("restoring terminal model")?;
+    stdout.flush().context("flushing restored terminal model")?;
     Ok(())
 }
 
@@ -1834,6 +1961,8 @@ fn draw_palette(
     info: &ConnectionInfo<'_>,
     escape_key: EscapeKey,
     daemon: &DaemonView,
+    terminal_model: &TerminalModel,
+    overlay_enabled: bool,
 ) -> anyhow::Result<()> {
     // Every invocation creates a fresh ratatui Terminal, whose previous frame
     // starts blank. Clear the real screen to match that model before painting;
@@ -1846,6 +1975,9 @@ fn draw_palette(
     terminal
         .draw(|frame| {
             let area = frame.area();
+            if overlay_enabled {
+                terminal_model.render(frame, area);
+            }
             let [top, body, footer] = Layout::vertical([
                 Constraint::Length(3),
                 Constraint::Min(6),
@@ -2393,6 +2525,16 @@ mod tests {
     }
 
     #[test]
+    fn mouse_and_bracketed_paste_input_remain_byte_exact() {
+        let mut mode = InputMode::Passthrough;
+        let input = b"\x1b[<0;12;9M\x1b[200~pasted\x1b[201~";
+        assert_eq!(
+            route_input(&mut mode, EscapeKey::default(), false, input),
+            vec![InputAction::Remote(input.to_vec())]
+        );
+    }
+
+    #[test]
     fn enhanced_sequences_can_span_reads_and_unmatched_input_is_unchanged() {
         let now = Instant::now();
         let mut router = InputRouter::default();
@@ -2566,6 +2708,30 @@ mod tests {
             b"edcb"
         );
         assert!(output.truncated);
+    }
+
+    #[test]
+    fn overlay_extracts_complete_osc_sequences_across_output_chunks() {
+        let mut output = DeferredOutput::default();
+        assert!(output.extract_osc(b"prefix\x1b]2;title").is_empty());
+        assert_eq!(
+            output.extract_osc(b" continued\x07suffix"),
+            vec![b"\x1b]2;title continued\x07".to_vec()]
+        );
+
+        assert!(output.extract_osc(b"\x1b]52;c;SGV").is_empty());
+        assert_eq!(
+            output.extract_osc(b"sbG8=\x1b\\"),
+            vec![b"\x1b]52;c;SGVsbG8=\x1b\\".to_vec()]
+        );
+
+        let mut output = DeferredOutput::default();
+        assert!(output.extract_osc(b"\x1b").is_empty());
+        assert!(output.extract_osc(b"]2;split").is_empty());
+        assert_eq!(
+            output.extract_osc(b"\x07"),
+            vec![b"\x1b]2;split\x07".to_vec()]
+        );
     }
 
     #[test]

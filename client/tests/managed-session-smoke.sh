@@ -11,12 +11,18 @@ CLIENT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 TEST_DIR=$(mktemp -d "${TMPDIR:-/tmp}/beams-managed-session.XXXXXX")
 TRANSCRIPT="$TEST_DIR/transcript"
 DAEMON_PID=
+SESSION_FLAGS=
+if [ "${BEAMS_TEST_OVERLAY:-0}" = 1 ]; then
+    SESSION_FLAGS=--terminal-overlay
+fi
 cleanup() {
     if [ -n "$DAEMON_PID" ]; then
         kill "$DAEMON_PID" 2>/dev/null || true
         wait "$DAEMON_PID" 2>/dev/null || true
     fi
-    rm -rf "$TEST_DIR"
+    if [ "${BEAMS_TEST_KEEP:-0}" != 1 ]; then
+        rm -rf "$TEST_DIR"
+    fi
 }
 trap cleanup EXIT
 
@@ -61,7 +67,7 @@ set +e
         XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
         TERM=xterm-256color \
         script -qefc \
-        "stty rows 24 cols 100; exec \"$CLIENT_DIR/target/debug/beams\" ssh --purpose managed-session-test" \
+        "stty rows 24 cols 100; exec \"$CLIENT_DIR/target/debug/beams\" ssh $SESSION_FLAGS --purpose managed-session-test" \
         "$TRANSCRIPT" >/dev/null
 STATUS=$?
 set -e
@@ -74,6 +80,7 @@ fi
 strings "$TRANSCRIPT" | grep -q "Beams local menu"
 strings "$TRANSCRIPT" | grep -q "local port (empty = automatic)"
 strings "$TRANSCRIPT" | grep -q "REMOTE READY"
+strings "$TRANSCRIPT" | grep -q "REMOTE TITLE"
 strings "$TRANSCRIPT" | grep -q "24 100"
 strings "$TRANSCRIPT" | grep -q "REMOTE ECHO: hello"
 strings "$TRANSCRIPT" | grep -q "REMOTE RESIZE: 24 99"

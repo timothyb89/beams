@@ -68,6 +68,7 @@ prefix with `--escape-key`:
 beams ssh --escape-key ctrl-g
 beams ssh --escape-key 0x1d
 beams ssh --escape-key none   # pure passthrough; local menu disabled
+beams ssh --terminal-overlay # experimental shadow-screen compositing
 ```
 
 The input router recognizes both legacy control bytes and the Kitty CSI-u /
@@ -108,6 +109,26 @@ updates do not retain content from an older frame. Terminal raw mode and cursor
 visibility are restored on normal exit, errors, and handled termination
 signals. Daemon request, bridge, and service events repaint an open menu
 immediately; closing and reopening it is not required to refresh status.
+
+`--terminal-overlay` is an experimental alternative for testing local
+compositing. The client continuously feeds remote output into a `vt100`
+shadow screen while still passing the original bytes through unchanged. When
+the local menu is open, that captured screen is painted underneath the
+ratatui widgets; remote output continues updating the shadow screen while it
+is hidden from the physical terminal. OSC title/clipboard requests, mouse
+mode, bracketed paste, alternate-screen state, resize, colors, and wide
+characters are tracked by the model, but clipboard actions and unsupported
+terminal features are not interpreted by the model yet. Complete OSC
+sequences are still passed through to the physical terminal, preserving the
+existing title/clipboard behavior. The existing takeover path remains the
+fallback and default.
+
+The controlling-terminal smoke test exercises both paths:
+
+```sh
+./client/tests/managed-session-smoke.sh
+BEAMS_TEST_OVERLAY=1 ./client/tests/managed-session-smoke.sh
+```
 
 ## Local service daemon
 
