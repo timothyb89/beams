@@ -770,6 +770,18 @@ impl App {
                         remote_host,
                         remote_port
                     ),
+                    beams_protocol::ServiceRequestKind::FileCopy {
+                        direction,
+                        remote_path,
+                        local_path_hint,
+                        overwrite,
+                    } => format!(
+                        "{:?} {} <-> {} ({:?})",
+                        direction,
+                        local_path_hint.as_deref().unwrap_or("workstation path"),
+                        remote_path,
+                        overwrite
+                    ),
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(

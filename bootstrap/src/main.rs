@@ -138,6 +138,26 @@ enum ClientServiceCommand {
         #[arg(long)]
         local_port: Option<u16>,
     },
+    /// Request a one-shot file upload from a path selected and confirmed
+    /// by the workstation user.
+    Upload {
+        #[arg(long)]
+        remote_path: String,
+        #[arg(long)]
+        local_path_hint: Option<String>,
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Request a one-shot download to a path selected and confirmed by
+    /// the workstation user.
+    Download {
+        #[arg(long)]
+        remote_path: String,
+        #[arg(long)]
+        local_path_hint: Option<String>,
+        #[arg(long)]
+        overwrite: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -314,6 +334,30 @@ fn client_request(socket: Option<String>, service: ClientServiceCommand) -> i32 
     let kind = match service {
         ClientServiceCommand::PortForward { remote_host, remote_port, local_port } => {
             beams_protocol::ServiceRequestKind::LocalPortForward { remote_host, remote_port, local_port }
+        }
+        ClientServiceCommand::Upload { remote_path, local_path_hint, overwrite } => {
+            beams_protocol::ServiceRequestKind::FileCopy {
+                direction: beams_protocol::FileCopyDirection::Upload,
+                remote_path,
+                local_path_hint,
+                overwrite: if overwrite {
+                    beams_protocol::OverwritePolicy::Replace
+                } else {
+                    beams_protocol::OverwritePolicy::Deny
+                },
+            }
+        }
+        ClientServiceCommand::Download { remote_path, local_path_hint, overwrite } => {
+            beams_protocol::ServiceRequestKind::FileCopy {
+                direction: beams_protocol::FileCopyDirection::Download,
+                remote_path,
+                local_path_hint,
+                overwrite: if overwrite {
+                    beams_protocol::OverwritePolicy::Replace
+                } else {
+                    beams_protocol::OverwritePolicy::Deny
+                },
+            }
         }
     };
     let service_request = beams_protocol::ServiceRequest { request_id: Uuid::new_v4().to_string(), kind };

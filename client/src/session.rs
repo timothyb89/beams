@@ -1483,6 +1483,20 @@ fn draw_palette(
                                 remote_port
                             )));
                         }
+                        ServiceRequestKind::FileCopy {
+                            direction,
+                            remote_path,
+                            local_path_hint,
+                            overwrite,
+                        } => {
+                            body_text.push(Line::from(format!(
+                                "{:?} {} ↔ {} ({:?}); choose/confirm the workstation path locally",
+                                direction,
+                                local_path_hint.as_deref().unwrap_or("workstation path"),
+                                remote_path,
+                                overwrite
+                            )));
+                        }
                     }
                 } else if let Some(action) = &request.action {
                     body_text.push(Line::from(format!(
@@ -1522,6 +1536,17 @@ fn draw_palette(
                                 .unwrap_or_else(|| "?".to_string()),
                             remote_host,
                             remote_port
+                        ),
+                        Some(ServiceRequestKind::FileCopy {
+                            direction,
+                            remote_path,
+                            local_path_hint,
+                            ..
+                        }) => format!(
+                            "{:?} {} ↔ {}",
+                            direction,
+                            local_path_hint.as_deref().unwrap_or("workstation path"),
+                            remote_path
                         ),
                         None => service.kind.clone(),
                     };

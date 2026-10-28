@@ -156,7 +156,10 @@ fn start_forward(
         remote_host,
         remote_port,
         local_port,
-    } = kind;
+    } = kind
+    else {
+        bail!("port-forward worker received a non-forward service");
+    };
     if remote_host.is_empty() || *remote_port == 0 {
         bail!("remote host and port must be non-empty");
     }
@@ -363,6 +366,7 @@ fn forward_label(kind: &ServiceRequestKind) -> String {
             local_port: Some(local_port),
         } => format!("127.0.0.1:{local_port} -> {remote_host}:{remote_port}"),
         ServiceRequestKind::LocalPortForward { .. } => "local forward running".to_string(),
+        ServiceRequestKind::FileCopy { .. } => "invalid file-copy forward".to_string(),
     }
 }
 

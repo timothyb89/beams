@@ -95,6 +95,20 @@ pub enum ServiceAction {
     Restart,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileCopyDirection {
+    Upload,
+    Download,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverwritePolicy {
+    Deny,
+    Replace,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ServiceActionRequest {
     pub request_id: String,
@@ -117,12 +131,20 @@ pub enum ServiceRequestKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         local_port: Option<u16>,
     },
+    FileCopy {
+        direction: FileCopyDirection,
+        remote_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_path_hint: Option<String>,
+        overwrite: OverwritePolicy,
+    },
 }
 
 impl ServiceRequestKind {
     pub fn label(&self) -> &'static str {
         match self {
             Self::LocalPortForward { .. } => "local_port_forward",
+            Self::FileCopy { .. } => "file_copy",
         }
     }
 }
@@ -277,6 +299,24 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn file_copy_request_does_not_carry_an_authoritative_local_path() {
+        let request = ServiceRequest {
+            request_id: "copy-1".to_string(),
+            kind: ServiceRequestKind::FileCopy {
+                direction: FileCopyDirection::Download,
+                remote_path: "/home/beams/report.txt".to_string(),
+                local_path_hint: Some("report.txt".to_string()),
+                overwrite: OverwritePolicy::Deny,
+            },
+        };
+        let value = serde_json::to_value(BeamToClient::RequestSubmitted { request }).unwrap();
+        assert_eq!(value["request"]["kind"]["kind"], "file_copy");
+        assert_eq!(value["request"]["kind"]["direction"], "download");
+        assert_eq!(value["request"]["kind"]["local_path_hint"], "report.txt");
+        assert!(value["request"]["kind"].get("local_path").is_none());
     }
 
     #[test]
