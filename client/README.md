@@ -288,3 +288,19 @@ one Beam, exact token routing, rejection, a remote-initiated file download
 with local path approval and path-redaction checks, snapshot synchronization,
 and both VM- and workstation-daemon restarts. It needs permission to create
 temporary Unix sockets.
+
+Phase 7's opt-in OpenSSH multiplexing compatibility test must run on a
+workstation with a normal `tsh` profile and a disposable or otherwise safe
+Beam target:
+
+```sh
+tsh config > /tmp/beams-ssh-config
+./tests/openssh-controlmaster-spike.sh \
+  --config /tmp/beams-ssh-config \
+  --target beams@BEAM_HOST_AS_MATCHED_BY_THE_CONFIG
+```
+
+It exercises command, PTY, concurrent, SCP, dynamic-forward, cancellation,
+and master-recreation channels over one `ControlMaster`. See
+`../OPENSSH_MULTIPLEXING_SPIKE.md` for limitations and the remaining
+Teleport auth/MFA/recording matrix.

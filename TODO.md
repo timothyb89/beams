@@ -658,6 +658,17 @@ bootstrap `Task`s.
   Teleport auth renewal, MFA, recording, reconnect, PTY, forward, copy, and
   Mutagen tests. Keep separate long-lived `tsh` processes as the baseline;
   reconsider `russh` only after profiling identifies a real need.
+  - [x] Record the process/credential findings, proposed daemon-owned master
+    design, and fallback rules in `OPENSSH_MULTIPLEXING_SPIKE.md`. Add
+    `client/tests/openssh-controlmaster-spike.sh` for command, PTY,
+    concurrency, SCP, dynamic-forward/cancel, Mutagen-style options, and
+    master-recreation checks. This Beam's ProxyCommand and host-CA path work,
+    but its tbot/PIV identities cannot authenticate OpenSSH as `beams`.
+  - [ ] Run the harness from macOS and Linux workstation profiles, then test
+    Teleport per-session MFA, recording/audit behavior, certificate expiry and
+    `tsh login` recovery, network loss, Beam expiry, real Mutagen, and the
+    foreground interactive PTY before implementing or enabling
+    `OpenSshTransport`.
 
 ## Explicitly deferred — needs its own design pass later, not blocked on
 anything above

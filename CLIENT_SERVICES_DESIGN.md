@@ -1,7 +1,8 @@
 # Client-owned services and remote requests
 
-Status: implementation plan; Phases 1-5 implemented and Phase 6 code complete
-pending laptop validation, 2026-10-28.
+Status: implementation plan; Phases 1-5 implemented, Phase 6 code complete
+pending laptop validation, and the Phase 7 OpenSSH spike prepared for
+workstation validation, 2026-10-28.
 
 This design covers workstation-owned features that operate across a Beam's
 SSH connection: folder sync, port forwarding, and file transfer. It builds on
@@ -605,6 +606,13 @@ acceptance checks before changing this phase to fully complete.
   protocol fuzz/property tests, and end-to-end tests with disposable Beams.
 - Revisit approval rules, reverse/public forwards, SFTP, and git-bundle seeding
   as separate opt-in features.
+
+Exploratory result: `OPENSSH_MULTIPLEXING_SPIKE.md` records successful
+OpenSSH-to-Teleport proxy and host-certificate negotiation from this Beam,
+the tbot/PIV credential limitation that prevents a valid `beams` login here,
+the proposed fallback-capable backend, and a workstation harness covering the
+channel mechanics. Do not enable the backend until its remaining
+auth/MFA/recording/expiry matrix passes.
 
 ## Acceptance criteria for the first useful release
 
