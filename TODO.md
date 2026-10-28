@@ -547,9 +547,19 @@ bootstrap `Task`s.
   real PTY tests for binary input, exit status, and resize visibility, plus
   `client/tests/managed-session-smoke.sh` for the outer controlling-terminal
   path and rendered menu.
-- [ ] Phase 2: add the per-user local `beams daemon`/`beamsd`, its permissioned
-  UDS, typed/versioned protocol, persistent `client_id`, service/request state
-  machines, atomic state, and frontend subscriptions.
+- [x] Phase 2: `beams daemon` is the single-instance per-user workstation
+  daemon, auto-started by `beams ssh` (with `--no-client-daemon` as a
+  troubleshooting escape hatch). `client/src/clientd.rs` provides a mode-0600
+  UDS, typed/versioned NDJSON handshake and events, 64 KiB frame and bounded
+  event-queue limits, per-connection rate limiting, handshake timeout, stale-
+  socket handling, and frontend subscriptions/snapshots. Its atomically
+  replaced mode-0600 state file owns a stable UUID `client_id` plus typed
+  request/service records and explicit transition tables. The Phase 1 menu now
+  shows the live client ID, frontend count, pending-request count, service
+  count, and daemon disconnect/errors. Unit tests exercise protocol framing,
+  transitions, state durability/permissions, socket ownership, rate limiting,
+  and a real `UnixStream` handshake; the controlling-terminal smoke test also
+  runs a real temporary daemon and verifies its client ID is rendered.
 - [ ] Phase 3: add `beam-bootstrap client-bridge`, VM-daemon client/service
   projection, managed-session routing tokens, bridge reconnect/snapshots, and
   remote CLI requests. Direct or stale unmanaged sessions must fail clearly.

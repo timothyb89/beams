@@ -1,3 +1,4 @@
+mod clientd;
 mod stage;
 mod state;
 mod session;
@@ -52,6 +53,17 @@ enum Commands {
         /// character, or `none`.
         #[arg(long, default_value = "ctrl-]")]
         escape_key: session::EscapeKey,
+        /// Do not connect to or auto-start the workstation-side service
+        /// daemon. SSH still works, but service controls are unavailable.
+        #[arg(long)]
+        no_client_daemon: bool,
+    },
+    /// Run the workstation-side service daemon in the foreground. Normal
+    /// `beams ssh` invocations start it automatically as needed.
+    Daemon {
+        /// Override the local Unix socket path.
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
 }
 
@@ -64,13 +76,19 @@ fn main() -> anyhow::Result<ExitCode> {
             region,
             login,
             escape_key,
+            no_client_daemon,
         } => ssh(
             &expand_tilde(&repo),
             &purpose,
             region.as_deref(),
             &login,
             escape_key,
+            no_client_daemon,
         )?,
+        Commands::Daemon { socket } => {
+            clientd::serve(socket)?;
+            0
+        }
     };
     Ok(ExitCode::from(code))
 }
@@ -81,6 +99,7 @@ fn ssh(
     region: Option<&str>,
     login: &str,
     escape_key: session::EscapeKey,
+    no_client_daemon: bool,
 ) -> anyhow::Result<u8> {
     let mut state = state::State::load()?;
     let beams = tsh::list_beams()?;
@@ -148,12 +167,24 @@ fn ssh(
     };
 
     eprintln!("beams: connecting to {} ({})...", beam.id, beam.uuid);
+    let local_daemon = if no_client_daemon {
+        session::LocalDaemon::unavailable("disabled by --no-client-daemon")
+    } else {
+        match clientd::connect_or_start() {
+            Ok(frontend) => session::LocalDaemon::connected(frontend),
+            Err(err) => {
+                eprintln!("beams: local service daemon unavailable: {err:#}");
+                session::LocalDaemon::unavailable(err.to_string())
+            }
+        }
+    };
     tsh::ssh_interactive(
         login,
         &beam.id,
         &beam.uuid,
         &["~/beams/bin/beam-shell".to_string()],
         escape_key,
+        local_daemon,
     )
 }
 

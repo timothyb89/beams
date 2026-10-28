@@ -34,6 +34,8 @@ use ratatui::Terminal;
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
+use crate::clientd::{Frontend, ServerEvent};
+
 const LOOP_TICK: Duration = Duration::from_millis(25);
 const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
 const DEFERRED_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -143,6 +145,27 @@ pub struct ConnectionInfo<'a> {
     pub login: &'a str,
 }
 
+pub struct LocalDaemon {
+    frontend: Option<Frontend>,
+    unavailable: Option<String>,
+}
+
+impl LocalDaemon {
+    pub fn connected(frontend: Frontend) -> Self {
+        Self {
+            frontend: Some(frontend),
+            unavailable: None,
+        }
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            frontend: None,
+            unavailable: Some(message.into()),
+        }
+    }
+}
+
 /// Runs `program args...` under a local PTY until it exits, returning the
 /// child's exit code (clamped to the process-portable 0..=255 range).
 pub fn run(
@@ -150,6 +173,7 @@ pub fn run(
     args: &[String],
     info: ConnectionInfo<'_>,
     escape_key: EscapeKey,
+    mut local_daemon: LocalDaemon,
 ) -> anyhow::Result<u8> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("interactive `beams ssh` requires a terminal on stdin and stdout");
@@ -197,6 +221,7 @@ pub fn run(
         escape_key,
         initial_size,
         &mut terminal_state,
+        &mut local_daemon,
     );
 
     // Restore the local terminal before waiting/printing any error. The child
@@ -231,12 +256,16 @@ fn drive(
     escape_key: EscapeKey,
     mut last_size: PtySize,
     terminal_state: &mut TerminalState,
+    local_daemon: &mut LocalDaemon,
 ) -> anyhow::Result<u8> {
     let mut input_mode = InputMode::Passthrough;
     let mut deferred = DeferredOutput::default();
     let mut output_finished = false;
+    let mut daemon_view = DaemonView::new(local_daemon);
 
     loop {
+        daemon_view.drain(local_daemon);
+
         if let Ok(signal) = signal_rx.try_recv() {
             let _ = child.kill();
             close_palette(
@@ -268,7 +297,7 @@ fn drive(
                 master.resize(size).context("resizing local PTY")?;
                 last_size = size;
                 if input_mode == InputMode::Palette {
-                    draw_palette(info, escape_key)?;
+                    draw_palette(info, escape_key, &daemon_view)?;
                 }
             }
         }
@@ -298,7 +327,7 @@ fn drive(
                     }
                     InputAction::OpenPalette => {
                         terminal_state.open_palette()?;
-                        draw_palette(info, escape_key)?;
+                        draw_palette(info, escape_key, &daemon_view)?;
                     }
                     InputAction::ClosePalette => {
                         close_palette(
@@ -309,6 +338,79 @@ fn drive(
                             last_size,
                         )?;
                     }
+                }
+            }
+        }
+    }
+}
+
+struct DaemonView {
+    client_id: Option<String>,
+    connected: bool,
+    frontends: usize,
+    requests: usize,
+    services: usize,
+    message: String,
+}
+
+impl DaemonView {
+    fn new(local_daemon: &LocalDaemon) -> Self {
+        match &local_daemon.frontend {
+            Some(frontend) => Self {
+                client_id: Some(frontend.client_id.clone()),
+                connected: true,
+                frontends: 1,
+                requests: 0,
+                services: 0,
+                message: "connected".to_string(),
+            },
+            None => Self {
+                client_id: None,
+                connected: false,
+                frontends: 0,
+                requests: 0,
+                services: 0,
+                message: local_daemon
+                    .unavailable
+                    .clone()
+                    .unwrap_or_else(|| "unavailable".to_string()),
+            },
+        }
+    }
+
+    fn drain(&mut self, local_daemon: &mut LocalDaemon) {
+        let Some(frontend) = &mut local_daemon.frontend else {
+            return;
+        };
+        loop {
+            match frontend.events.try_recv() {
+                Ok(ServerEvent::Snapshot {
+                    client_id,
+                    frontends,
+                    requests,
+                    services,
+                }) => {
+                    self.client_id = Some(client_id);
+                    self.connected = true;
+                    self.frontends = frontends;
+                    self.requests = requests.len();
+                    self.services = services.len();
+                    self.message = "connected".to_string();
+                }
+                Ok(ServerEvent::DaemonStatus { frontends }) => {
+                    self.frontends = frontends;
+                    self.connected = true;
+                }
+                Ok(ServerEvent::Error { message }) => {
+                    self.message = format!("daemon error: {message}");
+                }
+                Ok(ServerEvent::Hello { .. } | ServerEvent::Pong) => {}
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.connected = false;
+                    self.message = "connection lost".to_string();
+                    local_daemon.frontend = None;
+                    return;
                 }
             }
         }
@@ -647,7 +749,11 @@ impl Drop for TerminalState {
     }
 }
 
-fn draw_palette(info: &ConnectionInfo<'_>, escape_key: EscapeKey) -> anyhow::Result<()> {
+fn draw_palette(
+    info: &ConnectionInfo<'_>,
+    escape_key: EscapeKey,
+    daemon: &DaemonView,
+) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("creating local menu terminal")?;
     terminal
@@ -676,6 +782,12 @@ fn draw_palette(info: &ConnectionInfo<'_>, escape_key: EscapeKey) -> anyhow::Res
             .block(Block::default().borders(Borders::ALL));
             frame.render_widget(heading, top);
 
+            let daemon_color = if daemon.connected {
+                Color::Green
+            } else {
+                Color::Yellow
+            };
+            let client_id = daemon.client_id.as_deref().unwrap_or("-");
             let body_text = vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -683,8 +795,15 @@ fn draw_palette(info: &ConnectionInfo<'_>, escape_key: EscapeKey) -> anyhow::Res
                     Style::default().add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
-                Line::from("Folder sync, port-forward, copy, and approval controls"),
-                Line::from("will appear here as the client service daemon is implemented."),
+                Line::from(vec![
+                    Span::raw("local daemon: "),
+                    Span::styled(&daemon.message, Style::default().fg(daemon_color)),
+                ]),
+                Line::from(format!("client id: {client_id}")),
+                Line::from(format!(
+                    "{} frontend(s), {} pending request(s), {} service(s)",
+                    daemon.frontends, daemon.requests, daemon.services
+                )),
                 Line::from(""),
                 Line::from("Remote output continues to be drained while this menu is open."),
             ];

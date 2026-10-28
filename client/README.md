@@ -79,6 +79,38 @@ resizes/restores the child PTY to make the remote application redraw. Terminal
 raw mode and cursor visibility are restored on normal exit, errors, and handled
 termination signals.
 
+## Local service daemon
+
+`beams ssh` connects to a per-user workstation daemon and starts one in the
+background if no instance is listening. The foreground SSH process still owns
+the interactive PTY; the daemon is the durable owner for the syncs, forwards,
+copies, and Beam bridges added by the later phases in
+`../CLIENT_SERVICES_DESIGN.md`.
+
+Run it explicitly in the foreground for debugging:
+
+```sh
+beams daemon
+beams daemon --socket /tmp/beams-test.sock
+```
+
+`--no-client-daemon` on `beams ssh` disables connection/auto-start without
+disabling the managed PTY itself.
+
+The default socket is `$XDG_RUNTIME_DIR/beams-client/daemon.sock` when
+`XDG_RUNTIME_DIR` is set, otherwise
+`~/.config/beams-client/daemon.sock`. It and the versioned state file
+`~/.config/beams-client/daemon-state.json` are mode `0600`; the state file is
+replaced atomically and contains the workstation's stable random `client_id`
+plus the request/service registry. Auto-start diagnostics go to
+`~/.config/beams-client/daemon.log`.
+
+The local protocol is typed, versioned newline-delimited JSON. It requires a
+frontend handshake, limits frames to 64 KiB, bounds event queues, rate-limits
+each connection, and times out incomplete handshakes. Frontends receive an
+initial snapshot and subsequent daemon-status broadcasts; the local SSH menu
+already shows the connected client ID and registry counts.
+
 ## State
 
 No server-side way exists to label a beam, so `~/.config/beams-client/state.json`
