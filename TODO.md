@@ -606,9 +606,24 @@ bootstrap `Task`s.
     removed immediately afterward) used real `tsh ssh -N -L`: remote approval
     exposed the Beam's HTTP server on `127.0.0.1:44693`, stop closed it, and
     restart restored the same endpoint.
-- [ ] Phase 5: add typed client↔Beam file-copy jobs with locally selected or
+- [x] Phase 5: add typed client↔Beam file-copy jobs with locally selected or
   confirmed workstation paths, overwrite policy, cancellation, and interrupted
   job handling.
+  - [x] Client- and remote-initiated upload/download requests share one
+    workstation-owned one-shot `tsh scp` runtime. The local menu provides
+    upload/download forms and confirms the real local path for remote
+    proposals; `beams copy-to`/`copy-from` provide blocking CLI equivalents.
+  - [x] Workstation paths remain local-only. The shared protocol carries only
+    a display hint, and service projections redact detailed local paths/errors.
+    Tests caught and guard this boundary.
+  - [x] Deny-overwrite is the default, with sibling temporary files and atomic
+    no-clobber/replace installation. Cancellation removes partial files
+    best-effort; copy jobs cannot restart, and daemon restart marks an active
+    job interrupted instead of replaying it.
+  - [x] Unit tests cover success, diagnostics, overwrite denial, cancellation,
+    local-path authority, and restart semantics. `client-bridge-smoke.sh`
+    covers a remote-initiated download through both real daemons and verifies
+    that its workstation path is absent from remote status.
 - [ ] Phase 6: productize the Mutagen wrapper transport and add folder-sync
   lifecycle/status/conflicts/recovery. Default to `--ignore-vcs` and
   `two-way-safe`; destructive replacement and local-wins behavior stay

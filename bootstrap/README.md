@@ -250,12 +250,25 @@ beam-bootstrap client list
 beam-bootstrap client request port-forward --remote-port 8080
 beam-bootstrap client request port-forward \
   --remote-host 127.0.0.1 --remote-port 8080 --local-port 18080
+beam-bootstrap client request upload \
+  --remote-path /tmp/input.tar --local-path-hint input.tar
+beam-bootstrap client request download \
+  --remote-path /tmp/result.json --local-path-hint result.json
 ```
 
 Approval creates a workstation-owned `tsh ssh -N -L` process bound only to
 `127.0.0.1`. Its selected endpoint and lifecycle are projected back into this
 daemon; the Beam never receives a privileged command that can start it
 directly. Every remotely submitted request begins as `pending_approval`.
+
+Upload/download requests create one-shot workstation-owned `tsh scp` jobs.
+`--local-path-hint` is display-only (normally a basename): the local user must
+enter or confirm the real workstation path before approval, and that path is
+never projected back to the Beam. Existing destinations are denied by default;
+`--overwrite` requests explicit replacement. These commands remain attached
+through both approval and transfer completion, exiting non-zero on rejection,
+failure, cancellation, or interruption. Copies are single-file jobs; folder
+sync is a separate Mutagen-backed phase.
 
 `beams ssh` supplies `BEAMS_CLIENT_ID` and a random
 `BEAMS_SESSION_TOKEN` to its remote `beam-shell` command. A direct SSH shell,

@@ -79,8 +79,14 @@ The menu shows connection/bridge state, typed remote requests, and local
 services for the current Beam. A pending port-forward proposal displays its
 requested local port (or automatic selection) and Beam endpoint; `y` approves
 and `n` rejects it. Press `f` to create a client-initiated forward, enter the
-required remote port and optional local port, then press enter. `j`/`k` select
-a service and `s`/`r` stop or restart it.
+required remote port and optional local port, then press enter. Press `u` or
+`d` to create a one-shot upload or download, enter the workstation and Beam
+file paths, and choose whether an existing destination may be replaced.
+Remote file-copy requests open a second local path-confirmation dialog:
+the Beam-provided value is only a hint and cannot select a workstation path
+by itself. `j`/`k` select a service, `s` stops a running forward or copy, and
+`r` restarts a forward. Completed, failed, cancelled, or interrupted copies
+are terminal; create a new job instead of restarting one.
 
 The client does not nest another terminal alternate screen over remote zellij
 (alternate-screen state is not stackable). It drains up to 1 MiB of remote
@@ -100,8 +106,8 @@ background if no instance is listening. The foreground SSH process still owns
 the interactive PTY. The daemon owns one reconnecting
 `tsh ssh ... ~/beams/bin/beam-client-bridge` process per Beam, shares it across
 local frontends, retains all managed-shell tokens when that bridge reconnects,
-and supervises approved `tsh ssh -N -L` processes independently of the
-interactive terminal.
+and supervises approved `tsh ssh -N -L` processes plus one-shot `tsh scp`
+jobs independently of the interactive terminal.
 
 Run it explicitly in the foreground for debugging:
 
@@ -145,6 +151,10 @@ Inside a managed Beam shell:
 ```sh
 beam-bootstrap client list
 beam-bootstrap client request port-forward --remote-port 8080
+beam-bootstrap client request upload \
+  --remote-path /tmp/input.tar --local-path-hint input.tar
+beam-bootstrap client request download \
+  --remote-path /tmp/result.json --local-path-hint result.json
 ```
 
 A direct SSH shell has no managed token and receives an actionable error. A
@@ -158,6 +168,40 @@ abrupt daemon crash cannot orphan the forward; macOS has no equivalent API.
 Desired-running forwards are restored from typed persisted state after a
 daemon restart without trusting an old PID. Stop/restart proposals from the
 remote TUI require the same local approval as creation.
+
+File copies support one regular file per job. They deny overwriting by
+default; select `Replace` in the menu or pass `--overwrite` explicitly to
+replace an existing destination. Uploads first write a unique sibling file
+on the Beam, then atomically replace the destination or atomically create it
+with a hard link for no-overwrite mode. Downloads use the same sibling-temp
+pattern locally. Cancellation kills the active `tsh` child and removes the
+temporary file best-effort, so a partial transfer is never installed as the
+requested destination. On Linux, copy children use the same parent-death
+protection as forwards. A daemon restart marks an in-flight copy interrupted
+and does not retry it automatically.
+
+Detailed workstation paths and transfer errors stay in local daemon state.
+The Beam receives the typed direction, Beam path, optional display-only
+basename hint, overwrite policy, and sanitized lifecycle text.
+
+## One-shot copy CLI
+
+The same client-initiated copy path is available without opening the local
+menu:
+
+```sh
+beams copy-to ./input.tar /tmp/input.tar
+beams copy-from /tmp/result.json ./result.json
+
+beams copy-to --purpose side-task --overwrite ./new.conf /etc/example.conf
+```
+
+`copy-to` takes `LOCAL_PATH REMOTE_PATH`; `copy-from` takes
+`REMOTE_PATH LOCAL_PATH`. The Beam must already be active and tracked for the
+selected `--purpose` (normally established by `beams ssh`), but an interactive
+shell does not need to remain open. The command connects to or starts the
+local daemon, prints lifecycle updates, blocks until the transfer completes,
+and exits non-zero on failure, cancellation, or daemon disconnection.
 
 ## State
 
@@ -194,6 +238,7 @@ propagation.
 The client-bridge smoke test runs both real daemons and the real
 `beam-bootstrap client-bridge`, with only the outer SSH executable replaced by
 a local fixture. It covers two independent workstation clients attached to
-one Beam, exact token routing, rejection, snapshot synchronization, and both
-VM- and workstation-daemon restarts. It needs permission to create temporary
-Unix sockets.
+one Beam, exact token routing, rejection, a remote-initiated file download
+with local path approval and path-redaction checks, snapshot synchronization,
+and both VM- and workstation-daemon restarts. It needs permission to create
+temporary Unix sockets.

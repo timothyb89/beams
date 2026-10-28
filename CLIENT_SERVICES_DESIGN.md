@@ -559,6 +559,12 @@ approval, and recovery are already exercised.
   interrupted-job recovery semantics.
 - Add CLI equivalents for non-TUI client-initiated operation.
 
+Implemented: the authoritative workstation path is retained only in local
+daemon state; the Beam receives a display-only basename hint and sanitized
+status text. Single-file uploads/downloads use sibling temporary files and
+atomic install/no-clobber operations. Copy jobs are terminal and never
+auto-restarted after daemon interruption.
+
 ### Phase 6: Mutagen folder sync
 
 - Productize the spike's `ssh`/`scp` wrappers in a private client state
