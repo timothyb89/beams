@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use beams_protocol::{
     RequestStatus, ServiceAction, ServiceActionRequest, ServiceProjection, ServiceRequest,
+    ServiceRequestKind, ServiceStatus,
 };
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -511,15 +512,30 @@ impl App {
     }
 
     fn request_service_action(&mut self, action: ServiceAction) {
-        let Some(service_id) = self
-            .services
-            .values()
-            .nth(self.service_selection)
-            .map(|service| service.service.service_id.clone())
+        let Some(service) = self.services.values().nth(self.service_selection)
         else {
             self.status_line = "no service selected".to_string();
             return;
         };
+        if action == ServiceAction::Restart
+            && matches!(
+                &service.service.kind,
+                ServiceRequestKind::FileCopy { .. }
+            )
+        {
+            self.status_line = "file-copy jobs are terminal; request a new copy".to_string();
+            return;
+        }
+        if action == ServiceAction::Stop
+            && matches!(
+                service.service.status,
+                ServiceStatus::Stopped | ServiceStatus::Error
+            )
+        {
+            self.status_line = "the selected service is already terminal".to_string();
+            return;
+        }
+        let service_id = service.service.service_id.clone();
         let Some(session_token) = self.session_token.clone() else {
             self.status_line =
                 "service actions require a managed shell opened with `beams ssh`".to_string();

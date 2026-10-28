@@ -360,6 +360,8 @@ fn client_request(socket: Option<String>, service: ClientServiceCommand) -> i32 
             }
         }
     };
+    let wait_for_service_completion =
+        matches!(kind, beams_protocol::ServiceRequestKind::FileCopy { .. });
     let service_request = beams_protocol::ServiceRequest { request_id: Uuid::new_v4().to_string(), kind };
     let socket_path = expand_tilde(&socket.unwrap_or_else(daemon::default_socket_path));
     let mut conn = match connect_or_exit_code(&socket_path) {
@@ -421,13 +423,60 @@ fn client_request(socket: Option<String>, service: ClientServiceCommand) -> i32 
                     }
                 }
                 match status {
-                    "running" => return 0,
+                    "running" if !wait_for_service_completion => return 0,
                     "rejected" | "expired" | "failed" => return 1,
+                    _ => {}
+                }
+            }
+            Some("client_service_status" | "client_services_snapshot")
+                if wait_for_service_completion =>
+            {
+                let Some(service) =
+                    projected_service_for_request(&value, &service_request.request_id)
+                else {
+                    continue;
+                };
+                let status = service
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                let message = service.get("message").and_then(Value::as_str);
+                match message {
+                    Some(message) => println!("{status}: {message}"),
+                    None => println!("{status}"),
+                }
+                match status {
+                    "stopped" if message == Some("file copy completed") => return 0,
+                    "stopped" => return 1,
+                    "error" => return 1,
                     _ => {}
                 }
             }
             _ => {}
         }
+    }
+}
+
+fn projected_service_for_request<'a>(
+    value: &'a Value,
+    request_id: &str,
+) -> Option<&'a Value> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("client_service_status") => value
+            .get("service")
+            .and_then(|owned| owned.get("service"))
+            .filter(|service| {
+                service.get("request_id").and_then(Value::as_str) == Some(request_id)
+            }),
+        Some("client_services_snapshot") => value
+            .get("services")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(|owned| owned.get("service"))
+            .find(|service| {
+                service.get("request_id").and_then(Value::as_str) == Some(request_id)
+            }),
+        _ => None,
     }
 }
 
@@ -744,8 +793,9 @@ fn daemon_run_manifest(socket: Option<String>, file: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use clap::Subcommand;
+    use serde_json::json;
 
-    use super::TaskCommand;
+    use super::{projected_service_for_request, TaskCommand};
 
     /// `task run`/`run-task` only reach a template if `TaskCommand` has a
     /// variant for it - easy to forget when adding a new template (it's
@@ -769,5 +819,55 @@ mod tests {
             "TaskCommand is missing a variant for some template(s) - \
              `task run`/`run-task` can't reach it without one"
         );
+    }
+
+    #[test]
+    fn file_copy_waiter_finds_incremental_and_snapshot_service_updates() {
+        let update = json!({
+            "type": "client_service_status",
+            "service": {
+                "owner_client_id": "client",
+                "service": {
+                    "service_id": "service",
+                    "request_id": "request",
+                    "status": "stopped"
+                }
+            }
+        });
+        assert_eq!(
+            projected_service_for_request(&update, "request")
+                .and_then(|service| service.get("status"))
+                .and_then(serde_json::Value::as_str),
+            Some("stopped")
+        );
+
+        let snapshot = json!({
+            "type": "client_services_snapshot",
+            "services": [
+                {
+                    "owner_client_id": "client",
+                    "service": {
+                        "service_id": "other-service",
+                        "request_id": "other-request",
+                        "status": "running"
+                    }
+                },
+                {
+                    "owner_client_id": "client",
+                    "service": {
+                        "service_id": "service",
+                        "request_id": "request",
+                        "status": "error"
+                    }
+                }
+            ]
+        });
+        assert_eq!(
+            projected_service_for_request(&snapshot, "request")
+                .and_then(|service| service.get("status"))
+                .and_then(serde_json::Value::as_str),
+            Some("error")
+        );
+        assert!(projected_service_for_request(&snapshot, "missing").is_none());
     }
 }

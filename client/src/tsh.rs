@@ -285,7 +285,7 @@ fn git_target_script(remote_path: &str, branch: &str, origin_url: Option<&str>) 
 /// Wraps `s` in single quotes for a POSIX shell, escaping any embedded
 /// single quotes the standard way (`'\''`: close the quote, an escaped
 /// literal `'`, reopen the quote).
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 

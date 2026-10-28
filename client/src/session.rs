@@ -34,7 +34,10 @@ use ratatui::Terminal;
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
-use beams_protocol::{RequestStatus, ServiceAction, ServiceRequestKind};
+use beams_protocol::{
+    FileCopyDirection, OverwritePolicy, RequestStatus, ServiceAction, ServiceRequestKind,
+    ServiceStatus,
+};
 
 use crate::clientd::{Frontend, RequestRecord, ServerEvent, ServiceRecord};
 
@@ -335,7 +338,7 @@ fn drive(
 
         let now = Instant::now();
         let mut actions =
-            input_router.flush_expired(escape_key, daemon_view.forward_form.is_some(), now);
+            input_router.flush_expired(escape_key, daemon_view.form_active(), now);
         let poll_timeout = input_router.poll_timeout(now);
         if stdin_ready(poll_timeout).context("polling terminal input")? {
             let mut bytes = [0u8; 4096];
@@ -356,14 +359,14 @@ fn drive(
 
             actions.extend(input_router.route(
                 escape_key,
-                daemon_view.forward_form.is_some(),
+                daemon_view.form_active(),
                 &bytes[..read],
                 Instant::now(),
             ));
         }
         actions.extend(input_router.flush_expired(
             escape_key,
-            daemon_view.forward_form.is_some(),
+            daemon_view.form_active(),
             Instant::now(),
         ));
 
@@ -387,7 +390,7 @@ fn drive(
                     )?;
                 }
                 InputAction::ApprovePending => {
-                    daemon_view.decide(local_daemon, true);
+                    daemon_view.approve_or_prompt(local_daemon);
                     draw_palette(info, escape_key, &daemon_view)?;
                 }
                 InputAction::RejectPending => {
@@ -396,6 +399,14 @@ fn drive(
                 }
                 InputAction::BeginForward => {
                     daemon_view.forward_form = Some(ForwardForm::default());
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::BeginUpload => {
+                    daemon_view.copy_form = Some(CopyForm::new(FileCopyDirection::Upload));
+                    draw_palette(info, escape_key, &daemon_view)?;
+                }
+                InputAction::BeginDownload => {
+                    daemon_view.copy_form = Some(CopyForm::new(FileCopyDirection::Download));
                     draw_palette(info, escape_key, &daemon_view)?;
                 }
                 InputAction::FormChar(byte) => {
@@ -416,6 +427,8 @@ fn drive(
                 }
                 InputAction::CancelForm => {
                     daemon_view.forward_form = None;
+                    daemon_view.copy_form = None;
+                    daemon_view.copy_approval_form = None;
                     draw_palette(info, escape_key, &daemon_view)?;
                 }
                 InputAction::StopService => {
@@ -450,6 +463,8 @@ struct DaemonView {
     bridge_statuses: BTreeMap<String, String>,
     selected_service: usize,
     forward_form: Option<ForwardForm>,
+    copy_form: Option<CopyForm>,
+    copy_approval_form: Option<CopyApprovalForm>,
     message: String,
 }
 
@@ -458,6 +473,31 @@ struct ForwardForm {
     remote_port: String,
     local_port: String,
     field: usize,
+}
+
+struct CopyForm {
+    direction: FileCopyDirection,
+    local_path: String,
+    remote_path: String,
+    overwrite: OverwritePolicy,
+    field: usize,
+}
+
+impl CopyForm {
+    fn new(direction: FileCopyDirection) -> Self {
+        Self {
+            direction,
+            local_path: String::new(),
+            remote_path: String::new(),
+            overwrite: OverwritePolicy::Deny,
+            field: 0,
+        }
+    }
+}
+
+struct CopyApprovalForm {
+    request_id: String,
+    local_path: String,
 }
 
 impl DaemonView {
@@ -474,6 +514,8 @@ impl DaemonView {
                 bridge_statuses: BTreeMap::new(),
                 selected_service: 0,
                 forward_form: None,
+                copy_form: None,
+                copy_approval_form: None,
                 message: "connected".to_string(),
             },
             None => Self {
@@ -487,6 +529,8 @@ impl DaemonView {
                 bridge_statuses: BTreeMap::new(),
                 selected_service: 0,
                 forward_form: None,
+                copy_form: None,
+                copy_approval_form: None,
                 message: local_daemon
                     .unavailable
                     .clone()
@@ -615,6 +659,30 @@ impl DaemonView {
             .find(|request| request.status == RequestStatus::PendingApproval)
     }
 
+    fn form_active(&self) -> bool {
+        self.forward_form.is_some()
+            || self.copy_form.is_some()
+            || self.copy_approval_form.is_some()
+    }
+
+    fn approve_or_prompt(&mut self, local_daemon: &mut LocalDaemon) {
+        let Some(request) = self.pending_request() else {
+            self.message = "no pending request to decide".to_string();
+            return;
+        };
+        if let Some(ServiceRequestKind::FileCopy {
+            local_path_hint, ..
+        }) = request.request.as_ref().map(|request| &request.kind)
+        {
+            self.copy_approval_form = Some(CopyApprovalForm {
+                request_id: request.request_id.clone(),
+                local_path: local_path_hint.clone().unwrap_or_default(),
+            });
+        } else {
+            self.decide(local_daemon, true);
+        }
+    }
+
     fn connected_bridges(&self) -> usize {
         self.bridge_statuses
             .values()
@@ -672,6 +740,27 @@ impl DaemonView {
     }
 
     fn form_char(&mut self, byte: u8) {
+        if let Some(form) = &mut self.copy_approval_form {
+            if byte.is_ascii_graphic() || byte == b' ' {
+                form.local_path.push(char::from(byte));
+            }
+            return;
+        }
+        if let Some(form) = &mut self.copy_form {
+            if form.field == 2 && byte == b' ' {
+                form.overwrite = match form.overwrite {
+                    OverwritePolicy::Deny => OverwritePolicy::Replace,
+                    OverwritePolicy::Replace => OverwritePolicy::Deny,
+                };
+            } else if byte.is_ascii_graphic() || byte == b' ' {
+                if form.field == 0 {
+                    form.local_path.push(char::from(byte));
+                } else if form.field == 1 {
+                    form.remote_path.push(char::from(byte));
+                }
+            }
+            return;
+        }
         let Some(form) = &mut self.forward_form else {
             return;
         };
@@ -686,6 +775,18 @@ impl DaemonView {
     }
 
     fn form_backspace(&mut self) {
+        if let Some(form) = &mut self.copy_approval_form {
+            form.local_path.pop();
+            return;
+        }
+        if let Some(form) = &mut self.copy_form {
+            if form.field == 0 {
+                form.local_path.pop();
+            } else if form.field == 1 {
+                form.remote_path.pop();
+            }
+            return;
+        }
         let Some(form) = &mut self.forward_form else {
             return;
         };
@@ -697,12 +798,61 @@ impl DaemonView {
     }
 
     fn form_next(&mut self) {
+        if let Some(form) = &mut self.copy_form {
+            form.field = (form.field + 1) % 3;
+            return;
+        }
         if let Some(form) = &mut self.forward_form {
             form.field = (form.field + 1) % 2;
         }
     }
 
     fn submit_forward(&mut self, local_daemon: &mut LocalDaemon) {
+        if let Some(form) = self.copy_approval_form.take() {
+            let Some(frontend) = &mut local_daemon.frontend else {
+                self.message = "local daemon connection is unavailable".to_string();
+                self.copy_approval_form = Some(form);
+                return;
+            };
+            match frontend.decide_file_copy(&form.request_id, true, Some(&form.local_path)) {
+                Ok(()) => self.message = format!("approving file copy {}", form.request_id),
+                Err(err) => {
+                    self.message = format!("could not approve file copy: {err}");
+                    self.copy_approval_form = Some(form);
+                }
+            }
+            return;
+        }
+        if let Some(form) = self.copy_form.take() {
+            if form.local_path.is_empty() || form.remote_path.is_empty() {
+                self.message = "local and remote paths are required".to_string();
+                self.copy_form = Some(form);
+                return;
+            }
+            let Some(managed) = &local_daemon.managed_bridge else {
+                self.message = "this session has no managed Beam target".to_string();
+                return;
+            };
+            let Some(frontend) = &mut local_daemon.frontend else {
+                self.message = "local daemon connection is unavailable".to_string();
+                self.copy_form = Some(form);
+                return;
+            };
+            match frontend.create_file_copy(
+                &managed.target,
+                form.direction,
+                &form.local_path,
+                &form.remote_path,
+                form.overwrite,
+            ) {
+                Ok(_) => self.message = format!("starting {:?} job", form.direction),
+                Err(err) => {
+                    self.message = format!("could not create file copy: {err}");
+                    self.copy_form = Some(form);
+                }
+            }
+            return;
+        }
         let Some(form) = self.forward_form.take() else {
             return;
         };
@@ -753,13 +903,27 @@ impl DaemonView {
     }
 
     fn control_selected(&mut self, local_daemon: &mut LocalDaemon, action: ServiceAction) {
-        let Some(service_id) = self
-            .selected_service(local_daemon)
-            .map(|service| service.service_id.clone())
+        let Some(service) = self.selected_service(local_daemon)
         else {
             self.message = "no local service is selected".to_string();
             return;
         };
+        if action == ServiceAction::Restart
+            && matches!(
+                service.spec.as_ref(),
+                Some(ServiceRequestKind::FileCopy { .. })
+            )
+        {
+            self.message = "file-copy jobs are terminal; create a new job".to_string();
+            return;
+        }
+        if action == ServiceAction::Stop
+            && matches!(service.status, ServiceStatus::Stopped | ServiceStatus::Error)
+        {
+            self.message = "the selected service is already terminal".to_string();
+            return;
+        }
+        let service_id = service.service_id.clone();
         let Some(frontend) = &mut local_daemon.frontend else {
             self.message = "local daemon connection is unavailable".to_string();
             return;
@@ -789,6 +953,8 @@ enum InputAction {
     ApprovePending,
     RejectPending,
     BeginForward,
+    BeginUpload,
+    BeginDownload,
     FormChar(u8),
     FormBackspace,
     FormNext,
@@ -975,6 +1141,12 @@ impl InputRouter {
             }
             InputMode::Palette if matches!(byte, b'f' | b'F') => {
                 actions.push(InputAction::BeginForward);
+            }
+            InputMode::Palette if matches!(byte, b'u' | b'U') => {
+                actions.push(InputAction::BeginUpload);
+            }
+            InputMode::Palette if matches!(byte, b'd' | b'D') => {
+                actions.push(InputAction::BeginDownload);
             }
             InputMode::Palette if matches!(byte, b's' | b'S') => {
                 actions.push(InputAction::StopService);
@@ -1583,10 +1755,10 @@ fn draw_palette(
             } else {
                 ""
             };
-            let service_keys = if daemon.forward_form.is_some() {
+            let service_keys = if daemon.form_active() {
                 ""
             } else {
-                "f: forward  •  j/k: select  •  s: stop  •  r: restart  •  "
+                "f: forward  •  u/d: upload/download  •  j/k: select  •  s/r: stop/restart  •  "
             };
             frame.render_widget(
                 Paragraph::new(format!(
@@ -1638,6 +1810,91 @@ fn draw_palette(
                             Block::default()
                                 .borders(Borders::ALL)
                                 .title(" Create local port forward "),
+                        ),
+                    popup,
+                );
+            }
+            if let Some(form) = &daemon.copy_form {
+                let popup = centered_rect(area, 72, 11);
+                let selected = Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
+                let normal = Style::default();
+                let form_text = vec![
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(
+                            if form.field == 0 {
+                                "› workstation path: "
+                            } else {
+                                "  workstation path: "
+                            },
+                            if form.field == 0 { selected } else { normal },
+                        ),
+                        Span::raw(&form.local_path),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            if form.field == 1 {
+                                "› Beam path: "
+                            } else {
+                                "  Beam path: "
+                            },
+                            if form.field == 1 { selected } else { normal },
+                        ),
+                        Span::raw(&form.remote_path),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            if form.field == 2 {
+                                "› overwrite: "
+                            } else {
+                                "  overwrite: "
+                            },
+                            if form.field == 2 { selected } else { normal },
+                        ),
+                        Span::raw(format!("{:?} (space toggles)", form.overwrite)),
+                    ]),
+                    Line::from(""),
+                    Line::from("Tab changes field  •  Enter starts  •  Esc cancels"),
+                ];
+                frame.render_widget(RatatuiClear, popup);
+                frame.render_widget(
+                    Paragraph::new(form_text)
+                        .alignment(Alignment::Left)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(format!(" {:?} file ", form.direction)),
+                        ),
+                    popup,
+                );
+            }
+            if let Some(form) = &daemon.copy_approval_form {
+                let popup = centered_rect(area, 72, 8);
+                let form_text = vec![
+                    Line::from(""),
+                    Line::from("The Beam supplied only a hint. Confirm the real local path:"),
+                    Line::from(vec![
+                        Span::styled(
+                            "› workstation path: ",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(&form.local_path),
+                    ]),
+                    Line::from(""),
+                    Line::from("Enter approves  •  Esc cancels without deciding"),
+                ];
+                frame.render_widget(RatatuiClear, popup);
+                frame.render_widget(
+                    Paragraph::new(form_text)
+                        .alignment(Alignment::Left)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(" Confirm file-copy path "),
                         ),
                     popup,
                 );

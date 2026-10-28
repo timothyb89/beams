@@ -1,5 +1,6 @@
 mod bridge;
 mod clientd;
+mod copy;
 mod forward;
 mod stage;
 mod state;
@@ -9,7 +10,8 @@ mod tsh;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::bail;
+use anyhow::{bail, Context};
+use beams_protocol::{FileCopyDirection, OverwritePolicy, ServiceStatus};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Parser, Subcommand};
 use uuid::Uuid;
@@ -68,6 +70,28 @@ enum Commands {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Upload one local file to an existing tracked Beam.
+    CopyTo {
+        #[arg(long, default_value = DEFAULT_PURPOSE)]
+        purpose: String,
+        #[arg(long, default_value = DEFAULT_LOGIN)]
+        login: String,
+        local_path: String,
+        remote_path: String,
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Download one file from an existing tracked Beam.
+    CopyFrom {
+        #[arg(long, default_value = DEFAULT_PURPOSE)]
+        purpose: String,
+        #[arg(long, default_value = DEFAULT_LOGIN)]
+        login: String,
+        remote_path: String,
+        local_path: String,
+        #[arg(long)]
+        overwrite: bool,
+    },
 }
 
 fn main() -> anyhow::Result<ExitCode> {
@@ -92,8 +116,97 @@ fn main() -> anyhow::Result<ExitCode> {
             clientd::serve(socket)?;
             0
         }
+        Commands::CopyTo {
+            purpose,
+            login,
+            local_path,
+            remote_path,
+            overwrite,
+        } => copy_file(
+            &purpose,
+            &login,
+            FileCopyDirection::Upload,
+            &local_path,
+            &remote_path,
+            overwrite,
+        )?,
+        Commands::CopyFrom {
+            purpose,
+            login,
+            remote_path,
+            local_path,
+            overwrite,
+        } => copy_file(
+            &purpose,
+            &login,
+            FileCopyDirection::Download,
+            &local_path,
+            &remote_path,
+            overwrite,
+        )?,
     };
     Ok(ExitCode::from(code))
+}
+
+fn copy_file(
+    purpose: &str,
+    login: &str,
+    direction: FileCopyDirection,
+    local_path: &str,
+    remote_path: &str,
+    overwrite: bool,
+) -> anyhow::Result<u8> {
+    let state = state::State::load()?;
+    let tracked = state
+        .purposes
+        .get(purpose)
+        .with_context(|| format!("no Beam is tracked for purpose {purpose:?}; run `beams ssh --purpose {purpose}` first"))?;
+    let beam = tsh::list_beams()?
+        .into_iter()
+        .find(|beam| beam.uuid == tracked.uuid)
+        .with_context(|| format!("the Beam tracked for purpose {purpose:?} is no longer active"))?;
+    let target = bridge::Target {
+        beam_id: beam.id,
+        beam_uuid: beam.uuid,
+        login: login.to_string(),
+    };
+    let mut frontend = clientd::connect_or_start()?;
+    let request_id = frontend.create_file_copy(
+        &target,
+        direction,
+        local_path,
+        remote_path,
+        if overwrite {
+            OverwritePolicy::Replace
+        } else {
+            OverwritePolicy::Deny
+        },
+    )?;
+    eprintln!("beams: submitted file-copy job {request_id}");
+    while let Ok(event) = frontend.events.recv() {
+        match event {
+            clientd::ServerEvent::ServiceChanged { service }
+                if service.request_id == request_id =>
+            {
+                if let Some(message) = &service.message {
+                    eprintln!("beams: {:?}: {message}", service.status);
+                }
+                match service.status {
+                    ServiceStatus::Stopped
+                        if service.message.as_deref() == Some("cancelled locally") =>
+                    {
+                        return Ok(1);
+                    }
+                    ServiceStatus::Stopped => return Ok(0),
+                    ServiceStatus::Error => return Ok(1),
+                    _ => {}
+                }
+            }
+            clientd::ServerEvent::Error { message } => bail!("{message}"),
+            _ => {}
+        }
+    }
+    bail!("local daemon disconnected before the file-copy job completed")
 }
 
 fn ssh(

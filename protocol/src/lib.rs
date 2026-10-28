@@ -64,10 +64,17 @@ impl ServiceStatus {
     pub fn transition(self, next: Self) -> Result<Self, String> {
         let valid = matches!(
             (self, next),
-            (Self::Starting, Self::Running | Self::Stopped | Self::Error)
+            (
+                Self::Starting,
+                Self::Running | Self::Stopping | Self::Stopped | Self::Error,
+            )
                 | (
                     Self::Running,
-                    Self::Stopping | Self::Degraded | Self::Unknown | Self::Error
+                    Self::Stopping
+                        | Self::Stopped
+                        | Self::Degraded
+                        | Self::Unknown
+                        | Self::Error
                 )
                 | (
                     Self::Degraded,
@@ -352,6 +359,14 @@ mod tests {
         assert_eq!(
             ServiceStatus::Stopped.transition(ServiceStatus::Starting),
             Ok(ServiceStatus::Starting)
+        );
+        assert_eq!(
+            ServiceStatus::Running.transition(ServiceStatus::Stopped),
+            Ok(ServiceStatus::Stopped)
+        );
+        assert_eq!(
+            ServiceStatus::Starting.transition(ServiceStatus::Stopping),
+            Ok(ServiceStatus::Stopping)
         );
     }
 

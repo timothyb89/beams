@@ -41,14 +41,20 @@ case " $* " in
         exec "$TEST_BOOTSTRAP_BIN" client-bridge --socket "$TEST_VM_SOCKET"
         ;;
 esac
-exec python3 "$TEST_FAKE_FORWARD" "$@"
+exec python3 "$TEST_FAKE_TSH" "$@"
 EOF
 chmod 700 "$TEST_DIR/bin/tsh"
 
-cat >"$TEST_DIR/fake-forward.py" <<'PY'
+cat >"$TEST_DIR/fake-tsh.py" <<'PY'
 import signal
 import socket
 import sys
+
+if sys.argv[1] == "scp":
+    destination = sys.argv[-1]
+    with open(destination, "wb") as downloaded:
+        downloaded.write(b"beams-copy-smoke\n")
+    raise SystemExit(0)
 
 forward = sys.argv[sys.argv.index("-L") + 1]
 bind, port, _remote_host, _remote_port = forward.split(":")
@@ -127,7 +133,7 @@ if mode == "ensure":
             break
     else:
         raise RuntimeError("bridge did not connect")
-elif mode in ("reject", "approve"):
+elif mode in ("reject", "approve", "approve-copy"):
     pending = None
     while time.time() < deadline and pending is None:
         event = receive()
@@ -143,11 +149,14 @@ elif mode in ("reject", "approve"):
             pending = event["request"]
     if pending is None:
         raise RuntimeError("pending request did not arrive")
-    send({
+    decision = {
         "op": "decide_request",
         "request_id": pending["request_id"],
-        "approve": mode == "approve",
-    })
+        "approve": mode != "reject",
+    }
+    if mode == "approve-copy":
+        decision["local_path"] = sys.argv[3]
+    send(decision)
     wanted = "rejected" if mode == "reject" else "running"
     while time.time() < deadline:
         event = receive()
@@ -173,6 +182,34 @@ elif mode in ("reject", "approve"):
                     break
         else:
             raise RuntimeError("running service did not appear")
+    elif mode == "approve-copy":
+        while time.time() < deadline:
+            event = receive()
+            if (
+                event.get("type") == "service_changed"
+                and event["service"]["request_id"] == pending["request_id"]
+                and event["service"]["status"] in ("stopped", "error")
+            ):
+                completed = event["service"]
+            elif event.get("type") == "snapshot":
+                completed = next(
+                    (
+                        s
+                        for s in event["services"]
+                        if s["request_id"] == pending["request_id"]
+                        and s["status"] in ("stopped", "error")
+                    ),
+                    None,
+                )
+            else:
+                completed = None
+            if completed is not None:
+                if completed["status"] != "stopped":
+                    raise RuntimeError(completed.get("message", "copy failed"))
+                print(json.dumps(completed, sort_keys=True))
+                break
+        else:
+            raise RuntimeError("file-copy service did not complete")
 elif mode == "assert-empty":
     while time.time() < deadline:
         event = receive()
@@ -265,7 +302,7 @@ start_local_a() {
         XDG_CONFIG_HOME="$TEST_DIR/config-a" \
         TEST_BOOTSTRAP_BIN="$ROOT/bootstrap/target/debug/beam-bootstrap" \
         TEST_VM_SOCKET="$VM_SOCKET" \
-        TEST_FAKE_FORWARD="$TEST_DIR/fake-forward.py" \
+        TEST_FAKE_TSH="$TEST_DIR/fake-tsh.py" \
         "$ROOT/client/target/debug/beams" daemon --socket "$LOCAL_A_SOCKET" \
         >"$TEST_DIR/local-a.log" 2>&1 &
     LOCAL_A_PID=$!
@@ -277,7 +314,7 @@ start_local_b() {
         XDG_CONFIG_HOME="$TEST_DIR/config-b" \
         TEST_BOOTSTRAP_BIN="$ROOT/bootstrap/target/debug/beam-bootstrap" \
         TEST_VM_SOCKET="$VM_SOCKET" \
-        TEST_FAKE_FORWARD="$TEST_DIR/fake-forward.py" \
+        TEST_FAKE_TSH="$TEST_DIR/fake-tsh.py" \
         "$ROOT/client/target/debug/beams" daemon --socket "$LOCAL_B_SOCKET" \
         >"$TEST_DIR/local-b.log" 2>&1 &
     LOCAL_B_PID=$!
@@ -368,6 +405,29 @@ if [ "$REQUEST_STATUS" -ne 1 ]; then
 fi
 grep -q "submitted" "$TEST_DIR/request.out"
 grep -q "rejected" "$TEST_DIR/request.out"
+
+# A remote file-copy proposal requires the local frontend to supply the real
+# workstation path. The VM sees only the hint and sanitized lifecycle text,
+# while the one-shot command blocks until the transfer itself is terminal.
+COPY_DEST="$TEST_DIR/downloaded.txt"
+env \
+    BEAMS_CLIENT_ID="$(cat "$TEST_DIR/client-b-id")" \
+    BEAMS_SESSION_TOKEN=token-b \
+    "$ROOT/bootstrap/target/debug/beam-bootstrap" client request \
+        --socket "$VM_SOCKET" download --remote-path /tmp/source \
+        --local-path-hint suggested.txt \
+        >"$TEST_DIR/copy-request.out" 2>&1 &
+COPY_REQUEST_PID=$!
+python3 "$TEST_DIR/frontend.py" approve-copy "$LOCAL_B_SOCKET" "$COPY_DEST" \
+    >"$TEST_DIR/copy-service.json"
+wait "$COPY_REQUEST_PID"
+grep -q "beams-copy-smoke" "$COPY_DEST"
+grep -q "file copy completed" "$TEST_DIR/copy-request.out"
+if grep -Fq "$COPY_DEST" "$TEST_DIR/copy-request.out"; then
+    echo "remote copy status leaked the workstation path" >&2
+    exit 1
+fi
+python3 "$TEST_DIR/frontend.py" assert-empty "$LOCAL_A_SOCKET"
 
 # Approving the same remote request creates a real loopback listener owned by
 # client B. Client A must remain an observer.

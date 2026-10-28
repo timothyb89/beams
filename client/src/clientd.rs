@@ -50,6 +50,9 @@ pub struct RequestRecord {
     pub action: Option<ServiceActionRequest>,
     #[serde(default)]
     pub message: Option<String>,
+    /// Workstation-only approved path. Never included in Beam projections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -70,6 +73,9 @@ pub struct ServiceRecord {
     pub desired_running: bool,
     #[serde(default)]
     pub message: Option<String>,
+    /// Workstation-only approved path. Never included in Beam projections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<String>,
 }
 
 fn default_login() -> String {
@@ -108,6 +114,8 @@ enum ClientMessage {
     DecideRequest {
         request_id: String,
         approve: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_path: Option<String>,
     },
     CreatePortForward {
         beam_id: String,
@@ -116,6 +124,16 @@ enum ClientMessage {
         remote_host: String,
         remote_port: u16,
         local_port: Option<u16>,
+    },
+    CreateFileCopy {
+        request_id: String,
+        beam_id: String,
+        beam_uuid: String,
+        login: String,
+        direction: beams_protocol::FileCopyDirection,
+        local_path: String,
+        remote_path: String,
+        overwrite: beams_protocol::OverwritePolicy,
     },
     ControlService {
         service_id: String,
@@ -249,8 +267,14 @@ impl PersistedState {
                     | ServiceStatus::Unknown
             ) {
                 service.status = ServiceStatus::Stopped;
-                service.message =
-                    Some("local daemon restarted; waiting to restore the forward".to_string());
+                if matches!(service.spec, Some(ServiceRequestKind::FileCopy { .. })) {
+                    service.desired_running = false;
+                    service.message =
+                        Some("local daemon restarted; file copy was interrupted".to_string());
+                } else {
+                    service.message =
+                        Some("local daemon restarted; waiting to restore the forward".to_string());
+                }
                 changed = true;
             }
         }
@@ -274,7 +298,12 @@ struct BridgeRuntime {
 }
 
 struct ServiceRuntime {
-    actions: SyncSender<crate::forward::Action>,
+    actions: RuntimeActions,
+}
+
+enum RuntimeActions {
+    Forward(SyncSender<crate::forward::Action>),
+    Copy(SyncSender<crate::copy::Action>),
 }
 
 impl Hub {
@@ -451,7 +480,12 @@ impl Hub {
         }
     }
 
-    fn decide_request(self: &Arc<Self>, request_id: &str, approve: bool) -> anyhow::Result<RequestRecord> {
+    fn decide_request(
+        self: &Arc<Self>,
+        request_id: &str,
+        approve: bool,
+        local_path: Option<String>,
+    ) -> anyhow::Result<RequestRecord> {
         let next = if approve {
             RequestStatus::Approved
         } else {
@@ -478,6 +512,17 @@ impl Hub {
                 .requests
                 .get_mut(request_id)
                 .with_context(|| format!("unknown request {request_id:?}"))?;
+            if approve
+                && matches!(
+                    request.request.as_ref().map(|request| &request.kind),
+                    Some(ServiceRequestKind::FileCopy { .. })
+                )
+            {
+                let path = local_path
+                    .as_deref()
+                    .context("file-copy approval requires a workstation path")?;
+                request.local_path = Some(normalize_local_path(path)?);
+            }
             request.status = request
                 .status
                 .transition(next)
@@ -570,6 +615,7 @@ impl Hub {
             request: Some(request),
             action: None,
             message: Some("created by local user".to_string()),
+            local_path: None,
         };
         {
             let mut state = self.state.lock().unwrap();
@@ -577,6 +623,65 @@ impl Hub {
                 .requests
                 .insert(record.request_id.clone(), record.clone());
         }
+        self.save_state()?;
+        self.broadcast(ServerEvent::RequestChanged {
+            request: record.clone(),
+        });
+        if let Err(err) = self.start_service_request_with_target(&record.request_id, target) {
+            self.fail_request(&record.request_id, false, &format!("{err:#}"));
+            return Err(err);
+        }
+        Ok(record)
+    }
+
+    fn create_file_copy(
+        self: &Arc<Self>,
+        request_id: String,
+        target: crate::bridge::Target,
+        direction: beams_protocol::FileCopyDirection,
+        local_path: String,
+        remote_path: String,
+        overwrite: beams_protocol::OverwritePolicy,
+    ) -> anyhow::Result<RequestRecord> {
+        if target.beam_uuid.is_empty() || target.login.is_empty() {
+            bail!("Beam UUID and login must not be empty");
+        }
+        if remote_path.is_empty() {
+            bail!("remote path must not be empty");
+        }
+        let local_path = normalize_local_path(&local_path)?;
+        let local_label = Path::new(&local_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workstation file")
+            .to_string();
+        if request_id.is_empty() {
+            bail!("request ID must not be empty");
+        }
+        let request = ServiceRequest {
+            request_id,
+            kind: ServiceRequestKind::FileCopy {
+                direction,
+                remote_path,
+                local_path_hint: Some(local_label),
+                overwrite,
+            },
+        };
+        let record = RequestRecord {
+            request_id: request.request_id.clone(),
+            beam_uuid: target.beam_uuid.clone(),
+            kind: request.kind.label().to_string(),
+            status: RequestStatus::Approved,
+            request: Some(request),
+            action: None,
+            message: Some("created by local user".to_string()),
+            local_path: Some(local_path),
+        };
+        self.state
+            .lock()
+            .unwrap()
+            .requests
+            .insert(record.request_id.clone(), record.clone());
         self.save_state()?;
         self.broadcast(ServerEvent::RequestChanged {
             request: record.clone(),
@@ -632,6 +737,8 @@ impl Hub {
                 .map_err(anyhow::Error::msg)?;
             request.message = Some("starting workstation service".to_string());
             let updated_request = request.clone();
+            let desired_running =
+                matches!(service_request.kind, ServiceRequestKind::LocalPortForward { .. });
             let service = ServiceRecord {
                 service_id: Uuid::new_v4().to_string(),
                 request_id: request_id.to_string(),
@@ -641,8 +748,9 @@ impl Hub {
                 kind: service_request.kind.label().to_string(),
                 spec: Some(service_request.kind),
                 status: ServiceStatus::Starting,
-                desired_running: true,
-                message: Some("starting SSH local forward".to_string()),
+                desired_running,
+                message: Some("starting workstation service".to_string()),
+                local_path: request.local_path.clone(),
             };
             state
                 .services
@@ -665,37 +773,81 @@ impl Hub {
             .spec
             .clone()
             .context("service specification disappeared before start")?;
-        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
-        let actions = crate::forward::spawn(
-            self.forward_program.clone(),
-            crate::forward::Target {
-                beam_uuid: target.beam_uuid.clone(),
-                login: target.login.clone(),
-            },
-            service.service_id.clone(),
-            spec,
-            event_tx,
-        );
-        self.service_runtimes
-            .lock()
-            .unwrap()
-            .insert(service.service_id.clone(), ServiceRuntime { actions });
-        let weak = Arc::downgrade(self);
-        thread::spawn(move || handle_service_events(weak, event_rx));
+        match &spec {
+            ServiceRequestKind::LocalPortForward { .. } => {
+                let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+                let actions = crate::forward::spawn(
+                    self.forward_program.clone(),
+                    crate::forward::Target {
+                        beam_uuid: target.beam_uuid.clone(),
+                        login: target.login.clone(),
+                    },
+                    service.service_id.clone(),
+                    spec,
+                    event_tx,
+                );
+                self.service_runtimes.lock().unwrap().insert(
+                    service.service_id.clone(),
+                    ServiceRuntime {
+                        actions: RuntimeActions::Forward(actions),
+                    },
+                );
+                let weak = Arc::downgrade(self);
+                thread::spawn(move || handle_service_events(weak, event_rx));
+            }
+            ServiceRequestKind::FileCopy { .. } => {
+                let local_path = service
+                    .local_path
+                    .as_deref()
+                    .context("file-copy service has no approved workstation path")?;
+                let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+                let actions = crate::copy::spawn(
+                    self.forward_program.clone(),
+                    crate::copy::Target {
+                        beam_uuid: target.beam_uuid.clone(),
+                        login: target.login.clone(),
+                    },
+                    service.service_id.clone(),
+                    spec,
+                    PathBuf::from(local_path),
+                    event_tx,
+                );
+                self.service_runtimes.lock().unwrap().insert(
+                    service.service_id.clone(),
+                    ServiceRuntime {
+                        actions: RuntimeActions::Copy(actions),
+                    },
+                );
+                let weak = Arc::downgrade(self);
+                thread::spawn(move || handle_copy_events(weak, event_rx));
+            }
+        }
         Ok(())
     }
 
     fn control_service(&self, service_id: &str, action: ServiceAction) -> anyhow::Result<ServiceRecord> {
-        let runtime_action = match action {
-            ServiceAction::Stop => crate::forward::Action::Stop,
-            ServiceAction::Restart => crate::forward::Action::Restart,
-        };
+        if action == ServiceAction::Restart
+            && matches!(
+                self.state
+                    .lock()
+                    .unwrap()
+                    .services
+                    .get(service_id)
+                    .and_then(|service| service.spec.as_ref()),
+                Some(ServiceRequestKind::FileCopy { .. })
+            )
+        {
+            bail!("file-copy jobs cannot be restarted; create a new job instead");
+        }
         let actions = self
             .service_runtimes
             .lock()
             .unwrap()
             .get(service_id)
-            .map(|runtime| runtime.actions.clone())
+            .map(|runtime| match &runtime.actions {
+                RuntimeActions::Forward(actions) => RuntimeActions::Forward(actions.clone()),
+                RuntimeActions::Copy(actions) => RuntimeActions::Copy(actions.clone()),
+            })
             .with_context(|| format!("service {service_id:?} is not owned by this daemon process"))?;
         let updated = {
             let mut state = self.state.lock().unwrap();
@@ -732,9 +884,20 @@ impl Hub {
             }
             service.clone()
         };
-        actions
-            .try_send(runtime_action)
-            .map_err(|err| anyhow::anyhow!("sending service action: {err}"))?;
+        match (actions, action) {
+            (RuntimeActions::Forward(actions), ServiceAction::Stop) => actions
+                .try_send(crate::forward::Action::Stop)
+                .map_err(|err| anyhow::anyhow!("sending service action: {err}"))?,
+            (RuntimeActions::Forward(actions), ServiceAction::Restart) => actions
+                .try_send(crate::forward::Action::Restart)
+                .map_err(|err| anyhow::anyhow!("sending service action: {err}"))?,
+            (RuntimeActions::Copy(actions), ServiceAction::Stop) => actions
+                .try_send(crate::copy::Action::Stop)
+                .map_err(|err| anyhow::anyhow!("sending copy cancellation: {err}"))?,
+            (RuntimeActions::Copy(_), ServiceAction::Restart) => {
+                bail!("completed or interrupted file-copy jobs cannot be restarted")
+            }
+        }
         self.save_state()?;
         self.publish_service(&updated);
         Ok(updated)
@@ -818,10 +981,22 @@ impl Hub {
             .lock()
             .unwrap()
             .values()
-            .map(|runtime| runtime.actions.clone())
+            .map(|runtime| match &runtime.actions {
+                RuntimeActions::Forward(actions) => {
+                    RuntimeActions::Forward(actions.clone())
+                }
+                RuntimeActions::Copy(actions) => RuntimeActions::Copy(actions.clone()),
+            })
             .collect::<Vec<_>>();
         for actions in actions {
-            let _ = actions.try_send(crate::forward::Action::Stop);
+            match actions {
+                RuntimeActions::Forward(actions) => {
+                    let _ = actions.try_send(crate::forward::Action::Stop);
+                }
+                RuntimeActions::Copy(actions) => {
+                    let _ = actions.try_send(crate::copy::Action::Stop);
+                }
+            }
         }
         // Dropping every bridge command sender makes each supervisor kill and
         // reap its current SSH child instead of reconnecting.
@@ -906,13 +1081,61 @@ fn validate_port_forward(
     Ok(())
 }
 
+fn normalize_local_path(path: &str) -> anyhow::Result<String> {
+    if path.is_empty() {
+        bail!("workstation path must not be empty");
+    }
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        PathBuf::from(std::env::var("HOME").context("HOME is not set")?).join(rest)
+    } else {
+        PathBuf::from(path)
+    };
+    let absolute = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir()
+            .context("reading workstation current directory")?
+            .join(expanded)
+    };
+    Ok(absolute.to_string_lossy().into_owned())
+}
+
 fn service_projection(service: &ServiceRecord) -> Option<ServiceProjection> {
+    let kind = service.spec.clone()?;
     Some(ServiceProjection {
         service_id: service.service_id.clone(),
         request_id: service.request_id.clone(),
-        kind: service.spec.clone()?,
+        kind: kind.clone(),
         status: service.status,
-        message: service.message.clone(),
+        message: match kind {
+            ServiceRequestKind::LocalPortForward { .. } => service.message.clone(),
+            ServiceRequestKind::FileCopy { .. } => Some(
+                match service.status {
+                    ServiceStatus::Starting => "preparing file copy",
+                    ServiceStatus::Running => "file copy in progress",
+                    ServiceStatus::Stopping => "cancelling file copy",
+                    ServiceStatus::Stopped => {
+                        if service.message.as_deref() == Some("cancelled locally") {
+                            "file copy cancelled"
+                        } else if service
+                            .message
+                            .as_deref()
+                            .is_some_and(|message| message.contains("interrupted"))
+                        {
+                            "file copy interrupted"
+                        } else {
+                            "file copy completed"
+                        }
+                    }
+                    ServiceStatus::Error => {
+                        "file copy failed; inspect the workstation client for details"
+                    }
+                    ServiceStatus::Degraded => "file copy degraded",
+                    ServiceStatus::Unknown => "file copy status unknown",
+                }
+                .to_string(),
+            ),
+        },
     })
 }
 
@@ -921,27 +1144,64 @@ fn handle_service_events(hub: Weak<Hub>, events: Receiver<crate::forward::Event>
         let Some(hub) = hub.upgrade() else {
             return;
         };
-        handle_service_event(&hub, event);
+        handle_service_update(
+            &hub,
+            event.service_id,
+            event.kind,
+            event.status,
+            event.message,
+        );
+    }
+}
+
+fn handle_copy_events(hub: Weak<Hub>, events: Receiver<crate::copy::Event>) {
+    while let Ok(event) = events.recv() {
+        let Some(hub) = hub.upgrade() else {
+            return;
+        };
+        handle_service_update(
+            &hub,
+            event.service_id,
+            event.kind,
+            event.status,
+            event.message,
+        );
     }
 }
 
 fn handle_service_event(hub: &Arc<Hub>, event: crate::forward::Event) {
+    handle_service_update(
+        hub,
+        event.service_id,
+        event.kind,
+        event.status,
+        event.message,
+    );
+}
+
+fn handle_service_update(
+    hub: &Arc<Hub>,
+    service_id: String,
+    kind: ServiceRequestKind,
+    status: ServiceStatus,
+    message: Option<String>,
+) {
     let (service, completed_actions) = {
         let mut state = hub.state.lock().unwrap();
-        let Some(service) = state.services.get_mut(&event.service_id) else {
+        let Some(service) = state.services.get_mut(&service_id) else {
             return;
         };
-        if service.status != event.status {
-            match service.status.transition(event.status) {
+        if service.status != status {
+            match service.status.transition(status) {
                 Ok(next) => service.status = next,
-                Err(_) if event.status == ServiceStatus::Starting => {
+                Err(_) if status == ServiceStatus::Starting => {
                     service.status = ServiceStatus::Starting;
                 }
                 Err(_) => return,
             }
         }
-        service.spec = Some(event.kind);
-        service.message = event.message;
+        service.spec = Some(kind);
+        service.message = message;
         let service = service.clone();
 
         if service.status == ServiceStatus::Running {
@@ -1002,6 +1262,14 @@ fn handle_service_event(hub: &Arc<Hub>, event: crate::forward::Event) {
     }
     for request in completed_actions {
         hub.publish_request(&request, true);
+    }
+    if matches!(service.spec, Some(ServiceRequestKind::FileCopy { .. }))
+        && matches!(service.status, ServiceStatus::Stopped | ServiceStatus::Error)
+    {
+        hub.service_runtimes
+            .lock()
+            .unwrap()
+            .remove(&service.service_id);
     }
 }
 
@@ -1106,6 +1374,7 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                     request: Some(request),
                     action: None,
                     message: None,
+                    local_path: None,
                 };
                 let inserted = {
                     let mut state = hub.state.lock().unwrap();
@@ -1152,6 +1421,7 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                     request: None,
                     action: Some(request),
                     message: None,
+                    local_path: None,
                 };
                 let inserted = {
                     let mut state = hub.state.lock().unwrap();
@@ -1287,9 +1557,27 @@ impl Frontend {
             &ClientMessage::DecideRequest {
                 request_id: request_id.to_string(),
                 approve,
+                local_path: None,
             },
         )
         .context("sending request decision")
+    }
+
+    pub fn decide_file_copy(
+        &mut self,
+        request_id: &str,
+        approve: bool,
+        local_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        write_json(
+            &mut self.write_half,
+            &ClientMessage::DecideRequest {
+                request_id: request_id.to_string(),
+                approve,
+                local_path: local_path.map(str::to_string),
+            },
+        )
+        .context("sending file-copy decision")
     }
 
     pub fn create_port_forward(
@@ -1311,6 +1599,32 @@ impl Frontend {
             },
         )
         .context("creating local port forward")
+    }
+
+    pub fn create_file_copy(
+        &mut self,
+        target: &crate::bridge::Target,
+        direction: beams_protocol::FileCopyDirection,
+        local_path: &str,
+        remote_path: &str,
+        overwrite: beams_protocol::OverwritePolicy,
+    ) -> anyhow::Result<String> {
+        let request_id = Uuid::new_v4().to_string();
+        write_json(
+            &mut self.write_half,
+            &ClientMessage::CreateFileCopy {
+                request_id: request_id.clone(),
+                beam_id: target.beam_id.clone(),
+                beam_uuid: target.beam_uuid.clone(),
+                login: target.login.clone(),
+                direction,
+                local_path: local_path.to_string(),
+                remote_path: remote_path.to_string(),
+                overwrite,
+            },
+        )
+        .context("creating file-copy job")?;
+        Ok(request_id)
     }
 
     pub fn control_service(
@@ -1562,10 +1876,41 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                     ClientMessage::DecideRequest {
                         request_id,
                         approve,
+                        local_path,
                     } => {
-                        if let Err(err) = hub.decide_request(&request_id, approve) {
+                        if let Err(err) =
+                            hub.decide_request(&request_id, approve, local_path)
+                        {
                             let _ = tx.try_send(ServerEvent::Error {
                                 message: format!("deciding request: {err:#}"),
+                            });
+                        }
+                    }
+                    ClientMessage::CreateFileCopy {
+                        request_id,
+                        beam_id,
+                        beam_uuid,
+                        login,
+                        direction,
+                        local_path,
+                        remote_path,
+                        overwrite,
+                    } => {
+                        let target = crate::bridge::Target {
+                            beam_id,
+                            beam_uuid,
+                            login,
+                        };
+                        if let Err(err) = hub.create_file_copy(
+                            request_id,
+                            target,
+                            direction,
+                            local_path,
+                            remote_path,
+                            overwrite,
+                        ) {
+                            let _ = tx.try_send(ServerEvent::Error {
+                                message: format!("creating file-copy job: {err:#}"),
                             });
                         }
                     }
@@ -1766,6 +2111,21 @@ mod tests {
         path
     }
 
+    fn fake_copy_program() -> PathBuf {
+        let path = temp_path("beams-clientd-fake-copy");
+        fs::write(
+            &path,
+            "#!/bin/sh\n\
+             if [ \"$1\" = scp ]; then\n\
+               for arg do destination=$arg; done\n\
+               printf daemon-copy > \"$destination\"\n\
+             fi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
     fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + timeout;
         while !condition() {
@@ -1847,11 +2207,43 @@ mod tests {
                 request: None,
                 action: None,
                 message: None,
+                local_path: None,
             },
         );
         assert!(state.expire_pending_after_restart());
         assert_eq!(state.requests["pending"].status, RequestStatus::Expired);
         assert!(!state.expire_pending_after_restart());
+    }
+
+    #[test]
+    fn daemon_restart_marks_file_copy_interrupted_without_restoring_it() {
+        let mut state = PersistedState::default();
+        state.services.insert(
+            "copy".to_string(),
+            ServiceRecord {
+                service_id: "copy".to_string(),
+                request_id: "request".to_string(),
+                beam_id: "beam".to_string(),
+                beam_uuid: "beam-uuid".to_string(),
+                login: "beams".to_string(),
+                kind: "file_copy".to_string(),
+                spec: Some(ServiceRequestKind::FileCopy {
+                    direction: beams_protocol::FileCopyDirection::Download,
+                    remote_path: "/tmp/source".to_string(),
+                    local_path_hint: Some("destination".to_string()),
+                    overwrite: beams_protocol::OverwritePolicy::Deny,
+                }),
+                status: ServiceStatus::Running,
+                desired_running: true,
+                message: None,
+                local_path: Some("/tmp/destination".to_string()),
+            },
+        );
+        assert!(state.mark_process_services_stopped_after_restart());
+        let copy = &state.services["copy"];
+        assert_eq!(copy.status, ServiceStatus::Stopped);
+        assert!(!copy.desired_running);
+        assert!(copy.message.as_deref().unwrap().contains("interrupted"));
     }
 
     #[test]
@@ -1957,7 +2349,7 @@ mod tests {
         assert_eq!(stored.status, RequestStatus::PendingApproval);
         assert_eq!(stored.request, Some(request));
 
-        let decided = hub.decide_request("request-1", false).unwrap();
+        let decided = hub.decide_request("request-1", false, None).unwrap();
         assert_eq!(decided.status, RequestStatus::Rejected);
         assert!(matches!(
             commands.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -1967,7 +2359,7 @@ mod tests {
                 ..
             } if request_id == "request-1"
         ));
-        assert!(hub.decide_request("request-1", true).is_err());
+        assert!(hub.decide_request("request-1", true, None).is_err());
     }
 
     #[test]
@@ -1991,8 +2383,10 @@ mod tests {
         );
         let first = Arc::clone(&hub);
         let second = Arc::clone(&hub);
-        let a = thread::spawn(move || first.decide_request("raced-request", false).is_ok());
-        let b = thread::spawn(move || second.decide_request("raced-request", false).is_ok());
+        let a =
+            thread::spawn(move || first.decide_request("raced-request", false, None).is_ok());
+        let b =
+            thread::spawn(move || second.decide_request("raced-request", false, None).is_ok());
         let winners = usize::from(a.join().unwrap()) + usize::from(b.join().unwrap());
         assert_eq!(winners, 1);
         assert_eq!(
@@ -2021,6 +2415,7 @@ mod tests {
                 }),
                 action: None,
                 message: Some("rejected by local user".to_string()),
+                local_path: None,
             },
         );
 
@@ -2085,6 +2480,7 @@ mod tests {
                 request: None,
                 action: None,
                 message: None,
+                local_path: None,
             },
         );
         hub.expire_request("request-3");
@@ -2100,6 +2496,83 @@ mod tests {
             }
         ));
         assert!(hub.state.lock().unwrap().services.is_empty());
+    }
+
+    #[test]
+    fn remote_file_copy_requires_a_local_path_and_keeps_it_off_the_beam() {
+        let program = fake_copy_program();
+        let dir = temp_path("beams-clientd-copy-destination");
+        fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("actual-local-destination");
+        let (hub, _commands) =
+            hub_with_bridge_and_program("beam-uuid", program.display().to_string());
+        handle_bridge_event(
+            &hub,
+            crate::bridge::Event::Message {
+                beam_uuid: "beam-uuid".to_string(),
+                message: BeamToClient::RequestSubmitted {
+                    request: ServiceRequest {
+                        request_id: "request-copy".to_string(),
+                        kind: ServiceRequestKind::FileCopy {
+                            direction: beams_protocol::FileCopyDirection::Download,
+                            remote_path: "/tmp/source".to_string(),
+                            local_path_hint: Some("suggested-name".to_string()),
+                            overwrite: beams_protocol::OverwritePolicy::Deny,
+                        },
+                    },
+                },
+            },
+        );
+
+        assert!(hub.decide_request("request-copy", true, None).is_err());
+        assert_eq!(
+            hub.state.lock().unwrap().requests["request-copy"].status,
+            RequestStatus::PendingApproval
+        );
+        hub.decide_request(
+            "request-copy",
+            true,
+            Some(destination.display().to_string()),
+        )
+        .unwrap();
+        wait_until(Duration::from_secs(2), || {
+            hub.state
+                .lock()
+                .unwrap()
+                .services
+                .values()
+                .any(|service| service.status == ServiceStatus::Stopped)
+        });
+
+        let service = hub
+            .state
+            .lock()
+            .unwrap()
+            .services
+            .values()
+            .next()
+            .cloned()
+            .unwrap();
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "daemon-copy");
+        assert_eq!(
+            service.local_path.as_deref(),
+            Some(destination.to_string_lossy().as_ref())
+        );
+        let projection = serde_json::to_string(&service_projection(&service).unwrap()).unwrap();
+        assert!(!projection.contains(&destination.to_string_lossy().to_string()));
+        assert!(projection.contains("suggested-name"));
+        assert!(!hub
+            .service_runtimes
+            .lock()
+            .unwrap()
+            .contains_key(&service.service_id));
+        assert!(hub
+            .control_service(&service.service_id, ServiceAction::Restart)
+            .is_err());
+
+        drop(hub);
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_file(program);
     }
 
     #[test]
@@ -2124,7 +2597,7 @@ mod tests {
             },
         );
 
-        hub.decide_request("request-forward", true).unwrap();
+        hub.decide_request("request-forward", true, None).unwrap();
         wait_until(Duration::from_secs(3), || {
             hub.state.lock().unwrap().requests["request-forward"].status
                 == RequestStatus::Running

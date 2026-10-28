@@ -267,7 +267,7 @@ fn spawn_child(
 }
 
 #[cfg(target_os = "linux")]
-fn configure_parent_death_signal(command: &mut Command) {
+pub(crate) fn configure_parent_death_signal(command: &mut Command) {
     // SAFETY: this closure only invokes async-signal-safe libc calls before
     // exec. Linux's parent-death signal additionally covers an abrupt daemon
     // crash that cannot run the portable graceful-shutdown path.
@@ -288,7 +288,7 @@ fn configure_parent_death_signal(command: &mut Command) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn configure_parent_death_signal(_command: &mut Command) {
+pub(crate) fn configure_parent_death_signal(_command: &mut Command) {
     // macOS and other Unix targets do not expose Linux PR_SET_PDEATHSIG.
     // `clientd::serve` catches normal termination signals and explicitly
     // stops every worker before exiting instead.
