@@ -1,5 +1,6 @@
 mod bridge;
 mod clientd;
+mod forward;
 mod stage;
 mod state;
 mod session;

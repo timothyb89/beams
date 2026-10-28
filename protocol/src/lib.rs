@@ -78,6 +78,7 @@ impl ServiceStatus {
                     Self::Running | Self::Stopping | Self::Stopped | Self::Error
                 )
                 | (Self::Stopping, Self::Stopped | Self::Error)
+                | (Self::Stopped | Self::Error, Self::Starting)
         );
         if valid {
             Ok(next)
@@ -85,6 +86,20 @@ impl ServiceStatus {
             Err(format!("invalid service transition {self:?} -> {next:?}"))
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceAction {
+    Stop,
+    Restart,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ServiceActionRequest {
+    pub request_id: String,
+    pub service_id: String,
+    pub action: ServiceAction,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -156,6 +171,15 @@ pub enum ClientToBeam {
     ServiceSnapshot {
         services: Vec<ServiceProjection>,
     },
+    ServiceStatus {
+        service: ServiceProjection,
+    },
+    ServiceActionStatus {
+        request_id: String,
+        status: RequestStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     Ready,
     Ping {
         nonce: String,
@@ -190,6 +214,9 @@ pub enum BeamToClient {
     },
     RequestSubmitted {
         request: ServiceRequest,
+    },
+    ServiceActionRequested {
+        request: ServiceActionRequest,
     },
     Pong {
         nonce: String,

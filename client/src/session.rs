@@ -34,9 +34,9 @@ use ratatui::Terminal;
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
-use beams_protocol::{RequestStatus, ServiceRequestKind};
+use beams_protocol::{RequestStatus, ServiceAction, ServiceRequestKind};
 
-use crate::clientd::{Frontend, RequestRecord, ServerEvent};
+use crate::clientd::{Frontend, RequestRecord, ServerEvent, ServiceRecord};
 
 const LOOP_TICK: Duration = Duration::from_millis(25);
 const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
@@ -340,7 +340,12 @@ fn drive(
                 return Ok(0);
             }
 
-            for action in route_input(&mut input_mode, escape_key, &bytes[..read]) {
+            for action in route_input(
+                &mut input_mode,
+                escape_key,
+                daemon_view.forward_form.is_some(),
+                &bytes[..read],
+            ) {
                 match action {
                     InputAction::Remote(bytes) => {
                         writer.write_all(&bytes).context("writing to local PTY")?;
@@ -367,6 +372,46 @@ fn drive(
                         daemon_view.decide(local_daemon, false);
                         draw_palette(info, escape_key, &daemon_view)?;
                     }
+                    InputAction::BeginForward => {
+                        daemon_view.forward_form = Some(ForwardForm::default());
+                        draw_palette(info, escape_key, &daemon_view)?;
+                    }
+                    InputAction::FormChar(byte) => {
+                        daemon_view.form_char(byte);
+                        draw_palette(info, escape_key, &daemon_view)?;
+                    }
+                    InputAction::FormBackspace => {
+                        daemon_view.form_backspace();
+                        draw_palette(info, escape_key, &daemon_view)?;
+                    }
+                    InputAction::FormNext => {
+                        daemon_view.form_next();
+                        draw_palette(info, escape_key, &daemon_view)?;
+                    }
+                    InputAction::SubmitForm => {
+                        daemon_view.submit_forward(local_daemon);
+                        draw_palette(info, escape_key, &daemon_view)?;
+                    }
+                    InputAction::CancelForm => {
+                        daemon_view.forward_form = None;
+                        draw_palette(info, escape_key, &daemon_view)?;
+                    }
+                    InputAction::StopService => {
+                        daemon_view.control_selected(local_daemon, ServiceAction::Stop);
+                        draw_palette(info, escape_key, &daemon_view)?;
+                    }
+                    InputAction::RestartService => {
+                        daemon_view.control_selected(local_daemon, ServiceAction::Restart);
+                        draw_palette(info, escape_key, &daemon_view)?;
+                    }
+                    InputAction::NextService => {
+                        daemon_view.select_next();
+                        draw_palette(info, escape_key, &daemon_view)?;
+                    }
+                    InputAction::PreviousService => {
+                        daemon_view.select_previous();
+                        draw_palette(info, escape_key, &daemon_view)?;
+                    }
                 }
             }
         }
@@ -380,8 +425,18 @@ struct DaemonView {
     requests: usize,
     services: usize,
     request_records: BTreeMap<String, RequestRecord>,
+    service_records: BTreeMap<String, ServiceRecord>,
     bridge_statuses: BTreeMap<String, String>,
+    selected_service: usize,
+    forward_form: Option<ForwardForm>,
     message: String,
+}
+
+#[derive(Default)]
+struct ForwardForm {
+    remote_port: String,
+    local_port: String,
+    field: usize,
 }
 
 impl DaemonView {
@@ -394,7 +449,10 @@ impl DaemonView {
                 requests: 0,
                 services: 0,
                 request_records: BTreeMap::new(),
+                service_records: BTreeMap::new(),
                 bridge_statuses: BTreeMap::new(),
+                selected_service: 0,
+                forward_form: None,
                 message: "connected".to_string(),
             },
             None => Self {
@@ -404,7 +462,10 @@ impl DaemonView {
                 requests: 0,
                 services: 0,
                 request_records: BTreeMap::new(),
+                service_records: BTreeMap::new(),
                 bridge_statuses: BTreeMap::new(),
+                selected_service: 0,
+                forward_form: None,
                 message: local_daemon
                     .unavailable
                     .clone()
@@ -464,6 +525,10 @@ impl DaemonView {
                         .into_iter()
                         .map(|request| (request.request_id.clone(), request))
                         .collect();
+                    self.service_records = services
+                        .into_iter()
+                        .map(|service| (service.service_id.clone(), service))
+                        .collect();
                     self.bridge_statuses = bridges
                         .into_iter()
                         .map(|bridge| (bridge.beam_uuid, bridge.status))
@@ -481,6 +546,11 @@ impl DaemonView {
                     self.request_records
                         .insert(request.request_id.clone(), request);
                     self.requests = self.request_records.len();
+                }
+                Ok(ServerEvent::ServiceChanged { service }) => {
+                    self.service_records
+                        .insert(service.service_id.clone(), service);
+                    self.services = self.service_records.len();
                 }
                 Ok(ServerEvent::BridgeStatus { bridge }) => {
                     self.bridge_statuses
@@ -546,6 +616,129 @@ impl DaemonView {
             }
         }
     }
+
+    fn visible_services<'a>(&'a self, local_daemon: &'a LocalDaemon) -> Vec<&'a ServiceRecord> {
+        let beam_uuid = local_daemon
+            .managed_bridge
+            .as_ref()
+            .map(|managed| managed.target.beam_uuid.as_str());
+        self.service_records
+            .values()
+            .filter(|service| Some(service.beam_uuid.as_str()) == beam_uuid)
+            .collect()
+    }
+
+    fn selected_service<'a>(&'a self, local_daemon: &'a LocalDaemon) -> Option<&'a ServiceRecord> {
+        let services = self.visible_services(local_daemon);
+        services.get(self.selected_service.min(services.len().saturating_sub(1))).copied()
+    }
+
+    fn select_next(&mut self) {
+        self.selected_service = self.selected_service.saturating_add(1);
+    }
+
+    fn select_previous(&mut self) {
+        self.selected_service = self.selected_service.saturating_sub(1);
+    }
+
+    fn form_char(&mut self, byte: u8) {
+        let Some(form) = &mut self.forward_form else {
+            return;
+        };
+        if !byte.is_ascii_digit() {
+            return;
+        }
+        if form.field == 0 {
+            form.remote_port.push(char::from(byte));
+        } else {
+            form.local_port.push(char::from(byte));
+        }
+    }
+
+    fn form_backspace(&mut self) {
+        let Some(form) = &mut self.forward_form else {
+            return;
+        };
+        if form.field == 0 {
+            form.remote_port.pop();
+        } else {
+            form.local_port.pop();
+        }
+    }
+
+    fn form_next(&mut self) {
+        if let Some(form) = &mut self.forward_form {
+            form.field = (form.field + 1) % 2;
+        }
+    }
+
+    fn submit_forward(&mut self, local_daemon: &mut LocalDaemon) {
+        let Some(form) = self.forward_form.take() else {
+            return;
+        };
+        let remote_port = match form.remote_port.parse::<u16>() {
+            Ok(port) if port > 0 => port,
+            _ => {
+                self.message = "remote port must be between 1 and 65535".to_string();
+                self.forward_form = Some(form);
+                return;
+            }
+        };
+        let local_port = if form.local_port.is_empty() {
+            None
+        } else {
+            match form.local_port.parse::<u16>() {
+                Ok(port) if port > 0 => Some(port),
+                _ => {
+                    self.message = "local port must be empty or between 1 and 65535".to_string();
+                    self.forward_form = Some(form);
+                    return;
+                }
+            }
+        };
+        let Some(managed) = &local_daemon.managed_bridge else {
+            self.message = "this session has no managed Beam target".to_string();
+            return;
+        };
+        let Some(frontend) = &mut local_daemon.frontend else {
+            self.message = "local daemon connection is unavailable".to_string();
+            return;
+        };
+        match frontend.create_port_forward(
+            &managed.target,
+            "127.0.0.1",
+            remote_port,
+            local_port,
+        ) {
+            Ok(()) => {
+                self.message = format!(
+                    "creating local port {} → 127.0.0.1:{remote_port}",
+                    local_port
+                        .map(|port| port.to_string())
+                        .unwrap_or_else(|| "automatic".to_string())
+                );
+            }
+            Err(err) => self.message = format!("could not create forward: {err}"),
+        }
+    }
+
+    fn control_selected(&mut self, local_daemon: &mut LocalDaemon, action: ServiceAction) {
+        let Some(service_id) = self
+            .selected_service(local_daemon)
+            .map(|service| service.service_id.clone())
+        else {
+            self.message = "no local service is selected".to_string();
+            return;
+        };
+        let Some(frontend) = &mut local_daemon.frontend else {
+            self.message = "local daemon connection is unavailable".to_string();
+            return;
+        };
+        match frontend.control_service(&service_id, action) {
+            Ok(()) => self.message = format!("{action:?} requested for {service_id}"),
+            Err(err) => self.message = format!("could not control service: {err}"),
+        }
+    }
 }
 
 fn exit_code(status: &ExitStatus) -> u8 {
@@ -565,13 +758,28 @@ enum InputAction {
     ClosePalette,
     ApprovePending,
     RejectPending,
+    BeginForward,
+    FormChar(u8),
+    FormBackspace,
+    FormNext,
+    SubmitForm,
+    CancelForm,
+    StopService,
+    RestartService,
+    NextService,
+    PreviousService,
 }
 
 /// Routes bytes without decoding/re-encoding terminal escape sequences. This
 /// is the property that keeps normal SSH/zellij/mouse/paste behavior
 /// transparent. The palette's intentionally tiny phase-one keymap is also raw:
 /// q/Esc/Enter close it, while a second prefix sends the literal prefix byte.
-fn route_input(mode: &mut InputMode, escape_key: EscapeKey, input: &[u8]) -> Vec<InputAction> {
+fn route_input(
+    mode: &mut InputMode,
+    escape_key: EscapeKey,
+    form_active: bool,
+    input: &[u8],
+) -> Vec<InputAction> {
     let mut actions = Vec::new();
     let mut remote = Vec::new();
 
@@ -589,6 +797,21 @@ fn route_input(mode: &mut InputMode, escape_key: EscapeKey, input: &[u8]) -> Vec
                 actions.push(InputAction::OpenPalette);
             }
             InputMode::Passthrough => remote.push(byte),
+            InputMode::Palette if form_active && byte == b'\x1b' => {
+                actions.push(InputAction::CancelForm);
+            }
+            InputMode::Palette if form_active && byte == b'\t' => {
+                actions.push(InputAction::FormNext);
+            }
+            InputMode::Palette if form_active && matches!(byte, b'\r' | b'\n') => {
+                actions.push(InputAction::SubmitForm);
+            }
+            InputMode::Palette if form_active && matches!(byte, b'\x08' | b'\x7f') => {
+                actions.push(InputAction::FormBackspace);
+            }
+            InputMode::Palette if form_active => {
+                actions.push(InputAction::FormChar(byte));
+            }
             InputMode::Palette if escape_key.byte() == Some(byte) => {
                 *mode = InputMode::Passthrough;
                 actions.push(InputAction::ClosePalette);
@@ -603,6 +826,21 @@ fn route_input(mode: &mut InputMode, escape_key: EscapeKey, input: &[u8]) -> Vec
             }
             InputMode::Palette if matches!(byte, b'n' | b'N') => {
                 actions.push(InputAction::RejectPending);
+            }
+            InputMode::Palette if matches!(byte, b'f' | b'F') => {
+                actions.push(InputAction::BeginForward);
+            }
+            InputMode::Palette if matches!(byte, b's' | b'S') => {
+                actions.push(InputAction::StopService);
+            }
+            InputMode::Palette if matches!(byte, b'r' | b'R') => {
+                actions.push(InputAction::RestartService);
+            }
+            InputMode::Palette if matches!(byte, b'j' | b'J') => {
+                actions.push(InputAction::NextService);
+            }
+            InputMode::Palette if matches!(byte, b'k' | b'K') => {
+                actions.push(InputAction::PreviousService);
             }
             InputMode::Palette => {
                 // Future service forms will extend this tiny state machine.
@@ -971,10 +1209,79 @@ fn draw_palette(
                             )));
                         }
                     }
+                } else if let Some(action) = &request.action {
+                    body_text.push(Line::from(format!(
+                        "{:?} service {}",
+                        action.action, action.service_id
+                    )));
                 } else {
                     body_text.push(Line::from(format!("service: {}", request.kind)));
                 }
                 body_text.push(Line::from("Press y to approve or n to reject."));
+            }
+            let services = daemon
+                .service_records
+                .values()
+                .filter(|service| service.beam_uuid == info.beam_uuid)
+                .collect::<Vec<_>>();
+            if !services.is_empty() {
+                body_text.push(Line::from(""));
+                body_text.push(Line::from(Span::styled(
+                    "Local services",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                let selected = daemon.selected_service.min(services.len() - 1);
+                for (index, service) in services.iter().enumerate() {
+                    let marker = if index == selected { "›" } else { " " };
+                    let endpoint = match &service.spec {
+                        Some(ServiceRequestKind::LocalPortForward {
+                            remote_host,
+                            remote_port,
+                            local_port,
+                        }) => format!(
+                            "127.0.0.1:{} → {}:{}",
+                            local_port
+                                .map(|port| port.to_string())
+                                .unwrap_or_else(|| "?".to_string()),
+                            remote_host,
+                            remote_port
+                        ),
+                        None => service.kind.clone(),
+                    };
+                    body_text.push(Line::from(format!(
+                        "{marker} {endpoint} [{:?}]{}",
+                        service.status,
+                        service
+                            .message
+                            .as_deref()
+                            .map(|message| format!(" — {message}"))
+                            .unwrap_or_default()
+                    )));
+                }
+            }
+            if let Some(form) = &daemon.forward_form {
+                body_text.push(Line::from(""));
+                body_text.push(Line::from(Span::styled(
+                    "Create local port forward",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                body_text.push(Line::from(format!(
+                    "{} remote port: {}",
+                    if form.field == 0 { "›" } else { " " },
+                    form.remote_port
+                )));
+                body_text.push(Line::from(format!(
+                    "{} local port (empty = automatic): {}",
+                    if form.field == 1 { "›" } else { " " },
+                    form.local_port
+                )));
+                body_text.push(Line::from(
+                    "Tab changes field; Enter creates; Esc cancels.",
+                ));
             }
             body_text.push(Line::from(""));
             body_text.push(Line::from(
@@ -998,8 +1305,15 @@ fn draw_palette(
             } else {
                 ""
             };
+            let service_keys = if daemon.forward_form.is_some() {
+                ""
+            } else {
+                "f: forward  •  j/k: select  •  s: stop  •  r: restart  •  "
+            };
             frame.render_widget(
-                Paragraph::new(format!("{decision_keys}{literal}q / Esc / Enter: close"))
+                Paragraph::new(format!(
+                    "{decision_keys}{service_keys}{literal}q / Esc / Enter: close"
+                ))
                     .alignment(Alignment::Center)
                     .block(Block::default().borders(Borders::ALL)),
                 footer,
@@ -1030,7 +1344,7 @@ mod tests {
         let mut mode = InputMode::Passthrough;
         let input = b"\x1b[<0;12;9Mhello\x00\xff";
         assert_eq!(
-            route_input(&mut mode, EscapeKey::default(), input),
+            route_input(&mut mode, EscapeKey::default(), false, input),
             vec![InputAction::Remote(input.to_vec())]
         );
         assert_eq!(mode, InputMode::Passthrough);
@@ -1040,13 +1354,13 @@ mod tests {
     fn prefix_opens_palette_and_second_prefix_sends_literal() {
         let mut mode = InputMode::Passthrough;
         assert_eq!(
-            route_input(&mut mode, EscapeKey::default(), b"\x1d"),
+            route_input(&mut mode, EscapeKey::default(), false, b"\x1d"),
             vec![InputAction::OpenPalette]
         );
         assert_eq!(mode, InputMode::Palette);
 
         assert_eq!(
-            route_input(&mut mode, EscapeKey::default(), b"\x1d"),
+            route_input(&mut mode, EscapeKey::default(), false, b"\x1d"),
             vec![InputAction::ClosePalette, InputAction::Remote(vec![0x1d])]
         );
         assert_eq!(mode, InputMode::Passthrough);
@@ -1056,7 +1370,7 @@ mod tests {
     fn palette_routes_local_approval_keys_without_sending_them_remotely() {
         let mut mode = InputMode::Palette;
         assert_eq!(
-            route_input(&mut mode, EscapeKey::default(), b"yn"),
+            route_input(&mut mode, EscapeKey::default(), false, b"yn"),
             vec![InputAction::ApprovePending, InputAction::RejectPending]
         );
         assert_eq!(mode, InputMode::Palette);
@@ -1066,7 +1380,7 @@ mod tests {
     fn input_before_and_after_a_prefix_keeps_its_order() {
         let mut mode = InputMode::Passthrough;
         assert_eq!(
-            route_input(&mut mode, EscapeKey::default(), b"before\x1dqafter"),
+            route_input(&mut mode, EscapeKey::default(), false, b"before\x1dqafter"),
             vec![
                 InputAction::Remote(b"before".to_vec()),
                 InputAction::OpenPalette,
@@ -1081,7 +1395,7 @@ mod tests {
     fn disabled_prefix_is_pure_passthrough() {
         let mut mode = InputMode::Passthrough;
         assert_eq!(
-            route_input(&mut mode, EscapeKey::Disabled, b"a\x1dz"),
+            route_input(&mut mode, EscapeKey::Disabled, false, b"a\x1dz"),
             vec![InputAction::Remote(b"a\x1dz".to_vec())]
         );
         assert_eq!(mode, InputMode::Passthrough);

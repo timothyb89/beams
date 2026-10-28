@@ -2,8 +2,8 @@
 //!
 //! It owns the authority boundary for client services: one process per user,
 //! a permissioned UDS, persistent client identity/request state, reconnecting
-//! per-Beam control bridges, and local-only approval decisions. Phase 3 routes
-//! port-forward proposals; Phase 4 will create the actual forwarding process.
+//! per-Beam control bridges, local-only approval decisions, and supervised
+//! workstation-owned service processes.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -21,8 +21,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use beams_protocol::{
-    BeamToClient, ClientToBeam, RequestProjection, RequestStatus, ServiceProjection,
-    ServiceRequest, ServiceStatus, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
+    BeamToClient, ClientToBeam, RequestProjection, RequestStatus, ServiceAction,
+    ServiceActionRequest, ServiceProjection, ServiceRequest, ServiceRequestKind, ServiceStatus,
+    MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -45,15 +46,33 @@ pub struct RequestRecord {
     #[serde(default)]
     pub request: Option<ServiceRequest>,
     #[serde(default)]
+    pub action: Option<ServiceActionRequest>,
+    #[serde(default)]
     pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ServiceRecord {
     pub service_id: String,
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub beam_id: String,
     pub beam_uuid: String,
+    #[serde(default = "default_login")]
+    pub login: String,
     pub kind: String,
+    #[serde(default)]
+    pub spec: Option<ServiceRequestKind>,
     pub status: ServiceStatus,
+    #[serde(default)]
+    pub desired_running: bool,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+fn default_login() -> String {
+    "beams".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -89,6 +108,18 @@ enum ClientMessage {
         request_id: String,
         approve: bool,
     },
+    CreatePortForward {
+        beam_id: String,
+        beam_uuid: String,
+        login: String,
+        remote_host: String,
+        remote_port: u16,
+        local_port: Option<u16>,
+    },
+    ControlService {
+        service_id: String,
+        action: ServiceAction,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -111,6 +142,9 @@ pub enum ServerEvent {
     },
     RequestChanged {
         request: RequestRecord,
+    },
+    ServiceChanged {
+        service: ServiceRecord,
     },
     BridgeStatus {
         bridge: BridgeRecord,
@@ -209,6 +243,8 @@ struct Hub {
     subscribers: Mutex<Vec<SyncSender<ServerEvent>>>,
     frontends: AtomicUsize,
     bridges: Mutex<BTreeMap<String, BridgeRuntime>>,
+    service_runtimes: Mutex<BTreeMap<String, ServiceRuntime>>,
+    forward_program: String,
 }
 
 struct BridgeRuntime {
@@ -216,19 +252,29 @@ struct BridgeRuntime {
     commands: SyncSender<ClientToBeam>,
 }
 
+struct ServiceRuntime {
+    actions: SyncSender<crate::forward::Action>,
+}
+
 impl Hub {
     #[cfg(test)]
     fn new(state: PersistedState) -> Self {
-        Self::with_state_path(state, None)
+        Self::with_state_path_and_program(state, None, "tsh".to_string())
     }
 
-    fn with_state_path(state: PersistedState, state_path: Option<PathBuf>) -> Self {
+    fn with_state_path_and_program(
+        state: PersistedState,
+        state_path: Option<PathBuf>,
+        forward_program: String,
+    ) -> Self {
         Self {
             state: Mutex::new(state),
             state_path,
             subscribers: Mutex::new(Vec::new()),
             frontends: AtomicUsize::new(0),
             bridges: Mutex::new(BTreeMap::new()),
+            service_runtimes: Mutex::new(BTreeMap::new()),
+            forward_program,
         }
     }
 
@@ -336,19 +382,19 @@ impl Hub {
         Ok(())
     }
 
-    fn decide_request(&self, request_id: &str, approve: bool) -> anyhow::Result<RequestRecord> {
+    fn decide_request(self: &Arc<Self>, request_id: &str, approve: bool) -> anyhow::Result<RequestRecord> {
         let next = if approve {
             RequestStatus::Approved
         } else {
             RequestStatus::Rejected
         };
-        let beam_uuid = self
+        let (beam_uuid, is_action) = self
             .state
             .lock()
             .unwrap()
             .requests
             .get(request_id)
-            .map(|request| request.beam_uuid.clone())
+            .map(|request| (request.beam_uuid.clone(), request.action.is_some()))
             .with_context(|| format!("unknown request {request_id:?}"))?;
         let commands = self
             .bridges
@@ -373,11 +419,20 @@ impl Hub {
                 "rejected by local user".to_string()
             });
             let updated = request.clone();
-            if let Err(err) = commands.try_send(ClientToBeam::RequestStatus {
-                request_id: request_id.to_string(),
-                status: updated.status,
-                message: updated.message.clone(),
-            }) {
+            let decision = if is_action {
+                ClientToBeam::ServiceActionStatus {
+                    request_id: request_id.to_string(),
+                    status: updated.status,
+                    message: updated.message.clone(),
+                }
+            } else {
+                ClientToBeam::RequestStatus {
+                    request_id: request_id.to_string(),
+                    status: updated.status,
+                    message: updated.message.clone(),
+                }
+            };
+            if let Err(err) = commands.try_send(decision) {
                 request.status = RequestStatus::PendingApproval;
                 request.message = None;
                 return Err(anyhow::anyhow!("sending request decision to bridge: {err}"));
@@ -388,7 +443,261 @@ impl Hub {
         self.broadcast(ServerEvent::RequestChanged {
             request: updated.clone(),
         });
+        if approve {
+            if is_action {
+                self.start_action_request(request_id)?;
+            } else {
+                self.start_service_request(request_id)?;
+            }
+        }
         Ok(updated)
+    }
+
+    fn create_port_forward(
+        self: &Arc<Self>,
+        target: crate::bridge::Target,
+        remote_host: String,
+        remote_port: u16,
+        local_port: Option<u16>,
+    ) -> anyhow::Result<RequestRecord> {
+        validate_port_forward(&remote_host, remote_port, local_port)?;
+        if target.beam_uuid.is_empty() || target.login.is_empty() {
+            bail!("Beam UUID and login must not be empty");
+        }
+        let request = ServiceRequest {
+            request_id: Uuid::new_v4().to_string(),
+            kind: ServiceRequestKind::LocalPortForward {
+                remote_host,
+                remote_port,
+                local_port,
+            },
+        };
+        let record = RequestRecord {
+            request_id: request.request_id.clone(),
+            beam_uuid: target.beam_uuid.clone(),
+            kind: request.kind.label().to_string(),
+            status: RequestStatus::Approved,
+            request: Some(request),
+            action: None,
+            message: Some("created by local user".to_string()),
+        };
+        {
+            let mut state = self.state.lock().unwrap();
+            state
+                .requests
+                .insert(record.request_id.clone(), record.clone());
+        }
+        self.save_state()?;
+        self.broadcast(ServerEvent::RequestChanged {
+            request: record.clone(),
+        });
+        self.start_service_request_with_target(&record.request_id, target)?;
+        Ok(record)
+    }
+
+    fn start_service_request(self: &Arc<Self>, request_id: &str) -> anyhow::Result<()> {
+        let beam_uuid = self
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .get(request_id)
+            .map(|request| request.beam_uuid.clone())
+            .with_context(|| format!("unknown request {request_id:?}"))?;
+        let target = {
+            let bridges = self.bridges.lock().unwrap();
+            let bridge = bridges
+                .get(&beam_uuid)
+                .with_context(|| format!("no bridge target for Beam {beam_uuid}"))?;
+            crate::bridge::Target {
+                beam_id: bridge.record.beam_id.clone(),
+                beam_uuid: bridge.record.beam_uuid.clone(),
+                login: bridge.record.login.clone(),
+            }
+        };
+        self.start_service_request_with_target(request_id, target)
+    }
+
+    fn start_service_request_with_target(
+        self: &Arc<Self>,
+        request_id: &str,
+        target: crate::bridge::Target,
+    ) -> anyhow::Result<()> {
+        let (request, service) = {
+            let mut state = self.state.lock().unwrap();
+            let request = state
+                .requests
+                .get_mut(request_id)
+                .with_context(|| format!("unknown request {request_id:?}"))?;
+            let service_request = request
+                .request
+                .clone()
+                .context("request does not contain a service specification")?;
+            request.status = request
+                .status
+                .transition(RequestStatus::Starting)
+                .map_err(anyhow::Error::msg)?;
+            request.message = Some("starting workstation service".to_string());
+            let updated_request = request.clone();
+            let service = ServiceRecord {
+                service_id: Uuid::new_v4().to_string(),
+                request_id: request_id.to_string(),
+                beam_id: target.beam_id.clone(),
+                beam_uuid: target.beam_uuid.clone(),
+                login: target.login.clone(),
+                kind: service_request.kind.label().to_string(),
+                spec: Some(service_request.kind),
+                status: ServiceStatus::Starting,
+                desired_running: true,
+                message: Some("starting SSH local forward".to_string()),
+            };
+            state
+                .services
+                .insert(service.service_id.clone(), service.clone());
+            (updated_request, service)
+        };
+        self.save_state()?;
+        self.publish_request(&request, false);
+        self.publish_service(&service);
+
+        let spec = service
+            .spec
+            .clone()
+            .context("service specification disappeared before start")?;
+        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        let actions = crate::forward::spawn(
+            self.forward_program.clone(),
+            crate::forward::Target {
+                beam_uuid: target.beam_uuid,
+                login: target.login,
+            },
+            service.service_id.clone(),
+            spec,
+            event_tx,
+        );
+        self.service_runtimes
+            .lock()
+            .unwrap()
+            .insert(service.service_id, ServiceRuntime { actions });
+        let weak = Arc::downgrade(self);
+        thread::spawn(move || handle_service_events(weak, event_rx));
+        Ok(())
+    }
+
+    fn control_service(&self, service_id: &str, action: ServiceAction) -> anyhow::Result<ServiceRecord> {
+        let runtime_action = match action {
+            ServiceAction::Stop => crate::forward::Action::Stop,
+            ServiceAction::Restart => crate::forward::Action::Restart,
+        };
+        let actions = self
+            .service_runtimes
+            .lock()
+            .unwrap()
+            .get(service_id)
+            .map(|runtime| runtime.actions.clone())
+            .with_context(|| format!("service {service_id:?} is not owned by this daemon process"))?;
+        let updated = {
+            let mut state = self.state.lock().unwrap();
+            let service = state
+                .services
+                .get_mut(service_id)
+                .with_context(|| format!("unknown service {service_id:?}"))?;
+            match action {
+                ServiceAction::Stop => {
+                    if service.status != ServiceStatus::Stopping {
+                        service.status = service
+                            .status
+                            .transition(ServiceStatus::Stopping)
+                            .map_err(anyhow::Error::msg)?;
+                    }
+                    service.desired_running = false;
+                    service.message = Some("stopping".to_string());
+                }
+                ServiceAction::Restart => {
+                    service.desired_running = true;
+                    service.message = Some("restart requested".to_string());
+                }
+            }
+            service.clone()
+        };
+        actions
+            .try_send(runtime_action)
+            .map_err(|err| anyhow::anyhow!("sending service action: {err}"))?;
+        self.save_state()?;
+        self.publish_service(&updated);
+        Ok(updated)
+    }
+
+    fn start_action_request(self: &Arc<Self>, request_id: &str) -> anyhow::Result<()> {
+        let action = {
+            let mut state = self.state.lock().unwrap();
+            let request = state
+                .requests
+                .get_mut(request_id)
+                .with_context(|| format!("unknown action request {request_id:?}"))?;
+            let action = request
+                .action
+                .clone()
+                .context("request does not contain a service action")?;
+            request.status = request
+                .status
+                .transition(RequestStatus::Starting)
+                .map_err(anyhow::Error::msg)?;
+            request.message = Some("performing service action".to_string());
+            action
+        };
+        self.save_state()?;
+        let request = self.state.lock().unwrap().requests[request_id].clone();
+        self.publish_request(&request, true);
+        self.control_service(&action.service_id, action.action)?;
+        Ok(())
+    }
+
+    fn publish_request(&self, request: &RequestRecord, action: bool) {
+        if let Some(commands) = self
+            .bridges
+            .lock()
+            .unwrap()
+            .get(&request.beam_uuid)
+            .map(|bridge| bridge.commands.clone())
+        {
+            let message = if action {
+                ClientToBeam::ServiceActionStatus {
+                    request_id: request.request_id.clone(),
+                    status: request.status,
+                    message: request.message.clone(),
+                }
+            } else {
+                ClientToBeam::RequestStatus {
+                    request_id: request.request_id.clone(),
+                    status: request.status,
+                    message: request.message.clone(),
+                }
+            };
+            let _ = commands.try_send(message);
+        }
+        self.broadcast(ServerEvent::RequestChanged {
+            request: request.clone(),
+        });
+    }
+
+    fn publish_service(&self, service: &ServiceRecord) {
+        if let Some(projection) = service_projection(service) {
+            if let Some(commands) = self
+                .bridges
+                .lock()
+                .unwrap()
+                .get(&service.beam_uuid)
+                .map(|bridge| bridge.commands.clone())
+            {
+                let _ = commands.try_send(ClientToBeam::ServiceStatus {
+                    service: projection,
+                });
+            }
+        }
+        self.broadcast(ServerEvent::ServiceChanged {
+            service: service.clone(),
+        });
     }
 
     fn expire_request(&self, request_id: &str) {
@@ -411,14 +720,136 @@ impl Hub {
             .get(&updated.beam_uuid)
             .map(|bridge| bridge.commands.clone())
         {
-            let _ = commands.try_send(ClientToBeam::RequestStatus {
-                request_id: updated.request_id.clone(),
-                status: updated.status,
-                message: updated.message.clone(),
-            });
+            let message = if updated.action.is_some() {
+                ClientToBeam::ServiceActionStatus {
+                    request_id: updated.request_id.clone(),
+                    status: updated.status,
+                    message: updated.message.clone(),
+                }
+            } else {
+                ClientToBeam::RequestStatus {
+                    request_id: updated.request_id.clone(),
+                    status: updated.status,
+                    message: updated.message.clone(),
+                }
+            };
+            let _ = commands.try_send(message);
         }
         let _ = self.save_state();
         self.broadcast(ServerEvent::RequestChanged { request: updated });
+    }
+}
+
+fn validate_port_forward(
+    remote_host: &str,
+    remote_port: u16,
+    local_port: Option<u16>,
+) -> anyhow::Result<()> {
+    if remote_host.is_empty() || remote_port == 0 {
+        bail!("remote host must not be empty and remote port must be non-zero");
+    }
+    if local_port == Some(0) {
+        bail!("an explicit local port must be non-zero; omit it to select one automatically");
+    }
+    Ok(())
+}
+
+fn service_projection(service: &ServiceRecord) -> Option<ServiceProjection> {
+    Some(ServiceProjection {
+        service_id: service.service_id.clone(),
+        request_id: service.request_id.clone(),
+        kind: service.spec.clone()?,
+        status: service.status,
+        message: service.message.clone(),
+    })
+}
+
+fn handle_service_events(hub: Weak<Hub>, events: Receiver<crate::forward::Event>) {
+    while let Ok(event) = events.recv() {
+        let Some(hub) = hub.upgrade() else {
+            return;
+        };
+        handle_service_event(&hub, event);
+    }
+}
+
+fn handle_service_event(hub: &Arc<Hub>, event: crate::forward::Event) {
+    let (service, completed_actions) = {
+        let mut state = hub.state.lock().unwrap();
+        let Some(service) = state.services.get_mut(&event.service_id) else {
+            return;
+        };
+        if service.status != event.status {
+            match service.status.transition(event.status) {
+                Ok(next) => service.status = next,
+                Err(_) if event.status == ServiceStatus::Starting => {
+                    service.status = ServiceStatus::Starting;
+                }
+                Err(_) => return,
+            }
+        }
+        service.spec = Some(event.kind);
+        service.message = event.message;
+        let service = service.clone();
+
+        if service.status == ServiceStatus::Running {
+            if let Some(request) = state.requests.get_mut(&service.request_id) {
+                if request.status == RequestStatus::Starting {
+                    request.status = RequestStatus::Running;
+                    request.message = Some("workstation service is running".to_string());
+                }
+            }
+        } else if service.status == ServiceStatus::Error {
+            if let Some(request) = state.requests.get_mut(&service.request_id) {
+                if matches!(request.status, RequestStatus::Approved | RequestStatus::Starting) {
+                    request.status = RequestStatus::Failed;
+                    request.message = service.message.clone();
+                }
+            }
+        }
+
+        let completed_actions = state
+            .requests
+            .values_mut()
+            .filter_map(|request| {
+                let action = request.action.as_ref()?;
+                if action.service_id != service.service_id || request.status != RequestStatus::Starting {
+                    return None;
+                }
+                let completed = matches!(
+                    (action.action, service.status),
+                    (ServiceAction::Stop, ServiceStatus::Stopped)
+                        | (ServiceAction::Restart, ServiceStatus::Running)
+                );
+                if completed {
+                    request.status = RequestStatus::Running;
+                    request.message = Some("service action completed".to_string());
+                    Some(request.clone())
+                } else if service.status == ServiceStatus::Error {
+                    request.status = RequestStatus::Failed;
+                    request.message = service.message.clone();
+                    Some(request.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        (service, completed_actions)
+    };
+    let _ = hub.save_state();
+    hub.publish_service(&service);
+    if let Some(request) = hub
+        .state
+        .lock()
+        .unwrap()
+        .requests
+        .get(&service.request_id)
+        .cloned()
+    {
+        hub.publish_request(&request, false);
+    }
+    for request in completed_actions {
+        hub.publish_request(&request, true);
     }
 }
 
@@ -465,7 +896,15 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                         })
                 })
                 .collect();
-            let services: Vec<ServiceProjection> = Vec::new();
+            let services = hub
+                .state
+                .lock()
+                .unwrap()
+                .services
+                .values()
+                .filter(|service| service.beam_uuid == beam_uuid)
+                .filter_map(service_projection)
+                .collect();
             let _ = commands.send(ClientToBeam::RequestSnapshot { requests });
             let _ = commands.send(ClientToBeam::ServiceSnapshot { services });
             let _ = commands.send(ClientToBeam::Ready);
@@ -492,6 +931,53 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                     kind: request.kind.label().to_string(),
                     status: RequestStatus::PendingApproval,
                     request: Some(request),
+                    action: None,
+                    message: None,
+                };
+                let inserted = {
+                    let mut state = hub.state.lock().unwrap();
+                    if state.requests.contains_key(&record.request_id) {
+                        false
+                    } else {
+                        state
+                            .requests
+                            .insert(record.request_id.clone(), record.clone());
+                        true
+                    }
+                };
+                if inserted {
+                    let _ = hub.save_state();
+                    hub.broadcast(ServerEvent::RequestChanged {
+                        request: record.clone(),
+                    });
+                    let request_id = record.request_id;
+                    let weak = Arc::downgrade(hub);
+                    thread::spawn(move || {
+                        thread::sleep(REQUEST_TIMEOUT);
+                        if let Some(hub) = weak.upgrade() {
+                            hub.expire_request(&request_id);
+                        }
+                    });
+                }
+            }
+            BeamToClient::ServiceActionRequested { request } => {
+                let beam_matches = hub
+                    .state
+                    .lock()
+                    .unwrap()
+                    .services
+                    .get(&request.service_id)
+                    .is_some_and(|service| service.beam_uuid == beam_uuid);
+                if !beam_matches {
+                    return;
+                }
+                let record = RequestRecord {
+                    request_id: request.request_id.clone(),
+                    beam_uuid: beam_uuid.clone(),
+                    kind: format!("{:?}", request.action).to_lowercase(),
+                    status: RequestStatus::PendingApproval,
+                    request: None,
+                    action: Some(request),
                     message: None,
                 };
                 let inserted = {
@@ -632,6 +1118,42 @@ impl Frontend {
         )
         .context("sending request decision")
     }
+
+    pub fn create_port_forward(
+        &mut self,
+        target: &crate::bridge::Target,
+        remote_host: &str,
+        remote_port: u16,
+        local_port: Option<u16>,
+    ) -> anyhow::Result<()> {
+        write_json(
+            &mut self.write_half,
+            &ClientMessage::CreatePortForward {
+                beam_id: target.beam_id.clone(),
+                beam_uuid: target.beam_uuid.clone(),
+                login: target.login.clone(),
+                remote_host: remote_host.to_string(),
+                remote_port,
+                local_port,
+            },
+        )
+        .context("creating local port forward")
+    }
+
+    pub fn control_service(
+        &mut self,
+        service_id: &str,
+        action: ServiceAction,
+    ) -> anyhow::Result<()> {
+        write_json(
+            &mut self.write_half,
+            &ClientMessage::ControlService {
+                service_id: service_id.to_string(),
+                action,
+            },
+        )
+        .context("controlling local service")
+    }
 }
 
 /// Connects to the local daemon, starting it in the background if needed.
@@ -700,7 +1222,12 @@ pub fn serve(socket_path: Option<PathBuf>) -> anyhow::Result<()> {
         state.save(&state_path)?;
     }
     let listener = bind_socket(&socket_path)?;
-    let hub = Arc::new(Hub::with_state_path(state, Some(state_path)));
+    let forward_program = std::env::var("BEAMS_TSH").unwrap_or_else(|_| "tsh".to_string());
+    let hub = Arc::new(Hub::with_state_path_and_program(
+        state,
+        Some(state_path),
+        forward_program,
+    ));
 
     for stream in listener.incoming() {
         let stream = stream.context("accepting local daemon connection")?;
@@ -838,6 +1365,37 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                         if let Err(err) = hub.decide_request(&request_id, approve) {
                             let _ = tx.try_send(ServerEvent::Error {
                                 message: format!("deciding request: {err:#}"),
+                            });
+                        }
+                    }
+                    ClientMessage::CreatePortForward {
+                        beam_id,
+                        beam_uuid,
+                        login,
+                        remote_host,
+                        remote_port,
+                        local_port,
+                    } => {
+                        let target = crate::bridge::Target {
+                            beam_id,
+                            beam_uuid,
+                            login,
+                        };
+                        if let Err(err) = hub.create_port_forward(
+                            target,
+                            remote_host,
+                            remote_port,
+                            local_port,
+                        ) {
+                            let _ = tx.try_send(ServerEvent::Error {
+                                message: format!("creating port forward: {err:#}"),
+                            });
+                        }
+                    }
+                    ClientMessage::ControlService { service_id, action } => {
+                        if let Err(err) = hub.control_service(&service_id, action) {
+                            let _ = tx.try_send(ServerEvent::Error {
+                                message: format!("controlling service: {err:#}"),
                             });
                         }
                     }
@@ -1055,6 +1613,7 @@ mod tests {
                 kind: "local_port_forward".to_string(),
                 status: RequestStatus::PendingApproval,
                 request: None,
+                action: None,
                 message: None,
             },
         );
@@ -1193,6 +1752,7 @@ mod tests {
                         local_port: None,
                     },
                 }),
+                action: None,
                 message: Some("rejected by local user".to_string()),
             },
         );
@@ -1252,6 +1812,7 @@ mod tests {
                 kind: "local_port_forward".to_string(),
                 status: RequestStatus::PendingApproval,
                 request: None,
+                action: None,
                 message: None,
             },
         );

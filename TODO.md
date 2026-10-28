@@ -580,8 +580,14 @@ bootstrap `Task`s.
     against disposable Beam `outer-aura`, which was removed immediately
     afterward. Phase 4 will turn approval into a real loopback listener.
 - [ ] Phase 4: implement loopback-only local port forwards as the first full
-  client- and remote-initiated service, including approval, status,
-  stop/restart, ownership, and `Tasks | Services | Requests` in the remote TUI.
+  client- and remote-initiated service.
+  - [x] Workstation runtime: client- and remote-initiated requests share one
+    creation path; `beamsd` supervises loopback-only `tsh ssh -N -L` children,
+    auto-selects or preflights local ports, captures bounded diagnostics, and
+    exposes persistent typed status plus local stop/restart controls.
+  - [ ] Finish the remote `Tasks | Services | Requests` tabs and typed,
+    owner-routed stop/restart approval flow; extend the multi-client smoke test
+    through real service creation and action races.
 - [ ] Phase 5: add typed client↔Beam file-copy jobs with locally selected or
   confirmed workstation paths, overwrite policy, cancellation, and interrupted
   job handling.

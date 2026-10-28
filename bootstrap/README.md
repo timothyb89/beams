@@ -252,10 +252,10 @@ beam-bootstrap client request port-forward \
   --remote-host 127.0.0.1 --remote-port 8080 --local-port 18080
 ```
 
-The port-forward command currently proves the Phase 3 request/decision round
-trip only; Phase 4 will create the real loopback listener and SSH forwarding
-process after approval. Every remotely submitted request begins as
-`pending_approval`.
+Approval creates a workstation-owned `tsh ssh -N -L` process bound only to
+`127.0.0.1`. Its selected endpoint and lifecycle are projected back into this
+daemon; the Beam never receives a privileged command that can start it
+directly. Every remotely submitted request begins as `pending_approval`.
 
 `beams ssh` supplies `BEAMS_CLIENT_ID` and a random
 `BEAMS_SESSION_TOKEN` to its remote `beam-shell` command. A direct SSH shell,

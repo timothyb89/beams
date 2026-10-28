@@ -71,8 +71,9 @@ use std::thread;
 
 use anyhow::Context;
 use beams_protocol::{
-    BeamToClient, ClientToBeam, RequestProjection, RequestStatus, ServiceProjection, ServiceRequest,
-    ServiceRequestKind, PROTOCOL, PROTOCOL_VERSION,
+    BeamToClient, ClientToBeam, RequestProjection, RequestStatus, ServiceActionRequest,
+    ServiceProjection, ServiceRequest, ServiceRequestKind, ServiceStatus,
+    PROTOCOL, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -95,6 +96,7 @@ struct Hub {
     connection_counter: AtomicU64,
     bridges: Mutex<BTreeMap<String, BridgeRegistration>>,
     client_requests: Mutex<BTreeMap<String, ClientRequestProjection>>,
+    client_action_requests: Mutex<BTreeMap<String, ClientActionProjection>>,
     client_services: Mutex<BTreeMap<String, OwnedServiceProjection>>,
 }
 
@@ -107,6 +109,7 @@ impl Default for Hub {
             connection_counter: AtomicU64::new(0),
             bridges: Mutex::new(BTreeMap::new()),
             client_requests: Mutex::new(BTreeMap::new()),
+            client_action_requests: Mutex::new(BTreeMap::new()),
             client_services: Mutex::new(BTreeMap::new()),
         }
     }
@@ -134,6 +137,15 @@ struct ClientRequestProjection {
 struct OwnedServiceProjection {
     owner_client_id: String,
     service: ServiceProjection,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ClientActionProjection {
+    request: ServiceActionRequest,
+    owner_client_id: String,
+    bridge_id: String,
+    status: RequestStatus,
+    message: Option<String>,
 }
 
 #[derive(Default)]
@@ -194,6 +206,28 @@ impl Hub {
     fn unregister_bridge(&self, bridge_id: &str) {
         let removed = self.bridges.lock().unwrap().remove(bridge_id);
         if let Some(registration) = removed {
+            let changed = {
+                let mut services = self.client_services.lock().unwrap();
+                services
+                    .values_mut()
+                    .filter(|service| service.owner_client_id == registration.client_id)
+                    .filter_map(|service| {
+                        if service.service.status == ServiceStatus::Running {
+                            service.service.status = ServiceStatus::Unknown;
+                            service.service.message =
+                                Some("owning workstation bridge disconnected".to_string());
+                            Some(service.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for service in changed {
+                self.broadcast(
+                    &json!({"type": "client_service_status", "service": service}).to_string(),
+                );
+            }
             self.broadcast(
                 &json!({
                     "type": "client_status",
@@ -320,8 +354,14 @@ fn handle_line(hub: &Hub, line: &str, reply: &Sender<String>, context: &mut Conn
         "list_clients" => {
             list_clients(hub, request_id, reply);
         }
+        "list_client_state" => {
+            list_client_state(hub, request_id, reply);
+        }
         "request_service" => {
             request_service(hub, request_id, &request, reply);
+        }
+        "request_service_action" => {
+            request_service_action(hub, request_id, &request, reply);
         }
         other => {
             let _ = reply.send(error_reply(request_id, &format!("unknown op {other:?}")));
@@ -542,6 +582,99 @@ fn client_bridge_message(
             );
             let _ = reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
         }
+        ClientToBeam::ServiceStatus { service } => {
+            let client_id = {
+                let bridges = hub.bridges.lock().unwrap();
+                match bridges.get(bridge_id) {
+                    Some(bridge) => bridge.client_id.clone(),
+                    None => {
+                        let _ = reply.send(error_reply(request_id, "bridge is no longer registered"));
+                        return;
+                    }
+                }
+            };
+            let owned = {
+                let mut current = hub.client_services.lock().unwrap();
+                match current.get_mut(&service.service_id) {
+                    Some(existing) if existing.owner_client_id != client_id => {
+                        let _ = reply.send(error_reply(
+                            request_id,
+                            "service is owned by a different client bridge",
+                        ));
+                        return;
+                    }
+                    Some(existing) => {
+                        existing.service = service;
+                        existing.clone()
+                    }
+                    None => {
+                        let owned = OwnedServiceProjection {
+                            owner_client_id: client_id,
+                            service,
+                        };
+                        current.insert(owned.service.service_id.clone(), owned.clone());
+                        owned
+                    }
+                }
+            };
+            hub.broadcast(
+                &json!({"type": "client_service_status", "service": owned}).to_string(),
+            );
+            let _ = reply.send(
+                json!({"request_id": request_id, "type": "bridge_message_accepted"})
+                    .to_string(),
+            );
+        }
+        ClientToBeam::ServiceActionStatus {
+            request_id: action_request_id,
+            status,
+            message,
+        } => {
+            let client_id = {
+                let bridges = hub.bridges.lock().unwrap();
+                match bridges.get(bridge_id) {
+                    Some(bridge) => bridge.client_id.clone(),
+                    None => {
+                        let _ = reply.send(error_reply(request_id, "bridge is no longer registered"));
+                        return;
+                    }
+                }
+            };
+            let projection = {
+                let mut requests = hub.client_action_requests.lock().unwrap();
+                let Some(projection) = requests.get_mut(&action_request_id) else {
+                    let _ = reply.send(error_reply(
+                        request_id,
+                        &format!("unknown service action request {action_request_id:?}"),
+                    ));
+                    return;
+                };
+                if projection.owner_client_id != client_id || projection.bridge_id != bridge_id {
+                    let _ = reply.send(error_reply(
+                        request_id,
+                        "service action request is owned by a different client bridge",
+                    ));
+                    return;
+                }
+                match projection.status.transition(status) {
+                    Ok(next) => projection.status = next,
+                    Err(err) => {
+                        let _ = reply.send(error_reply(request_id, &err));
+                        return;
+                    }
+                }
+                projection.message = message;
+                projection.clone()
+            };
+            hub.broadcast(
+                &json!({"type": "service_action_request_status", "request": projection})
+                    .to_string(),
+            );
+            let _ = reply.send(
+                json!({"request_id": request_id, "type": "bridge_message_accepted"})
+                    .to_string(),
+            );
+        }
         ClientToBeam::Ready => {
             let (client_id, bridge_id) = {
                 let mut bridges = hub.bridges.lock().unwrap();
@@ -585,6 +718,40 @@ fn list_clients(hub: &Hub, request_id: Option<&str>, reply: &Sender<String>) {
         })
         .collect();
     let _ = reply.send(json!({"request_id": request_id, "type": "clients", "clients": clients}).to_string());
+}
+
+fn list_client_state(hub: &Hub, request_id: Option<&str>, reply: &Sender<String>) {
+    let requests = hub
+        .client_requests
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let action_requests = hub
+        .client_action_requests
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let services = hub
+        .client_services
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let _ = reply.send(
+        json!({
+            "request_id": request_id,
+            "type": "client_state",
+            "requests": requests,
+            "action_requests": action_requests,
+            "services": services,
+        })
+        .to_string(),
+    );
 }
 
 fn request_service(hub: &Hub, request_id: Option<&str>, request: &Value, reply: &Sender<String>) {
@@ -696,6 +863,159 @@ fn request_service(hub: &Hub, request_id: Option<&str>, request: &Value, reply: 
             "type": "service_request_accepted",
             "service_request_id": service_request.request_id,
             "client_id": bridge.client_id,
+        })
+        .to_string(),
+    );
+}
+
+fn request_service_action(
+    hub: &Hub,
+    request_id: Option<&str>,
+    request: &Value,
+    reply: &Sender<String>,
+) {
+    let session_token = request
+        .get("session_token")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let client_hint = request.get("client_id").and_then(Value::as_str);
+    let action_request: ServiceActionRequest = match serde_json::from_value(
+        request
+            .get("request")
+            .cloned()
+            .unwrap_or(Value::Null),
+    ) {
+        Ok(request) => request,
+        Err(err) => {
+            let _ = reply.send(error_reply(
+                request_id,
+                &format!("invalid service action request: {err}"),
+            ));
+            return;
+        }
+    };
+    if session_token.is_empty() {
+        let _ = reply.send(error_reply(
+            request_id,
+            "no managed Beams client is associated with this shell; reconnect with `beams ssh`, then retry the request",
+        ));
+        return;
+    }
+    if action_request.request_id.is_empty() || action_request.service_id.is_empty() {
+        let _ = reply.send(error_reply(
+            request_id,
+            "service action request_id and service_id must not be empty",
+        ));
+        return;
+    }
+    let owner_client_id = match hub
+        .client_services
+        .lock()
+        .unwrap()
+        .get(&action_request.service_id)
+        .map(|service| service.owner_client_id.clone())
+    {
+        Some(owner) => owner,
+        None => {
+            let _ = reply.send(error_reply(
+                request_id,
+                &format!("unknown client service {:?}", action_request.service_id),
+            ));
+            return;
+        }
+    };
+    let matching = hub
+        .bridges
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|bridge| {
+            bridge.ready
+                && bridge.client_id == owner_client_id
+                && bridge.session_tokens.contains(session_token)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let bridge = match matching.as_slice() {
+        [bridge] => bridge.clone(),
+        [] => {
+            let message = if client_hint == Some(owner_client_id.as_str()) {
+                format!(
+                    "the managed Beams session token for client {owner_client_id} is stale; reconnect with `beams ssh`, then retry the request"
+                )
+            } else {
+                format!(
+                    "service {} is owned by client {}; use a managed shell from that client",
+                    action_request.service_id, owner_client_id
+                )
+            };
+            let _ = reply.send(error_reply(request_id, &message));
+            return;
+        }
+        _ => {
+            let _ = reply.send(error_reply(
+                request_id,
+                "managed session token is registered by more than one client bridge; reconnect with `beams ssh`",
+            ));
+            return;
+        }
+    };
+
+    {
+        let mut requests = hub.client_action_requests.lock().unwrap();
+        if requests.contains_key(&action_request.request_id) {
+            let _ = reply.send(error_reply(
+                request_id,
+                &format!(
+                    "service action request {:?} already exists",
+                    action_request.request_id
+                ),
+            ));
+            return;
+        }
+        requests.insert(
+            action_request.request_id.clone(),
+            ClientActionProjection {
+                request: action_request.clone(),
+                owner_client_id: owner_client_id.clone(),
+                bridge_id: bridge.bridge_id.clone(),
+                status: RequestStatus::PendingApproval,
+                message: None,
+            },
+        );
+    }
+    if !send_bridge_event(
+        &bridge.sender,
+        &BeamToClient::ServiceActionRequested {
+            request: action_request.clone(),
+        },
+    ) {
+        hub.client_action_requests
+            .lock()
+            .unwrap()
+            .remove(&action_request.request_id);
+        let _ = reply.send(error_reply(
+            request_id,
+            "the owning Beams client disconnected while submitting the action",
+        ));
+        return;
+    }
+    let projection = hub
+        .client_action_requests
+        .lock()
+        .unwrap()
+        .get(&action_request.request_id)
+        .cloned()
+        .expect("action request was just inserted");
+    hub.broadcast(
+        &json!({"type": "service_action_request_status", "request": projection}).to_string(),
+    );
+    let _ = reply.send(
+        json!({
+            "request_id": request_id,
+            "type": "service_action_request_accepted",
+            "service_action_request_id": action_request.request_id,
+            "client_id": owner_client_id,
         })
         .to_string(),
     );

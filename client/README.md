@@ -70,11 +70,12 @@ beams ssh --escape-key 0x1d
 beams ssh --escape-key none   # pure passthrough; local menu disabled
 ```
 
-The menu shows connection/bridge state and typed remote requests. A pending
-port-forward proposal displays its requested local port (or automatic
-selection) and Beam endpoint; `y` approves and `n` rejects it. Phase 3 only
-round-trips that decision—approval does not create a listener until the Phase
-4 forwarding implementation lands.
+The menu shows connection/bridge state, typed remote requests, and local
+services for the current Beam. A pending port-forward proposal displays its
+requested local port (or automatic selection) and Beam endpoint; `y` approves
+and `n` rejects it. Press `f` to create a client-initiated forward, enter the
+required remote port and optional local port, then press enter. `j`/`k` select
+a service and `s`/`r` stop or restart it.
 
 The client does not nest another terminal alternate screen over remote zellij
 (alternate-screen state is not stackable). It drains up to 1 MiB of remote
@@ -89,8 +90,9 @@ termination signals.
 background if no instance is listening. The foreground SSH process still owns
 the interactive PTY. The daemon owns one reconnecting
 `tsh ssh ... ~/beams/bin/beam-client-bridge` process per Beam, shares it across
-local frontends, and retains all managed-shell tokens when that bridge
-reconnects.
+local frontends, retains all managed-shell tokens when that bridge reconnects,
+and supervises approved `tsh ssh -N -L` processes independently of the
+interactive terminal.
 
 Run it explicitly in the foreground for debugging:
 
@@ -107,7 +109,9 @@ The default socket is `$XDG_RUNTIME_DIR/beams-client/daemon.sock` when
 `~/.config/beams-client/daemon.sock`. It and the versioned state file
 `~/.config/beams-client/daemon-state.json` are mode `0600`; the state file is
 replaced atomically and contains the workstation's stable random `client_id`
-plus the request/service registry. Auto-start diagnostics go to
+plus the request/service registry. Service records contain typed endpoints,
+desired state, and bounded diagnostic summaries, but never persisted PIDs.
+Auto-start diagnostics go to
 `~/.config/beams-client/daemon.log`.
 
 The local protocol is typed, versioned newline-delimited JSON. It requires a
@@ -136,7 +140,9 @@ beam-bootstrap client request port-forward --remote-port 8080
 
 A direct SSH shell has no managed token and receives an actionable error. A
 stale token is also rejected rather than falling back to another workstation.
-The request expires after 60 seconds if no local frontend decides it.
+The request expires after 60 seconds if no local frontend decides it. Approval
+starts a listener bound only to `127.0.0.1`; explicit bind conflicts fail
+before SSH is started, while an omitted local port is selected automatically.
 
 ## State
 
