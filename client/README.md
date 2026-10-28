@@ -90,7 +90,8 @@ application redraw. Every menu frame clears stale cells before painting, and
 service forms render as cleared modal panels, so local resizes and shorter
 updates do not retain content from an older frame. Terminal raw mode and cursor
 visibility are restored on normal exit, errors, and handled termination
-signals.
+signals. Daemon request, bridge, and service events repaint an open menu
+immediately; closing and reopening it is not required to refresh status.
 
 ## Local service daemon
 

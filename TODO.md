@@ -547,11 +547,13 @@ bootstrap `Task`s.
   newest-data buffer while the menu owns the screen, then restored before a
   two-step resize-driven remote redraw. Distinct resize notifications avoid
   coalescing, every local frame clears stale cells before repainting, and
-  service forms render in a cleared modal. The menu deliberately clears the
-  existing screen instead of nesting an alternate screen over zellij. Covered
-  by pure byte-router/buffer tests and real PTY tests for binary input, exit
-  status, and resize visibility, plus `client/tests/managed-session-smoke.sh`
-  for the outer controlling-terminal path and rendered menu.
+  service forms render in a cleared modal. Daemon events repaint an open menu
+  immediately so service/request status remains live. The menu deliberately
+  clears the existing screen instead of nesting an alternate screen over
+  zellij. Covered by pure byte-router/buffer tests and real PTY tests for
+  binary input, exit status, and resize visibility, plus
+  `client/tests/managed-session-smoke.sh` for the outer controlling-terminal
+  path and rendered menu.
 - [x] Phase 2: `beams daemon` is the single-instance per-user workstation
   daemon, auto-started by `beams ssh` (with `--no-client-daemon` as a
   troubleshooting escape hatch). `client/src/clientd.rs` provides a mode-0600

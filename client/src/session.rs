@@ -288,7 +288,9 @@ fn drive(
     let mut daemon_view = DaemonView::new(local_daemon);
 
     loop {
-        daemon_view.drain(local_daemon);
+        if daemon_view.drain(local_daemon) && input_router.mode == InputMode::Palette {
+            draw_palette(info, escape_key, &daemon_view)?;
+        }
 
         if let Ok(signal) = signal_rx.try_recv() {
             let _ = child.kill();
@@ -493,7 +495,9 @@ impl DaemonView {
         }
     }
 
-    fn drain(&mut self, local_daemon: &mut LocalDaemon) {
+    /// Applies queued daemon events and reports whether visible state changed.
+    fn drain(&mut self, local_daemon: &mut LocalDaemon) -> bool {
+        let mut changed = false;
         let reconnect =
             if local_daemon.frontend.is_none() && Instant::now() >= local_daemon.reconnect_after {
                 local_daemon
@@ -513,18 +517,19 @@ impl DaemonView {
                     self.connected = true;
                     self.message = "reconnected to local daemon".to_string();
                     local_daemon.frontend = Some(frontend);
+                    changed = true;
                 }
                 Err(err) => {
                     self.connected = false;
                     self.message = format!("reconnecting to local daemon: {err}");
                     local_daemon.reconnect_after = Instant::now() + DAEMON_RECONNECT_RETRY;
-                    return;
+                    return true;
                 }
             }
         }
 
         let Some(frontend) = &mut local_daemon.frontend else {
-            return;
+            return changed;
         };
         loop {
             match frontend.events.try_recv() {
@@ -553,23 +558,28 @@ impl DaemonView {
                         .map(|bridge| (bridge.beam_uuid, bridge.status))
                         .collect();
                     self.message = "connected".to_string();
+                    changed = true;
                 }
                 Ok(ServerEvent::DaemonStatus { frontends }) => {
                     self.frontends = frontends;
                     self.connected = true;
+                    changed = true;
                 }
                 Ok(ServerEvent::Error { message }) => {
                     self.message = format!("daemon error: {message}");
+                    changed = true;
                 }
                 Ok(ServerEvent::RequestChanged { request }) => {
                     self.request_records
                         .insert(request.request_id.clone(), request);
                     self.requests = self.request_records.len();
+                    changed = true;
                 }
                 Ok(ServerEvent::ServiceChanged { service }) => {
                     self.service_records
                         .insert(service.service_id.clone(), service);
                     self.services = self.service_records.len();
+                    changed = true;
                 }
                 Ok(ServerEvent::BridgeStatus { bridge }) => {
                     self.bridge_statuses
@@ -584,15 +594,16 @@ impl DaemonView {
                             .map(|message| format!(" ({message})"))
                             .unwrap_or_default()
                     );
+                    changed = true;
                 }
                 Ok(ServerEvent::Hello { .. } | ServerEvent::Pong) => {}
-                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Empty) => return changed,
                 Err(TryRecvError::Disconnected) => {
                     self.connected = false;
                     self.message = "connection lost".to_string();
                     local_daemon.frontend = None;
                     local_daemon.reconnect_after = Instant::now() + DAEMON_RECONNECT_RETRY;
-                    return;
+                    return true;
                 }
             }
         }
