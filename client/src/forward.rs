@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -58,7 +59,7 @@ fn supervise(
     program: String,
     target: Target,
     service_id: String,
-    requested_kind: ServiceRequestKind,
+    mut requested_kind: ServiceRequestKind,
     events: SyncSender<Event>,
     commands: Receiver<Action>,
 ) {
@@ -77,6 +78,7 @@ fn supervise(
                     kind: running_kind,
                     diagnostics,
                 }) => {
+                    requested_kind = running_kind.clone();
                     let _ = events.send(Event {
                         service_id: service_id.clone(),
                         kind: running_kind.clone(),
@@ -229,7 +231,8 @@ fn spawn_child(
 ) -> anyhow::Result<Child> {
     let forward = format!("127.0.0.1:{local_port}:{remote_host}:{remote_port}");
     let destination = format!("{}@{}", target.login, target.beam_uuid);
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args([
             "ssh",
             "-N",
@@ -241,7 +244,25 @@ fn spawn_child(
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: this closure only invokes async-signal-safe libc calls before
+    // exec. It prevents a forward from surviving as an orphan if `beamsd`
+    // crashes or is killed.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() == 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "beams daemon exited before forward exec",
+                ));
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("starting local forward to {destination}"))?;
     let stderr = child.stderr.take().context("capturing port-forward diagnostics")?;

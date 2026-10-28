@@ -579,15 +579,24 @@ bootstrap `Task`s.
     the same request/rejection path was also exercised through real `tsh ssh`
     against disposable Beam `outer-aura`, which was removed immediately
     afterward. Phase 4 will turn approval into a real loopback listener.
-- [ ] Phase 4: implement loopback-only local port forwards as the first full
+- [x] Phase 4: implement loopback-only local port forwards as the first full
   client- and remote-initiated service.
   - [x] Workstation runtime: client- and remote-initiated requests share one
     creation path; `beamsd` supervises loopback-only `tsh ssh -N -L` children,
     auto-selects or preflights local ports, captures bounded diagnostics, and
     exposes persistent typed status plus local stop/restart controls.
-  - [ ] Finish the remote `Tasks | Services | Requests` tabs and typed,
-    owner-routed stop/restart approval flow; extend the multi-client smoke test
-    through real service creation and action races.
+  - [x] The remote TUI now has `Tasks | Services | Requests` tabs. Service
+    stop/restart keys submit typed action proposals routed only to the owning
+    client and require a fresh local approval. Full-state and reconnect
+    snapshots cover requests, action requests, and services.
+  - [x] Tests cover two local frontends racing one decision, two clients on one
+    Beam without cross-client control, bind conflicts, diagnostics,
+    stop/restart, parent-daemon death, VM/local daemon restart, and selected
+    port recovery. `client-bridge-smoke.sh` runs the complete lifecycle with a
+    real loopback listener. A final disposable-Beam test (`stable-outpost`,
+    removed immediately afterward) used real `tsh ssh -N -L`: remote approval
+    exposed the Beam's HTTP server on `127.0.0.1:44693`, stop closed it, and
+    restart restored the same endpoint.
 - [ ] Phase 5: add typed client↔Beam file-copy jobs with locally selected or
   confirmed workstation paths, overwrite policy, cancellation, and interrupted
   job handling.

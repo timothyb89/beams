@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use beams_protocol::{
-    BeamToClient, ClientToBeam, RequestProjection, RequestStatus, ServiceAction,
-    ServiceActionRequest, ServiceProjection, ServiceRequest, ServiceRequestKind, ServiceStatus,
-    MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
+    ActionRequestProjection, BeamToClient, ClientToBeam, RequestProjection, RequestStatus,
+    ServiceAction, ServiceActionRequest, ServiceProjection, ServiceRequest, ServiceRequestKind,
+    ServiceStatus, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -235,6 +235,26 @@ impl PersistedState {
         }
         changed
     }
+
+    fn mark_process_services_stopped_after_restart(&mut self) -> bool {
+        let mut changed = false;
+        for service in self.services.values_mut() {
+            if matches!(
+                service.status,
+                ServiceStatus::Starting
+                    | ServiceStatus::Running
+                    | ServiceStatus::Stopping
+                    | ServiceStatus::Degraded
+                    | ServiceStatus::Unknown
+            ) {
+                service.status = ServiceStatus::Stopped;
+                service.message =
+                    Some("local daemon restarted; waiting to restore the forward".to_string());
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 struct Hub {
@@ -352,6 +372,7 @@ impl Hub {
             let record = existing.record.clone();
             drop(bridges);
             self.broadcast(ServerEvent::BridgeStatus { bridge: record });
+            self.recover_services(&target);
             return Ok(());
         }
 
@@ -359,16 +380,16 @@ impl Hub {
         let (event_tx, event_rx) = mpsc::sync_channel(BRIDGE_EVENT_QUEUE_CAPACITY);
         let commands = crate::bridge::spawn(target.clone(), client_id, session_token, event_tx);
         let record = BridgeRecord {
-            beam_id: target.beam_id,
+            beam_id: target.beam_id.clone(),
             beam_uuid: target.beam_uuid.clone(),
-            login: target.login,
+            login: target.login.clone(),
             status: "connecting".to_string(),
             session_count: 1,
             bridge_id: None,
             message: None,
         };
         bridges.insert(
-            target.beam_uuid,
+            target.beam_uuid.clone(),
             BridgeRuntime {
                 record: record.clone(),
                 commands,
@@ -376,10 +397,57 @@ impl Hub {
         );
         drop(bridges);
         self.broadcast(ServerEvent::BridgeStatus { bridge: record });
+        self.recover_services(&target);
 
         let weak = Arc::downgrade(self);
         thread::spawn(move || handle_bridge_events(weak, event_rx));
         Ok(())
+    }
+
+    fn recover_services(self: &Arc<Self>, target: &crate::bridge::Target) {
+        let services = self
+            .state
+            .lock()
+            .unwrap()
+            .services
+            .values()
+            .filter(|service| {
+                service.beam_uuid == target.beam_uuid
+                    && service.desired_running
+                    && service.spec.is_some()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut service in services {
+            if self
+                .service_runtimes
+                .lock()
+                .unwrap()
+                .contains_key(&service.service_id)
+            {
+                continue;
+            }
+            service.status = ServiceStatus::Starting;
+            service.message = Some("restoring after local daemon restart".to_string());
+            self.state
+                .lock()
+                .unwrap()
+                .services
+                .insert(service.service_id.clone(), service.clone());
+            let _ = self.save_state();
+            self.publish_service(&service);
+            if let Err(err) = self.spawn_service_worker(&service, target) {
+                handle_service_event(
+                    self,
+                    crate::forward::Event {
+                        service_id: service.service_id.clone(),
+                        kind: service.spec.clone().expect("filtered above"),
+                        status: ServiceStatus::Error,
+                        message: Some(format!("restoring service: {err:#}")),
+                    },
+                );
+            }
+        }
     }
 
     fn decide_request(self: &Arc<Self>, request_id: &str, approve: bool) -> anyhow::Result<RequestRecord> {
@@ -444,13 +512,34 @@ impl Hub {
             request: updated.clone(),
         });
         if approve {
-            if is_action {
-                self.start_action_request(request_id)?;
+            let result = if is_action {
+                self.start_action_request(request_id)
             } else {
-                self.start_service_request(request_id)?;
+                self.start_service_request(request_id)
+            };
+            if let Err(err) = result {
+                self.fail_request(request_id, is_action, &format!("{err:#}"));
+                return Err(err);
             }
         }
         Ok(updated)
+    }
+
+    fn fail_request(&self, request_id: &str, action: bool, message: &str) {
+        let updated = {
+            let mut state = self.state.lock().unwrap();
+            let Some(request) = state.requests.get_mut(request_id) else {
+                return;
+            };
+            if !matches!(request.status, RequestStatus::Approved | RequestStatus::Starting) {
+                return;
+            }
+            request.status = RequestStatus::Failed;
+            request.message = Some(message.to_string());
+            request.clone()
+        };
+        let _ = self.save_state();
+        self.publish_request(&updated, action);
     }
 
     fn create_port_forward(
@@ -491,7 +580,10 @@ impl Hub {
         self.broadcast(ServerEvent::RequestChanged {
             request: record.clone(),
         });
-        self.start_service_request_with_target(&record.request_id, target)?;
+        if let Err(err) = self.start_service_request_with_target(&record.request_id, target) {
+            self.fail_request(&record.request_id, false, &format!("{err:#}"));
+            return Err(err);
+        }
         Ok(record)
     }
 
@@ -560,6 +652,14 @@ impl Hub {
         self.publish_request(&request, false);
         self.publish_service(&service);
 
+        self.spawn_service_worker(&service, &target)
+    }
+
+    fn spawn_service_worker(
+        self: &Arc<Self>,
+        service: &ServiceRecord,
+        target: &crate::bridge::Target,
+    ) -> anyhow::Result<()> {
         let spec = service
             .spec
             .clone()
@@ -568,8 +668,8 @@ impl Hub {
         let actions = crate::forward::spawn(
             self.forward_program.clone(),
             crate::forward::Target {
-                beam_uuid: target.beam_uuid,
-                login: target.login,
+                beam_uuid: target.beam_uuid.clone(),
+                login: target.login.clone(),
             },
             service.service_id.clone(),
             spec,
@@ -578,7 +678,7 @@ impl Hub {
         self.service_runtimes
             .lock()
             .unwrap()
-            .insert(service.service_id, ServiceRuntime { actions });
+            .insert(service.service_id.clone(), ServiceRuntime { actions });
         let weak = Arc::downgrade(self);
         thread::spawn(move || handle_service_events(weak, event_rx));
         Ok(())
@@ -614,6 +714,17 @@ impl Hub {
                     service.message = Some("stopping".to_string());
                 }
                 ServiceAction::Restart => {
+                    if matches!(
+                        service.status,
+                        ServiceStatus::Running
+                            | ServiceStatus::Degraded
+                            | ServiceStatus::Unknown
+                    ) {
+                        service.status = service
+                            .status
+                            .transition(ServiceStatus::Stopping)
+                            .map_err(anyhow::Error::msg)?;
+                    }
                     service.desired_running = true;
                     service.message = Some("restart requested".to_string());
                 }
@@ -896,6 +1007,24 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                         })
                 })
                 .collect();
+            let action_requests = hub
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .values()
+                .filter(|request| request.beam_uuid == beam_uuid)
+                .filter_map(|request| {
+                    request
+                        .action
+                        .clone()
+                        .map(|action_request| ActionRequestProjection {
+                            request: action_request,
+                            status: request.status,
+                            message: request.message.clone(),
+                        })
+                })
+                .collect();
             let services = hub
                 .state
                 .lock()
@@ -906,6 +1035,9 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                 .filter_map(service_projection)
                 .collect();
             let _ = commands.send(ClientToBeam::RequestSnapshot { requests });
+            let _ = commands.send(ClientToBeam::ActionRequestSnapshot {
+                requests: action_requests,
+            });
             let _ = commands.send(ClientToBeam::ServiceSnapshot { services });
             let _ = commands.send(ClientToBeam::Ready);
             hub.broadcast(ServerEvent::BridgeStatus { bridge: record });
@@ -1218,7 +1350,9 @@ pub fn serve(socket_path: Option<PathBuf>) -> anyhow::Result<()> {
     let socket_path = socket_path.unwrap_or(default_socket_path()?);
     let state_path = default_state_path()?;
     let mut state = PersistedState::load_or_create(&state_path)?;
-    if state.expire_pending_after_restart() {
+    let approvals_changed = state.expire_pending_after_restart();
+    let services_changed = state.mark_process_services_stopped_after_restart();
+    if approvals_changed || services_changed {
         state.save(&state_path)?;
     }
     let listener = bind_socket(&socket_path)?;
@@ -1516,13 +1650,25 @@ fn config_dir() -> anyhow::Result<PathBuf> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::os::unix::fs::PermissionsExt;
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{name}-{}-{}", std::process::id(), Uuid::new_v4()))
     }
 
     fn hub_with_bridge(beam_uuid: &str) -> (Arc<Hub>, Receiver<ClientToBeam>) {
-        let hub = Arc::new(Hub::new(PersistedState::default()));
+        hub_with_bridge_and_program(beam_uuid, "tsh".to_string())
+    }
+
+    fn hub_with_bridge_and_program(
+        beam_uuid: &str,
+        program: String,
+    ) -> (Arc<Hub>, Receiver<ClientToBeam>) {
+        let hub = Arc::new(Hub::with_state_path_and_program(
+            PersistedState::default(),
+            None,
+            program,
+        ));
         let (commands, command_rx) = mpsc::sync_channel(16);
         hub.bridges.lock().unwrap().insert(
             beam_uuid.to_string(),
@@ -1540,6 +1686,25 @@ mod tests {
             },
         );
         (hub, command_rx)
+    }
+
+    fn fake_forward_program() -> PathBuf {
+        let path = temp_path("beams-clientd-fake-forward");
+        fs::write(
+            &path,
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + timeout;
+        while !condition() {
+            assert!(Instant::now() < deadline, "condition did not become true");
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -1735,6 +1900,37 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_frontends_racing_one_decision_have_exactly_one_winner() {
+        let (hub, _commands) = hub_with_bridge("beam-uuid");
+        handle_bridge_event(
+            &hub,
+            crate::bridge::Event::Message {
+                beam_uuid: "beam-uuid".to_string(),
+                message: BeamToClient::RequestSubmitted {
+                    request: ServiceRequest {
+                        request_id: "raced-request".to_string(),
+                        kind: ServiceRequestKind::LocalPortForward {
+                            remote_host: "127.0.0.1".to_string(),
+                            remote_port: 8080,
+                            local_port: Some(18080),
+                        },
+                    },
+                },
+            },
+        );
+        let first = Arc::clone(&hub);
+        let second = Arc::clone(&hub);
+        let a = thread::spawn(move || first.decide_request("raced-request", false).is_ok());
+        let b = thread::spawn(move || second.decide_request("raced-request", false).is_ok());
+        let winners = usize::from(a.join().unwrap()) + usize::from(b.join().unwrap());
+        assert_eq!(winners, 1);
+        assert_eq!(
+            hub.state.lock().unwrap().requests["raced-request"].status,
+            RequestStatus::Rejected
+        );
+    }
+
+    #[test]
     fn connected_bridge_receives_authoritative_request_and_service_snapshots() {
         let (hub, commands) = hub_with_bridge("beam-uuid");
         hub.state.lock().unwrap().requests.insert(
@@ -1770,6 +1966,10 @@ mod tests {
             ClientToBeam::RequestSnapshot { requests }
                 if requests.len() == 1
                     && requests[0].status == RequestStatus::Rejected
+        ));
+        assert!(matches!(
+            commands.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ClientToBeam::ActionRequestSnapshot { requests } if requests.is_empty()
         ));
         assert!(matches!(
             commands.recv_timeout(Duration::from_secs(1)).unwrap(),
@@ -1829,5 +2029,67 @@ mod tests {
             }
         ));
         assert!(hub.state.lock().unwrap().services.is_empty());
+    }
+
+    #[test]
+    fn approving_remote_forward_runs_and_local_stop_restart_controls_it() {
+        let program = fake_forward_program();
+        let (hub, _commands) =
+            hub_with_bridge_and_program("beam-uuid", program.display().to_string());
+        handle_bridge_event(
+            &hub,
+            crate::bridge::Event::Message {
+                beam_uuid: "beam-uuid".to_string(),
+                message: BeamToClient::RequestSubmitted {
+                    request: ServiceRequest {
+                        request_id: "request-forward".to_string(),
+                        kind: ServiceRequestKind::LocalPortForward {
+                            remote_host: "127.0.0.1".to_string(),
+                            remote_port: 8080,
+                            local_port: None,
+                        },
+                    },
+                },
+            },
+        );
+
+        hub.decide_request("request-forward", true).unwrap();
+        wait_until(Duration::from_secs(3), || {
+            hub.state.lock().unwrap().requests["request-forward"].status
+                == RequestStatus::Running
+        });
+        let service = hub
+            .state
+            .lock()
+            .unwrap()
+            .services
+            .values()
+            .next()
+            .cloned()
+            .unwrap();
+        assert_eq!(service.status, ServiceStatus::Running);
+        assert!(matches!(
+            service.spec,
+            Some(ServiceRequestKind::LocalPortForward {
+                local_port: Some(port),
+                ..
+            }) if port > 0
+        ));
+
+        hub.control_service(&service.service_id, ServiceAction::Stop)
+            .unwrap();
+        wait_until(Duration::from_secs(2), || {
+            hub.state.lock().unwrap().services[&service.service_id].status
+                == ServiceStatus::Stopped
+        });
+        hub.control_service(&service.service_id, ServiceAction::Restart)
+            .unwrap();
+        wait_until(Duration::from_secs(3), || {
+            hub.state.lock().unwrap().services[&service.service_id].status
+                == ServiceStatus::Running
+        });
+
+        drop(hub);
+        let _ = fs::remove_file(program);
     }
 }

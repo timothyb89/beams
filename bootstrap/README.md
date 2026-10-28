@@ -321,7 +321,9 @@ that's what it binds to).
 ## TUI
 
 `beam-bootstrap tui [--socket ...]` is a ratatui client for the daemon
-(requires one already running - it doesn't spawn its own). Top half:
+(requires one already running - it doesn't spawn its own). Its `1 Tasks`,
+`2 Services`, and `3 Requests` tabs can also be selected with left/right.
+The Tasks tab has a top half of
 available templates (↑/↓ to pick, enter to open a param-entry form, tab
 to move between fields, enter on the last field to submit, esc to
 cancel). Bottom half: one row per task the daemon's broadcast anywhere
@@ -332,6 +334,13 @@ refreshes the template list, `tab` (outside a form) switches focus
 between the template list and the task list for scrolling, the scroll
 wheel moves whichever of those is focused the same way the arrow keys
 do, `q`/`esc` quits.
+
+The Services tab shows each workstation-owned forward, its selected loopback
+endpoint, owner client, lifecycle, and diagnostic summary. `j`/`k` select a
+service; `s` and `r` request stop/restart. These keys submit a typed proposal
+to the owning client and do not act until the workstation user approves it.
+The Requests tab shows create and action requests with their current local
+decision/status; `r` refreshes the full client projection.
 
 If the daemon connection drops (e.g. `beamctl restart beam-bootstrapd`
 mid-session), the status line says so and the TUI retries every second

@@ -71,8 +71,8 @@ use std::thread;
 
 use anyhow::Context;
 use beams_protocol::{
-    BeamToClient, ClientToBeam, RequestProjection, RequestStatus, ServiceActionRequest,
-    ServiceProjection, ServiceRequest, ServiceRequestKind, ServiceStatus,
+    ActionRequestProjection, BeamToClient, ClientToBeam, RequestProjection, RequestStatus,
+    ServiceActionRequest, ServiceProjection, ServiceRequest, ServiceRequestKind, ServiceStatus,
     PROTOCOL, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -542,6 +542,59 @@ fn client_bridge_message(
                 .to_string(),
             );
             let _ = reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
+        }
+        ClientToBeam::ActionRequestSnapshot { requests } => {
+            let client_id = {
+                let bridges = hub.bridges.lock().unwrap();
+                match bridges.get(bridge_id) {
+                    Some(bridge) => bridge.client_id.clone(),
+                    None => {
+                        let _ = reply.send(error_reply(request_id, "bridge is no longer registered"));
+                        return;
+                    }
+                }
+            };
+            {
+                let mut current = hub.client_action_requests.lock().unwrap();
+                current.retain(|_, request| request.owner_client_id != client_id);
+                for ActionRequestProjection {
+                    request,
+                    status,
+                    message,
+                } in requests
+                {
+                    current.insert(
+                        request.request_id.clone(),
+                        ClientActionProjection {
+                            request,
+                            owner_client_id: client_id.clone(),
+                            bridge_id: bridge_id.to_string(),
+                            status,
+                            message,
+                        },
+                    );
+                }
+            }
+            let requests = hub
+                .client_action_requests
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|request| request.owner_client_id == client_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            hub.broadcast(
+                &json!({
+                    "type": "client_action_requests_snapshot",
+                    "client_id": client_id,
+                    "requests": requests,
+                })
+                .to_string(),
+            );
+            let _ = reply.send(
+                json!({"request_id": request_id, "type": "bridge_message_accepted"})
+                    .to_string(),
+            );
         }
         ClientToBeam::ServiceSnapshot { services } => {
             let client_id = {
@@ -1590,6 +1643,95 @@ mod tests {
                 }
                 Err(err) => panic!("reading non-target bridge: {err}"),
             }
+        }
+    }
+
+    #[test]
+    fn service_actions_route_only_to_the_owning_client_and_require_approval() {
+        let hub = Arc::new(Hub::default());
+        let (_bridge_a, mut bridge_a_reader, _a_handle) =
+            register_bridge(Arc::clone(&hub), "client-a", "bridge-a", "token-a");
+        let (_bridge_b, mut bridge_b_reader, _b_handle) =
+            register_bridge(Arc::clone(&hub), "client-b", "bridge-b", "token-b");
+        hub.client_services.lock().unwrap().insert(
+            "service-b".to_string(),
+            OwnedServiceProjection {
+                owner_client_id: "client-b".to_string(),
+                service: ServiceProjection {
+                    service_id: "service-b".to_string(),
+                    request_id: "create-b".to_string(),
+                    kind: ServiceRequestKind::LocalPortForward {
+                        remote_host: "127.0.0.1".to_string(),
+                        remote_port: 8080,
+                        local_port: Some(18080),
+                    },
+                    status: ServiceStatus::Running,
+                    message: None,
+                },
+            },
+        );
+        let (mut requester, mut reader, _handle) = connect_to(Arc::clone(&hub));
+
+        send(
+            &mut requester,
+            &json!({
+                "request_id": "wrong-owner",
+                "op": "request_service_action",
+                "session_token": "token-a",
+                "client_id": "client-a",
+                "request": {
+                    "request_id": "action-wrong",
+                    "service_id": "service-b",
+                    "action": "stop"
+                }
+            })
+            .to_string(),
+        );
+        let error = recv_type(&mut reader, "error");
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .contains("owned by client client-b"));
+
+        send(
+            &mut requester,
+            &json!({
+                "request_id": "right-owner",
+                "op": "request_service_action",
+                "session_token": "token-b",
+                "client_id": "client-b",
+                "request": {
+                    "request_id": "action-right",
+                    "service_id": "service-b",
+                    "action": "stop"
+                }
+            })
+            .to_string(),
+        );
+        let event = recv_type(&mut bridge_b_reader, "client_bridge_event");
+        assert_eq!(event["message"]["type"], "service_action_requested");
+        assert_eq!(event["message"]["request"]["service_id"], "service-b");
+        let pending = recv_type(&mut reader, "service_action_request_status");
+        assert_eq!(pending["request"]["status"], "pending_approval");
+        let accepted = recv_type(&mut reader, "service_action_request_accepted");
+        assert_eq!(accepted["client_id"], "client-b");
+
+        bridge_a_reader
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        while let Ok(line) = {
+            let mut line = String::new();
+            bridge_a_reader.read_line(&mut line).map(|_| line)
+        } {
+            if line.is_empty() {
+                break;
+            }
+            let value: Value = serde_json::from_str(line.trim()).unwrap();
+            assert_ne!(
+                value.get("type").and_then(Value::as_str),
+                Some("client_bridge_event")
+            );
         }
     }
 

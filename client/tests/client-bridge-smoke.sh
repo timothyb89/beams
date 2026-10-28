@@ -36,9 +36,36 @@ cargo build --manifest-path "$ROOT/client/Cargo.toml"
 mkdir -p "$TEST_DIR/bin" "$TEST_DIR/config-a" "$TEST_DIR/config-b"
 cat >"$TEST_DIR/bin/tsh" <<'EOF'
 #!/bin/sh
-exec "$TEST_BOOTSTRAP_BIN" client-bridge --socket "$TEST_VM_SOCKET"
+case " $* " in
+    *"beam-client-bridge"*)
+        exec "$TEST_BOOTSTRAP_BIN" client-bridge --socket "$TEST_VM_SOCKET"
+        ;;
+esac
+exec python3 "$TEST_FAKE_FORWARD" "$@"
 EOF
 chmod 700 "$TEST_DIR/bin/tsh"
+
+cat >"$TEST_DIR/fake-forward.py" <<'PY'
+import signal
+import socket
+import sys
+
+forward = sys.argv[sys.argv.index("-L") + 1]
+bind, port, _remote_host, _remote_port = forward.split(":")
+listener = socket.socket()
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind((bind, int(port)))
+listener.listen()
+
+def stop(_signal, _frame):
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop)
+while True:
+    connection, _ = listener.accept()
+    connection.sendall(b"beams-forward-smoke\n")
+    connection.close()
+PY
 
 cat >"$TEST_DIR/frontend.py" <<'PY'
 import json
@@ -100,7 +127,7 @@ if mode == "ensure":
             break
     else:
         raise RuntimeError("bridge did not connect")
-elif mode == "reject":
+elif mode in ("reject", "approve"):
     pending = None
     while time.time() < deadline and pending is None:
         event = receive()
@@ -119,18 +146,33 @@ elif mode == "reject":
     send({
         "op": "decide_request",
         "request_id": pending["request_id"],
-        "approve": False,
+        "approve": mode == "approve",
     })
+    wanted = "rejected" if mode == "reject" else "running"
     while time.time() < deadline:
         event = receive()
         if (
             event.get("type") == "request_changed"
             and event["request"]["request_id"] == pending["request_id"]
-            and event["request"]["status"] == "rejected"
+            and event["request"]["status"] == wanted
         ):
             break
     else:
-        raise RuntimeError("rejection was not committed")
+        raise RuntimeError(f"decision did not reach {wanted}")
+    if mode == "approve" and pending.get("action") is None:
+        send({"op": "snapshot"})
+        while time.time() < deadline:
+            event = receive()
+            if event.get("type") == "snapshot":
+                running = next(
+                    (s for s in event["services"] if s["status"] == "running"),
+                    None,
+                )
+                if running is not None:
+                    print(json.dumps(running, sort_keys=True))
+                    break
+        else:
+            raise RuntimeError("running service did not appear")
 elif mode == "assert-empty":
     while time.time() < deadline:
         event = receive()
@@ -139,6 +181,22 @@ elif mode == "assert-empty":
             break
     else:
         raise RuntimeError("snapshot did not arrive")
+elif mode == "wait-running":
+    while time.time() < deadline:
+        send({"op": "snapshot"})
+        event = receive()
+        while event.get("type") != "snapshot":
+            event = receive()
+        running = next(
+            (s for s in event["services"] if s["status"] == "running"),
+            None,
+        )
+        if running is not None:
+            print(json.dumps(running, sort_keys=True))
+            break
+        time.sleep(0.05)
+    else:
+        raise RuntimeError("running service did not appear")
 elif mode == "dump":
     while time.time() < deadline:
         event = receive()
@@ -147,6 +205,52 @@ elif mode == "dump":
             break
 else:
     raise RuntimeError(f"unknown mode {mode}")
+PY
+
+cat >"$TEST_DIR/remote-action.py" <<'PY'
+import json
+import socket
+import sys
+import time
+import uuid
+
+socket_path, token, client_id, service_id, action = sys.argv[1:6]
+request_id = str(uuid.uuid4())
+sock = socket.socket(socket.AF_UNIX)
+sock.connect(socket_path)
+reader = sock.makefile("r")
+writer = sock.makefile("w")
+writer.write(json.dumps({
+    "request_id": "submit-action",
+    "op": "request_service_action",
+    "session_token": token,
+    "client_id": client_id,
+    "request": {
+        "request_id": request_id,
+        "service_id": service_id,
+        "action": action,
+    },
+}) + "\n")
+writer.flush()
+deadline = time.time() + 15
+while time.time() < deadline:
+    line = reader.readline()
+    if not line:
+        raise RuntimeError("VM daemon disconnected")
+    event = json.loads(line)
+    if event.get("type") == "error" and event.get("request_id") == "submit-action":
+        raise RuntimeError(event["message"])
+    if (
+        event.get("type") == "service_action_request_status"
+        and event["request"]["request"]["request_id"] == request_id
+    ):
+        status = event["request"]["status"]
+        if status == "running":
+            print(status)
+            raise SystemExit(0)
+        if status in ("rejected", "expired", "failed"):
+            raise RuntimeError(status)
+raise RuntimeError("action did not complete")
 PY
 
 start_vm() {
@@ -161,6 +265,7 @@ start_local_a() {
         XDG_CONFIG_HOME="$TEST_DIR/config-a" \
         TEST_BOOTSTRAP_BIN="$ROOT/bootstrap/target/debug/beam-bootstrap" \
         TEST_VM_SOCKET="$VM_SOCKET" \
+        TEST_FAKE_FORWARD="$TEST_DIR/fake-forward.py" \
         "$ROOT/client/target/debug/beams" daemon --socket "$LOCAL_A_SOCKET" \
         >"$TEST_DIR/local-a.log" 2>&1 &
     LOCAL_A_PID=$!
@@ -172,6 +277,7 @@ start_local_b() {
         XDG_CONFIG_HOME="$TEST_DIR/config-b" \
         TEST_BOOTSTRAP_BIN="$ROOT/bootstrap/target/debug/beam-bootstrap" \
         TEST_VM_SOCKET="$VM_SOCKET" \
+        TEST_FAKE_FORWARD="$TEST_DIR/fake-forward.py" \
         "$ROOT/client/target/debug/beams" daemon --socket "$LOCAL_B_SOCKET" \
         >"$TEST_DIR/local-b.log" 2>&1 &
     LOCAL_B_PID=$!
@@ -263,8 +369,60 @@ fi
 grep -q "submitted" "$TEST_DIR/request.out"
 grep -q "rejected" "$TEST_DIR/request.out"
 
+# Approving the same remote request creates a real loopback listener owned by
+# client B. Client A must remain an observer.
+env \
+    BEAMS_CLIENT_ID="$(cat "$TEST_DIR/client-b-id")" \
+    BEAMS_SESSION_TOKEN=token-b \
+    "$ROOT/bootstrap/target/debug/beam-bootstrap" client request \
+        --socket "$VM_SOCKET" port-forward --remote-port 8081 \
+        >"$TEST_DIR/approved-request.out" 2>&1 &
+APPROVED_REQUEST_PID=$!
+python3 "$TEST_DIR/frontend.py" approve "$LOCAL_B_SOCKET" >"$TEST_DIR/service.json"
+wait "$APPROVED_REQUEST_PID"
+python3 "$TEST_DIR/frontend.py" assert-empty "$LOCAL_A_SOCKET"
+
+SERVICE_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["service_id"])' "$TEST_DIR/service.json")
+LOCAL_PORT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["spec"]["local_port"])' "$TEST_DIR/service.json")
+python3 - "$LOCAL_PORT" <<'PY'
+import socket
+import sys
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=2) as connection:
+    assert connection.recv(64).startswith(b"beams-forward-smoke")
+PY
+
+# Remote stop/restart are proposals too: each is routed to client B and waits
+# for a fresh local approval.
+python3 "$TEST_DIR/remote-action.py" "$VM_SOCKET" token-b \
+    "$(cat "$TEST_DIR/client-b-id")" "$SERVICE_ID" stop \
+    >"$TEST_DIR/stop-action.out" 2>&1 &
+STOP_PID=$!
+python3 "$TEST_DIR/frontend.py" approve "$LOCAL_B_SOCKET"
+wait "$STOP_PID"
+if python3 - "$LOCAL_PORT" <<'PY'
+import socket
+import sys
+try:
+    socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=.2)
+except OSError:
+    raise SystemExit(1)
+PY
+then
+    echo "stopped forward still accepted connections" >&2
+    exit 1
+fi
+
+python3 "$TEST_DIR/remote-action.py" "$VM_SOCKET" token-b \
+    "$(cat "$TEST_DIR/client-b-id")" "$SERVICE_ID" restart \
+    >"$TEST_DIR/restart-action.out" 2>&1 &
+RESTART_PID=$!
+python3 "$TEST_DIR/frontend.py" approve "$LOCAL_B_SOCKET"
+wait "$RESTART_PID"
+python3 "$TEST_DIR/frontend.py" wait-running "$LOCAL_B_SOCKET" >"$TEST_DIR/service-restarted.json"
+
 # Restart one workstation daemon. Its stable client ID survives, and a new
-# ensure call recreates exactly one bridge for that client/Beam pair.
+# ensure call recreates exactly one bridge for that client/Beam pair and
+# restores the desired-running forward without trusting its old PID.
 kill "$LOCAL_B_PID"
 wait "$LOCAL_B_PID" 2>/dev/null || true
 LOCAL_B_PID=
@@ -275,5 +433,12 @@ python3 "$TEST_DIR/frontend.py" ensure "$LOCAL_B_SOCKET" beam-a beam-uuid token-
 cmp "$TEST_DIR/client-b-id" "$TEST_DIR/client-b-id-after-restart"
 echo "checking bridge synchronization after workstation daemon restart"
 wait_for_clients 2
+python3 "$TEST_DIR/frontend.py" wait-running "$LOCAL_B_SOCKET" >"$TEST_DIR/service-restored.json"
+python3 - "$LOCAL_PORT" <<'PY'
+import socket
+import sys
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=2) as connection:
+    assert connection.recv(64).startswith(b"beams-forward-smoke")
+PY
 
 echo "client bridge smoke test passed"

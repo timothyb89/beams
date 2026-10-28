@@ -128,8 +128,8 @@ enum ClientCommand {
 #[derive(Subcommand)]
 enum ClientServiceCommand {
     /// Request a loopback-only local port forward to an endpoint in the
-    /// Beam. Phase 3 routes and approves/rejects the proposal; Phase 4
-    /// creates the actual SSH forward.
+    /// Beam. The workstation user must approve it before a listener is
+    /// created.
     PortForward {
         #[arg(long, default_value = "127.0.0.1")]
         remote_host: String,
@@ -377,7 +377,7 @@ fn client_request(socket: Option<String>, service: ClientServiceCommand) -> i32 
                     }
                 }
                 match status {
-                    "approved" => return 0,
+                    "running" => return 0,
                     "rejected" | "expired" | "failed" => return 1,
                     _ => {}
                 }

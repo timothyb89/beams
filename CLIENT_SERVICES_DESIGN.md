@@ -1,7 +1,6 @@
 # Client-owned services and remote requests
 
-Status: implementation plan; Phases 1-3 implemented, Phase 4 in progress,
-2026-10-28.
+Status: implementation plan; Phases 1-4 implemented, 2026-10-28.
 
 This design covers workstation-owned features that operate across a Beam's
 SSH connection: folder sync, port forwarding, and file transfer. It builds on

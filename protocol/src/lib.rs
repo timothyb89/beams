@@ -145,6 +145,14 @@ pub struct RequestProjection {
     pub message: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ActionRequestProjection {
+    pub request: ServiceActionRequest,
+    pub status: RequestStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 /// Messages emitted by the authoritative workstation daemon.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -167,6 +175,9 @@ pub enum ClientToBeam {
     },
     RequestSnapshot {
         requests: Vec<RequestProjection>,
+    },
+    ActionRequestSnapshot {
+        requests: Vec<ActionRequestProjection>,
     },
     ServiceSnapshot {
         services: Vec<ServiceProjection>,
@@ -298,5 +309,22 @@ mod tests {
         assert!(ServiceStatus::Stopped
             .transition(ServiceStatus::Running)
             .is_err());
+        assert_eq!(
+            ServiceStatus::Stopped.transition(ServiceStatus::Starting),
+            Ok(ServiceStatus::Starting)
+        );
+    }
+
+    #[test]
+    fn remote_service_actions_are_proposals_not_commands() {
+        let request = ServiceActionRequest {
+            request_id: "action-1".to_string(),
+            service_id: "service-1".to_string(),
+            action: ServiceAction::Stop,
+        };
+        let value = serde_json::to_value(BeamToClient::ServiceActionRequested { request }).unwrap();
+        assert_eq!(value["type"], "service_action_requested");
+        assert_eq!(value["request"]["action"], "stop");
+        assert!(serde_json::from_value::<ClientToBeam>(value).is_err());
     }
 }
