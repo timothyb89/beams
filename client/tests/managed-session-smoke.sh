@@ -45,8 +45,16 @@ done
 
 set +e
 # zellij enables enhanced keyboard reporting on capable outer terminals.
-# Exercise Ctrl-] in its Kitty CSI-u form, not only as legacy byte 0x1d.
-printf 'hello\r\033[93;5uq' |
+# Exercise Ctrl-] in its Kitty CSI-u form, then open/cancel the forward modal.
+{
+    printf 'hello\r\033[93;5u'
+    sleep 0.1
+    printf 'f'
+    sleep 0.1
+    printf '8080\t18080\033'
+    sleep 0.1
+    printf 'q'
+} |
     env \
         PATH="$CLIENT_DIR/tests/fixtures/bin:$PATH" \
         XDG_CONFIG_HOME="$TEST_DIR/config" \
@@ -64,9 +72,12 @@ if [ "$STATUS" -ne 7 ]; then
 fi
 
 strings "$TRANSCRIPT" | grep -q "Beams local menu"
+strings "$TRANSCRIPT" | grep -q "local port (empty = automatic)"
 strings "$TRANSCRIPT" | grep -q "REMOTE READY"
 strings "$TRANSCRIPT" | grep -q "24 100"
 strings "$TRANSCRIPT" | grep -q "REMOTE ECHO: hello"
+strings "$TRANSCRIPT" | grep -q "REMOTE RESIZE: 24 99"
+strings "$TRANSCRIPT" | grep -q "REMOTE RESIZE: 24 100"
 CLIENT_ID=$(sed -n 's/.*"client_id": "\([^"]*\)".*/\1/p' \
     "$TEST_DIR/config/beams-client/daemon-state.json")
 test -n "$CLIENT_ID"

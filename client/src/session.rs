@@ -26,10 +26,10 @@ use crossterm::execute;
 use crossterm::terminal::{self, Clear, ClearType};
 use portable_pty::{native_pty_system, CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear as RatatuiClear, Paragraph};
 use ratatui::Terminal;
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
@@ -42,6 +42,7 @@ const LOOP_TICK: Duration = Duration::from_millis(25);
 const INPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_INPUT_SEQUENCE_LEN: usize = 64;
 const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
+const REDRAW_RESIZE_DELAY: Duration = Duration::from_millis(40);
 const DAEMON_RECONNECT_RETRY: Duration = Duration::from_secs(1);
 const DEFERRED_OUTPUT_LIMIT: usize = 1024 * 1024;
 
@@ -1250,7 +1251,10 @@ fn close_palette(
 
 /// Force a SIGWINCH-driven redraw without injecting Ctrl-L (which could be
 /// meaningful input to a non-shell remote application). The transient size is
-/// changed in the least disruptive dimension, then immediately restored.
+/// changed in the least disruptive dimension, then restored after enough time
+/// for the supervised SSH process to observe both distinct sizes. Restoring
+/// immediately lets some SSH clients coalesce the two notifications and leaves
+/// the remote full-screen application unaware that it needs to repaint.
 fn force_remote_redraw(master: &dyn MasterPty, size: PtySize) -> anyhow::Result<()> {
     let transient = if size.cols > 1 {
         PtySize {
@@ -1269,6 +1273,7 @@ fn force_remote_redraw(master: &dyn MasterPty, size: PtySize) -> anyhow::Result<
         master
             .resize(transient)
             .context("triggering remote redraw")?;
+        thread::sleep(REDRAW_RESIZE_DELAY);
     }
     master.resize(size).context("restoring remote PTY size")
 }
@@ -1378,6 +1383,17 @@ fn draw_palette(
     escape_key: EscapeKey,
     daemon: &DaemonView,
 ) -> anyhow::Result<()> {
+    // Every invocation creates a fresh ratatui Terminal, whose previous frame
+    // starts blank. Clear the real screen to match that model before painting;
+    // otherwise shorter text, modal transitions, and resizes retain stale
+    // cells from the prior frame.
+    execute!(
+        io::stdout(),
+        Hide,
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    )
+    .context("clearing local menu frame")?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("creating local menu terminal")?;
     terminal
@@ -1509,28 +1525,6 @@ fn draw_palette(
                     )));
                 }
             }
-            if let Some(form) = &daemon.forward_form {
-                body_text.push(Line::from(""));
-                body_text.push(Line::from(Span::styled(
-                    "Create local port forward",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                body_text.push(Line::from(format!(
-                    "{} remote port: {}",
-                    if form.field == 0 { "›" } else { " " },
-                    form.remote_port
-                )));
-                body_text.push(Line::from(format!(
-                    "{} local port (empty = automatic): {}",
-                    if form.field == 1 { "›" } else { " " },
-                    form.local_port
-                )));
-                body_text.push(Line::from(
-                    "Tab changes field; Enter creates; Esc cancels.",
-                ));
-            }
             body_text.push(Line::from(""));
             body_text.push(Line::from(
                 "Remote output continues to be drained while this menu is open.",
@@ -1566,9 +1560,66 @@ fn draw_palette(
                     .block(Block::default().borders(Borders::ALL)),
                 footer,
             );
+
+            if let Some(form) = &daemon.forward_form {
+                let popup = centered_rect(area, 64, 9);
+                let selected = Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
+                let normal = Style::default();
+                let form_text = vec![
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(
+                            if form.field == 0 {
+                                "› remote port: "
+                            } else {
+                                "  remote port: "
+                            },
+                            if form.field == 0 { selected } else { normal },
+                        ),
+                        Span::raw(&form.remote_port),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            if form.field == 1 {
+                                "› local port (empty = automatic): "
+                            } else {
+                                "  local port (empty = automatic): "
+                            },
+                            if form.field == 1 { selected } else { normal },
+                        ),
+                        Span::raw(&form.local_port),
+                    ]),
+                    Line::from(""),
+                    Line::from("Tab changes field  •  Enter creates  •  Esc cancels"),
+                ];
+                frame.render_widget(RatatuiClear, popup);
+                frame.render_widget(
+                    Paragraph::new(form_text)
+                        .alignment(Alignment::Left)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(" Create local port forward "),
+                        ),
+                    popup,
+                );
+            }
         })
         .context("drawing local menu")?;
     Ok(())
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
 }
 
 #[cfg(test)]

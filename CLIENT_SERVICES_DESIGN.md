@@ -333,9 +333,12 @@ local UI temporarily clears and owns the current terminal screen and offers:
 It deliberately does **not** enter another terminal alternate screen: the
 remote zellij process normally already owns that mode, and alternate screens
 are not safely nestable. On close, clear the palette and force a remote redraw
-via PTY resize (`SIGWINCH` propagation). If a full-screen application still
-renders badly, offer a configurable redraw byte (normally `Ctrl-L`) rather than
-always injecting input into the remote session.
+via two distinct PTY resize notifications (`SIGWINCH` propagation); a short
+delay prevents the supervised SSH process from coalescing them. Each local
+frame is fully cleared before repainting, and forms clear their modal area
+before rendering. If a full-screen application still renders badly, offer a
+configurable redraw byte (normally `Ctrl-L`) rather than always injecting input
+into the remote session.
 
 This is a modal takeover, not a terminal emulator. Rendering the remote screen
 into a local ratatui widget would require a VT parser, mouse-mode translation,

@@ -545,24 +545,28 @@ bootstrap `Task`s.
   keyboard reporting in terminals such as iTerm2, while preserving unmatched
   sequences byte-for-byte. Remote output is drained into a bounded 1 MiB
   newest-data buffer while the menu owns the screen, then restored before a
-  resize-driven remote redraw. The menu deliberately clears the existing
-  screen instead of nesting an alternate screen over zellij. Covered by pure
-  byte-router/buffer tests and real PTY tests for binary input, exit status,
-  and resize visibility, plus `client/tests/managed-session-smoke.sh` for the
-  outer controlling-terminal path and rendered menu.
+  two-step resize-driven remote redraw. Distinct resize notifications avoid
+  coalescing, every local frame clears stale cells before repainting, and
+  service forms render in a cleared modal. The menu deliberately clears the
+  existing screen instead of nesting an alternate screen over zellij. Covered
+  by pure byte-router/buffer tests and real PTY tests for binary input, exit
+  status, and resize visibility, plus `client/tests/managed-session-smoke.sh`
+  for the outer controlling-terminal path and rendered menu.
 - [x] Phase 2: `beams daemon` is the single-instance per-user workstation
   daemon, auto-started by `beams ssh` (with `--no-client-daemon` as a
   troubleshooting escape hatch). `client/src/clientd.rs` provides a mode-0600
   UDS, typed/versioned NDJSON handshake and events, 64 KiB frame and bounded
   event-queue limits, per-connection rate limiting, handshake timeout, stale-
-  socket handling, and frontend subscriptions/snapshots. Its atomically
-  replaced mode-0600 state file owns a stable UUID `client_id` plus typed
-  request/service records and explicit transition tables. The Phase 1 menu now
-  shows the live client ID, frontend count, pending-request count, service
-  count, and daemon disconnect/errors. Unit tests exercise protocol framing,
-  transitions, state durability/permissions, socket ownership, rate limiting,
-  and a real `UnixStream` handshake; the controlling-terminal smoke test also
-  runs a real temporary daemon and verifies its client ID is rendered.
+  socket handling, explicit blocking mode for accepted sockets on BSD/macOS,
+  and frontend subscriptions/snapshots. Its atomically replaced mode-0600 state
+  file owns a stable UUID `client_id` plus typed request/service records and
+  explicit transition tables. The Phase 1 menu now shows the live client ID,
+  frontend count, pending-request count, service count, and daemon
+  disconnect/errors. Unit tests exercise protocol framing, transitions, state
+  durability/permissions, socket ownership, rate limiting, and a real
+  `UnixStream` handshake (including an inherited nonblocking stream); the
+  controlling-terminal smoke test also runs a real temporary daemon and
+  verifies its client ID is rendered.
 - [x] Phase 3: add `beam-bootstrap client-bridge`, VM-daemon client/service
   projection, managed-session routing tokens, bridge reconnect/snapshots, and
   remote CLI requests. Direct or stale unmanaged sessions must fail clearly.

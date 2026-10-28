@@ -1454,6 +1454,13 @@ fn bind_socket(path: &Path) -> anyhow::Result<UnixListener> {
 }
 
 fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<()> {
+    // The listener is nonblocking so `serve` can notice termination signals.
+    // Accepted-socket inheritance differs across Unix platforms; macOS can
+    // leave this stream nonblocking, making the first idle post-handshake read
+    // fail with WouldBlock. Each frontend has its own thread and must block.
+    stream
+        .set_nonblocking(false)
+        .context("making frontend connection blocking")?;
     stream
         .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
         .context("setting frontend handshake timeout")?;
@@ -1603,7 +1610,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
             Ok(None) => break,
             Err(err) => {
                 let _ = tx.try_send(ServerEvent::Error {
-                    message: err.to_string(),
+                    message: format!("{err:#}"),
                 });
                 break;
             }
@@ -1884,12 +1891,16 @@ mod tests {
     #[test]
     fn typed_handshake_and_snapshot_work_over_a_real_unix_stream() {
         let (server, client) = UnixStream::pair().unwrap();
+        // Models platforms where accept inherits the daemon listener's
+        // nonblocking mode.
+        server.set_nonblocking(true).unwrap();
         let state = PersistedState::default();
         let expected_client_id = state.client_id.clone();
         let hub = Arc::new(Hub::new(state));
         let server_hub = Arc::clone(&hub);
         let server_thread = thread::spawn(move || handle_connection(&server_hub, server).unwrap());
 
+        thread::sleep(Duration::from_millis(20));
         let mut frontend = Frontend::from_stream(client).unwrap();
         assert_eq!(frontend.client_id, expected_client_id);
         let snapshot = frontend

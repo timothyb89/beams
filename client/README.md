@@ -85,9 +85,12 @@ a service and `s`/`r` stop or restart it.
 The client does not nest another terminal alternate screen over remote zellij
 (alternate-screen state is not stackable). It drains up to 1 MiB of remote
 output while the menu is visible, restores that output on close, and briefly
-resizes/restores the child PTY to make the remote application redraw. Terminal
-raw mode and cursor visibility are restored on normal exit, errors, and handled
-termination signals.
+resizes/restores the child PTY with distinct notifications to make the remote
+application redraw. Every menu frame clears stale cells before painting, and
+service forms render as cleared modal panels, so local resizes and shorter
+updates do not retain content from an older frame. Terminal raw mode and cursor
+visibility are restored on normal exit, errors, and handled termination
+signals.
 
 ## Local service daemon
 

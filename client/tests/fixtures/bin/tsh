@@ -8,9 +8,14 @@ fi
 if [ "$1" = "ssh" ]; then
     printf 'REMOTE READY\r\n'
     stty size
+    trap 'printf "REMOTE RESIZE: "; stty size' WINCH
     IFS= read -r line
     printf 'REMOTE ECHO: %s\r\n' "$line"
-    sleep 1
+    sleep 1 &
+    child=$!
+    while kill -0 "$child" 2>/dev/null; do
+        wait "$child" || true
+    done
     exit 7
 fi
 
