@@ -67,7 +67,13 @@ impl ServiceStatus {
             (self, next),
             (
                 Self::Starting,
-                Self::Running | Self::Stopping | Self::Stopped | Self::Error,
+                Self::Running
+                    | Self::Paused
+                    | Self::Stopping
+                    | Self::Stopped
+                    | Self::Degraded
+                    | Self::Unknown
+                    | Self::Error,
             ) | (
                 Self::Running,
                 Self::Paused
@@ -81,7 +87,12 @@ impl ServiceStatus {
                 Self::Running | Self::Paused | Self::Stopping | Self::Unknown | Self::Error
             ) | (
                 Self::Paused,
-                Self::Running | Self::Stopping | Self::Stopped | Self::Unknown | Self::Error
+                Self::Running
+                    | Self::Stopping
+                    | Self::Stopped
+                    | Self::Degraded
+                    | Self::Unknown
+                    | Self::Error
             ) | (
                 Self::Unknown,
                 Self::Running | Self::Paused | Self::Stopping | Self::Stopped | Self::Error
@@ -433,6 +444,18 @@ mod tests {
         assert_eq!(
             ServiceStatus::Paused.transition(ServiceStatus::Running),
             Ok(ServiceStatus::Running)
+        );
+        assert_eq!(
+            ServiceStatus::Paused.transition(ServiceStatus::Degraded),
+            Ok(ServiceStatus::Degraded)
+        );
+        assert_eq!(
+            ServiceStatus::Starting.transition(ServiceStatus::Paused),
+            Ok(ServiceStatus::Paused)
+        );
+        assert_eq!(
+            ServiceStatus::Starting.transition(ServiceStatus::Degraded),
+            Ok(ServiceStatus::Degraded)
         );
     }
 

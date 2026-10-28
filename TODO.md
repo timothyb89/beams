@@ -642,9 +642,17 @@ bootstrap `Task`s.
     adopting, and detaches rather than terminating on daemon shutdown.
     Client creation/control is available from the hotkey menu and
     `beams sync create/list/pause/resume/terminate`.
-  - [ ] Finish fake-Mutagen daemon recovery tests and a disposable-Beam
-    end-to-end run covering initial sync, both directions, conflict reporting,
-    pause/resume, and daemon-restart adoption.
+  - [x] A real disposable-Beam run from this ephemeral Beam (`hidden-lab`,
+    removed immediately afterward) covered pre-populated-directory merge,
+    propagation in both directions, pause/resume isolation, `two-way-safe`
+    conflict reporting, daemon-restart adoption, CLI conflict detail, and
+    explicit termination removing the Mutagen session. Unit tests cover
+    transport permissions, deterministic naming, endpoint drift, status
+    summaries, missing-Mutagen diagnostics, restart persistence, and
+    local-path/error redaction.
+  - [ ] Run the final laptop-to-Beam acceptance check (including macOS) and
+    add an automated fake-Mutagen fixture for disconnected transport and
+    expired-Beam regression coverage.
 - [ ] Phase 7: run the isolated OpenSSH `ControlMaster`/`tsh proxy ssh`
   compatibility spike and add a multiplexed backend only if it passes
   Teleport auth renewal, MFA, recording, reconnect, PTY, forward, copy, and

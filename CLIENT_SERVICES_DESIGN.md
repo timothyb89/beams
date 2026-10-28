@@ -1,6 +1,7 @@
 # Client-owned services and remote requests
 
-Status: implementation plan; Phases 1-4 implemented, 2026-10-28.
+Status: implementation plan; Phases 1-5 implemented and Phase 6 code complete
+pending laptop validation, 2026-10-28.
 
 This design covers workstation-owned features that operate across a Beam's
 SSH connection: folder sync, port forwarding, and file transfer. It builds on
@@ -584,6 +585,17 @@ auto-restarted after daemon interruption.
   destructive options in the approval UI.
 - Test pre-populated directories, conflicts, dropped SSH bridges, Beam expiry,
   local daemon restart, and a real laptop-to-Beam path before calling it done.
+
+Implemented in `client/src/sync.rs` and the shared client-service protocol.
+The workstation daemon stores the authoritative local path and deterministic
+Mutagen session name, while the Beam sees only a display hint and its own
+endpoint. A disposable-Beam run from this ephemeral Beam (`hidden-lab`,
+removed immediately afterward) verified pre-populated-directory merge,
+propagation in both directions, pause/resume isolation, `two-way-safe`
+conflict reporting, daemon-restart adoption with exact endpoint/settings
+validation, and explicit termination removing the Mutagen session. A real
+laptop-to-Beam run and automated disconnected/expired-Beam cases remain the
+acceptance checks before changing this phase to fully complete.
 
 ### Phase 7: multiplexing and hardening
 

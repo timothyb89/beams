@@ -1141,10 +1141,7 @@ impl DaemonView {
             Some(ServiceRequestKind::FileCopy { .. }) => action == ServiceAction::Stop,
             Some(ServiceRequestKind::FolderSync { .. }) => matches!(
                 action,
-                ServiceAction::Stop
-                    | ServiceAction::Pause
-                    | ServiceAction::Resume
-                    | ServiceAction::Terminate
+                ServiceAction::Pause | ServiceAction::Resume | ServiceAction::Terminate
             ),
             None => false,
         };

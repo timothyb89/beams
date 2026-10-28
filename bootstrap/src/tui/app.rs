@@ -527,10 +527,7 @@ impl App {
             ServiceRequestKind::FileCopy { .. } => action == ServiceAction::Stop,
             ServiceRequestKind::FolderSync { .. } => matches!(
                 action,
-                ServiceAction::Stop
-                    | ServiceAction::Pause
-                    | ServiceAction::Resume
-                    | ServiceAction::Terminate
+                ServiceAction::Pause | ServiceAction::Resume | ServiceAction::Terminate
             ),
         };
         if !supported {

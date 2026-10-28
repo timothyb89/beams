@@ -341,6 +341,7 @@ impl Hub {
         Self::with_state_path_and_program(state, None, "tsh".to_string())
     }
 
+    #[cfg(test)]
     fn with_state_path_and_program(
         state: PersistedState,
         state_path: Option<PathBuf>,
@@ -1061,10 +1062,7 @@ impl Hub {
             | (ServiceRequestKind::FileCopy { .. }, ServiceAction::Stop)
             | (
                 ServiceRequestKind::FolderSync { .. },
-                ServiceAction::Stop
-                | ServiceAction::Pause
-                | ServiceAction::Resume
-                | ServiceAction::Terminate,
+                ServiceAction::Pause | ServiceAction::Resume | ServiceAction::Terminate,
             ) => {}
             (ServiceRequestKind::FileCopy { .. }, _) => {
                 bail!("file-copy jobs only support cancellation")
@@ -1072,8 +1070,11 @@ impl Hub {
             (ServiceRequestKind::LocalPortForward { .. }, _) => {
                 bail!("port forwards only support stop and restart")
             }
-            (ServiceRequestKind::FolderSync { .. }, ServiceAction::Restart) => {
-                bail!("folder syncs use pause/resume; terminated syncs must be recreated")
+            (
+                ServiceRequestKind::FolderSync { .. },
+                ServiceAction::Stop | ServiceAction::Restart,
+            ) => {
+                bail!("folder syncs use pause/resume/terminate; terminated syncs must be recreated")
             }
         }
         let actions = self
@@ -1165,7 +1166,7 @@ impl Hub {
             (RuntimeActions::Sync(actions), ServiceAction::Resume) => actions
                 .try_send(crate::sync::Action::Resume)
                 .map_err(|err| anyhow::anyhow!("sending sync resume: {err}"))?,
-            (RuntimeActions::Sync(actions), ServiceAction::Stop | ServiceAction::Terminate) => {
+            (RuntimeActions::Sync(actions), ServiceAction::Terminate) => {
                 actions
                     .try_send(crate::sync::Action::Terminate)
                     .map_err(|err| anyhow::anyhow!("sending sync termination: {err}"))?
@@ -1176,7 +1177,8 @@ impl Hub {
             | (RuntimeActions::Forward(_), ServiceAction::Terminate)
             | (RuntimeActions::Copy(_), ServiceAction::Pause)
             | (RuntimeActions::Copy(_), ServiceAction::Resume)
-            | (RuntimeActions::Copy(_), ServiceAction::Terminate) => {
+            | (RuntimeActions::Copy(_), ServiceAction::Terminate)
+            | (RuntimeActions::Sync(_), ServiceAction::Stop) => {
                 unreachable!("service/action compatibility validated above")
             }
         }
@@ -1515,6 +1517,11 @@ fn handle_service_update(
         }
         service.spec = Some(kind);
         service.message = message;
+        if status == ServiceStatus::Error
+            && matches!(service.spec, Some(ServiceRequestKind::FolderSync { .. }))
+        {
+            service.desired_running = false;
+        }
         let service = service.clone();
 
         if matches!(
@@ -2652,6 +2659,75 @@ mod tests {
         assert_eq!(copy.status, ServiceStatus::Stopped);
         assert!(!copy.desired_running);
         assert!(copy.message.as_deref().unwrap().contains("interrupted"));
+    }
+
+    #[test]
+    fn daemon_restart_preserves_folder_sync_for_name_based_adoption() {
+        let mut state = PersistedState::default();
+        state.services.insert(
+            "sync".to_string(),
+            ServiceRecord {
+                service_id: "sync".to_string(),
+                request_id: "request".to_string(),
+                beam_id: "beam".to_string(),
+                beam_uuid: "beam-uuid".to_string(),
+                login: "beams".to_string(),
+                kind: "folder_sync".to_string(),
+                spec: Some(ServiceRequestKind::FolderSync {
+                    remote_path: "/home/beams/project".to_string(),
+                    local_path_hint: Some("project".to_string()),
+                    mode: beams_protocol::FolderSyncMode::TwoWaySafe,
+                    ignore_vcs: true,
+                    ignores: Vec::new(),
+                }),
+                status: ServiceStatus::Paused,
+                desired_running: true,
+                message: None,
+                local_path: Some("/tmp/project".to_string()),
+                mutagen_session: Some("beams-beam-uuid-sync".to_string()),
+            },
+        );
+        assert!(state.mark_process_services_stopped_after_restart());
+        let sync = &state.services["sync"];
+        assert_eq!(sync.status, ServiceStatus::Unknown);
+        assert!(sync.desired_running);
+        assert_eq!(
+            sync.mutagen_session.as_deref(),
+            Some("beams-beam-uuid-sync")
+        );
+    }
+
+    #[test]
+    fn folder_sync_projection_redacts_workstation_paths_and_errors() {
+        let local_path = "/Users/example/secret-project";
+        let service = ServiceRecord {
+            service_id: "sync".to_string(),
+            request_id: "request".to_string(),
+            beam_id: "beam".to_string(),
+            beam_uuid: "beam-uuid".to_string(),
+            login: "beams".to_string(),
+            kind: "folder_sync".to_string(),
+            spec: Some(ServiceRequestKind::FolderSync {
+                remote_path: "/home/beams/project".to_string(),
+                local_path_hint: Some("secret-project".to_string()),
+                mode: beams_protocol::FolderSyncMode::TwoWaySafe,
+                ignore_vcs: true,
+                ignores: Vec::new(),
+            }),
+            status: ServiceStatus::Error,
+            desired_running: false,
+            message: Some(format!("failed while opening {local_path}")),
+            local_path: Some(local_path.to_string()),
+            mutagen_session: Some("session".to_string()),
+        };
+        let projection = service_projection(&service).unwrap();
+        let encoded = serde_json::to_string(&projection).unwrap();
+        assert!(!encoded.contains(local_path));
+        assert!(projection
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("inspect the workstation"));
     }
 
     #[test]

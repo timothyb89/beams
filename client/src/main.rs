@@ -314,8 +314,12 @@ fn list_folder_syncs() -> anyhow::Result<u8> {
                         _ => unreachable!(),
                     };
                     println!(
-                        "{}\t{:?}\t{}\t{}",
-                        service.service_id, service.status, service.beam_uuid, endpoint
+                        "{}\t{:?}\t{}\t{}\t{}",
+                        service.service_id,
+                        service.status,
+                        service.beam_uuid,
+                        endpoint,
+                        service.message.as_deref().unwrap_or("")
                     );
                 }
                 return Ok(0);

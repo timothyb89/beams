@@ -347,7 +347,10 @@ fn validate_remote_directory(
         bail!("remote synchronization path must not be empty");
     }
     let destination = format!("{}@{}", target.login, target.beam_uuid);
-    let test = format!("test -d -- {}", crate::tsh::shell_quote(remote_path));
+    // Bash's `test` builtin does not consistently accept `--`; the path is
+    // shell-quoted, so it cannot be interpreted as an operator even if it
+    // begins with `-`.
+    let test = format!("test -d {}", crate::tsh::shell_quote(remote_path));
     let remote_command = format!("bash -lc {}", crate::tsh::shell_quote(&test));
     let status = Command::new(tsh_program)
         .args(["ssh", &destination, "--", &remote_command])
@@ -695,5 +698,13 @@ mod tests {
             &["target".to_string()],
         )
         .is_err());
+    }
+
+    #[test]
+    fn missing_mutagen_has_an_actionable_error() {
+        let error = check_version("/definitely/missing/beams-mutagen").unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("Mutagen is required"));
+        assert!(message.contains("0.18"));
     }
 }
