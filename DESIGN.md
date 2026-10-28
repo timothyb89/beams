@@ -6,6 +6,11 @@ describes what's *implemented today*; this file describes where it's
 going. `project.md` is the original brief and stays as historical context.
 Update `TODO.md` as pieces of this land.
 
+Workstation-owned folder syncs, port forwards, file copies, and the
+remote-to-client approval bridge are a separate control plane; see
+`CLIENT_SERVICES_DESIGN.md`. They may be requested and observed through this
+daemon/TUI, but they are deliberately not bootstrap tasks.
+
 ## Why
 
 The original design (see `project.md`) only covered unattended startup

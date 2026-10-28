@@ -525,16 +525,45 @@ section above for status/details.
   `cargo check`/`cargo test` workflow for both `bootstrap/` and `client/`
   would catch breakage before it's discovered on a live beam.
 
+## Client-owned services and remote requests
+
+The design and phased implementation plan now live in
+`CLIENT_SERVICES_DESIGN.md`, based on the transport/Mutagen findings in
+`FOLDER_SYNC_SPIKE.md`. The governing boundary is that a Beam may submit a
+typed request and observe status, but only the local `beams` client may approve
+and own a folder sync, port forward, or file copy. These are deliberately not
+bootstrap `Task`s.
+
+- [ ] Phase 1: replace `beams ssh`'s direct `exec` into `tsh` with a supervised
+  local PTY, byte passthrough, resize/signal/exit handling, a configurable
+  prefix key, and a local ratatui modal.
+- [ ] Phase 2: add the per-user local `beams daemon`/`beamsd`, its permissioned
+  UDS, typed/versioned protocol, persistent `client_id`, service/request state
+  machines, atomic state, and frontend subscriptions.
+- [ ] Phase 3: add `beam-bootstrap client-bridge`, VM-daemon client/service
+  projection, managed-session routing tokens, bridge reconnect/snapshots, and
+  remote CLI requests. Direct or stale unmanaged sessions must fail clearly.
+- [ ] Phase 4: implement loopback-only local port forwards as the first full
+  client- and remote-initiated service, including approval, status,
+  stop/restart, ownership, and `Tasks | Services | Requests` in the remote TUI.
+- [ ] Phase 5: add typed client↔Beam file-copy jobs with locally selected or
+  confirmed workstation paths, overwrite policy, cancellation, and interrupted
+  job handling.
+- [ ] Phase 6: productize the Mutagen wrapper transport and add folder-sync
+  lifecycle/status/conflicts/recovery. Default to `--ignore-vcs` and
+  `two-way-safe`; destructive replacement and local-wins behavior stay
+  explicit.
+- [ ] Phase 7: run the isolated OpenSSH `ControlMaster`/`tsh proxy ssh`
+  compatibility spike and add a multiplexed backend only if it passes
+  Teleport auth renewal, MFA, recording, reconnect, PTY, forward, copy, and
+  Mutagen tests. Keep separate long-lived `tsh` processes as the baseline;
+  reconsider `russh` only after profiling identifies a real need.
+
 ## Explicitly deferred — needs its own design pass later, not blocked on
 anything above
 
 - [x] **Fixed, see the "New tasks enabled by the graph" section below** -
   web-based editor hosting via a new `install-code-server` task.
-- [ ] Client↔beam folder sharing (mutagen-style, e.g. for
-  `~/projects/core`) — see DESIGN.md.
-- [ ] `russh`-based data channel / on-the-fly port-forward management —
-  see DESIGN.md. Start with shelling out to `tsh proxy ssh`/`tsh ssh -L`
-  instead.
 - [ ] `tsh beams publish` (HTTP/TCP app publishing from a beam) isn't
   integrated into either binary yet — now actually relevant, since
   `install-code-server` (see the "New tasks enabled by the graph"
