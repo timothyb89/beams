@@ -7,6 +7,7 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
@@ -245,23 +246,7 @@ fn spawn_child(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    // SAFETY: this closure only invokes async-signal-safe libc calls before
-    // exec. It prevents a forward from surviving as an orphan if `beamsd`
-    // crashes or is killed.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::getppid() == 1 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "beams daemon exited before forward exec",
-                ));
-            }
-            Ok(())
-        });
-    }
+    configure_parent_death_signal(&mut command);
     let mut child = command
         .spawn()
         .with_context(|| format!("starting local forward to {destination}"))?;
@@ -276,6 +261,34 @@ fn spawn_child(
         }
     });
     Ok(child)
+}
+
+#[cfg(target_os = "linux")]
+fn configure_parent_death_signal(command: &mut Command) {
+    // SAFETY: this closure only invokes async-signal-safe libc calls before
+    // exec. Linux's parent-death signal additionally covers an abrupt daemon
+    // crash that cannot run the portable graceful-shutdown path.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() == 1 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "beams daemon exited before forward exec",
+                ));
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_parent_death_signal(_command: &mut Command) {
+    // macOS and other Unix targets do not expose Linux PR_SET_PDEATHSIG.
+    // `clientd::serve` catches normal termination signals and explicitly
+    // stops every worker before exiting instead.
 }
 
 enum RunningOutcome {

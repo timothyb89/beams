@@ -143,8 +143,10 @@ stale token is also rejected rather than falling back to another workstation.
 The request expires after 60 seconds if no local frontend decides it. Approval
 starts a listener bound only to `127.0.0.1`; explicit bind conflicts fail
 before SSH is started, while an omitted local port is selected automatically.
-The daemon owns the forward child, arranges for it to terminate if the daemon
-dies, and restores desired-running forwards from typed persisted state after a
+The daemon owns the forward child and stops it during handled shutdown on every
+supported Unix platform. Linux additionally uses `PR_SET_PDEATHSIG` so an
+abrupt daemon crash cannot orphan the forward; macOS has no equivalent API.
+Desired-running forwards are restored from typed persisted state after a
 daemon restart without trusting an old PID. Stop/restart proposals from the
 remote TUI require the same local approval as creation.
 

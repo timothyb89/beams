@@ -13,7 +13,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
@@ -26,6 +26,7 @@ use beams_protocol::{
     ServiceStatus, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
+use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use uuid::Uuid;
 
 const START_TIMEOUT: Duration = Duration::from_secs(3);
@@ -811,6 +812,46 @@ impl Hub {
         });
     }
 
+    fn shutdown(&self) {
+        let actions = self
+            .service_runtimes
+            .lock()
+            .unwrap()
+            .values()
+            .map(|runtime| runtime.actions.clone())
+            .collect::<Vec<_>>();
+        for actions in actions {
+            let _ = actions.try_send(crate::forward::Action::Stop);
+        }
+        // Dropping every bridge command sender makes each supervisor kill and
+        // reap its current SSH child instead of reconnecting.
+        self.bridges.lock().unwrap().clear();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let active = self
+                .state
+                .lock()
+                .unwrap()
+                .services
+                .values()
+                .any(|service| {
+                    matches!(
+                        service.status,
+                        ServiceStatus::Starting
+                            | ServiceStatus::Running
+                            | ServiceStatus::Stopping
+                            | ServiceStatus::Degraded
+                            | ServiceStatus::Unknown
+                    )
+                });
+            if !active {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn expire_request(&self, request_id: &str) {
         let updated = {
             let mut state = self.state.lock().unwrap();
@@ -1356,6 +1397,9 @@ pub fn serve(socket_path: Option<PathBuf>) -> anyhow::Result<()> {
         state.save(&state_path)?;
     }
     let listener = bind_socket(&socket_path)?;
+    listener
+        .set_nonblocking(true)
+        .context("making daemon listener nonblocking")?;
     let forward_program = std::env::var("BEAMS_TSH").unwrap_or_else(|_| "tsh".to_string());
     let hub = Arc::new(Hub::with_state_path_and_program(
         state,
@@ -1363,15 +1407,31 @@ pub fn serve(socket_path: Option<PathBuf>) -> anyhow::Result<()> {
         forward_program,
     ));
 
-    for stream in listener.incoming() {
-        let stream = stream.context("accepting local daemon connection")?;
-        let hub = Arc::clone(&hub);
-        thread::spawn(move || {
-            if let Err(err) = handle_connection(&hub, stream) {
-                eprintln!("beams daemon: connection error: {err}");
-            }
-        });
+    let terminating = Arc::new(AtomicBool::new(false));
+    for signal in [SIGHUP, SIGINT, SIGQUIT, SIGTERM] {
+        signal_hook::flag::register(signal, Arc::clone(&terminating))
+            .context("installing daemon termination handler")?;
     }
+
+    while !terminating.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let hub = Arc::clone(&hub);
+                thread::spawn(move || {
+                    if let Err(err) = handle_connection(&hub, stream) {
+                        eprintln!("beams daemon: connection error: {err}");
+                    }
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => return Err(err).context("accepting local daemon connection"),
+        }
+    }
+    hub.shutdown();
+    drop(listener);
+    let _ = fs::remove_file(&socket_path);
     Ok(())
 }
 
