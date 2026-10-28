@@ -12,7 +12,7 @@
 //! - remote output is drained and bounded while that palette is visible;
 //! - terminal modes are restored on every normal/error/signal exit path.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::io::{self, IsTerminal, Read, Write};
 use std::str::FromStr;
@@ -34,10 +34,13 @@ use ratatui::Terminal;
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
-use crate::clientd::{Frontend, ServerEvent};
+use beams_protocol::{RequestStatus, ServiceRequestKind};
+
+use crate::clientd::{Frontend, RequestRecord, ServerEvent};
 
 const LOOP_TICK: Duration = Duration::from_millis(25);
 const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
+const DAEMON_RECONNECT_RETRY: Duration = Duration::from_secs(1);
 const DEFERRED_OUTPUT_LIMIT: usize = 1024 * 1024;
 
 /// The local prefix byte intercepted by the managed SSH session.
@@ -148,13 +151,29 @@ pub struct ConnectionInfo<'a> {
 pub struct LocalDaemon {
     frontend: Option<Frontend>,
     unavailable: Option<String>,
+    managed_bridge: Option<ManagedBridge>,
+    reconnect_after: Instant,
+}
+
+struct ManagedBridge {
+    target: crate::bridge::Target,
+    session_token: String,
 }
 
 impl LocalDaemon {
-    pub fn connected(frontend: Frontend) -> Self {
+    pub fn connected(
+        frontend: Frontend,
+        target: crate::bridge::Target,
+        session_token: String,
+    ) -> Self {
         Self {
             frontend: Some(frontend),
             unavailable: None,
+            managed_bridge: Some(ManagedBridge {
+                target,
+                session_token,
+            }),
+            reconnect_after: Instant::now(),
         }
     }
 
@@ -162,6 +181,8 @@ impl LocalDaemon {
         Self {
             frontend: None,
             unavailable: Some(message.into()),
+            managed_bridge: None,
+            reconnect_after: Instant::now(),
         }
     }
 }
@@ -338,6 +359,14 @@ fn drive(
                             last_size,
                         )?;
                     }
+                    InputAction::ApprovePending => {
+                        daemon_view.decide(local_daemon, true);
+                        draw_palette(info, escape_key, &daemon_view)?;
+                    }
+                    InputAction::RejectPending => {
+                        daemon_view.decide(local_daemon, false);
+                        draw_palette(info, escape_key, &daemon_view)?;
+                    }
                 }
             }
         }
@@ -350,6 +379,8 @@ struct DaemonView {
     frontends: usize,
     requests: usize,
     services: usize,
+    request_records: BTreeMap<String, RequestRecord>,
+    bridge_statuses: BTreeMap<String, String>,
     message: String,
 }
 
@@ -362,6 +393,8 @@ impl DaemonView {
                 frontends: 1,
                 requests: 0,
                 services: 0,
+                request_records: BTreeMap::new(),
+                bridge_statuses: BTreeMap::new(),
                 message: "connected".to_string(),
             },
             None => Self {
@@ -370,6 +403,8 @@ impl DaemonView {
                 frontends: 0,
                 requests: 0,
                 services: 0,
+                request_records: BTreeMap::new(),
+                bridge_statuses: BTreeMap::new(),
                 message: local_daemon
                     .unavailable
                     .clone()
@@ -379,6 +414,35 @@ impl DaemonView {
     }
 
     fn drain(&mut self, local_daemon: &mut LocalDaemon) {
+        let reconnect =
+            if local_daemon.frontend.is_none() && Instant::now() >= local_daemon.reconnect_after {
+                local_daemon
+                    .managed_bridge
+                    .as_ref()
+                    .map(|managed| (managed.target.clone(), managed.session_token.clone()))
+            } else {
+                None
+            };
+        if let Some((target, session_token)) = reconnect {
+            match crate::clientd::connect_or_start().and_then(|mut frontend| {
+                frontend.ensure_bridge(&target, &session_token)?;
+                Ok(frontend)
+            }) {
+                Ok(frontend) => {
+                    self.client_id = Some(frontend.client_id.clone());
+                    self.connected = true;
+                    self.message = "reconnected to local daemon".to_string();
+                    local_daemon.frontend = Some(frontend);
+                }
+                Err(err) => {
+                    self.connected = false;
+                    self.message = format!("reconnecting to local daemon: {err}");
+                    local_daemon.reconnect_after = Instant::now() + DAEMON_RECONNECT_RETRY;
+                    return;
+                }
+            }
+        }
+
         let Some(frontend) = &mut local_daemon.frontend else {
             return;
         };
@@ -389,12 +453,21 @@ impl DaemonView {
                     frontends,
                     requests,
                     services,
+                    bridges,
                 }) => {
                     self.client_id = Some(client_id);
                     self.connected = true;
                     self.frontends = frontends;
                     self.requests = requests.len();
                     self.services = services.len();
+                    self.request_records = requests
+                        .into_iter()
+                        .map(|request| (request.request_id.clone(), request))
+                        .collect();
+                    self.bridge_statuses = bridges
+                        .into_iter()
+                        .map(|bridge| (bridge.beam_uuid, bridge.status))
+                        .collect();
                     self.message = "connected".to_string();
                 }
                 Ok(ServerEvent::DaemonStatus { frontends }) => {
@@ -404,14 +477,72 @@ impl DaemonView {
                 Ok(ServerEvent::Error { message }) => {
                     self.message = format!("daemon error: {message}");
                 }
+                Ok(ServerEvent::RequestChanged { request }) => {
+                    self.request_records
+                        .insert(request.request_id.clone(), request);
+                    self.requests = self.request_records.len();
+                }
+                Ok(ServerEvent::BridgeStatus { bridge }) => {
+                    self.bridge_statuses
+                        .insert(bridge.beam_uuid.clone(), bridge.status.clone());
+                    self.message = format!(
+                        "bridge to {}: {}{}",
+                        bridge.beam_id,
+                        bridge.status,
+                        bridge
+                            .message
+                            .as_deref()
+                            .map(|message| format!(" ({message})"))
+                            .unwrap_or_default()
+                    );
+                }
                 Ok(ServerEvent::Hello { .. } | ServerEvent::Pong) => {}
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
                     self.connected = false;
                     self.message = "connection lost".to_string();
                     local_daemon.frontend = None;
+                    local_daemon.reconnect_after = Instant::now() + DAEMON_RECONNECT_RETRY;
                     return;
                 }
+            }
+        }
+    }
+
+    fn pending_request(&self) -> Option<&RequestRecord> {
+        self.request_records
+            .values()
+            .find(|request| request.status == RequestStatus::PendingApproval)
+    }
+
+    fn connected_bridges(&self) -> usize {
+        self.bridge_statuses
+            .values()
+            .filter(|status| status.as_str() == "connected")
+            .count()
+    }
+
+    fn decide(&mut self, local_daemon: &mut LocalDaemon, approve: bool) {
+        let Some(request_id) = self
+            .pending_request()
+            .map(|request| request.request_id.clone())
+        else {
+            self.message = "no pending request to decide".to_string();
+            return;
+        };
+        let Some(frontend) = &mut local_daemon.frontend else {
+            self.message = "local daemon connection is unavailable".to_string();
+            return;
+        };
+        match frontend.decide_request(&request_id, approve) {
+            Ok(()) => {
+                self.message = format!(
+                    "{} request {request_id}",
+                    if approve { "approving" } else { "rejecting" }
+                );
+            }
+            Err(err) => {
+                self.message = format!("could not send decision: {err}");
             }
         }
     }
@@ -432,6 +563,8 @@ enum InputAction {
     Remote(Vec<u8>),
     OpenPalette,
     ClosePalette,
+    ApprovePending,
+    RejectPending,
 }
 
 /// Routes bytes without decoding/re-encoding terminal escape sequences. This
@@ -465,9 +598,14 @@ fn route_input(mode: &mut InputMode, escape_key: EscapeKey, input: &[u8]) -> Vec
                 *mode = InputMode::Passthrough;
                 actions.push(InputAction::ClosePalette);
             }
+            InputMode::Palette if matches!(byte, b'y' | b'Y') => {
+                actions.push(InputAction::ApprovePending);
+            }
+            InputMode::Palette if matches!(byte, b'n' | b'N') => {
+                actions.push(InputAction::RejectPending);
+            }
             InputMode::Palette => {
-                // Phase one is an informational menu. Future service forms
-                // will replace this branch with a real palette state machine.
+                // Future service forms will extend this tiny state machine.
             }
         }
     }
@@ -788,7 +926,7 @@ fn draw_palette(
                 Color::Yellow
             };
             let client_id = daemon.client_id.as_deref().unwrap_or("-");
-            let body_text = vec![
+            let mut body_text = vec![
                 Line::from(""),
                 Line::from(Span::styled(
                     "The managed SSH session is active.",
@@ -801,12 +939,47 @@ fn draw_palette(
                 ]),
                 Line::from(format!("client id: {client_id}")),
                 Line::from(format!(
-                    "{} frontend(s), {} pending request(s), {} service(s)",
-                    daemon.frontends, daemon.requests, daemon.services
+                    "{} frontend(s), {} request(s), {} service(s), {} connected bridge(s)",
+                    daemon.frontends,
+                    daemon.requests,
+                    daemon.services,
+                    daemon.connected_bridges()
                 )),
-                Line::from(""),
-                Line::from("Remote output continues to be drained while this menu is open."),
             ];
+            if let Some(request) = daemon.pending_request() {
+                body_text.push(Line::from(""));
+                body_text.push(Line::from(Span::styled(
+                    "Remote request awaiting approval",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                if let Some(service_request) = &request.request {
+                    match &service_request.kind {
+                        ServiceRequestKind::LocalPortForward {
+                            remote_host,
+                            remote_port,
+                            local_port,
+                        } => {
+                            body_text.push(Line::from(format!(
+                                "local port {} → {}:{} in the Beam",
+                                local_port
+                                    .map(|port| port.to_string())
+                                    .unwrap_or_else(|| "automatic".to_string()),
+                                remote_host,
+                                remote_port
+                            )));
+                        }
+                    }
+                } else {
+                    body_text.push(Line::from(format!("service: {}", request.kind)));
+                }
+                body_text.push(Line::from("Press y to approve or n to reject."));
+            }
+            body_text.push(Line::from(""));
+            body_text.push(Line::from(
+                "Remote output continues to be drained while this menu is open.",
+            ));
             frame.render_widget(
                 Paragraph::new(body_text)
                     .alignment(Alignment::Center)
@@ -820,8 +993,13 @@ fn draw_palette(
                 }
                 EscapeKey::Disabled => String::new(),
             };
+            let decision_keys = if daemon.pending_request().is_some() {
+                "y: approve  •  n: reject  •  "
+            } else {
+                ""
+            };
             frame.render_widget(
-                Paragraph::new(format!("{literal}q / Esc / Enter: close"))
+                Paragraph::new(format!("{decision_keys}{literal}q / Esc / Enter: close"))
                     .alignment(Alignment::Center)
                     .block(Block::default().borders(Borders::ALL)),
                 footer,
@@ -872,6 +1050,16 @@ mod tests {
             vec![InputAction::ClosePalette, InputAction::Remote(vec![0x1d])]
         );
         assert_eq!(mode, InputMode::Passthrough);
+    }
+
+    #[test]
+    fn palette_routes_local_approval_keys_without_sending_them_remotely() {
+        let mut mode = InputMode::Palette;
+        assert_eq!(
+            route_input(&mut mode, EscapeKey::default(), b"yn"),
+            vec![InputAction::ApprovePending, InputAction::RejectPending]
+        );
+        assert_eq!(mode, InputMode::Palette);
     }
 
     #[test]

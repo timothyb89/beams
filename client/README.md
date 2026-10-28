@@ -42,7 +42,9 @@ beams ssh [--repo ~/beams] [--purpose default] [--region REGION] [--login beams]
    binary has to be copied over either way - see `../bootstrap/README.md`.
    `stage.rs` looks for a cross-compiled build first and falls back to a
    native one, refusing to ship anything that isn't a Linux ELF binary.)
-5. Connects with `tsh ssh -t <login>@<uuid> -- ~/beams/bin/beam-shell` -
+5. Registers a random managed-session token with the local daemon's
+   per-Beam bridge, then connects with `tsh ssh -t <login>@<uuid> -- env
+   BEAMS_CLIENT_ID=... BEAMS_SESSION_TOKEN=... ~/beams/bin/beam-shell` -
    bypassing the `tsh beams ssh` layer (which can't take a remote command)
    in favor of plain `tsh ssh`, per project.md. Unlike the original direct
    `exec` handoff, `beams` now supervises `tsh` under a local PTY: terminal
@@ -68,9 +70,11 @@ beams ssh --escape-key 0x1d
 beams ssh --escape-key none   # pure passthrough; local menu disabled
 ```
 
-The first implementation's menu only shows connection status. It is the PTY/UI
-foundation for the client-owned folder-sync, port-forward, copy, and approval
-controls in `../CLIENT_SERVICES_DESIGN.md`.
+The menu shows connection/bridge state and typed remote requests. A pending
+port-forward proposal displays its requested local port (or automatic
+selection) and Beam endpoint; `y` approves and `n` rejects it. Phase 3 only
+round-trips that decision—approval does not create a listener until the Phase
+4 forwarding implementation lands.
 
 The client does not nest another terminal alternate screen over remote zellij
 (alternate-screen state is not stackable). It drains up to 1 MiB of remote
@@ -83,9 +87,10 @@ termination signals.
 
 `beams ssh` connects to a per-user workstation daemon and starts one in the
 background if no instance is listening. The foreground SSH process still owns
-the interactive PTY; the daemon is the durable owner for the syncs, forwards,
-copies, and Beam bridges added by the later phases in
-`../CLIENT_SERVICES_DESIGN.md`.
+the interactive PTY. The daemon owns one reconnecting
+`tsh ssh ... ~/beams/bin/beam-client-bridge` process per Beam, shares it across
+local frontends, and retains all managed-shell tokens when that bridge
+reconnects.
 
 Run it explicitly in the foreground for debugging:
 
@@ -108,8 +113,30 @@ plus the request/service registry. Auto-start diagnostics go to
 The local protocol is typed, versioned newline-delimited JSON. It requires a
 frontend handshake, limits frames to 64 KiB, bounds event queues, rate-limits
 each connection, and times out incomplete handshakes. Frontends receive an
-initial snapshot and subsequent daemon-status broadcasts; the local SSH menu
-already shows the connected client ID and registry counts.
+initial snapshot and subsequent daemon, bridge, and request broadcasts. If the
+local daemon restarts while an interactive session remains open, that frontend
+reconnects, re-registers its Beam/token pair, and keeps the remote shell
+running. Pending approvals orphaned by a daemon restart become `expired`
+rather than being silently revived.
+
+The cross-SSH bridge uses the shared typed protocol in `../protocol/`.
+`beamsd` generates a fresh `bridge_id` for each reconnect, sends its
+authoritative request/service snapshots, and only then marks the bridge ready.
+That synchronization barrier prevents a just-submitted request from being
+overwritten by a late restart snapshot. A Beam can submit proposals and
+observe decisions, but the bridge protocol has no VM-to-client approval
+message.
+
+Inside a managed Beam shell:
+
+```sh
+beam-bootstrap client list
+beam-bootstrap client request port-forward --remote-port 8080
+```
+
+A direct SSH shell has no managed token and receives an actionable error. A
+stale token is also rejected rather than falling back to another workstation.
+The request expires after 60 seconds if no local frontend decides it.
 
 ## State
 
@@ -133,9 +160,18 @@ Tests:
 ```sh
 cargo test
 ./tests/managed-session-smoke.sh
+./tests/client-bridge-smoke.sh
 ```
 
-The smoke test is Unix-specific (`script(1)` + a fake `tsh` fixture) and
+The managed-session smoke test is Unix-specific (`script(1)` + a fake `tsh`
+fixture) and
 exercises the compiled client inside a real controlling terminal: local menu
 rendering, raw input around the prefix, PTY size propagation, deferred remote
 output, and child exit-code propagation.
+
+The client-bridge smoke test runs both real daemons and the real
+`beam-bootstrap client-bridge`, with only the outer SSH executable replaced by
+a local fixture. It covers two independent workstation clients attached to
+one Beam, exact token routing, rejection, snapshot synchronization, and both
+VM- and workstation-daemon restarts. It needs permission to create temporary
+Unix sockets.

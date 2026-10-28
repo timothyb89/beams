@@ -560,7 +560,7 @@ bootstrap `Task`s.
   transitions, state durability/permissions, socket ownership, rate limiting,
   and a real `UnixStream` handshake; the controlling-terminal smoke test also
   runs a real temporary daemon and verifies its client ID is rendered.
-- [ ] Phase 3: add `beam-bootstrap client-bridge`, VM-daemon client/service
+- [x] Phase 3: add `beam-bootstrap client-bridge`, VM-daemon client/service
   projection, managed-session routing tokens, bridge reconnect/snapshots, and
   remote CLI requests. Direct or stale unmanaged sessions must fail clearly.
   - [x] Shared `protocol/` crate plus the VM half: typed, versioned bridge
@@ -570,9 +570,15 @@ bootstrap `Task`s.
     `client request port-forward`. Tests cover stable serialization,
     one-of-many routing, rejection transitions, and direct/stale-session
     errors. The request deliberately creates no forward yet.
-  - [ ] Workstation half: supervise one reconnecting bridge per Beam, register
+  - [x] Workstation half: supervise one reconnecting bridge per Beam, register
     each managed shell token, show/decide pending requests locally, expire
     unanswered requests, and resend snapshots after either daemon restarts.
+    A bridge stays unroutable until its restart snapshots have crossed an
+    explicit `ready` barrier. `client-bridge-smoke.sh` covers two client
+    daemons, exact-token routing and rejection, plus VM/local daemon restarts;
+    the same request/rejection path was also exercised through real `tsh ssh`
+    against disposable Beam `outer-aura`, which was removed immediately
+    afterward. Phase 4 will turn approval into a real loopback listener.
 - [ ] Phase 4: implement loopback-only local port forwards as the first full
   client- and remote-initiated service, including approval, status,
   stop/restart, ownership, and `Tasks | Services | Requests` in the remote TUI.

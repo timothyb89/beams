@@ -1,3 +1,4 @@
+mod bridge;
 mod clientd;
 mod stage;
 mod state;
@@ -10,6 +11,7 @@ use std::process::ExitCode;
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
 use clap::{Parser, Subcommand};
+use uuid::Uuid;
 
 const MIN_TTL_HOURS: i64 = 12;
 const MAX_CONCURRENT_BEAMS: usize = 5;
@@ -167,14 +169,50 @@ fn ssh(
     };
 
     eprintln!("beams: connecting to {} ({})...", beam.id, beam.uuid);
-    let local_daemon = if no_client_daemon {
-        session::LocalDaemon::unavailable("disabled by --no-client-daemon")
+    let (local_daemon, remote_command) = if no_client_daemon {
+        (
+            session::LocalDaemon::unavailable("disabled by --no-client-daemon"),
+            "~/beams/bin/beam-shell".to_string(),
+        )
     } else {
         match clientd::connect_or_start() {
-            Ok(frontend) => session::LocalDaemon::connected(frontend),
+            Ok(mut frontend) => {
+                let session_token = Uuid::new_v4().to_string();
+                let target = bridge::Target {
+                    beam_id: beam.id.clone(),
+                    beam_uuid: beam.uuid.clone(),
+                    login: login.to_string(),
+                };
+                match frontend.ensure_bridge(&target, &session_token) {
+                    Ok(()) => {
+                        let command = format!(
+                            "env BEAMS_CLIENT_ID={} BEAMS_SESSION_TOKEN={} ~/beams/bin/beam-shell",
+                            frontend.client_id, session_token
+                        );
+                        (
+                            session::LocalDaemon::connected(
+                                frontend,
+                                target,
+                                session_token,
+                            ),
+                            command,
+                        )
+                    }
+                    Err(err) => {
+                        eprintln!("beams: could not register managed session: {err:#}");
+                        (
+                            session::LocalDaemon::unavailable(err.to_string()),
+                            "~/beams/bin/beam-shell".to_string(),
+                        )
+                    }
+                }
+            }
             Err(err) => {
                 eprintln!("beams: local service daemon unavailable: {err:#}");
-                session::LocalDaemon::unavailable(err.to_string())
+                (
+                    session::LocalDaemon::unavailable(err.to_string()),
+                    "~/beams/bin/beam-shell".to_string(),
+                )
             }
         }
     };
@@ -182,7 +220,7 @@ fn ssh(
         login,
         &beam.id,
         &beam.uuid,
-        &["~/beams/bin/beam-shell".to_string()],
+        &[remote_command],
         escape_key,
         local_daemon,
     )

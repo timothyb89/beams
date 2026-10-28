@@ -71,8 +71,8 @@ use std::thread;
 
 use anyhow::Context;
 use beams_protocol::{
-    BeamToClient, ClientToBeam, RequestStatus, ServiceProjection, ServiceRequest, ServiceRequestKind, PROTOCOL,
-    PROTOCOL_VERSION,
+    BeamToClient, ClientToBeam, RequestProjection, RequestStatus, ServiceProjection, ServiceRequest,
+    ServiceRequestKind, PROTOCOL, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -117,6 +117,7 @@ struct BridgeRegistration {
     client_id: String,
     bridge_id: String,
     session_tokens: HashSet<String>,
+    ready: bool,
     sender: Sender<String>,
 }
 
@@ -183,7 +184,7 @@ impl Hub {
                 "type": "client_status",
                 "client_id": client_id,
                 "bridge_id": bridge_id,
-                "status": "connected",
+                "status": "synchronizing",
             })
             .to_string(),
         );
@@ -367,6 +368,7 @@ fn register_client_bridge(
         client_id,
         bridge_id: bridge_id.clone(),
         session_tokens: session_tokens.into_iter().filter(|token| !token.is_empty()).collect(),
+        ready: false,
         sender: reply.clone(),
     };
     if let Err(err) = hub.register_bridge(registration) {
@@ -456,6 +458,51 @@ fn client_bridge_message(
             hub.broadcast(&json!({"type": "service_request_status", "request": projection}).to_string());
             let _ = reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
         }
+        ClientToBeam::RequestSnapshot { requests } => {
+            let client_id = {
+                let bridges = hub.bridges.lock().unwrap();
+                match bridges.get(bridge_id) {
+                    Some(bridge) => bridge.client_id.clone(),
+                    None => {
+                        let _ = reply.send(error_reply(request_id, "bridge is no longer registered"));
+                        return;
+                    }
+                }
+            };
+            {
+                let mut current = hub.client_requests.lock().unwrap();
+                current.retain(|_, request| request.owner_client_id != client_id);
+                for RequestProjection { request, status, message } in requests {
+                    current.insert(
+                        request.request_id.clone(),
+                        ClientRequestProjection {
+                            request,
+                            owner_client_id: client_id.clone(),
+                            bridge_id: bridge_id.to_string(),
+                            status,
+                            message,
+                        },
+                    );
+                }
+            }
+            let requests = hub
+                .client_requests
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|request| request.owner_client_id == client_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            hub.broadcast(
+                &json!({
+                    "type": "client_requests_snapshot",
+                    "client_id": client_id,
+                    "requests": requests,
+                })
+                .to_string(),
+            );
+            let _ = reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
+        }
         ClientToBeam::ServiceSnapshot { services } => {
             let client_id = {
                 let bridges = hub.bridges.lock().unwrap();
@@ -477,11 +524,40 @@ fn client_bridge_message(
                     );
                 }
             }
+            let services = hub
+                .client_services
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|service| service.owner_client_id == client_id)
+                .cloned()
+                .collect::<Vec<_>>();
             hub.broadcast(
                 &json!({
                     "type": "client_services_snapshot",
                     "client_id": client_id,
-                    "services": hub.client_services.lock().unwrap().values().cloned().collect::<Vec<_>>(),
+                    "services": services,
+                })
+                .to_string(),
+            );
+            let _ = reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
+        }
+        ClientToBeam::Ready => {
+            let (client_id, bridge_id) = {
+                let mut bridges = hub.bridges.lock().unwrap();
+                let Some(bridge) = bridges.get_mut(bridge_id) else {
+                    let _ = reply.send(error_reply(request_id, "bridge is no longer registered"));
+                    return;
+                };
+                bridge.ready = true;
+                (bridge.client_id.clone(), bridge.bridge_id.clone())
+            };
+            hub.broadcast(
+                &json!({
+                    "type": "client_status",
+                    "client_id": client_id,
+                    "bridge_id": bridge_id,
+                    "status": "connected",
                 })
                 .to_string(),
             );
@@ -504,7 +580,7 @@ fn list_clients(hub: &Hub, request_id: Option<&str>, reply: &Sender<String>) {
                 "client_id": bridge.client_id,
                 "bridge_id": bridge.bridge_id,
                 "session_count": bridge.session_tokens.len(),
-                "status": "connected",
+                "status": if bridge.ready { "connected" } else { "synchronizing" },
             })
         })
         .collect();
@@ -549,14 +625,14 @@ fn request_service(hub: &Hub, request_id: Option<&str>, request: &Value, reply: 
         .lock()
         .unwrap()
         .values()
-        .filter(|bridge| bridge.session_tokens.contains(session_token))
+        .filter(|bridge| bridge.ready && bridge.session_tokens.contains(session_token))
         .cloned()
         .collect();
     let bridge = match matching.as_slice() {
         [bridge] => bridge.clone(),
         [] => {
             let client_connected = client_hint.is_some_and(|client_id| {
-                hub.bridges.lock().unwrap().values().any(|bridge| bridge.client_id == client_id)
+                hub.bridges.lock().unwrap().values().any(|bridge| bridge.ready && bridge.client_id == client_id)
             });
             let message = if client_connected {
                 format!(
@@ -871,6 +947,17 @@ mod tests {
         );
         let registered = recv_type(&mut reader, "bridge_registered");
         assert_eq!(registered["request_id"], "register");
+        send(
+            &mut stream,
+            &json!({
+                "request_id": "ready",
+                "op": "client_bridge_message",
+                "message": ClientToBeam::Ready,
+            })
+            .to_string(),
+        );
+        let ready = recv_type(&mut reader, "bridge_message_accepted");
+        assert_eq!(ready["request_id"], "ready");
         (stream, reader, handle)
     }
 
@@ -1184,6 +1271,64 @@ mod tests {
                 Err(err) => panic!("reading non-target bridge: {err}"),
             }
         }
+    }
+
+    #[test]
+    fn bridge_is_not_routable_until_authoritative_snapshots_are_ready() {
+        let hub = Arc::new(Hub::default());
+        let (mut bridge, mut bridge_reader, _bridge_handle) = connect_to(Arc::clone(&hub));
+        send(
+            &mut bridge,
+            &json!({
+                "request_id": "register",
+                "op": "register_client_bridge",
+                "message": ClientToBeam::hello(
+                    "client-a",
+                    "bridge-a",
+                    vec!["token-a".to_string()],
+                ),
+            })
+            .to_string(),
+        );
+        let _ = recv_type(&mut bridge_reader, "bridge_registered");
+
+        let (mut requester, mut requester_reader, _requester_handle) = connect_to(Arc::clone(&hub));
+        let request = |id: &str| {
+            json!({
+                "request_id": id,
+                "op": "request_service",
+                "session_token": "token-a",
+                "client_id": "client-a",
+                "request": {
+                    "request_id": format!("service-{id}"),
+                    "kind": {
+                        "kind": "local_port_forward",
+                        "remote_host": "127.0.0.1",
+                        "remote_port": 8080
+                    }
+                },
+            })
+        };
+        send(&mut requester, &request("before-ready").to_string());
+        let error = recv_type(&mut requester_reader, "error");
+        assert!(error["message"].as_str().unwrap().contains("no managed Beams client"));
+
+        send(
+            &mut bridge,
+            &json!({
+                "request_id": "ready",
+                "op": "client_bridge_message",
+                "message": ClientToBeam::Ready,
+            })
+            .to_string(),
+        );
+        let _ = recv_type(&mut bridge_reader, "bridge_message_accepted");
+
+        send(&mut requester, &request("after-ready").to_string());
+        let event = recv_type(&mut bridge_reader, "client_bridge_event");
+        assert_eq!(event["message"]["request"]["request_id"], "service-after-ready");
+        let accepted = recv_type(&mut requester_reader, "service_request_accepted");
+        assert_eq!(accepted["client_id"], "client-a");
     }
 
     #[test]

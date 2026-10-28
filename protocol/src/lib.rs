@@ -122,6 +122,14 @@ pub struct ServiceProjection {
     pub message: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct RequestProjection {
+    pub request: ServiceRequest,
+    pub status: RequestStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 /// Messages emitted by the authoritative workstation daemon.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -142,9 +150,13 @@ pub enum ClientToBeam {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    RequestSnapshot {
+        requests: Vec<RequestProjection>,
+    },
     ServiceSnapshot {
         services: Vec<ServiceProjection>,
     },
+    Ready,
     Ping {
         nonce: String,
     },

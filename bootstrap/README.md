@@ -271,6 +271,10 @@ The token selects exactly one registered client bridge; it is a routing aid,
 not the approval boundary. The workstation user's local daemon remains the
 only component allowed to approve a request.
 
+After a bridge reconnects, it remains `synchronizing` and cannot receive
+requests until the workstation has replayed its authoritative request/service
+snapshots and sent the explicit `ready` barrier.
+
 ### `task` - the daemon-backed CLI
 
 Hand-rolling JSON above is still the lowest-level way to talk to the

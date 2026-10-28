@@ -274,10 +274,11 @@ fn client_list(socket: Option<String>) -> i32 {
             } else {
                 for client in clients {
                     println!(
-                        "{} bridge={} sessions={}",
+                        "{} bridge={} sessions={} status={}",
                         client.get("client_id").and_then(Value::as_str).unwrap_or("?"),
                         client.get("bridge_id").and_then(Value::as_str).unwrap_or("?"),
                         client.get("session_count").and_then(Value::as_u64).unwrap_or(0),
+                        client.get("status").and_then(Value::as_str).unwrap_or("?"),
                     );
                 }
             }

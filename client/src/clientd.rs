@@ -1,9 +1,9 @@
 //! Workstation-side daemon and its local frontend protocol.
 //!
-//! This is intentionally service-neutral for now. It establishes the pieces
-//! every later port-forward/sync/copy implementation needs: one authoritative
-//! per-user process, a permissioned UDS, a persistent client identity,
-//! versioned typed messages, subscriptions, and durable request/service state.
+//! It owns the authority boundary for client services: one process per user,
+//! a permissioned UDS, persistent client identity/request state, reconnecting
+//! per-Beam control bridges, and local-only approval decisions. Phase 3 routes
+//! port-forward proposals; Phase 4 will create the actual forwarding process.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -15,94 +15,26 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
+use beams_protocol::{
+    BeamToClient, ClientToBeam, RequestProjection, RequestStatus, ServiceProjection,
+    ServiceRequest, ServiceStatus, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-const PROTOCOL: &str = "beams-client-services";
-const PROTOCOL_VERSION: u32 = 1;
-const MAX_FRAME_BYTES: usize = 64 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(3);
 const START_RETRY: Duration = Duration::from_millis(50);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const EVENT_QUEUE_CAPACITY: usize = 256;
+const BRIDGE_EVENT_QUEUE_CAPACITY: usize = 256;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_MESSAGES_PER_WINDOW: usize = 120;
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RequestStatus {
-    PendingApproval,
-    Approved,
-    Rejected,
-    Expired,
-    Starting,
-    Running,
-    Failed,
-}
-
-impl RequestStatus {
-    #[allow(dead_code)] // exercised now by tests; mutations arrive with Phase 3
-    pub fn transition(self, next: Self) -> Result<Self, String> {
-        let valid = matches!(
-            (self, next),
-            (
-                Self::PendingApproval,
-                Self::Approved | Self::Rejected | Self::Expired
-            ) | (Self::Approved, Self::Starting | Self::Failed)
-                | (Self::Starting, Self::Running | Self::Failed)
-        );
-        if valid {
-            Ok(next)
-        } else {
-            Err(format!("invalid request transition {self:?} -> {next:?}"))
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceStatus {
-    Starting,
-    Running,
-    Stopping,
-    Stopped,
-    Degraded,
-    Unknown,
-    Error,
-}
-
-impl ServiceStatus {
-    #[allow(dead_code)] // exercised now by tests; mutations arrive with Phase 4
-    pub fn transition(self, next: Self) -> Result<Self, String> {
-        let valid = matches!(
-            (self, next),
-            (Self::Starting, Self::Running | Self::Stopped | Self::Error)
-                | (
-                    Self::Running,
-                    Self::Stopping | Self::Degraded | Self::Unknown | Self::Error
-                )
-                | (
-                    Self::Degraded,
-                    Self::Running | Self::Stopping | Self::Unknown | Self::Error
-                )
-                | (
-                    Self::Unknown,
-                    Self::Running | Self::Stopping | Self::Stopped | Self::Error
-                )
-                | (Self::Stopping, Self::Stopped | Self::Error)
-        );
-        if valid {
-            Ok(next)
-        } else {
-            Err(format!("invalid service transition {self:?} -> {next:?}"))
-        }
-    }
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RequestRecord {
@@ -110,6 +42,10 @@ pub struct RequestRecord {
     pub beam_uuid: String,
     pub kind: String,
     pub status: RequestStatus,
+    #[serde(default)]
+    pub request: Option<ServiceRequest>,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -118,6 +54,19 @@ pub struct ServiceRecord {
     pub beam_uuid: String,
     pub kind: String,
     pub status: ServiceStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BridgeRecord {
+    pub beam_id: String,
+    pub beam_uuid: String,
+    pub login: String,
+    pub status: String,
+    pub session_count: usize,
+    #[serde(default)]
+    pub bridge_id: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -130,6 +79,16 @@ enum ClientMessage {
     },
     Snapshot,
     Ping,
+    EnsureBridge {
+        beam_id: String,
+        beam_uuid: String,
+        login: String,
+        session_token: String,
+    },
+    DecideRequest {
+        request_id: String,
+        approve: bool,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -145,9 +104,16 @@ pub enum ServerEvent {
         frontends: usize,
         requests: Vec<RequestRecord>,
         services: Vec<ServiceRecord>,
+        bridges: Vec<BridgeRecord>,
     },
     DaemonStatus {
         frontends: usize,
+    },
+    RequestChanged {
+        request: RequestRecord,
+    },
+    BridgeStatus {
+        bridge: BridgeRecord,
     },
     Pong,
     Error {
@@ -223,20 +189,46 @@ impl PersistedState {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("setting permissions on {}", path.display()))
     }
+
+    fn expire_pending_after_restart(&mut self) -> bool {
+        let mut changed = false;
+        for request in self.requests.values_mut() {
+            if request.status == RequestStatus::PendingApproval {
+                request.status = RequestStatus::Expired;
+                request.message = Some("local Beams daemon restarted before approval".to_string());
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 struct Hub {
     state: Mutex<PersistedState>,
+    state_path: Option<PathBuf>,
     subscribers: Mutex<Vec<SyncSender<ServerEvent>>>,
     frontends: AtomicUsize,
+    bridges: Mutex<BTreeMap<String, BridgeRuntime>>,
+}
+
+struct BridgeRuntime {
+    record: BridgeRecord,
+    commands: SyncSender<ClientToBeam>,
 }
 
 impl Hub {
+    #[cfg(test)]
     fn new(state: PersistedState) -> Self {
+        Self::with_state_path(state, None)
+    }
+
+    fn with_state_path(state: PersistedState, state_path: Option<PathBuf>) -> Self {
         Self {
             state: Mutex::new(state),
+            state_path,
             subscribers: Mutex::new(Vec::new()),
             frontends: AtomicUsize::new(0),
+            bridges: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -270,7 +262,277 @@ impl Hub {
             frontends: self.frontends.load(Ordering::SeqCst),
             requests: state.requests.values().cloned().collect(),
             services: state.services.values().cloned().collect(),
+            bridges: self
+                .bridges
+                .lock()
+                .unwrap()
+                .values()
+                .map(|bridge| bridge.record.clone())
+                .collect(),
         }
+    }
+
+    fn save_state(&self) -> anyhow::Result<()> {
+        if let Some(path) = &self.state_path {
+            self.state.lock().unwrap().save(path)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_bridge(
+        self: &Arc<Self>,
+        target: crate::bridge::Target,
+        session_token: String,
+    ) -> anyhow::Result<()> {
+        if target.beam_uuid.is_empty() || target.login.is_empty() || session_token.is_empty() {
+            bail!("beam UUID, login, and managed-session token must not be empty");
+        }
+
+        let mut bridges = self.bridges.lock().unwrap();
+        if let Some(existing) = bridges.get_mut(&target.beam_uuid) {
+            if existing.record.login != target.login {
+                bail!(
+                    "Beam {} already has a bridge for login {:?}, not {:?}",
+                    target.beam_uuid,
+                    existing.record.login,
+                    target.login
+                );
+            }
+            existing
+                .commands
+                .try_send(ClientToBeam::AddSessionToken { session_token })
+                .map_err(|err| anyhow::anyhow!("adding managed session to bridge: {err}"))?;
+            existing.record.session_count += 1;
+            let record = existing.record.clone();
+            drop(bridges);
+            self.broadcast(ServerEvent::BridgeStatus { bridge: record });
+            return Ok(());
+        }
+
+        let client_id = self.state.lock().unwrap().client_id.clone();
+        let (event_tx, event_rx) = mpsc::sync_channel(BRIDGE_EVENT_QUEUE_CAPACITY);
+        let commands = crate::bridge::spawn(target.clone(), client_id, session_token, event_tx);
+        let record = BridgeRecord {
+            beam_id: target.beam_id,
+            beam_uuid: target.beam_uuid.clone(),
+            login: target.login,
+            status: "connecting".to_string(),
+            session_count: 1,
+            bridge_id: None,
+            message: None,
+        };
+        bridges.insert(
+            target.beam_uuid,
+            BridgeRuntime {
+                record: record.clone(),
+                commands,
+            },
+        );
+        drop(bridges);
+        self.broadcast(ServerEvent::BridgeStatus { bridge: record });
+
+        let weak = Arc::downgrade(self);
+        thread::spawn(move || handle_bridge_events(weak, event_rx));
+        Ok(())
+    }
+
+    fn decide_request(&self, request_id: &str, approve: bool) -> anyhow::Result<RequestRecord> {
+        let next = if approve {
+            RequestStatus::Approved
+        } else {
+            RequestStatus::Rejected
+        };
+        let beam_uuid = self
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .get(request_id)
+            .map(|request| request.beam_uuid.clone())
+            .with_context(|| format!("unknown request {request_id:?}"))?;
+        let commands = self
+            .bridges
+            .lock()
+            .unwrap()
+            .get(&beam_uuid)
+            .map(|bridge| bridge.commands.clone())
+            .with_context(|| format!("no live bridge for Beam {beam_uuid}"))?;
+        let updated = {
+            let mut state = self.state.lock().unwrap();
+            let request = state
+                .requests
+                .get_mut(request_id)
+                .with_context(|| format!("unknown request {request_id:?}"))?;
+            request.status = request
+                .status
+                .transition(next)
+                .map_err(anyhow::Error::msg)?;
+            request.message = Some(if approve {
+                "approved by local user".to_string()
+            } else {
+                "rejected by local user".to_string()
+            });
+            let updated = request.clone();
+            if let Err(err) = commands.try_send(ClientToBeam::RequestStatus {
+                request_id: request_id.to_string(),
+                status: updated.status,
+                message: updated.message.clone(),
+            }) {
+                request.status = RequestStatus::PendingApproval;
+                request.message = None;
+                return Err(anyhow::anyhow!("sending request decision to bridge: {err}"));
+            }
+            updated
+        };
+        self.save_state()?;
+        self.broadcast(ServerEvent::RequestChanged {
+            request: updated.clone(),
+        });
+        Ok(updated)
+    }
+
+    fn expire_request(&self, request_id: &str) {
+        let updated = {
+            let mut state = self.state.lock().unwrap();
+            let Some(request) = state.requests.get_mut(request_id) else {
+                return;
+            };
+            if request.status != RequestStatus::PendingApproval {
+                return;
+            }
+            request.status = RequestStatus::Expired;
+            request.message = Some("local approval timed out".to_string());
+            request.clone()
+        };
+        if let Some(commands) = self
+            .bridges
+            .lock()
+            .unwrap()
+            .get(&updated.beam_uuid)
+            .map(|bridge| bridge.commands.clone())
+        {
+            let _ = commands.try_send(ClientToBeam::RequestStatus {
+                request_id: updated.request_id.clone(),
+                status: updated.status,
+                message: updated.message.clone(),
+            });
+        }
+        let _ = self.save_state();
+        self.broadcast(ServerEvent::RequestChanged { request: updated });
+    }
+}
+
+fn handle_bridge_events(hub: Weak<Hub>, events: Receiver<crate::bridge::Event>) {
+    while let Ok(event) = events.recv() {
+        let Some(hub) = hub.upgrade() else {
+            return;
+        };
+        handle_bridge_event(&hub, event);
+    }
+}
+
+fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
+    match event {
+        crate::bridge::Event::Connected {
+            beam_uuid,
+            bridge_id,
+        } => {
+            let (record, commands) = {
+                let mut bridges = hub.bridges.lock().unwrap();
+                let Some(bridge) = bridges.get_mut(&beam_uuid) else {
+                    return;
+                };
+                bridge.record.status = "connected".to_string();
+                bridge.record.bridge_id = Some(bridge_id);
+                bridge.record.message = None;
+                (bridge.record.clone(), bridge.commands.clone())
+            };
+            let requests = hub
+                .state
+                .lock()
+                .unwrap()
+                .requests
+                .values()
+                .filter(|request| request.beam_uuid == beam_uuid)
+                .filter_map(|request| {
+                    request
+                        .request
+                        .clone()
+                        .map(|service_request| RequestProjection {
+                            request: service_request,
+                            status: request.status,
+                            message: request.message.clone(),
+                        })
+                })
+                .collect();
+            let services: Vec<ServiceProjection> = Vec::new();
+            let _ = commands.send(ClientToBeam::RequestSnapshot { requests });
+            let _ = commands.send(ClientToBeam::ServiceSnapshot { services });
+            let _ = commands.send(ClientToBeam::Ready);
+            hub.broadcast(ServerEvent::BridgeStatus { bridge: record });
+        }
+        crate::bridge::Event::Disconnected { beam_uuid, message } => {
+            let record = {
+                let mut bridges = hub.bridges.lock().unwrap();
+                let Some(bridge) = bridges.get_mut(&beam_uuid) else {
+                    return;
+                };
+                bridge.record.status = "reconnecting".to_string();
+                bridge.record.bridge_id = None;
+                bridge.record.message = Some(message);
+                bridge.record.clone()
+            };
+            hub.broadcast(ServerEvent::BridgeStatus { bridge: record });
+        }
+        crate::bridge::Event::Message { beam_uuid, message } => match message {
+            BeamToClient::RequestSubmitted { request } => {
+                let record = RequestRecord {
+                    request_id: request.request_id.clone(),
+                    beam_uuid: beam_uuid.clone(),
+                    kind: request.kind.label().to_string(),
+                    status: RequestStatus::PendingApproval,
+                    request: Some(request),
+                    message: None,
+                };
+                let inserted = {
+                    let mut state = hub.state.lock().unwrap();
+                    if state.requests.contains_key(&record.request_id) {
+                        false
+                    } else {
+                        state
+                            .requests
+                            .insert(record.request_id.clone(), record.clone());
+                        true
+                    }
+                };
+                if inserted {
+                    let _ = hub.save_state();
+                    hub.broadcast(ServerEvent::RequestChanged {
+                        request: record.clone(),
+                    });
+                    let request_id = record.request_id;
+                    let weak = Arc::downgrade(hub);
+                    thread::spawn(move || {
+                        thread::sleep(REQUEST_TIMEOUT);
+                        if let Some(hub) = weak.upgrade() {
+                            hub.expire_request(&request_id);
+                        }
+                    });
+                }
+            }
+            BeamToClient::Error { message } => {
+                let record = {
+                    let mut bridges = hub.bridges.lock().unwrap();
+                    let Some(bridge) = bridges.get_mut(&beam_uuid) else {
+                        return;
+                    };
+                    bridge.record.message = Some(message);
+                    bridge.record.clone()
+                };
+                hub.broadcast(ServerEvent::BridgeStatus { bridge: record });
+            }
+            BeamToClient::Pong { .. } | BeamToClient::Hello { .. } => {}
+        },
     }
 }
 
@@ -342,6 +604,34 @@ impl Frontend {
         write_json(&mut self.write_half, &ClientMessage::Snapshot)
             .context("requesting daemon snapshot")
     }
+
+    pub fn ensure_bridge(
+        &mut self,
+        target: &crate::bridge::Target,
+        session_token: &str,
+    ) -> anyhow::Result<()> {
+        write_json(
+            &mut self.write_half,
+            &ClientMessage::EnsureBridge {
+                beam_id: target.beam_id.clone(),
+                beam_uuid: target.beam_uuid.clone(),
+                login: target.login.clone(),
+                session_token: session_token.to_string(),
+            },
+        )
+        .context("requesting Beam bridge")
+    }
+
+    pub fn decide_request(&mut self, request_id: &str, approve: bool) -> anyhow::Result<()> {
+        write_json(
+            &mut self.write_half,
+            &ClientMessage::DecideRequest {
+                request_id: request_id.to_string(),
+                approve,
+            },
+        )
+        .context("sending request decision")
+    }
 }
 
 /// Connects to the local daemon, starting it in the background if needed.
@@ -405,9 +695,12 @@ fn spawn_daemon(socket_path: &Path) -> anyhow::Result<()> {
 pub fn serve(socket_path: Option<PathBuf>) -> anyhow::Result<()> {
     let socket_path = socket_path.unwrap_or(default_socket_path()?);
     let state_path = default_state_path()?;
-    let state = PersistedState::load_or_create(&state_path)?;
+    let mut state = PersistedState::load_or_create(&state_path)?;
+    if state.expire_pending_after_restart() {
+        state.save(&state_path)?;
+    }
     let listener = bind_socket(&socket_path)?;
-    let hub = Arc::new(Hub::new(state));
+    let hub = Arc::new(Hub::with_state_path(state, Some(state_path)));
 
     for stream in listener.incoming() {
         let stream = stream.context("accepting local daemon connection")?;
@@ -520,6 +813,33 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                     }
                     ClientMessage::Ping => {
                         let _ = tx.try_send(ServerEvent::Pong);
+                    }
+                    ClientMessage::EnsureBridge {
+                        beam_id,
+                        beam_uuid,
+                        login,
+                        session_token,
+                    } => {
+                        let target = crate::bridge::Target {
+                            beam_id,
+                            beam_uuid,
+                            login,
+                        };
+                        if let Err(err) = hub.ensure_bridge(target, session_token) {
+                            let _ = tx.try_send(ServerEvent::Error {
+                                message: format!("starting Beam bridge: {err:#}"),
+                            });
+                        }
+                    }
+                    ClientMessage::DecideRequest {
+                        request_id,
+                        approve,
+                    } => {
+                        if let Err(err) = hub.decide_request(&request_id, approve) {
+                            let _ = tx.try_send(ServerEvent::Error {
+                                message: format!("deciding request: {err:#}"),
+                            });
+                        }
                     }
                     ClientMessage::Hello { .. } => {
                         let _ = tx.try_send(ServerEvent::Error {
@@ -643,6 +963,27 @@ mod tests {
         std::env::temp_dir().join(format!("{name}-{}-{}", std::process::id(), Uuid::new_v4()))
     }
 
+    fn hub_with_bridge(beam_uuid: &str) -> (Arc<Hub>, Receiver<ClientToBeam>) {
+        let hub = Arc::new(Hub::new(PersistedState::default()));
+        let (commands, command_rx) = mpsc::sync_channel(16);
+        hub.bridges.lock().unwrap().insert(
+            beam_uuid.to_string(),
+            BridgeRuntime {
+                record: BridgeRecord {
+                    beam_id: "beam-name".to_string(),
+                    beam_uuid: beam_uuid.to_string(),
+                    login: "beams".to_string(),
+                    status: "connected".to_string(),
+                    session_count: 1,
+                    bridge_id: Some("bridge-id".to_string()),
+                    message: None,
+                },
+                commands,
+            },
+        );
+        (hub, command_rx)
+    }
+
     #[test]
     fn request_transitions_are_explicit() {
         assert_eq!(
@@ -701,6 +1042,25 @@ mod tests {
             "atomic temp file should have been renamed away"
         );
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn daemon_restart_expires_orphaned_pending_approvals() {
+        let mut state = PersistedState::default();
+        state.requests.insert(
+            "pending".to_string(),
+            RequestRecord {
+                request_id: "pending".to_string(),
+                beam_uuid: "beam-uuid".to_string(),
+                kind: "local_port_forward".to_string(),
+                status: RequestStatus::PendingApproval,
+                request: None,
+                message: None,
+            },
+        );
+        assert!(state.expire_pending_after_restart());
+        assert_eq!(state.requests["pending"].status, RequestStatus::Expired);
+        assert!(!state.expire_pending_after_restart());
     }
 
     #[test]
@@ -769,5 +1129,144 @@ mod tests {
         frontend.request_snapshot().unwrap();
         drop(frontend);
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn remote_request_is_pending_until_one_local_decision_wins() {
+        let (hub, commands) = hub_with_bridge("beam-uuid");
+        let request = ServiceRequest {
+            request_id: "request-1".to_string(),
+            kind: beams_protocol::ServiceRequestKind::LocalPortForward {
+                remote_host: "127.0.0.1".to_string(),
+                remote_port: 8080,
+                local_port: Some(18080),
+            },
+        };
+        handle_bridge_event(
+            &hub,
+            crate::bridge::Event::Message {
+                beam_uuid: "beam-uuid".to_string(),
+                message: BeamToClient::RequestSubmitted {
+                    request: request.clone(),
+                },
+            },
+        );
+        let stored = hub
+            .state
+            .lock()
+            .unwrap()
+            .requests
+            .get("request-1")
+            .cloned()
+            .unwrap();
+        assert_eq!(stored.status, RequestStatus::PendingApproval);
+        assert_eq!(stored.request, Some(request));
+
+        let decided = hub.decide_request("request-1", false).unwrap();
+        assert_eq!(decided.status, RequestStatus::Rejected);
+        assert!(matches!(
+            commands.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ClientToBeam::RequestStatus {
+                request_id,
+                status: RequestStatus::Rejected,
+                ..
+            } if request_id == "request-1"
+        ));
+        assert!(hub.decide_request("request-1", true).is_err());
+    }
+
+    #[test]
+    fn connected_bridge_receives_authoritative_request_and_service_snapshots() {
+        let (hub, commands) = hub_with_bridge("beam-uuid");
+        hub.state.lock().unwrap().requests.insert(
+            "request-2".to_string(),
+            RequestRecord {
+                request_id: "request-2".to_string(),
+                beam_uuid: "beam-uuid".to_string(),
+                kind: "local_port_forward".to_string(),
+                status: RequestStatus::Rejected,
+                request: Some(ServiceRequest {
+                    request_id: "request-2".to_string(),
+                    kind: beams_protocol::ServiceRequestKind::LocalPortForward {
+                        remote_host: "localhost".to_string(),
+                        remote_port: 3000,
+                        local_port: None,
+                    },
+                }),
+                message: Some("rejected by local user".to_string()),
+            },
+        );
+
+        handle_bridge_event(
+            &hub,
+            crate::bridge::Event::Connected {
+                beam_uuid: "beam-uuid".to_string(),
+                bridge_id: "new-bridge-id".to_string(),
+            },
+        );
+        let request_snapshot = commands.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            request_snapshot,
+            ClientToBeam::RequestSnapshot { requests }
+                if requests.len() == 1
+                    && requests[0].status == RequestStatus::Rejected
+        ));
+        assert!(matches!(
+            commands.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ClientToBeam::ServiceSnapshot { services } if services.is_empty()
+        ));
+        assert!(matches!(
+            commands.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ClientToBeam::Ready
+        ));
+    }
+
+    #[test]
+    fn second_frontend_for_the_same_beam_reuses_one_bridge_and_adds_its_token() {
+        let (hub, commands) = hub_with_bridge("beam-uuid");
+        hub.ensure_bridge(
+            crate::bridge::Target {
+                beam_id: "beam-name".to_string(),
+                beam_uuid: "beam-uuid".to_string(),
+                login: "beams".to_string(),
+            },
+            "second-token".to_string(),
+        )
+        .unwrap();
+        assert_eq!(hub.bridges.lock().unwrap().len(), 1);
+        assert!(matches!(
+            commands.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ClientToBeam::AddSessionToken { session_token }
+                if session_token == "second-token"
+        ));
+    }
+
+    #[test]
+    fn pending_request_can_expire_without_starting_a_service() {
+        let (hub, commands) = hub_with_bridge("beam-uuid");
+        hub.state.lock().unwrap().requests.insert(
+            "request-3".to_string(),
+            RequestRecord {
+                request_id: "request-3".to_string(),
+                beam_uuid: "beam-uuid".to_string(),
+                kind: "local_port_forward".to_string(),
+                status: RequestStatus::PendingApproval,
+                request: None,
+                message: None,
+            },
+        );
+        hub.expire_request("request-3");
+        assert_eq!(
+            hub.state.lock().unwrap().requests["request-3"].status,
+            RequestStatus::Expired
+        );
+        assert!(matches!(
+            commands.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ClientToBeam::RequestStatus {
+                status: RequestStatus::Expired,
+                ..
+            }
+        ));
+        assert!(hub.state.lock().unwrap().services.is_empty());
     }
 }
