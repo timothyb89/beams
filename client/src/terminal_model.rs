@@ -280,6 +280,17 @@ mod tests {
     }
 
     #[test]
+    fn preserves_private_use_nerd_font_glyphs() {
+        let mut model = TerminalModel::new(size());
+        model.process("\u{f120} shell".as_bytes());
+
+        let cell = model.screen().cell(0, 0).unwrap();
+        assert_eq!(cell.contents(), "\u{f120}");
+        assert!(!cell.is_wide());
+        assert_eq!(model.screen().cell(0, 1).unwrap().contents(), " ");
+    }
+
+    #[test]
     fn exposes_osc_title_and_clipboard_events_without_acting_on_them() {
         let mut model = TerminalModel::new(size());
         model.process(b"\x1b]2;beam title\x07\x1b]52;c;SGVsbG8=\x07");

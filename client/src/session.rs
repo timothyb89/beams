@@ -50,6 +50,7 @@ const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
 const REDRAW_RESIZE_DELAY: Duration = Duration::from_millis(40);
 const DAEMON_RECONNECT_RETRY: Duration = Duration::from_secs(1);
 const DEFERRED_OUTPUT_LIMIT: usize = 1024 * 1024;
+type PaletteTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 /// The local prefix byte intercepted by the managed SSH session.
 ///
@@ -298,9 +299,13 @@ fn drive(
     let mut output_finished = false;
     let mut daemon_view = DaemonView::new(local_daemon);
     let mut approval_takeover_guard = None;
+    let mut palette_terminal = None;
     macro_rules! redraw_palette {
         () => {
             draw_palette(
+                palette_terminal
+                    .as_mut()
+                    .expect("palette terminal exists while palette is open"),
                 info,
                 escape_key,
                 &daemon_view,
@@ -318,6 +323,7 @@ fn drive(
             terminal_state.open_palette()?;
             input_router.mode = InputMode::Palette;
             approval_takeover_guard = Some(Instant::now() + APPROVAL_TAKEOVER_GUARD);
+            palette_terminal = Some(new_palette_terminal()?);
             redraw_palette!();
         } else if daemon_changed && input_router.mode == InputMode::Palette {
             redraw_palette!();
@@ -328,6 +334,7 @@ fn drive(
             close_palette(
                 master,
                 terminal_state,
+                &mut palette_terminal,
                 &mut input_router.mode,
                 &mut deferred,
                 last_size,
@@ -357,6 +364,7 @@ fn drive(
             close_palette(
                 master,
                 terminal_state,
+                &mut palette_terminal,
                 &mut input_router.mode,
                 &mut deferred,
                 last_size,
@@ -391,6 +399,7 @@ fn drive(
                 close_palette(
                     master,
                     terminal_state,
+                    &mut palette_terminal,
                     &mut input_router.mode,
                     &mut deferred,
                     last_size,
@@ -427,6 +436,7 @@ fn drive(
                 InputAction::OpenPalette => {
                     approval_takeover_guard = None;
                     terminal_state.open_palette()?;
+                    palette_terminal = Some(new_palette_terminal()?);
                     redraw_palette!();
                 }
                 InputAction::ClosePalette => {
@@ -434,6 +444,7 @@ fn drive(
                     close_palette(
                         master,
                         terminal_state,
+                        &mut palette_terminal,
                         &mut input_router.mode,
                         &mut deferred,
                         last_size,
@@ -1796,6 +1807,7 @@ fn finish_output(
 fn close_palette(
     master: &dyn MasterPty,
     terminal_state: &mut TerminalState,
+    palette_terminal: &mut Option<PaletteTerminal>,
     mode: &mut InputMode,
     deferred: &mut DeferredOutput,
     size: PtySize,
@@ -1803,14 +1815,15 @@ fn close_palette(
     overlay_enabled: bool,
 ) -> anyhow::Result<()> {
     if terminal_state.palette_open {
-        terminal_state.close_palette()?;
+        palette_terminal.take();
+        terminal_state.close_palette(overlay_enabled)?;
         if overlay_enabled {
             deferred.clear();
             restore_terminal_model(terminal_model)?;
         } else {
             deferred.flush()?;
+            force_remote_redraw(master, size)?;
         }
-        force_remote_redraw(master, size)?;
     }
     *mode = InputMode::Passthrough;
     Ok(())
@@ -1931,16 +1944,20 @@ impl TerminalState {
         Ok(())
     }
 
-    fn close_palette(&mut self) -> io::Result<()> {
+    fn close_palette(&mut self, overlay_enabled: bool) -> io::Result<()> {
         let mut stdout = io::stdout();
-        execute!(stdout, Clear(ClearType::All), MoveTo(0, 0), Show)?;
+        if overlay_enabled {
+            execute!(stdout, Show)?;
+        } else {
+            execute!(stdout, Clear(ClearType::All), MoveTo(0, 0), Show)?;
+        }
         self.palette_open = false;
         Ok(())
     }
 
     fn restore(&mut self) {
         if self.palette_open {
-            let _ = self.close_palette();
+            let _ = self.close_palette(false);
         } else {
             let _ = execute!(io::stdout(), Show);
         }
@@ -1958,25 +1975,20 @@ impl Drop for TerminalState {
 }
 
 fn draw_palette(
+    terminal: &mut PaletteTerminal,
     info: &ConnectionInfo<'_>,
     escape_key: EscapeKey,
     daemon: &DaemonView,
     terminal_model: &TerminalModel,
     overlay_enabled: bool,
 ) -> anyhow::Result<()> {
-    // Every invocation creates a fresh ratatui Terminal, whose previous frame
-    // starts blank. Clear the real screen to match that model before painting;
-    // otherwise shorter text, modal transitions, and resizes retain stale
-    // cells from the prior frame.
-    execute!(io::stdout(), Hide, Clear(ClearType::All), MoveTo(0, 0))
-        .context("clearing local menu frame")?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend).context("creating local menu terminal")?;
     terminal
         .draw(|frame| {
             let area = frame.area();
             if overlay_enabled {
                 terminal_model.render(frame, area);
+                draw_overlay_palette(frame, area, daemon, escape_key);
+                return;
             }
             let [top, body, footer] = Layout::vertical([
                 Constraint::Length(3),
@@ -2432,6 +2444,191 @@ fn draw_palette(
         })
         .context("drawing local menu")?;
     Ok(())
+}
+
+fn new_palette_terminal() -> anyhow::Result<PaletteTerminal> {
+    Terminal::new(CrosstermBackend::new(io::stdout())).context("creating local menu terminal")
+}
+
+fn draw_overlay_palette(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    daemon: &DaemonView,
+    escape_key: EscapeKey,
+) {
+    let approval = daemon.pending_request();
+    let popup = centered_rect(
+        area,
+        if approval.is_some() { 78 } else { 82 },
+        if approval.is_some() { 12 } else { 16 },
+    );
+    let mut lines = Vec::new();
+
+    if let Some(request) = approval {
+        lines.push(Line::from(Span::styled(
+            "A remote service is requesting permission",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        if let Some(service_request) = &request.request {
+            match &service_request.kind {
+                ServiceRequestKind::LocalPortForward {
+                    remote_host,
+                    remote_port,
+                    local_port,
+                } => lines.push(Line::from(format!(
+                    "Forward {}:{} to local port {}.",
+                    remote_host,
+                    remote_port,
+                    local_port
+                        .map(|port| port.to_string())
+                        .unwrap_or_else(|| "automatic".to_string())
+                ))),
+                ServiceRequestKind::FileCopy {
+                    direction,
+                    remote_path,
+                    local_path_hint,
+                    overwrite,
+                } => lines.push(Line::from(format!(
+                    "{direction:?} {} ↔ {} ({overwrite:?})",
+                    local_path_hint.as_deref().unwrap_or("workstation path"),
+                    remote_path
+                ))),
+                ServiceRequestKind::FolderSync {
+                    remote_path,
+                    local_path_hint,
+                    mode,
+                    ..
+                } => lines.push(Line::from(format!(
+                    "Sync {} ↔ {} ({mode:?})",
+                    local_path_hint
+                        .as_deref()
+                        .unwrap_or("workstation directory"),
+                    remote_path
+                ))),
+            }
+        } else if let Some(action) = &request.action {
+            lines.push(Line::from(format!(
+                "{:?} service {}",
+                action.action, action.service_id
+            )));
+        } else {
+            lines.push(Line::from(format!("service: {}", request.kind)));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from("y approve  •  n reject  •  Esc close"));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Beam background services",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!(
+            "local daemon: {}",
+            daemon.message
+        )));
+        if let Some(client_id) = &daemon.client_id {
+            lines.push(Line::from(format!("client id: {client_id}")));
+        }
+        lines.push(Line::from(""));
+
+        if let Some(form) = &daemon.copy_approval_form {
+            lines.push(Line::from("Confirm workstation path for file copy:"));
+            lines.push(Line::from(format!("  {}", form.local_path)));
+            lines.push(Line::from(""));
+            lines.push(Line::from("Enter approve  •  Esc cancel"));
+        } else if let Some(form) = &daemon.sync_approval_form {
+            lines.push(Line::from("Confirm workstation directory for sync:"));
+            lines.push(Line::from(format!("  {}", form.local_path)));
+            lines.push(Line::from(""));
+            lines.push(Line::from("Enter approve  •  Esc cancel"));
+        } else if let Some(form) = &daemon.forward_form {
+            lines.push(Line::from(format!(
+                "remote port: {}",
+                if form.remote_port.is_empty() {
+                    "?"
+                } else {
+                    &form.remote_port
+                }
+            )));
+            lines.push(Line::from(format!(
+                "local port (empty = automatic): {}",
+                if form.local_port.is_empty() {
+                    "automatic"
+                } else {
+                    &form.local_port
+                }
+            )));
+            lines.push(Line::from("Tab changes field  •  Enter creates  •  Esc cancels"));
+        } else if let Some(form) = &daemon.copy_form {
+            lines.push(Line::from(format!(
+                "{:?} file — {} ↔ {}",
+                form.direction, form.local_path, form.remote_path
+            )));
+        } else if let Some(form) = &daemon.sync_form {
+            lines.push(Line::from(format!(
+                "Sync — {} ↔ {} ({:?})",
+                form.local_path, form.remote_path, form.mode
+            )));
+        } else {
+            let services = daemon
+                .service_records
+                .values()
+                .filter(|service| {
+                    daemon.beam_uuid.as_deref() == Some(service.beam_uuid.as_str())
+                })
+                .collect::<Vec<_>>();
+            if services.is_empty() {
+                lines.push(Line::from("No background services are running."));
+            } else {
+                for (index, service) in services.iter().take(8).enumerate() {
+                    let marker = if index == daemon.selected_service {
+                        "›"
+                    } else {
+                        " "
+                    };
+                    let description = service
+                        .spec
+                        .as_ref()
+                        .map(|spec| format!("{spec:?}"))
+                        .unwrap_or_else(|| service.kind.clone());
+                    lines.push(Line::from(format!(
+                        "{marker} {description} [{:?}]",
+                        service.status
+                    )));
+                }
+            }
+        }
+        lines.push(Line::from(""));
+        let literal = match escape_key {
+            EscapeKey::Byte(_) => format!("{} again sends it remotely  •  ", escape_key.label()),
+            EscapeKey::Disabled => String::new(),
+        };
+        lines.push(Line::from(format!(
+            "f forward  •  m sync  •  u/d copy  •  j/k select  •  {}q / Esc close",
+            literal
+        )));
+    }
+
+    frame.render_widget(RatatuiClear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(if approval.is_some() {
+                        " Approve remote request "
+                    } else {
+                        " Beam background services "
+                    }),
+            ),
+        popup,
+    );
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {

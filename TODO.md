@@ -558,12 +558,13 @@ bootstrap `Task`s.
   binary input, exit status, and resize visibility, plus
   `client/tests/managed-session-smoke.sh` for the outer controlling-terminal
   path and rendered menu.
-- [ ] Experimental trusted terminal overlay: `--terminal-overlay` now keeps a
-  `vt100` shadow screen in sync with passthrough output and paints the local
-  menu over it. Expand the fixture/harness coverage for OSC title and
-  clipboard requests, bracketed paste, mouse encodings, alternate-screen
-  transitions, wide/combining characters, resize, and input/query response
-  behavior before considering this path for default use.
+- [ ] Experimental trusted terminal overlay: `--terminal-overlay` keeps a
+  `vt100` shadow screen in sync with passthrough output and paints bounded
+  approval/service dialogs over it. The renderer is persistent and close no
+  longer injects a synthetic resize pulse. Expand fixture/harness coverage
+  for OSC title and clipboard requests, bracketed paste, mouse encodings,
+  alternate-screen transitions, wide/combining characters, resize, and
+  input/query response behavior before considering this path for default use.
 - [x] Phase 2: `beams daemon` is the single-instance per-user workstation
   daemon, auto-started by `beams ssh` (with `--no-client-daemon` as a
   troubleshooting escape hatch). `client/src/clientd.rs` provides a mode-0600

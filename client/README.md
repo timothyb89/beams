@@ -113,14 +113,17 @@ immediately; closing and reopening it is not required to refresh status.
 `--terminal-overlay` is an experimental alternative for testing local
 compositing. The client continuously feeds remote output into a `vt100`
 shadow screen while still passing the original bytes through unchanged. When
-the local menu is open, that captured screen is painted underneath the
-ratatui widgets; remote output continues updating the shadow screen while it
-is hidden from the physical terminal. OSC title/clipboard requests, mouse
-mode, bracketed paste, alternate-screen state, resize, colors, and wide
-characters are tracked by the model, but clipboard actions and unsupported
-terminal features are not interpreted by the model yet. Complete OSC
-sequences are still passed through to the physical terminal, preserving the
-existing title/clipboard behavior. The existing takeover path remains the
+the local menu is open, that captured screen is painted underneath a bounded
+approval or service dialog; remote output continues updating the shadow screen
+while it is hidden from the physical terminal. A persistent ratatui renderer
+updates only changed cells, avoiding the full-screen clear/redraw flicker of
+the first prototype. Closing an overlay restores the model without sending a
+synthetic one-column resize pulse to the remote PTY. OSC title/clipboard
+requests, mouse mode, bracketed paste, alternate-screen state, resize, colors,
+and wide characters are tracked by the model, but clipboard actions and
+unsupported terminal features are not interpreted by the model yet. Complete
+OSC sequences are still passed through to the physical terminal, preserving
+the existing title/clipboard behavior. The existing takeover path remains the
 fallback and default.
 
 The controlling-terminal smoke test exercises both paths:

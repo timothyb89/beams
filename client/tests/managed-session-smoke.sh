@@ -77,14 +77,24 @@ if [ "$STATUS" -ne 7 ]; then
     exit 1
 fi
 
-strings "$TRANSCRIPT" | grep -q "Beams local menu"
-strings "$TRANSCRIPT" | grep -q "local port (empty = automatic)"
+if [ "${BEAMS_TEST_OVERLAY:-0}" = 1 ]; then
+    strings "$TRANSCRIPT" | grep -q "Beam background services"
+else
+    strings "$TRANSCRIPT" | grep -q "Beams local menu"
+fi
+if [ "${BEAMS_TEST_OVERLAY:-0}" = 1 ]; then
+    strings "$TRANSCRIPT" | grep -q "automatic"
+else
+    strings "$TRANSCRIPT" | grep -q "local port (empty = automatic)"
+fi
 strings "$TRANSCRIPT" | grep -q "REMOTE READY"
 strings "$TRANSCRIPT" | grep -q "REMOTE TITLE"
 strings "$TRANSCRIPT" | grep -q "24 100"
 strings "$TRANSCRIPT" | grep -q "REMOTE ECHO: hello"
-strings "$TRANSCRIPT" | grep -q "REMOTE RESIZE: 24 99"
-strings "$TRANSCRIPT" | grep -q "REMOTE RESIZE: 24 100"
+if [ "${BEAMS_TEST_OVERLAY:-0}" != 1 ]; then
+    strings "$TRANSCRIPT" | grep -q "REMOTE RESIZE: 24 99"
+    strings "$TRANSCRIPT" | grep -q "REMOTE RESIZE: 24 100"
+fi
 CLIENT_ID=$(sed -n 's/.*"client_id": "\([^"]*\)".*/\1/p' \
     "$TEST_DIR/config/beams-client/daemon-state.json")
 test -n "$CLIENT_ID"
