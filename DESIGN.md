@@ -123,14 +123,14 @@ filesystem/package state directly, not a cache.
 
 ### Concurrent execution
 
-The capability graph doubles as a schedule: `graph::resolve_levels`
-groups tasks into dependency "waves" (level 0 = no `requires` at all,
-level 1 = only depends on level 0, …) instead of one flat order, and
-`executor::run` runs every task in a wave on its own thread, only
-starting the next wave once the current one is fully done. Two tasks
-with no capability relationship — `apt-install` and `clone-git-repo`,
-say — land in the same wave and actually run at the same time, instead
-of waiting on each other just because they're both in one list.
+The capability graph doubles as a schedule. `executor::run` is
+dependency-driven: every task starts on its own thread the moment the
+tasks it `requires` have finished successfully, regardless of what else
+is still running. (The first version grouped tasks into barrier-style
+"waves" via `graph::resolve_levels` and only started wave N+1 once all
+of wave N had finished. That meant a slow, unrelated task, such as a
+large `git clone`, held up everything queued behind it, so it was
+dropped. `resolve_levels` survives only as a graph utility.)
 
 This is also what resolves the "`Step` and `Task` can't be ordered or
 run together" gap noted when the daemon skeleton first landed: rather
@@ -138,7 +138,12 @@ than merging the two into one trait, a thin adapter
 (`steps::StepAsTask`) wraps a `Step` (repo-path-parameterized, fixed at
 compile time) as a `Task` (no-param `run()`), so the fixed startup
 sequence and templated task instances can share one graph/executor.
-`steps::run` itself now goes through `executor::run`.
+
+Separate submissions don't wait on each other either: the daemon's
+`run_task`/`run_manifest` reply `accepted` and then execute on their own
+thread (there used to be a daemon-wide run lock, plus execution inline on
+the connection's reader thread, so the TUI couldn't even *submit* a second
+task until the first finished).
 
 Real-world contention the capability graph doesn't (and shouldn't) know
 about still needs handling: `apt-install` and `install-kubectl` both
@@ -146,18 +151,22 @@ shell out to `apt-get`/`dpkg`, which don't tolerate two concurrent
 invocations, but there's no *capability* dependency between them to
 declare — mutual exclusion isn't a "produces a fact" relationship.
 `Task::exclusive_resources` (and `Step`'s mirror of it) names a resource
-a task holds for the duration of its `run()`; the executor serializes
-any two tasks in the same wave that share one, via a lock keyed by the
-resource name, without blocking the rest of the wave. Adding a new step
+a task holds for the duration of its `run()`; `executor::Resources`
+serializes any two tasks sharing one. The daemon keeps one `Resources`
+for its whole lifetime, so this holds *across* concurrently running
+manifests too, and it also implicitly locks each task's own id, so two
+submissions of the same instance (e.g. the same `clone-git-repo` dest)
+never overlap: the second waits, then typically skips. Adding a new step
 that shells out to `apt-get` means tagging it with this same resource —
 easy to forget, so it's worth checking for whenever a new task touches a
 system-level package manager, service manager, or similar shared state.
+(Cross-*process* contention, e.g. the in-process fixed sequence vs. the
+daemon, still goes through `aptlock`'s `flock(1)`.)
 
-A wave containing a failure doesn't start the next wave, but every other
-task already running in that wave finishes normally — cancelling
-mid-flight, real work (an apt install, a git clone) isn't generally safe,
-so "stop advancing, don't try to abort what's in flight" is the executor's
-actual failure policy.
+Failure policy: a failed task's dependents (transitively) never start
+and are reported as `blocked`; everything not depending on it keeps
+running. In-flight work is never cancelled — interrupting an apt install
+or a git clone mid-flight isn't generally safe.
 
 ### Deferred / optional tasks
 

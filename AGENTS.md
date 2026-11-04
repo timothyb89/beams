@@ -60,7 +60,7 @@ today, not just a description of the design:
 - **No daemon needed**: `beam-bootstrap list-tasks` /
   `run-task <template> --param value ...` runs one task in-process -
   same coverage as `task run` above (same `TaskCommand` enum drives
-  both), just without the daemon's concurrent-wave scheduling or
+  both), just without the daemon's concurrent scheduling or
   broadcast progress. Prefer `task run` above when a daemon's already up
   anyway (progress then shows in a connected TUI too), or for anything
   that needs its `exclusive_resources` tag actually serialized against

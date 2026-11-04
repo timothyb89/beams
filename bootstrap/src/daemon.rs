@@ -33,31 +33,35 @@
 //!
 //! `run_manifest` is `run_task` generalized to several task instances at
 //! once (see DESIGN.md's "Seeding manifest") - the entries are resolved
-//! against each other into dependency waves (`executor::plan`, the same
-//! thing `executor::run` uses to actually run them - see DESIGN.md's
-//! "Concurrent execution"), so listing them out of dependency order, as
-//! above, is fine, and independent entries run concurrently rather than
-//! waiting on each other. Its `accepted` reply's `waves` field is that
-//! plan: a list of task-id lists, one per wave, in the order they'll
-//! run. Stops at the first wave containing a failure (not the first
-//! failing *task* - the rest of that wave still finishes), same
-//! semantics as the fixed startup sequence (`steps::run`). A manifest
-//! entry can only depend on a capability provided by *another entry in
-//! the same manifest* - not on one left over from a previous, separate
-//! run. Because every task here is idempotent, the fix is simply to
-//! list the full chain every time (e.g. always include `clone-git-repo`
-//! alongside a `checkout-pr-worktree` that needs it): the redundant
-//! entry just skips if its work is already done.
+//! against each other by capability (`executor::plan`/`executor::run` -
+//! see DESIGN.md's "Concurrent execution"), so listing them out of
+//! dependency order, as above, is fine. Each entry starts as soon as the
+//! entries it depends on have finished; independent entries run
+//! concurrently. Its `accepted` reply's `tasks` field is that plan: a
+//! list of `{"task_id", "depends_on": [task_id, ...]}` in a valid
+//! topological order. A failed entry blocks only the entries that depend
+//! on it (reported with a `"blocked"` `task_status`); everything else
+//! keeps running. A manifest entry can only depend on a capability
+//! provided by *another entry in the same manifest* - not on one left
+//! over from a previous, separate run. Because every task here is
+//! idempotent, the fix is simply to list the full chain every time (e.g.
+//! always include `clone-git-repo` alongside a `checkout-pr-worktree`
+//! that needs it): the redundant entry just skips if its work is already
+//! done.
+//!
+//! `run_task`/`run_manifest` don't hold up anything else: each one
+//! replies `accepted` and then runs on its own thread, so the same
+//! connection can keep submitting, and separate submissions run
+//! concurrently with each other. What *does* serialize across
+//! submissions is the daemon-wide `executor::Resources` (`Hub::resources`):
+//! two tasks sharing an `exclusive_resources` entry (e.g. `apt`), or two
+//! submissions of the very same task id, never overlap.
 //!
 //! Direct replies (only to the requester) carry the same `request_id`
 //! back; broadcast `task_status`/`manifest_status` events don't carry
 //! one, since they aren't a reply to anything in particular. A
-//! `task_status` broadcast carries a `manifest_id` and a `wave` index
-//! (into that manifest's `accepted` reply's `waves`) when the task ran
-//! as part of a manifest - both `null` when it ran via a standalone
-//! `run_task`. Every task sharing a `wave` value ran (or at least
-//! started) concurrently - that's what a client should group progress
-//! rows by, rather than inferring concurrency from event timing.
+//! `task_status` broadcast carries a `manifest_id` when the task ran as
+//! part of a manifest (`null` for a standalone `run_task`).
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -86,12 +90,11 @@ pub fn default_socket_path() -> String {
 }
 
 /// State shared by every connection: who's listening for broadcast
-/// events, and a lock serializing task execution so only one task runs
-/// at a time system-wide - the same one-thing-at-a-time semantics the
-/// fixed startup sequence already has (see `steps::run`).
+/// events, and the exclusive-resource locks every task run through this
+/// daemon shares (see the module doc comment).
 struct Hub {
     subscribers: Mutex<Vec<(u64, Sender<String>)>>,
-    run_lock: Mutex<()>,
+    resources: executor::Resources,
     manifest_counter: AtomicU64,
     connection_counter: AtomicU64,
     bridges: Mutex<BTreeMap<String, BridgeRegistration>>,
@@ -104,7 +107,7 @@ impl Default for Hub {
     fn default() -> Self {
         Self {
             subscribers: Mutex::new(Vec::new()),
-            run_lock: Mutex::new(()),
+            resources: executor::Resources::default(),
             manifest_counter: AtomicU64::new(0),
             connection_counter: AtomicU64::new(0),
             bridges: Mutex::new(BTreeMap::new()),
@@ -320,7 +323,7 @@ fn handle_connection(hub: &Arc<Hub>, stream: UnixStream) -> anyhow::Result<()> {
 
 /// Parses and dispatches one request line, sending its direct reply (and
 /// any `run_task` broadcasts) through `reply`.
-fn handle_line(hub: &Hub, line: &str, reply: &Sender<String>, context: &mut ConnectionContext) {
+fn handle_line(hub: &Arc<Hub>, line: &str, reply: &Sender<String>, context: &mut ConnectionContext) {
     let request: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(err) => {
@@ -1085,7 +1088,7 @@ fn send_bridge_event(sender: &Sender<String>, message: &BeamToClient) -> bool {
     sender.send(json!({"type": "client_bridge_event", "message": message}).to_string()).is_ok()
 }
 
-fn run_task(hub: &Hub, request_id: Option<&str>, name: &str, params: Value, reply: &Sender<String>) {
+fn run_task(hub: &Arc<Hub>, request_id: Option<&str>, name: &str, params: Value, reply: &Sender<String>) {
     let task = match tasks::instantiate(name, params) {
         Ok(task) => task,
         Err(err) => {
@@ -1096,12 +1099,15 @@ fn run_task(hub: &Hub, request_id: Option<&str>, name: &str, params: Value, repl
     let task_id = task.id();
     let _ = reply.send(json!({"request_id": request_id, "type": "accepted", "task_id": task_id}).to_string());
 
-    // Held for the run's duration: only one task executes at a time
-    // system-wide (see `Hub::run_lock`'s doc comment). Other connections
-    // can still issue `list_tasks`/further `run_task` requests meanwhile
-    // (they just queue on this lock) and keep receiving broadcasts.
-    let _guard = hub.run_lock.lock().unwrap();
-    let _ = run_one_task(hub, task.as_ref(), None);
+    // Not resolved through `executor::run_with`'s graph: a standalone
+    // task's `requires` is deliberately not checked against anything
+    // (see `tasks`' module doc comment), so it would never resolve on
+    // its own. Still takes the shared resource locks, though.
+    let hub = Arc::clone(hub);
+    thread::spawn(move || {
+        let on_event = |event: executor::Event| hub.broadcast(&task_event_line(event, None));
+        hub.resources.with_held(task.as_ref(), || executor::run_one(task.as_ref(), &on_event));
+    });
 }
 
 #[derive(Deserialize)]
@@ -1125,7 +1131,7 @@ fn build_manifest(entries: Vec<ManifestEntry>) -> Result<Vec<Box<dyn Task>>, Str
         .collect()
 }
 
-fn run_manifest(hub: &Hub, request_id: Option<&str>, tasks_value: Value, reply: &Sender<String>) {
+fn run_manifest(hub: &Arc<Hub>, request_id: Option<&str>, tasks_value: Value, reply: &Sender<String>) {
     let entries: Vec<ManifestEntry> = match serde_json::from_value(tasks_value) {
         Ok(entries) => entries,
         Err(err) => {
@@ -1148,8 +1154,8 @@ fn run_manifest(hub: &Hub, request_id: Option<&str>, tasks_value: Value, reply: 
     // the `accepted` reply's `waves` list below - `executor::run` (which
     // actually runs these) resolves the same graph again itself, per
     // `executor::plan`'s own doc comment.
-    let waves: Vec<Vec<String>> = match executor::plan(&instances) {
-        Ok(waves) => waves,
+    let plan = match executor::plan(&instances) {
+        Ok(plan) => plan,
         Err(err) => {
             let _ = reply.send(error_reply(request_id, &err.to_string()));
             return;
@@ -1162,88 +1168,42 @@ fn run_manifest(hub: &Hub, request_id: Option<&str>, tasks_value: Value, reply: 
             "request_id": request_id,
             "type": "accepted",
             "manifest_id": manifest_id,
-            "waves": waves,
+            "tasks": plan,
         })
         .to_string(),
     );
 
-    // Held for the *whole* manifest's duration, not just one task at a
-    // time within it - a manifest runs as one atomic unit relative to
-    // other connections' `run_task`/`run_manifest` calls, which queue on
-    // this same lock (see `Hub::run_lock`'s doc comment). Tasks *within*
-    // the manifest still run concurrently where the graph allows it -
-    // this lock is about manifests/standalone tasks not interleaving
-    // with each other, not about serializing within one.
-    let _guard = hub.run_lock.lock().unwrap();
-    hub.broadcast(&json!({"type": "manifest_status", "manifest_id": manifest_id, "status": "start"}).to_string());
-
-    let on_event = |event: executor::Event| {
-        let line = match event {
-            executor::Event::Start { task_id, wave } => {
-                task_status(&task_id, "start", None, Some(&manifest_id), Some(wave))
-            }
-            executor::Event::Progress { task_id, wave, message } => {
-                task_status(&task_id, "progress", Some(&message), Some(&manifest_id), Some(wave))
-            }
-            executor::Event::Ok { task_id, wave, message } => {
-                task_status(&task_id, "ok", Some(&message), Some(&manifest_id), Some(wave))
-            }
-            executor::Event::Skip { task_id, wave } => {
-                task_status(&task_id, "skip", None, Some(&manifest_id), Some(wave))
-            }
-            executor::Event::Error { task_id, wave, message } => {
-                task_status(&task_id, "error", Some(&message), Some(&manifest_id), Some(wave))
-            }
-        };
-        hub.broadcast(&line);
-    };
-
-    // Already validated above (same instances) - the only way this
-    // fails is a graph error, which computing `waves` already ruled out.
-    let ok = executor::run(instances, &on_event).expect("graph already validated above");
-    let status = if ok { "ok" } else { "error" };
-    hub.broadcast(&json!({"type": "manifest_status", "manifest_id": manifest_id, "status": status}).to_string());
+    let hub = Arc::clone(hub);
+    thread::spawn(move || {
+        hub.broadcast(&json!({"type": "manifest_status", "manifest_id": manifest_id, "status": "start"}).to_string());
+        let on_event = |event: executor::Event| hub.broadcast(&task_event_line(event, Some(&manifest_id)));
+        // Already validated above (same instances) - the only way this
+        // fails is a graph error, which `plan` already ruled out.
+        let ok = executor::run_with(instances, &hub.resources, &on_event).expect("graph already validated above");
+        let status = if ok { "ok" } else { "error" };
+        hub.broadcast(&json!({"type": "manifest_status", "manifest_id": manifest_id, "status": status}).to_string());
+    });
 }
 
-/// Runs one task, broadcasting its `task_status` lifecycle (`start` then
-/// exactly one of `ok`/`skip`/`error`) - shared by `run_task` and
-/// `run_manifest` so the broadcast shape can't drift between the two.
-/// `manifest_id` tags the events when running as part of a manifest,
-/// `None` for a standalone `run_task`. Returns `Err` (with a message
-/// naming the failed task) on failure, so `run_manifest` knows to stop.
-fn run_one_task(hub: &Hub, task: &dyn Task, manifest_id: Option<&str>) -> Result<(), String> {
-    let task_id = task.id();
-    hub.broadcast(&task_status(&task_id, "start", None, manifest_id, None));
-    let report = |message: &str| {
-        hub.broadcast(&task_status(&task_id, "progress", Some(message), manifest_id, None));
+/// The `task_status` broadcast for one executor event - shared by
+/// `run_task` and `run_manifest` so the shape can't drift between them.
+fn task_event_line(event: executor::Event, manifest_id: Option<&str>) -> String {
+    let (task_id, status, message) = match event {
+        executor::Event::Start { task_id } => (task_id, "start", None),
+        executor::Event::Progress { task_id, message } => (task_id, "progress", Some(message)),
+        executor::Event::Ok { task_id, message } => (task_id, "ok", Some(message)),
+        executor::Event::Skip { task_id } => (task_id, "skip", None),
+        executor::Event::Error { task_id, message } => (task_id, "error", Some(message)),
+        executor::Event::Blocked { task_id, message } => (task_id, "blocked", Some(message)),
     };
-    match task.run_with_progress(&report) {
-        Ok(Some(message)) => {
-            hub.broadcast(&task_status(&task_id, "ok", Some(&message), manifest_id, None));
-            Ok(())
-        }
-        Ok(None) => {
-            hub.broadcast(&task_status(&task_id, "skip", None, manifest_id, None));
-            Ok(())
-        }
-        Err(err) => {
-            let message = err.to_string();
-            hub.broadcast(&task_status(&task_id, "error", Some(&message), manifest_id, None));
-            Err(format!("task {task_id} failed: {message}"))
-        }
-    }
+    task_status(&task_id, status, message.as_deref(), manifest_id)
 }
 
-/// `wave` is `None` for a standalone `run_task` (no concurrency grouping
-/// concept there) and `Some(i)` for a `run_manifest` task, matching the
-/// index into that manifest's `accepted` reply's `waves` list - see
-/// `executor::Event`'s doc comment on why a client would want this.
 fn task_status(
     task_id: &str,
     status: &str,
     message: Option<&str>,
     manifest_id: Option<&str>,
-    wave: Option<usize>,
 ) -> String {
     json!({
         "type": "task_status",
@@ -1251,7 +1211,6 @@ fn task_status(
         "status": status,
         "message": message,
         "manifest_id": manifest_id,
-        "wave": wave,
     })
     .to_string()
 }
@@ -1467,14 +1426,13 @@ mod tests {
 
         let accepted = recv(&mut reader);
         assert_eq!(accepted["type"], "accepted");
-        let waves = accepted["waves"].as_array().unwrap();
-        assert_eq!(waves.len(), 2, "checkout-pr-worktree depends on clone-git-repo, so they're 2 waves: {waves:?}");
-        let wave_task = |wave: &serde_json::Value, i: usize| wave[i].as_str().unwrap().to_string();
-        assert!(
-            wave_task(&waves[0], 0).starts_with("clone-git-repo:"),
-            "clone-git-repo should be reordered into the earlier wave, got {waves:?}"
-        );
-        assert!(wave_task(&waves[1], 0).starts_with("checkout-pr-worktree:"));
+        let planned = accepted["tasks"].as_array().unwrap();
+        assert_eq!(planned.len(), 2, "{planned:?}");
+        let clone_id = planned[0]["task_id"].as_str().unwrap();
+        assert!(clone_id.starts_with("clone-git-repo:"), "clone-git-repo should be planned first, got {planned:?}");
+        assert!(planned[0]["depends_on"].as_array().unwrap().is_empty());
+        assert!(planned[1]["task_id"].as_str().unwrap().starts_with("checkout-pr-worktree:"));
+        assert_eq!(planned[1]["depends_on"], serde_json::json!([clone_id]));
         let manifest_id = accepted["manifest_id"].as_str().unwrap().to_string();
 
         let manifest_start = recv(&mut reader);
@@ -1482,19 +1440,17 @@ mod tests {
         assert_eq!(manifest_start["status"], "start");
         assert_eq!(manifest_start["manifest_id"], manifest_id);
 
-        for (wave, expected_task) in [(0, "clone-git-repo"), (1, "checkout-pr-worktree")] {
+        for expected_task in ["clone-git-repo", "checkout-pr-worktree"] {
             let start = recv(&mut reader);
             assert_eq!(start["type"], "task_status");
             assert_eq!(start["status"], "start");
             assert_eq!(start["manifest_id"], manifest_id);
-            assert_eq!(start["wave"], wave);
             assert!(start["task_id"].as_str().unwrap().starts_with(expected_task));
 
             let done = recv_skipping_progress(&mut reader);
             assert_eq!(done["type"], "task_status");
             assert_eq!(done["status"], "ok");
             assert_eq!(done["manifest_id"], manifest_id);
-            assert_eq!(done["wave"], wave);
         }
 
         let manifest_done = recv(&mut reader);
@@ -1532,7 +1488,7 @@ mod tests {
     }
 
     #[test]
-    fn run_manifest_stops_at_the_first_failing_task() {
+    fn run_manifest_reports_a_failing_task_and_the_manifest_as_failed() {
         let tmp = scratch_dir("manifest-failure");
         let source = tmp.join("source");
         let base = tmp.join("base");

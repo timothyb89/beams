@@ -73,7 +73,7 @@ pub mod resource {
 /// their default empty slice.
 ///
 /// `Send` so a `Box<dyn Step>`, adapted into a `Task` via `StepAsTask`,
-/// can be handed off to whichever thread `executor::run` runs its wave
+/// can be handed off to whichever thread `executor::run` runs it
 /// on.
 pub trait Step: Send {
     fn id(&self) -> &'static str;
@@ -203,16 +203,16 @@ fn resolved() -> Vec<Box<dyn Step>> {
 /// exploiting concurrency wherever the capability graph allows it (see
 /// `executor::run`) - e.g. `apt-install` and `install-teleport-bin` no
 /// longer wait on each other just because they're both in one list.
-/// Stops after a wave containing any failure. Returns `true` if every
-/// step succeeded (including skips).
+/// A failed step blocks only the steps that depend on it; unrelated steps
+/// keep going. Returns `true` if every step succeeded (including skips).
 pub fn run_all(repo: &Path, emitter: &dyn Emitter) -> bool {
     run(repo, emitter, None)
 }
 
 /// Runs just the step with the given id, directly and synchronously - no
-/// concurrency, no waiting on a wave (used by `bin/beam-shell` to get
+/// concurrency, no waiting on other steps (used by `bin/beam-shell` to get
 /// `~/.ssh`/`~/bin` in place before anything else, which needs to happen
-/// immediately, not whenever its turn in some wave comes up). Still
+/// immediately, not whenever the scheduler gets to it). Still
 /// validates the *whole* step graph first, via `resolved()`, same as
 /// always - a broken capability declaration is a bug worth catching even
 /// when only running one step in isolation. Returns `true` if no step id
@@ -258,12 +258,9 @@ fn run_concurrent(repo: &Path, emitter: &dyn Emitter) -> bool {
         .map(|step| Box::new(StepAsTask { step, repo: repo.to_path_buf() }) as Box<dyn Task>)
         .collect();
 
-    // `wave` isn't surfaced here - the human/JSON step output has no
-    // concept of concurrency grouping, unlike the daemon's broadcasts
-    // (see `daemon::run_manifest`, which does tag `task_status` with it).
     let on_event = |event: executor::Event| {
         let translated = match event {
-            executor::Event::Start { task_id, .. } => Event::new(&task_id, Status::Start, None),
+            executor::Event::Start { task_id } => Event::new(&task_id, Status::Start, None),
             // `events::Status` has no in-progress state - this fixed
             // sequence's output has always just been start/terminal, and
             // no fixed `Step` overrides `run_with_progress` yet (see that
@@ -272,11 +269,14 @@ fn run_concurrent(repo: &Path, emitter: &dyn Emitter) -> bool {
             // `events.rs`'s human/JSON emitters for a case nothing
             // triggers today.
             executor::Event::Progress { .. } => return,
-            executor::Event::Ok { task_id, message, .. } => {
+            executor::Event::Ok { task_id, message } => {
                 Event::new(&task_id, Status::Ok, Some(message))
             }
-            executor::Event::Skip { task_id, .. } => Event::new(&task_id, Status::Skip, None),
-            executor::Event::Error { task_id, message, .. } => {
+            executor::Event::Skip { task_id } => Event::new(&task_id, Status::Skip, None),
+            // A step that never started because one it depends on failed
+            // - reported as an error (the run as a whole did fail), with
+            // a message naming the failed dependency.
+            executor::Event::Error { task_id, message } | executor::Event::Blocked { task_id, message } => {
                 Event::new(&task_id, Status::Error, Some(message))
             }
         };

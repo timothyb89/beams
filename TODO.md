@@ -505,6 +505,31 @@ section above for status/details.
   - `git@github.com:timothyb89/teleport-harness.git` → `~/projects/teleport-harness`
   - `git@github.com:timothyb89/rdocker.git` → `~/projects/rdocker`
 
+## Scheduling, default startup tasks, client wrappers
+
+- [x] Dependency-driven scheduling replaces wave barriers (supersedes
+  the wave-based items in "Migration to the daemon/task-graph design"
+  above): `executor::run` starts each task as soon as its own
+  `requires` have succeeded, rather than waiting for a whole wave to
+  drain. A failure blocks only its (transitive) dependents, reported as a
+  new `"blocked"` `task_status`. `Hub::run_lock` is gone, and
+  `run_task`/`run_manifest` now run on their own thread after replying
+  `accepted`, so neither the same connection (the TUI) nor other
+  connections wait on an in-flight submission. Mutual exclusion now
+  lives in a daemon-wide `executor::Resources` (exclusive resources +
+  an implicit per-task-id lock). On the wire, `accepted` carries `tasks:
+  [{task_id, depends_on}]` instead of `waves`, and `task_status` has no
+  `wave` field any more.
+  - [ ] No daemon-level test proves a second `run_task` on one
+    connection runs while the first is still in flight (executor-level
+    tests cover the scheduling itself). A test-only slow template, or
+    an injectable task registry, would make that testable without
+    relying on process-global env vars.
+  - [ ] A manifest still can't depend on a capability provided by a task
+    in a *different*, concurrently running submission - list the full
+    chain in each manifest (the redundant entry skips/serializes via the
+    per-task-id lock).
+
 ## k8s access workaround
 
 - [ ] `k3s-bot-join` / `tbot` kube output exists purely because "beams k8s

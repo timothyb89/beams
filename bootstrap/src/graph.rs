@@ -60,6 +60,24 @@ pub fn resolve_order<N: Node>(nodes: &[N]) -> anyhow::Result<Vec<usize>> {
 /// (indeed, `resolve_order` is just this, flattened): within a level,
 /// nodes appear in their original input order.
 pub fn resolve_levels<N: Node>(nodes: &[N]) -> anyhow::Result<Vec<Vec<usize>>> {
+    let deps = resolve_deps_unchecked(nodes)?;
+    levels_from_deps(nodes, &deps)
+}
+
+/// Each node's direct dependencies, as indices into `nodes` (deduplicated,
+/// in the order its `requires` names them) - what a dependency-driven
+/// scheduler (`executor::run`) actually needs, rather than the
+/// barrier-style levels `resolve_levels` groups them into. Validates
+/// exactly what `resolve_levels` does (unknown capability, duplicate
+/// provider, cycle), so a `deps` list returned from here is always
+/// schedulable.
+pub fn resolve_deps<N: Node>(nodes: &[N]) -> anyhow::Result<Vec<Vec<usize>>> {
+    let deps = resolve_deps_unchecked(nodes)?;
+    levels_from_deps(nodes, &deps)?; // cycle check
+    Ok(deps)
+}
+
+fn resolve_deps_unchecked<N: Node>(nodes: &[N]) -> anyhow::Result<Vec<Vec<usize>>> {
     let mut provided_by: HashMap<Capability, usize> = HashMap::new();
     for (i, node) in nodes.iter().enumerate() {
         for cap in node.provides() {
@@ -79,7 +97,8 @@ pub fn resolve_levels<N: Node>(nodes: &[N]) -> anyhow::Result<Vec<Vec<usize>>> {
         let mut d = Vec::new();
         for cap in node.requires() {
             match provided_by.get(&cap) {
-                Some(&idx) => d.push(idx),
+                Some(&idx) if !d.contains(&idx) => d.push(idx),
+                Some(_) => {}
                 None => bail!(
                     "{:?} requires capability {cap:?}, which no node provides",
                     node.node_id()
@@ -88,7 +107,10 @@ pub fn resolve_levels<N: Node>(nodes: &[N]) -> anyhow::Result<Vec<Vec<usize>>> {
         }
         deps.push(d);
     }
+    Ok(deps)
+}
 
+fn levels_from_deps<N: Node>(nodes: &[N], deps: &[Vec<usize>]) -> anyhow::Result<Vec<Vec<usize>>> {
     let mut placed = vec![false; nodes.len()];
     let mut placed_count = 0;
     let mut levels: Vec<Vec<usize>> = Vec::new();

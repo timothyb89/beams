@@ -733,7 +733,10 @@ fn daemon_run_task(socket: Option<String>, task: TaskCommand) -> i32 {
                 };
                 // Broadcasts go to every connection - only print/act on
                 // the one this call actually submitted.
-                if task_id.as_deref() != Some(id) {
+                // A manifest elsewhere can be running the same task id
+                // concurrently with (well, serialized against) this
+                // standalone one - its events carry a `manifest_id`.
+                if task_id.as_deref() != Some(id) || !value.get("manifest_id").map_or(true, Value::is_null) {
                     continue;
                 }
                 let status = value.get("status").and_then(Value::as_str).unwrap_or("?");
@@ -803,7 +806,21 @@ fn daemon_run_manifest(socket: Option<String>, file: &str) -> i32 {
         match value.get("type").and_then(Value::as_str) {
             Some("accepted") if value.get("request_id").and_then(Value::as_str) == Some(request_id) => {
                 let id = value.get("manifest_id").and_then(Value::as_str).unwrap_or("?").to_string();
-                println!("submitted manifest {id}, waves: {}", value.get("waves").cloned().unwrap_or(Value::Null));
+                let planned = value.get("tasks").and_then(Value::as_array).cloned().unwrap_or_default();
+                println!("submitted manifest {id} ({} tasks)", planned.len());
+                for entry in &planned {
+                    let task_id = entry.get("task_id").and_then(Value::as_str).unwrap_or("?");
+                    let deps: Vec<&str> = entry
+                        .get("depends_on")
+                        .and_then(Value::as_array)
+                        .map(|deps| deps.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    if deps.is_empty() {
+                        println!("  {task_id}");
+                    } else {
+                        println!("  {task_id} (after {})", deps.join(", "));
+                    }
+                }
                 manifest_id = Some(id);
             }
             Some("error") if value.get("request_id").and_then(Value::as_str) == Some(request_id) => {
