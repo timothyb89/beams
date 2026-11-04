@@ -41,6 +41,28 @@ const MAX_MESSAGES_PER_WINDOW: usize = 120;
 /// whether its Beam still exists, and how often it re-asks after that.
 const BRIDGE_GONE_CHECK_AFTER: Duration = Duration::from_secs(20);
 const BRIDGE_GONE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the daemon checks whether its own executable was replaced.
+const EXE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
+/// Set (to "1") when a daemon re-execs itself after an update, so the new
+/// process restores the port forwards the old one was running.
+const RESTORE_SERVICES_ENV: &str = "BEAMS_DAEMON_RESTORE_SERVICES";
+/// The listening socket's fd, inherited across a self-restart so the socket
+/// never disappears and no frontend can race in a second daemon.
+const LISTEN_FD_ENV: &str = "BEAMS_DAEMON_LISTEN_FD";
+
+/// A frontend and daemon disagree on protocol. Distinguished from other
+/// connection errors so `connect_or_start` only replaces a daemon that
+/// really is incompatible, never one that was merely slow to answer.
+#[derive(Debug)]
+pub struct ProtocolMismatch(String);
+
+impl std::fmt::Display for ProtocolMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "local daemon protocol mismatch: {}", self.0)
+    }
+}
+
+impl std::error::Error for ProtocolMismatch {}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RequestRecord {
@@ -157,6 +179,14 @@ enum ClientMessage {
         service_id: String,
         action: ServiceAction,
     },
+    /// Version-independent control op (see `daemonctl`): accepted as the
+    /// first message on a connection, without a hello. Never change it.
+    Status,
+    /// Version-independent control op (see `daemonctl`). Never change it.
+    Shutdown {
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -189,6 +219,17 @@ pub enum ServerEvent {
     Pong,
     Error {
         message: String,
+    },
+    /// Reply to the `status` control op. Never change its shape.
+    DaemonInfo {
+        #[serde(flatten)]
+        info: crate::daemonctl::DaemonInfo,
+    },
+    /// Reply to an accepted `shutdown` control op.
+    ShuttingDown,
+    /// Reply to a `shutdown` refused because stopping would lose work.
+    ShutdownRefused {
+        busy: Vec<String>,
     },
 }
 
@@ -323,6 +364,9 @@ struct Hub {
     mutagen_program: String,
     mutagen_root: PathBuf,
     beam_lister: BeamLister,
+    /// Set by a termination signal or the `shutdown` control op.
+    terminating: Arc<AtomicBool>,
+    started_at: Instant,
 }
 
 struct BridgeRuntime {
@@ -405,6 +449,94 @@ impl Hub {
             mutagen_program,
             mutagen_root,
             beam_lister: Box::new(list_beam_uuids),
+            terminating: Arc::new(AtomicBool::new(false)),
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Why stopping the daemon right now would lose something. Forwards and
+    /// syncs aren't listed: a restart restores forwards and re-adopts syncs.
+    fn busy_reasons(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        let copies = state
+            .services
+            .values()
+            .filter(|service| {
+                matches!(service.spec, Some(ServiceRequestKind::FileCopy { .. }))
+                    && matches!(
+                        service.status,
+                        ServiceStatus::Starting | ServiceStatus::Running | ServiceStatus::Stopping
+                    )
+            })
+            .count();
+        let pending = state
+            .requests
+            .values()
+            .filter(|request| request.status == RequestStatus::PendingApproval)
+            .count();
+        let mut reasons = Vec::new();
+        if copies > 0 {
+            reasons.push(format!("{copies} file copy job(s) in progress"));
+        }
+        if pending > 0 {
+            reasons.push(format!("{pending} request(s) awaiting approval"));
+        }
+        reasons
+    }
+
+    fn daemon_info(&self) -> crate::daemonctl::DaemonInfo {
+        let exe = crate::daemonctl::startup_exe();
+        crate::daemonctl::DaemonInfo {
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            uptime_secs: self.started_at.elapsed().as_secs(),
+            exe: exe.cloned(),
+            binary_replaced: exe.is_some_and(|exe| exe.replacement().is_some()),
+            busy: self.busy_reasons(),
+            frontends: self.frontends.load(Ordering::SeqCst),
+            bridges: self.bridges.lock().unwrap().len(),
+            services: self.state.lock().unwrap().services.len(),
+        }
+    }
+
+    /// Handles the `shutdown` control op, returning the reply to send.
+    fn request_shutdown(&self, force: bool) -> ServerEvent {
+        let busy = self.busy_reasons();
+        if !force && !busy.is_empty() {
+            return ServerEvent::ShutdownRefused { busy };
+        }
+        eprintln!("beams daemon: shutdown requested{}", if force { " (forced)" } else { "" });
+        self.terminating.store(true, Ordering::SeqCst);
+        ServerEvent::ShuttingDown
+    }
+
+    /// After a self-restart, start every forward the previous process was
+    /// running, rather than waiting for a `beams ssh` session to re-ensure
+    /// its Beam's bridge. (Syncs are re-adopted separately; interrupted
+    /// copies stay stopped.)
+    fn restore_forwards(self: &Arc<Self>) {
+        let targets = self
+            .state
+            .lock()
+            .unwrap()
+            .services
+            .values()
+            .filter(|service| {
+                service.desired_running
+                    && matches!(service.spec, Some(ServiceRequestKind::LocalPortForward { .. }))
+            })
+            .map(|service| crate::bridge::Target {
+                beam_id: service.beam_id.clone(),
+                beam_uuid: service.beam_uuid.clone(),
+                login: service.login.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut seen = std::collections::BTreeSet::new();
+        for target in targets {
+            if seen.insert(target.beam_uuid.clone()) {
+                self.recover_services(&target);
+            }
         }
     }
 
@@ -1937,7 +2069,17 @@ impl Frontend {
                 version,
                 client_id,
             } if protocol == PROTOCOL && version == PROTOCOL_VERSION => client_id,
-            ServerEvent::Error { message } => bail!("daemon rejected handshake: {message}"),
+            ServerEvent::Error { message } => {
+                return Err(ProtocolMismatch(format!("daemon rejected handshake: {message}")).into())
+            }
+            ServerEvent::Hello {
+                protocol, version, ..
+            } => {
+                return Err(ProtocolMismatch(format!(
+                    "daemon speaks {protocol} version {version}, not {PROTOCOL} version {PROTOCOL_VERSION}"
+                ))
+                .into())
+            }
             other => bail!("unexpected daemon handshake response: {other:?}"),
         };
         stream
@@ -2128,8 +2270,27 @@ impl Frontend {
 /// Connects to the local daemon, starting it in the background if needed.
 pub fn connect_or_start() -> anyhow::Result<Frontend> {
     let socket_path = default_socket_path()?;
-    if let Ok(frontend) = Frontend::connect(&socket_path) {
-        return Ok(frontend);
+    match Frontend::connect(&socket_path) {
+        Ok(frontend) => return Ok(frontend),
+        Err(err) if err.downcast_ref::<ProtocolMismatch>().is_some() => {
+            // A daemon from a different build is listening. Replace it with
+            // this binary's - unless this process is itself outdated, in
+            // which case the daemon is likely the newer one.
+            if crate::daemonctl::this_process_is_stale() {
+                return Err(err).context(
+                    "this beams binary was replaced since it started; start a new `beams ssh` to reconnect",
+                );
+            }
+            match crate::daemonctl::stop(&socket_path, false)? {
+                crate::daemonctl::StopOutcome::Refused(busy) => bail!(
+                    "the local daemon is from a different beams build but busy ({}); \
+                     run `beams daemon restart` once it's idle",
+                    busy.join("; ")
+                ),
+                _ => eprintln!("beams: replaced a local daemon from a different build"),
+            }
+        }
+        Err(_) => {}
     }
 
     spawn_daemon(&socket_path)?;
@@ -2156,7 +2317,7 @@ pub fn connect_or_start() -> anyhow::Result<Frontend> {
     }
 }
 
-fn spawn_daemon(socket_path: &Path) -> anyhow::Result<()> {
+pub fn spawn_daemon(socket_path: &Path) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("resolving beams executable")?;
     let log_path = default_log_path()?;
     if let Some(parent) = log_path.parent() {
@@ -2192,7 +2353,21 @@ pub fn serve(socket_path: Option<PathBuf>) -> anyhow::Result<()> {
     if approvals_changed || services_changed {
         state.save(&state_path)?;
     }
-    let listener = bind_socket(&socket_path)?;
+    let inherited_fd = std::env::var(LISTEN_FD_ENV)
+        .ok()
+        .and_then(|fd| fd.parse::<std::os::unix::io::RawFd>().ok());
+    std::env::remove_var(LISTEN_FD_ENV);
+    let restore_services = std::env::var_os(RESTORE_SERVICES_ENV).is_some();
+    std::env::remove_var(RESTORE_SERVICES_ENV);
+    let listener = match inherited_fd {
+        // Safety: the fd was handed over by the previous daemon process,
+        // which exec'd into this one with it open.
+        Some(fd) => unsafe {
+            use std::os::unix::io::FromRawFd;
+            UnixListener::from_raw_fd(fd)
+        },
+        None => bind_socket(&socket_path)?,
+    };
     listener
         .set_nonblocking(true)
         .context("making daemon listener nonblocking")?;
@@ -2210,14 +2385,24 @@ pub fn serve(socket_path: Option<PathBuf>) -> anyhow::Result<()> {
         mutagen_root,
     ));
     hub.recover_folder_syncs();
+    if restore_services {
+        eprintln!("beams daemon: restarted after an update; restoring forwards");
+        hub.restore_forwards();
+    }
 
-    let terminating = Arc::new(AtomicBool::new(false));
+    let terminating = Arc::clone(&hub.terminating);
     for signal in [SIGHUP, SIGINT, SIGQUIT, SIGTERM] {
         signal_hook::flag::register(signal, Arc::clone(&terminating))
             .context("installing daemon termination handler")?;
     }
 
+    let mut update = UpdateWatch::default();
+    let mut restart_into = None;
     while !terminating.load(Ordering::Relaxed) {
+        if let Some(exe) = update.poll(&hub) {
+            restart_into = Some(exe);
+            break;
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 let hub = Arc::clone(&hub);
@@ -2234,9 +2419,80 @@ pub fn serve(socket_path: Option<PathBuf>) -> anyhow::Result<()> {
         }
     }
     hub.shutdown();
+    if let Some(exe) = restart_into {
+        // Give bridge supervisors a moment to reap their SSH children.
+        thread::sleep(Duration::from_millis(250));
+        let err = exec_restart(&exe, &socket_path, &listener);
+        eprintln!("beams daemon: could not restart into {}: {err:#}", exe.display());
+    }
     drop(listener);
     let _ = fs::remove_file(&socket_path);
     Ok(())
+}
+
+/// Watches the daemon's own executable for replacement (a rebuild or
+/// reinstall) and decides when to restart into the new one: once the new
+/// file has stayed unchanged for a full check interval (so a half-written
+/// binary is never exec'd) and the daemon is idle.
+#[derive(Default)]
+struct UpdateWatch {
+    next_check: Option<Instant>,
+    candidate: Option<crate::daemonctl::ExeIdentity>,
+    reported_busy: bool,
+}
+
+impl UpdateWatch {
+    fn poll(&mut self, hub: &Hub) -> Option<PathBuf> {
+        let now = Instant::now();
+        if self.next_check.is_some_and(|next| now < next) {
+            return None;
+        }
+        self.next_check = Some(now + EXE_CHECK_INTERVAL);
+        let exe = crate::daemonctl::startup_exe()?;
+        let Some(current) = exe.replacement() else {
+            self.candidate = None;
+            return None;
+        };
+        if self.candidate.as_ref() != Some(&current) {
+            eprintln!(
+                "beams daemon: {} was replaced; restarting once it's stable and idle",
+                exe.path.display()
+            );
+            self.candidate = Some(current);
+            self.reported_busy = false;
+            return None;
+        }
+        let busy = hub.busy_reasons();
+        if !busy.is_empty() {
+            if !self.reported_busy {
+                eprintln!("beams daemon: update waiting: {}", busy.join("; "));
+                self.reported_busy = true;
+            }
+            return None;
+        }
+        eprintln!("beams daemon: restarting into the updated binary");
+        Some(exe.path.clone())
+    }
+}
+
+/// Replaces this process with `exe daemon --socket <path>`, handing over the
+/// listening socket. Only returns on failure.
+fn exec_restart(exe: &Path, socket_path: &Path, listener: &UnixListener) -> anyhow::Error {
+    use std::os::unix::io::AsRawFd;
+    let fd = listener.as_raw_fd();
+    // Rust opens sockets close-on-exec; clear it for this one fd only.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } != 0 {
+        return anyhow::Error::from(std::io::Error::last_os_error())
+            .context("clearing close-on-exec on the daemon socket");
+    }
+    let err = Command::new(exe)
+        .arg("daemon")
+        .arg("--socket")
+        .arg(socket_path)
+        .env(LISTEN_FD_ENV, fd.to_string())
+        .env(RESTORE_SERVICES_ENV, "1")
+        .exec();
+    anyhow::Error::from(err).context("exec")
 }
 
 fn bind_socket(path: &Path) -> anyhow::Result<UnixListener> {
@@ -2285,6 +2541,19 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
         }
     };
     match hello {
+        ClientMessage::Status => {
+            write_json(
+                &mut stream,
+                &ServerEvent::DaemonInfo {
+                    info: hub.daemon_info(),
+                },
+            )?;
+            return Ok(());
+        }
+        ClientMessage::Shutdown { force } => {
+            write_json(&mut stream, &hub.request_shutdown(force))?;
+            return Ok(());
+        }
         ClientMessage::Hello {
             protocol,
             version,
@@ -2345,6 +2614,14 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                     }
                     ClientMessage::Ping => {
                         let _ = tx.try_send(ServerEvent::Pong);
+                    }
+                    ClientMessage::Status => {
+                        let _ = tx.try_send(ServerEvent::DaemonInfo {
+                            info: hub.daemon_info(),
+                        });
+                    }
+                    ClientMessage::Shutdown { force } => {
+                        let _ = tx.try_send(hub.request_shutdown(force));
                     }
                     ClientMessage::EnsureBridge {
                         beam_id,
@@ -3282,5 +3559,93 @@ mod tests {
         let bridge = bridges.get("new-uuid").expect("not retired");
         assert!(bridge.failing_since.is_some());
         assert!(bridge.last_existence_check.is_none());
+    }
+
+    fn control_op(hub: &Arc<Hub>, request: &str) -> serde_json::Value {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let hub = Arc::clone(hub);
+        let handler = thread::spawn(move || handle_connection(&hub, server));
+        client.write_all(request.as_bytes()).unwrap();
+        client.write_all(b"\n").unwrap();
+        let mut reply = String::new();
+        BufReader::new(client).read_line(&mut reply).unwrap();
+        handler.join().unwrap().unwrap();
+        serde_json::from_str(&reply).unwrap()
+    }
+
+    fn submit_forward_request(hub: &Arc<Hub>, beam_uuid: &str, request_id: &str) {
+        handle_bridge_event(
+            hub,
+            crate::bridge::Event::Message {
+                beam_uuid: beam_uuid.to_string(),
+                message: BeamToClient::RequestSubmitted {
+                    request: ServiceRequest {
+                        request_id: request_id.to_string(),
+                        kind: ServiceRequestKind::LocalPortForward {
+                            remote_host: "127.0.0.1".to_string(),
+                            remote_port: 8080,
+                            local_port: None,
+                        },
+                    },
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn control_ops_work_without_a_hello_and_shutdown_refuses_when_busy() {
+        let (hub, _commands) = hub_with_bridge("beam-uuid");
+        let status = control_op(&hub, r#"{"op":"status"}"#);
+        assert_eq!(status["type"], "daemon_info");
+        assert_eq!(status["pid"], std::process::id());
+        assert_eq!(status["bridges"], 1);
+        assert_eq!(status["busy"], serde_json::json!([]));
+
+        submit_forward_request(&hub, "beam-uuid", "pending-request");
+        let status = control_op(&hub, r#"{"op":"status"}"#);
+        assert_eq!(status["busy"], serde_json::json!(["1 request(s) awaiting approval"]));
+
+        let refused = control_op(&hub, r#"{"op":"shutdown"}"#);
+        assert_eq!(refused["type"], "shutdown_refused");
+        assert!(!hub.terminating.load(Ordering::SeqCst));
+
+        let accepted = control_op(&hub, r#"{"op":"shutdown","force":true}"#);
+        assert_eq!(accepted["type"], "shutting_down");
+        assert!(hub.terminating.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_self_restarted_daemon_restores_running_forwards_without_a_session() {
+        let program = fake_forward_program();
+        let (hub, _commands) =
+            hub_with_bridge_and_program("beam-uuid", program.display().to_string());
+        submit_forward_request(&hub, "beam-uuid", "request-forward");
+        hub.decide_request("request-forward", true, None).unwrap();
+        wait_until(Duration::from_secs(3), || {
+            hub.state.lock().unwrap().services.values().any(|service| service.status == ServiceStatus::Running)
+        });
+        hub.shutdown();
+
+        // What the restarted process sees: the persisted state, with
+        // process-backed services marked stopped, and no bridges at all.
+        let mut state = hub.state.lock().unwrap().clone();
+        state.mark_process_services_stopped_after_restart();
+        let restarted = Arc::new(Hub::with_state_path_and_program(
+            state,
+            None,
+            program.display().to_string(),
+        ));
+        restarted.restore_forwards();
+        wait_until(Duration::from_secs(3), || {
+            restarted
+                .state
+                .lock()
+                .unwrap()
+                .services
+                .values()
+                .any(|service| service.status == ServiceStatus::Running)
+        });
+        restarted.shutdown();
+        let _ = fs::remove_file(program);
     }
 }

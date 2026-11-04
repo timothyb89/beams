@@ -931,7 +931,13 @@ impl DaemonView {
                     self.apply_bridge_status(bridge);
                     changed = true;
                 }
-                Ok(ServerEvent::Hello { .. } | ServerEvent::Pong) => {}
+                Ok(
+                    ServerEvent::Hello { .. }
+                    | ServerEvent::Pong
+                    | ServerEvent::DaemonInfo { .. }
+                    | ServerEvent::ShuttingDown
+                    | ServerEvent::ShutdownRefused { .. },
+                ) => {}
                 Err(TryRecvError::Empty) => return changed,
                 Err(TryRecvError::Disconnected) => {
                     self.connected = false;

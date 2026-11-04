@@ -176,6 +176,34 @@ beams daemon --socket /tmp/beams-test.sock
 `--no-client-daemon` on `beams ssh` disables connection/auto-start without
 disabling the managed PTY itself.
 
+### Daemon lifecycle and updates
+
+```sh
+beams daemon status            # PID, version, executable, busy/idle
+beams daemon stop [--force]    # graceful shutdown
+beams daemon restart [--force] # stop, then start one from this binary
+```
+
+The daemon updates itself. Every 15 seconds it checks whether the executable
+it started from has been replaced (by a rebuild or reinstall). Once the new
+file has been stable for a full check and nothing would be lost, it re-execs
+the new binary in place. "Nothing would be lost" means no file copy in
+flight and no approval pending. The PID stays the same, the listening socket
+is handed over (it never disappears, so no frontend can race in a second
+daemon), and the forwards that were running are restored. Folder syncs are
+re-adopted. Open `beams ssh` sessions reconnect and re-register their
+bridges on their own.
+
+`stop` and `restart` refuse while the daemon is busy unless `--force` is
+given. They use two control messages, `status` and `shutdown`, whose shape
+never changes and which work without a protocol handshake, so any `beams`
+can manage any daemon that understands them. A daemon too old for those
+messages is sent SIGTERM via the PID the kernel reports for the socket's
+peer. If `beams ssh` meets a daemon speaking a different protocol, it
+replaces it the same way. It does so only when its own binary hasn't been
+replaced since it started, so a stale session can't take down a newer
+daemon.
+
 The default socket is `$XDG_RUNTIME_DIR/beams-client/daemon.sock` when
 `XDG_RUNTIME_DIR` is set, otherwise
 `~/.config/beams-client/daemon.sock`. It and the versioned state file

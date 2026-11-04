@@ -624,6 +624,17 @@ bootstrap `Task`s.
   20s are retired once `tsh beams ls` confirms the Beam is gone, which also
   stops that Beam's forwards and copies and pauses its syncs. The menu
   filters bridge status to its own Beam.
+- [x] Daemon lifecycle: `beams daemon status|stop|restart` over
+  version-independent control messages (SIGTERM via the socket peer PID for
+  older daemons). The daemon self-restarts into a replaced binary once it is
+  stable and idle, handing over the listening socket and restoring forwards.
+  `beams ssh` replaces a protocol-incompatible daemon unless it is itself
+  stale.
+- [ ] Daemon updates across install paths: self-restart only watches the
+  daemon's own executable path. A daemon started from `~/.cargo/bin/beams`
+  ignores a newer `target/debug/beams` (`beams daemon status` points this
+  out; `beams daemon restart` from the new binary switches it). A cross-path
+  "newer build wins" rule would need an orderable build stamp.
 - [ ] Local menu home screen: Enter still closes the menu instead of opening
   an actions menu for the selected service, and `t` (terminate) acts without
   a confirmation step. Consider a proper table and per-request queue view

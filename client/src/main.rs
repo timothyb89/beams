@@ -2,6 +2,7 @@ mod beamcmd;
 mod bridge;
 mod clientd;
 mod copy;
+mod daemonctl;
 mod forward;
 mod session;
 mod stage;
@@ -75,10 +76,16 @@ enum Commands {
     },
     /// Run the workstation-side service daemon in the foreground. Normal
     /// `beams ssh` invocations start it automatically as needed.
+    ///
+    /// The daemon restarts itself into a rebuilt or reinstalled `beams`
+    /// binary once the new file is stable and nothing would be lost (no
+    /// file copy in flight, no approval pending).
     Daemon {
         /// Override the local Unix socket path.
-        #[arg(long)]
+        #[arg(long, global = true)]
         socket: Option<PathBuf>,
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
     },
     /// Upload one local file to an existing tracked Beam.
     CopyTo {
@@ -213,7 +220,30 @@ impl From<SyncModeArg> for FolderSyncMode {
     }
 }
 
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Show the running daemon's PID, version, executable, and whether it's
+    /// busy.
+    Status,
+    /// Ask the daemon to shut down gracefully. Forwards stop, syncs are
+    /// detached (their Mutagen sessions keep running), in-flight copies are
+    /// interrupted.
+    Stop {
+        /// Stop even if a file copy is in flight or an approval is pending.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Stop the daemon and start a fresh one from this `beams` binary.
+    /// Running `beams ssh` sessions reconnect on their own.
+    Restart {
+        /// Restart even if a file copy is in flight or an approval is pending.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
 fn main() -> anyhow::Result<ExitCode> {
+    daemonctl::record_startup_exe();
     let args = Args::parse();
     let code = match args.command {
         Commands::Ssh {
@@ -233,10 +263,15 @@ fn main() -> anyhow::Result<ExitCode> {
             no_client_daemon,
             terminal_overlay,
         )?,
-        Commands::Daemon { socket } => {
-            clientd::serve(socket)?;
-            0
-        }
+        Commands::Daemon { socket, action } => match action {
+            None => {
+                clientd::serve(socket)?;
+                0
+            }
+            Some(DaemonAction::Status) => daemonctl::print_status(socket)?,
+            Some(DaemonAction::Stop { force }) => daemonctl::run_stop(socket, force)?,
+            Some(DaemonAction::Restart { force }) => daemonctl::run_restart(socket, force)?,
+        },
         Commands::CopyTo {
             purpose,
             login,
