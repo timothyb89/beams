@@ -1,7 +1,7 @@
 # SSH agent proxy: workstation-held keys with per-use approval
 
-Status: 2026-11-04. Phase 0 spike and phase 1 plumbing done (see "Phase 0
-findings" and "Phase 1 status"). Builds on the bridge, request
+Status: 2026-11-04. Phases 0-3 and most of phase 4 done; the relay is the
+default on new Beams (see "Phases" at the end). Builds on the bridge, request
 queue, and toast/menu UI described in `CLIENT_SERVICES_DESIGN.md`.
 
 ## Problem
@@ -575,12 +575,28 @@ Not done yet, and noticed during the live run:
    frontend `SSH_AUTH_SOCK` registration, allowlist, identity push, relay to
    the workstation agent. Every signature prompts, using the existing toast
    and review flow with a minimal screen. Deny when no frontend is attached.
-2. **Context.** Authoritative parsing, host verification against
-   `known_hosts`, the two-tier review screen, and sanitization are done.
-   Remaining: the input guard, folding, a countdown, the audit log, and
-   RSA/ECDSA session-bind fixtures.
-3. **Client-owned startup.** `config.toml`, `ClientToBeam::RunManifest`,
-   startup grant, passive toasts, `wait-ssh-agent`; trim `bin/beam-shell`.
-4. **Cleanup and rules.** Remembered rules plus revoke UI, remove key staging
-   and the unlock pane, point the Beam's `SSH_AUTH_SOCK` at the relay, update
-   `AGENTS.md`/`bootstrap/README.md`/`TODO.md`.
+2. **Context.** *Done.* Authoritative parsing, host verification against
+   `known_hosts` (plain and hashed), the two-tier review screen,
+   sanitization, a 500ms input guard (and SSH key requests are only approved
+   from their own review menu), folding by reported parent process, a
+   countdown in the toast. RSA (sha2-256/512) and ECDSA P-256/384/521 host
+   keys verified against real OpenSSH (`bootstrap/tests/ssh-agent-hostkey-algos.sh`,
+   captured fixtures in `protocol/tests/fixtures/`). The audit trail is
+   `daemon.log` (one line per request and decision); a separate audit file
+   is not done.
+3. **Client-owned startup.** *Done.* `[startup]` in `config.toml`, sent once
+   per Beam over `RunManifest` (persisted in `daemon-state.json`), with
+   `wait-ssh-agent` added for ssh clones; `[startup.ssh_grant]` as designed,
+   except that it matches the prompt's *verified host name* rather than host
+   keys resolved when it's issued (hashed `known_hosts` can't be listed by
+   name; the check is equivalent). Passive "SSH key used" toasts; grants are
+   listed on the home screen with Revoke. `bin/beam-shell` no longer
+   submits a manifest. Tested end to end in `client/tests/ssh-agent-smoke.sh`.
+4. **Cleanup and rules.** *Mostly done.* The relay is the Beam's
+   `SSH_AUTH_SOCK` everywhere; no key is staged; `ssh-agent-init`, the
+   unlock pane and `agent.env` are gone; agents are told about
+   `SSH_KEY_REASON` via `.claude/CLAUDE.md`; docs updated. Key onboarding
+   (not in the original plan): `beams agent-keys --allow/--deny`, a one-time
+   "share a key?" offer in `beams ssh`, and `a` on the home screen.
+   Remaining: remembered approval rules ("allow github.com for 30m"), and
+   `TODO.md`.
