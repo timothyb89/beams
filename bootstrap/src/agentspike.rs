@@ -180,6 +180,7 @@ fn handle(conn_id: u64, mut conn: UnixStream, config: &SpikeConfig) -> anyhow::R
                     json!({
                         "conn": conn_id,
                         "session_id": agent::hex(&record.session_id),
+                        "raw": agent::b64_encode(&body),
                         "host_key_type": agent::key_type(&record.host_key),
                         "host_fingerprint": record.host_fingerprint,
                         "is_forwarding": record.is_forwarding,

@@ -937,8 +937,12 @@ fn menu_body(menu: &Menu, width: usize) -> Vec<Line<'static>> {
         } else {
             Style::default()
         };
-        for line in wrap(text, width) {
-            lines.push(Line::from(Span::styled(line, style)));
+        // `wrap` drops leading whitespace, so keep an intro line's own
+        // indentation (nested detail lines) on every wrapped line.
+        let indent = text.len() - text.trim_start().len();
+        let pad = " ".repeat(indent.min(width / 2));
+        for line in wrap(text.trim_start(), width.saturating_sub(pad.len())) {
+            lines.push(Line::from(Span::styled(format!("{pad}{line}"), style)));
         }
     }
     if !menu.intro.is_empty() {

@@ -79,6 +79,11 @@ impl ToastPolicy {
                 Span::styled(review, theme::key()),
                 Span::styled(" to review", theme::dim()),
             ];
+            // An SSH key request blocks whatever asked until it expires.
+            if let Some(prompt) = &newest.agent {
+                let left_ms = prompt.expires_at_ms.saturating_sub(crate::agent::now_ms());
+                hint.push(Span::styled(format!(" · {}s left", left_ms.div_ceil(1000)), theme::dim()));
+            }
             if more > 0 {
                 hint.insert(0, Span::styled(format!("+{more} more · "), theme::dim()));
             }

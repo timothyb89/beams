@@ -55,6 +55,8 @@ const APPROVAL_TAKEOVER_GUARD: Duration = Duration::from_millis(300);
 const MAX_INPUT_SEQUENCE_LEN: usize = 64;
 const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
 const REDRAW_RESIZE_DELAY: Duration = Duration::from_millis(40);
+/// How long keys are ignored after an SSH key request's menu opens.
+const AGENT_INPUT_GUARD: Duration = Duration::from_millis(500);
 const DAEMON_RECONNECT_RETRY: Duration = Duration::from_secs(1);
 const DEFERRED_OUTPUT_LIMIT: usize = 1024 * 1024;
 type PaletteTerminal = Terminal<CrosstermBackend<io::Stdout>>;
@@ -581,6 +583,10 @@ struct DaemonView {
     recents: recent::RecentPaths,
     /// The menu was opened from a request toast (see `review_request`).
     reviewing_from_toast: bool,
+    /// Keys are ignored until then (except Esc): set when an SSH key
+    /// request's menu opens, so typing that was meant for the shell can't
+    /// approve a signature.
+    input_guard_until: Option<Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1214,6 +1220,7 @@ impl DaemonView {
                 message: "connected".to_string(),
                 recents: Default::default(),
                 reviewing_from_toast: false,
+                input_guard_until: None,
             },
             None => Self {
                 beam_uuid,
@@ -1237,6 +1244,7 @@ impl DaemonView {
                     .unwrap_or_else(|| "unavailable".to_string()),
                 recents: Default::default(),
                 reviewing_from_toast: false,
+                input_guard_until: None,
             },
         }
     }
@@ -1534,9 +1542,29 @@ impl DaemonView {
         self.screen = Screen::Menu(menu);
     }
 
+    /// Opens a request's decision menu, guarding SSH key requests against
+    /// stray keys (see `input_guard_until`).
+    fn open_request_menu(&mut self, request_id: &str) {
+        let Some(request) = self.request_records.get(request_id) else {
+            return;
+        };
+        let guarded = request.agent.is_some();
+        let menu = request_menu(request);
+        self.open_menu(menu);
+        if guarded {
+            self.input_guard_until = Some(Instant::now() + AGENT_INPUT_GUARD);
+        }
+    }
+
     /// Handles one key while the menu is open. Returns whether the menu
     /// should close.
     fn handle_key(&mut self, key: Key, local_daemon: &mut LocalDaemon) -> bool {
+        if let Some(until) = self.input_guard_until {
+            if Instant::now() < until && key != Key::Esc {
+                return false;
+            }
+            self.input_guard_until = None;
+        }
         match &mut self.screen {
             Screen::Form { kind, form } => {
                 match form.handle_key(&key) {
@@ -1574,8 +1602,8 @@ impl DaemonView {
             Key::Char('q' | 'Q') | Key::Esc => return true,
             Key::Enter => match self.selected_row() {
                 Some(Row::Request(request)) => {
-                    let menu = request_menu(request);
-                    self.open_menu(menu);
+                    let request_id = request.request_id.clone();
+                    self.open_request_menu(&request_id);
                 }
                 Some(Row::Service(service)) => {
                     let menu = service_menu(service);
@@ -1584,6 +1612,11 @@ impl DaemonView {
                 None => {}
             },
             Key::Char('y' | 'Y') => match self.pending_request() {
+                // An SSH key is only ever approved from its own review menu.
+                Some(request) if request.agent.is_some() => {
+                    let request_id = request.request_id.clone();
+                    self.open_request_menu(&request_id);
+                }
                 Some(request) => {
                     let request_id = request.request_id.clone();
                     self.approve(&request_id, local_daemon);
@@ -1746,8 +1779,8 @@ impl DaemonView {
         if needs_path {
             self.approve(request_id, local_daemon);
         } else {
-            let menu = request_menu(request);
-            self.open_menu(menu);
+            let request_id = request_id.to_string();
+            self.open_request_menu(&request_id);
         }
     }
 
@@ -3618,6 +3651,70 @@ mod tests {
         view.note_request_arrival(&request.request_id);
         view.request_records
             .insert(request.request_id.clone(), request);
+    }
+
+    fn pending_agent(request_id: &str) -> RequestRecord {
+        serde_json::from_value(serde_json::json!({
+            "request_id": request_id,
+            "beam_uuid": "beam-a-uuid",
+            "kind": "ssh_agent",
+            "status": "pending_approval",
+            "agent": {
+                "key_fingerprint": "SHA256:abc",
+                "key_comment": "work key",
+                "operation": {"kind": "login", "user": "git",
+                              "host": {"status": "verified", "name": "github.com"}},
+                "claimed": {"reason": "clone the repo", "command": "ssh git@github.com git-upload-pack 'o/r.git'"},
+                "expires_at_ms": crate::agent::now_ms() + 60_000,
+            },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn ssh_key_requests_are_only_approved_from_a_guarded_review_menu() {
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        add_request(&mut view, pending_agent("key-1"));
+
+        // `y` on the home screen opens the review instead of approving.
+        view.handle_key(Key::Char('y'), &mut daemon);
+        let Screen::Menu(menu) = &view.screen else {
+            panic!("`y` should open the SSH key review");
+        };
+        assert_eq!(menu.title, "SSH key request");
+        assert_eq!(menu.items[menu.selected].action, MenuAction::Reject("key-1".to_string()));
+        assert!(view.input_guard_until.is_some());
+
+        // Keys typed right away are dropped; the menu stays open.
+        view.handle_key(Key::Char('y'), &mut daemon);
+        view.handle_key(Key::Enter, &mut daemon);
+        assert!(matches!(view.screen, Screen::Menu(_)), "guarded keys must not decide");
+
+        // Once the guard passes, keys work again; Enter takes the default (Deny).
+        view.input_guard_until = Some(Instant::now() - Duration::from_millis(1));
+        view.handle_key(Key::Enter, &mut daemon);
+        assert!(matches!(view.screen, Screen::Home));
+        assert!(view.notice.as_ref().is_some_and(|notice| notice.text.contains("rejected") || notice.error));
+    }
+
+    #[test]
+    fn ssh_key_review_keeps_the_beam_claims_indented_and_shows_a_countdown() {
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        add_request(&mut view, pending_agent("key-1"));
+        view.handle_key(Key::Enter, &mut daemon);
+        let text = screen_text(&render(&view, None));
+        assert!(text.contains("Sign in to github.com as git (host verified)."), "{text}");
+        assert!(text.contains("Reported by the Beam (unverified):"), "{text}");
+        assert!(text.contains("  Reason: clone the repo"), "claims stay indented:\n{text}");
+
+        let mut policy = notices::ToastPolicy::default();
+        view.screen = Screen::Home;
+        let (toast, _) = policy.current(&view, EscapeKey::Byte(0x1d), Instant::now()).unwrap();
+        assert_eq!(toast.title, "SSH key request");
+        let hint: String = toast.lines[1].spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(hint.contains("s left"), "{hint}");
     }
 
     #[test]

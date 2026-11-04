@@ -18,4 +18,4 @@ sha1 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
-ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519", "rand_core", "getrandom"] }
+ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519", "p256", "p384", "rand_core", "getrandom"] }

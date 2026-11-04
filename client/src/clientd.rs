@@ -407,14 +407,11 @@ struct PendingAgent {
     beam_request_id: String,
     body: Vec<u8>,
     record: RequestRecord,
+    /// See `crate::agent::fold_key`.
+    fold_key: Option<String>,
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use crate::agent::now_ms;
 
 fn load_agent_config() -> crate::agent::Config {
     crate::agent::Config::load().unwrap_or_else(|err| {
@@ -1852,6 +1849,7 @@ impl Hub {
             Ok(evaluated) => evaluated,
             Err(why) => return self.deny_agent(beam_uuid, &beam_request_id, &why),
         };
+        let fold_key = crate::agent::fold_key(&prompt, context);
         let record = RequestRecord {
             request_id: Uuid::new_v4().to_string(),
             beam_uuid: beam_uuid.to_string(),
@@ -1871,7 +1869,7 @@ impl Hub {
         let request_id = record.request_id.clone();
         self.agent.lock().unwrap().pending.insert(
             request_id.clone(),
-            PendingAgent { beam_request_id, body, record: record.clone() },
+            PendingAgent { beam_request_id, body, record: record.clone(), fold_key },
         );
         self.broadcast(ServerEvent::RequestChanged { request: record });
         let weak = Arc::downgrade(self);
@@ -1921,7 +1919,37 @@ impl Hub {
 
     /// A local decision on an agent request. The first decision wins; the
     /// signature comes from the deciding frontend's own agent.
+    /// Decides `request_id` and every pending request folded with it (see
+    /// `crate::agent::fold_key`).
     fn decide_agent(self: &Arc<Self>, request_id: &str, approve: bool, frontend: u64) -> anyhow::Result<()> {
+        let group: Vec<String> = {
+            let agent = self.agent.lock().unwrap();
+            let Some(chosen) = agent.pending.get(request_id) else {
+                bail!("that SSH key request was already decided or has expired");
+            };
+            match &chosen.fold_key {
+                Some(key) => agent
+                    .pending
+                    .iter()
+                    .filter(|(_, other)| {
+                        other.fold_key.as_ref() == Some(key) && other.record.beam_uuid == chosen.record.beam_uuid
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect(),
+                None => vec![request_id.to_string()],
+            }
+        };
+        let mut result = Ok(());
+        for id in group {
+            let decided = self.decide_one_agent(&id, approve, frontend);
+            if id == request_id {
+                result = decided;
+            }
+        }
+        result
+    }
+
+    fn decide_one_agent(self: &Arc<Self>, request_id: &str, approve: bool, frontend: u64) -> anyhow::Result<()> {
         if !approve {
             self.finish_agent_request(request_id, RequestStatus::Rejected, "rejected by local user");
             return Ok(());
@@ -1943,7 +1971,7 @@ impl Hub {
         self.broadcast(ServerEvent::RequestChanged { request: pending.record.clone() });
         // The local agent may itself prompt (confirm, hardware touch), so
         // sign off this frontend's connection thread.
-        let PendingAgent { beam_request_id, body, mut record } = pending;
+        let PendingAgent { beam_request_id, body, mut record, .. } = pending;
         let summary = record.agent.as_ref().map(|p| p.summary()).unwrap_or_default();
         let hub = Arc::clone(self);
         let request_id = request_id.to_string();
@@ -4275,6 +4303,95 @@ mod tests {
                 },
             },
         );
+    }
+
+    fn agent_sign_from(hub: &Arc<Hub>, beam_request_id: &str, user_key: &[u8], parent_pid: u32) {
+        use beams_protocol::agent as wire;
+        let data = wire::encode_userauth_data(&wire::UserAuthRequest {
+            session_id: vec![4; 32],
+            user: "git".into(),
+            service: "ssh-connection".into(),
+            method: wire::METHOD_PUBLICKEY.into(),
+            algorithm: "ssh-ed25519".into(),
+            key_blob: user_key.to_vec(),
+            host_key: None,
+        });
+        let process = |pid: u32, argv: &[&str]| beams_protocol::AgentProcess {
+            pid,
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            cwd: None,
+        };
+        handle_bridge_event(
+            hub,
+            crate::bridge::Event::Message {
+                beam_uuid: "beam-uuid".to_string(),
+                message: BeamToClient::AgentSignRequest {
+                    request_id: beam_request_id.to_string(),
+                    conn_id: format!("agent-{beam_request_id}"),
+                    message: wire::b64_encode(&wire::encode_sign_request(user_key, &data, 0)),
+                    context: beams_protocol::AgentContext {
+                        chain: vec![
+                            process(parent_pid + 100, &["ssh", "git@github.com"]),
+                            process(parent_pid + 50, &["/bin/sh", "-c", "ssh ..."]),
+                            process(parent_pid, &["git", "fetch", "--recurse-submodules"]),
+                        ],
+                        ..Default::default()
+                    },
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn requests_from_one_parent_process_are_decided_together() {
+        use beams_protocol::agent as wire;
+        use ssh_key::{rand_core::OsRng, Algorithm, PrivateKey};
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let blob = key.public_key().to_bytes().unwrap();
+        let (hub, commands) = agent_hub(&beams_protocol::agent_crypto::fingerprint(&blob).unwrap());
+        let sock = fake_local_agent(blob.clone());
+        handle_bridge_event(
+            &hub,
+            crate::bridge::Event::Connected {
+                beam_uuid: "beam-uuid".to_string(),
+                bridge_id: "bridge-1".to_string(),
+                capabilities: vec![CAPABILITY_SSH_AGENT.to_string()],
+            },
+        );
+        hub.agent_frontend_attached(7, "beam-uuid", Some(sock.clone()));
+        while !matches!(next_agent_message(&commands), ClientToBeam::AgentIdentities { ref keys } if !keys.is_empty()) {}
+
+        agent_sign_from(&hub, "a", &blob, 1000);
+        agent_sign_from(&hub, "b", &blob, 1000);
+        agent_sign_from(&hub, "c", &blob, 2000); // another process
+        let ids = pending_agent_ids(&hub);
+        assert_eq!(ids.len(), 3);
+        let first = hub
+            .agent
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .find(|(_, p)| p.beam_request_id == "a")
+            .map(|(id, _)| id.clone())
+            .unwrap();
+
+        hub.decide_agent(&first, true, 7).unwrap();
+        let mut signed = Vec::new();
+        for _ in 0..2 {
+            match next_agent_message(&commands) {
+                ClientToBeam::AgentResponse { request_id, message, .. } => {
+                    assert!(wire::parse_sign_response(&wire::b64_decode(&message).unwrap()).unwrap().is_some());
+                    signed.push(request_id);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        signed.sort();
+        assert_eq!(signed, vec!["a".to_string(), "b".to_string()]);
+        let left = hub.agent.lock().unwrap().pending.values().map(|p| p.beam_request_id.clone()).collect::<Vec<_>>();
+        assert_eq!(left, vec!["c".to_string()], "a different process still needs its own decision");
+        let _ = fs::remove_file(sock);
     }
 
     fn pending_agent_ids(hub: &Hub) -> Vec<String> {

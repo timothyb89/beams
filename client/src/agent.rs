@@ -38,6 +38,14 @@ pub const MAX_PENDING_PER_BEAM: usize = 8;
 /// a while.
 const LOCAL_AGENT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Wall-clock milliseconds since the Unix epoch (prompt expiry times).
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// `[ssh_agent]` in `config.toml`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -450,6 +458,17 @@ fn claimed_context(context: &AgentContext) -> Claimed {
         task_run: context.task_run.as_deref().map(clean),
         host: context.host_candidates.first().map(|c| clean(c)),
     }
+}
+
+/// Requests that should be decided together: same key, same operation
+/// (including the host verdict), from the same reported parent process -
+/// e.g. the several connections of one `git fetch --recurse-submodules`.
+/// The parent comes from the Beam's (forgeable) context, but folding can
+/// only merge requests whose verified prompt is identical anyway.
+pub fn fold_key(prompt: &AgentPrompt, context: &AgentContext) -> Option<String> {
+    let parent = context.chain.iter().skip(1).find(|p| !is_shell_wrapper(&p.argv))?;
+    let operation = serde_json::to_string(&prompt.operation).ok()?;
+    Some(format!("{}|{}|{}", prompt.key_fingerprint, operation, parent.pid))
 }
 
 fn is_shell_wrapper(argv: &[String]) -> bool {

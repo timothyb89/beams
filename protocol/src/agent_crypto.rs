@@ -141,6 +141,42 @@ mod tests {
     }
 
     #[test]
+    fn ecdsa_session_binds_verify() {
+        use signature::Signer;
+        let sid = [7u8; 32];
+        for curve in [ssh_key::EcdsaCurve::NistP256, ssh_key::EcdsaCurve::NistP384] {
+            let key = PrivateKey::random(&mut OsRng, Algorithm::Ecdsa { curve }).unwrap();
+            let sig: Signature = key.key_data().try_sign(&sid).unwrap();
+            let mut bind = SessionBind {
+                host_key: key.public_key().to_bytes().unwrap(),
+                session_id: sid.to_vec(),
+                signature: Vec::<u8>::try_from(sig).unwrap(),
+                is_forwarding: false,
+            };
+            assert!(verify_session_bind(&bind).is_ok(), "{curve:?}");
+            bind.session_id[0] ^= 1;
+            assert!(verify_session_bind(&bind).is_err(), "{curve:?} tampered");
+        }
+    }
+
+    /// Host signatures made by OpenSSH itself (see tests/fixtures/README.md).
+    #[test]
+    fn real_openssh_rsa_and_p521_session_binds_verify() {
+        for (name, b64) in [
+            ("rsa-sha2-512", include_str!("../tests/fixtures/session_bind_rsa_sha2_512.b64")),
+            ("ecdsa-p521", include_str!("../tests/fixtures/session_bind_ecdsa_p521.b64")),
+        ] {
+            let body = crate::agent::b64_decode(b64.trim()).unwrap();
+            let crate::agent::AgentRequest::SessionBind(mut bind) = crate::agent::parse_request(&body).unwrap() else {
+                panic!("{name}: not a session-bind");
+            };
+            assert!(verify_session_bind(&bind).is_ok(), "{name}");
+            bind.session_id[0] ^= 1;
+            assert!(verify_session_bind(&bind).is_err(), "{name} tampered");
+        }
+    }
+
+    #[test]
     fn known_hosts_plain_and_hashed_entries() {
         let key = host_key();
         let other = host_key();
