@@ -1,4 +1,4 @@
-//! Phase 0 spike for `SSH_AGENT_PROXY_DESIGN.md`: a filtering SSH agent
+//! Phase 0 spike for `docs/designs/SSH_AGENT_PROXY_DESIGN.md`: a filtering SSH agent
 //! listener in front of a local upstream agent, logging what it can parse,
 //! verify, and recover from `/proc`. No bridge, no prompts: approvals are
 //! simulated with `--delay-ms`. Everything is logged as JSON lines on stdout.

@@ -1,7 +1,7 @@
 # Spike: OpenSSH multiplexing for client-owned services
 
 Date: 2026-10-28. This is the Phase 7 follow-up to
-`CLIENT_SERVICES_DESIGN.md`: determine whether one OpenSSH connection can
+`docs/designs/CLIENT_SERVICES_DESIGN.md`: determine whether one OpenSSH connection can
 carry the interactive shell, client bridge, forwards, copies, and Mutagen
 transport instead of starting a separate `tsh` process for each.
 

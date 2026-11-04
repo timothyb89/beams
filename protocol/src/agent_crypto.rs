@@ -3,7 +3,7 @@
 //! and mapping a verified host key back to a hostname via `known_hosts`.
 //!
 //! These are the facts the workstation treats as *verified* (see
-//! `SSH_AGENT_PROXY_DESIGN.md`); everything else a Beam reports is advisory.
+//! `docs/designs/SSH_AGENT_PROXY_DESIGN.md`); everything else a Beam reports is advisory.
 
 use hmac::{Hmac, Mac};
 use sha1::Sha1;

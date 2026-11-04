@@ -1,5 +1,5 @@
 //! The workstation-owned startup manifest and its SSH key grant (see
-//! `SSH_AGENT_PROXY_DESIGN.md`, "Client-owned startup manifest").
+//! `docs/designs/SSH_AGENT_PROXY_DESIGN.md`, "Client-owned startup manifest").
 //!
 //! `beamsd` submits `[startup] tasks` to each Beam once, the first time
 //! its bridge connects. If `[startup.ssh_grant]` is set, the clones that

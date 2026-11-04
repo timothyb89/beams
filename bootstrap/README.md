@@ -14,8 +14,8 @@ still run it manually inside a beam you've already `ssh`'d into.
 
 The steps below run in dependency order, resolved from each step's
 declared capabilities (`provides`/`requires` in `src/steps/mod.rs`, see
-`DESIGN.md`) rather than a hardcoded sequence, and **concurrently**
-wherever the graph allows it (see `DESIGN.md`'s "Concurrent execution") -
+`docs/designs/DESIGN.md`) rather than a hardcoded sequence, and **concurrently**
+wherever the graph allows it (see `docs/designs/DESIGN.md`'s "Concurrent execution") -
 e.g. `apt-install` and `install-teleport-bin` run at the same time, not
 one after the other just because they're both in this list. The numbered
 order below is just this doc's presentation order (and still a valid
@@ -177,7 +177,7 @@ that into both bash and fish on its own.
 
 Separate from the fixed startup sequence above: `src/tasks/` holds
 templated tasks that take runtime params instead of running
-unconditionally at startup (see `DESIGN.md`'s "Templates vs. instances").
+unconditionally at startup (see `docs/designs/DESIGN.md`'s "Templates vs. instances").
 Two ways to reach them - directly (no daemon involved), or through the
 daemon (see "Daemon" below):
 
@@ -207,7 +207,7 @@ beamctl start --name beam-bootstrapd -- ./target/debug/beam-bootstrap daemon
 ```
 
 Nothing drives this from the fixed startup sequence, a TUI, or
-`client/` yet (see `DESIGN.md`'s migration plan) - today it only exists
+`client/` yet (see `docs/designs/DESIGN.md`'s migration plan) - today it only exists
 so these ops are reachable over a socket at all, same instantiation path
 as `run-task` above (`tasks::instantiate`), with task-status progress
 broadcast to every connected client, not just whoever asked - try it
@@ -312,7 +312,7 @@ snapshots and sent the explicit `ready` barrier.
 
 Hand-rolling JSON above is still the lowest-level way to talk to the
 socket, but `beam-bootstrap task ...` is the actual agent/scripting
-entry point now - `DESIGN.md`'s architecture diagram calls this `beams
+entry point now - `docs/designs/DESIGN.md`'s architecture diagram calls this `beams
 task run ...`; it landed as a `task` subcommand group on this binary
 rather than a new one, and covers both that and the `run_manifest` CLI
 sugar that used to be a separate open item, since they turned out to be
@@ -429,7 +429,7 @@ the bridge the first time it connects to a beam.
 its own socket) and relays agent requests to the workstation over the
 client bridge; the private key never leaves the workstation's own agent,
 and the user approves each signature in `beams ssh` (see
-`SSH_AGENT_PROXY_DESIGN.md`). `beam-shell` and `config.fish` set
+`docs/designs/SSH_AGENT_PROXY_DESIGN.md`). `beam-shell` and `config.fish` set
 `SSH_AUTH_SOCK` to it for every shell, interactive or not; tasks run by the
 daemon (clones, PR checkouts, `wait-ssh-agent`) pass it explicitly (see
 `src/sshagent.rs`). With no `beams ssh` attached the relay lists no keys,

@@ -4,7 +4,7 @@ Date: 2026-10-22. Goal: sanity-check whether `beams` <-> `bootstrap` folder
 sync (large repos like Teleport `core`, ~2 GiB) is viable over the existing
 Teleport-proxied SSH transport, and whether Mutagen is a good fit as the
 sync engine. This supersedes nothing; it's input for a later design in
-`DESIGN.md`/`TODO.md`.
+`docs/designs/DESIGN.md`/`TODO.md`.
 
 ## Setup
 

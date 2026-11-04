@@ -1,4 +1,4 @@
-//! Runtime-instantiated, templated tasks - see `DESIGN.md`'s "Templates
+//! Runtime-instantiated, templated tasks - see `docs/designs/DESIGN.md`'s "Templates
 //! vs. instances". Unlike `steps::Step` (a fixed, compile-time-known list
 //! run once at startup), a `Task` here is produced by *instantiating* a
 //! template with concrete parameters at runtime: its id and capabilities
@@ -160,7 +160,7 @@ impl Node for Box<dyn Task> {
 /// registry with introspectable param schemas - that only becomes
 /// necessary once something needs to enumerate templates and build forms
 /// or a manifest schema from them (the TUI/daemon work, still ahead - see
-/// DESIGN.md's "Seeding manifest"). Designing that now, with exactly two
+/// docs/designs/DESIGN.md's "Seeding manifest"). Designing that now, with exactly two
 /// example templates and no real consumer yet, would be guessing at a
 /// shape instead of discovering it from use.
 pub trait Template: Task {

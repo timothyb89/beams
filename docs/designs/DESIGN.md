@@ -8,7 +8,7 @@ Update `TODO.md` as pieces of this land.
 
 Workstation-owned folder syncs, port forwards, file copies, and the
 remote-to-client approval bridge are a separate control plane; see
-`CLIENT_SERVICES_DESIGN.md`. They may be requested and observed through this
+`docs/designs/CLIENT_SERVICES_DESIGN.md`. They may be requested and observed through this
 daemon/TUI, but they are deliberately not bootstrap tasks.
 
 ## Why

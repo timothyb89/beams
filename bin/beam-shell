@@ -71,7 +71,7 @@ fi
 # 2. every process started from here (zellij and its panes) uses the
 #    daemon's SSH agent relay, which holds no keys: each signature is
 #    approved on the workstation, in the attached `beams ssh` session (see
-#    SSH_AGENT_PROXY_DESIGN.md). fish's config.fish sets the same for
+#    docs/designs/SSH_AGENT_PROXY_DESIGN.md). fish's config.fish sets the same for
 #    shells started any other way.
 export SSH_AUTH_SOCK="$HOME/.beam-bootstrap/ssh-agent.sock"
 export TELEPORT_ADD_KEYS_TO_AGENT=no

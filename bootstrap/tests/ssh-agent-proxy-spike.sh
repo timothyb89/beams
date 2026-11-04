@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 0 spike for SSH_AGENT_PROXY_DESIGN.md. Run on a disposable Beam:
+# Phase 0 spike for docs/designs/SSH_AGENT_PROXY_DESIGN.md. Run on a disposable Beam:
 #
 #   BIN=/path/to/beam-bootstrap bootstrap/tests/ssh-agent-proxy-spike.sh
 #

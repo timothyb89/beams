@@ -1,6 +1,6 @@
 //! Capability-based dependency resolution for bootstrap steps/tasks.
 //!
-//! See `DESIGN.md`'s "Task model" section: a step declares the
+//! See `docs/designs/DESIGN.md`'s "Task model" section: a step declares the
 //! capabilities it provides and the ones it requires, instead of naming
 //! other steps directly. This lets a step's dependents be resolved without
 //! knowing a concrete step's identity up front - the piece that matters

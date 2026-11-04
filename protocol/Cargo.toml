@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 # Session-bind signature verification, fingerprints, and known_hosts
-# matching for the SSH agent proxy (see SSH_AGENT_PROXY_DESIGN.md).
+# matching for the SSH agent proxy (see docs/designs/SSH_AGENT_PROXY_DESIGN.md).
 agent-crypto = ["dep:ssh-key", "dep:signature", "dep:hmac", "dep:sha1"]
 
 [dependencies]

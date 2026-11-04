@@ -5,7 +5,7 @@
 //! daemon. A CLI invocation here *is* one blocking round trip by
 //! design: send a request, print whatever broadcasts come back, exit
 //! once the thing it asked for reaches a terminal state. See
-//! `DESIGN.md`'s architecture diagram (`beams task run ...`) and
+//! `docs/designs/DESIGN.md`'s architecture diagram (`beams task run ...`) and
 //! `TODO.md`'s "CLI/TUI sugar for run_manifest" item - this is both of
 //! those at once, since they turned out to be the same piece of work.
 

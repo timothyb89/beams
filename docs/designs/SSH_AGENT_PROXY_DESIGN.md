@@ -2,7 +2,7 @@
 
 Status: 2026-11-04. Phases 0-3 and most of phase 4 done; the relay is the
 default on new Beams (see "Phases" at the end). Builds on the bridge, request
-queue, and toast/menu UI described in `CLIENT_SERVICES_DESIGN.md`.
+queue, and toast/menu UI described in `docs/designs/CLIENT_SERVICES_DESIGN.md`.
 
 ## Problem
 
@@ -258,8 +258,8 @@ For now: interactive `beams ssh` frontends only.
    Sign in to   github.com  (known_hosts)  as  git
  ── Reported by the Beam (unverified) ─────────────
    Reason   Fetching the requested repository for review
-   Process  ssh -o SendEnv=GIT_PROTOCOL git@github.com git-upload-pack 'gravitational/core.git'
-   Parent   git clone git@github.com:gravitational/core.git
+   Process  ssh -o SendEnv=GIT_PROTOCOL git@github.com git-upload-pack 'example-org/example-repo.git'
+   Parent   git clone git@github.com:example-org/example-repo.git
    In       ~/projects
  ──────────────────────────────────────────────────
   [ Allow once ]  [ Allow for this process ]  [ Allow github.com for 30m ]  [ Deny ]
@@ -331,7 +331,7 @@ tasks = [
   { template = "install-toolchain-go" },
   { template = "install-toolchain-rust" },
   { template = "wait-ssh-agent" },
-  { template = "clone-git-repo", params = { repo = "git@github.com:gravitational/core.git", dest = "~/projects/core" } },
+  { template = "clone-git-repo", params = { repo = "git@github.com:example-org/example-repo.git", dest = "~/projects/example-repo" } },
 ]
 
 [startup.ssh_grant]

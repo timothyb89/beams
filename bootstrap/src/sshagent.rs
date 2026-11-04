@@ -2,7 +2,7 @@
 //!
 //! The agent is the daemon's own relay (`agentproxy`): it holds no keys
 //! itself and asks the workstation for each signature (see
-//! `SSH_AGENT_PROXY_DESIGN.md`). Interactive shells get the same socket as
+//! `docs/designs/SSH_AGENT_PROXY_DESIGN.md`). Interactive shells get the same socket as
 //! `SSH_AUTH_SOCK` from `bin/beam-shell` and `shell/fish/config.fish`; the
 //! daemon's own environment predates those, so tasks that run `git`/`ssh`
 //! (`clone_git_repo`, `checkout_pr_worktree`, `wait_ssh_agent`) pass this

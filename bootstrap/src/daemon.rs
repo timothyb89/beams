@@ -1,6 +1,6 @@
 //! The bootstrap daemon: a long-lived process reachable over a UDS
 //! socket, driving on-demand task execution for whoever's connected (a
-//! future TUI, the CLI, eventually a Mac app - see `DESIGN.md`'s
+//! future TUI, the CLI, eventually a Mac app - see `docs/designs/DESIGN.md`'s
 //! "Architecture" and "Wire protocol" sections).
 //!
 //! Protocol: newline-delimited JSON, one request per line in, any number
@@ -32,9 +32,9 @@
 //! hardcoding per-template knowledge.
 //!
 //! `run_manifest` is `run_task` generalized to several task instances at
-//! once (see DESIGN.md's "Seeding manifest") - the entries are resolved
+//! once (see docs/designs/DESIGN.md's "Seeding manifest") - the entries are resolved
 //! against each other by capability (`executor::plan`/`executor::run` -
-//! see DESIGN.md's "Concurrent execution"), so listing them out of
+//! see docs/designs/DESIGN.md's "Concurrent execution"), so listing them out of
 //! dependency order, as above, is fine. Each entry starts as soon as the
 //! entries it depends on have finished; independent entries run
 //! concurrently. Its `accepted` reply's `tasks` field is that plan: a

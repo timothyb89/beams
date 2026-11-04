@@ -1,6 +1,6 @@
 # TODO
 
-Live task list. See `DESIGN.md` for the current architecture direction
+Live task list. See `docs/designs/DESIGN.md` for the current architecture direction
 (daemon + capability-based task graph) and `project.md` for the original
 brief. Check off / remove items as they land, add new ones as they come
 up. Per `AGENTS.md`'s session workflow: update this in the *same commit*
@@ -29,10 +29,10 @@ individual checked-off line.
 - `bin/beam-shell`: zellij layout with the main pane next to the bootstrap
   TUI and log tail. SSH goes through the daemon's agent relay (see "SSH
   agent proxy" below); there is no unlock pane anymore.
-- `AGENTS.md`, `DESIGN.md`: architecture/conventions + the
+- `AGENTS.md`, `docs/designs/DESIGN.md`: architecture/conventions + the
   daemon/task-graph design written up and agreed.
 
-## Migration to the daemon/task-graph design (see DESIGN.md)
+## Migration to the daemon/task-graph design (see docs/designs/DESIGN.md)
 
 Supersedes the old "bootstrap wizard" / "bidirectional progress
 reporting" items from the previous version of this file — both are now
@@ -76,7 +76,7 @@ just consequences of this design rather than separate asks.
   execution" below for why this got settled now rather than later (it's
   what made `apt-install`-concurrent-with-`clone-git-repo` possible at
   all).
-- [x] **Concurrent execution** (see DESIGN.md's "Concurrent execution"):
+- [x] **Concurrent execution** (see docs/designs/DESIGN.md's "Concurrent execution"):
   `graph::resolve_levels` groups tasks into dependency waves instead of
   one flat order; `executor::run` runs each wave's tasks on their own
   threads, serializing only pairs sharing a `Task::exclusive_resources`
@@ -127,7 +127,7 @@ just consequences of this design rather than separate asks.
   `tasks::instantiate` the CLI's `run-task` uses. Refuses to start a
   second instance against an already-listening socket. Thread-per-
   connection + a global run-lock (std threads/mpsc, no async runtime —
-  stayed with the "boring" approach DESIGN.md calls for; a handful of
+  stayed with the "boring" approach docs/designs/DESIGN.md calls for; a handful of
   local connections doesn't need one). Not yet wired to anything that
   starts it automatically (`beamctl start ...`, see next item) or to the
   fixed startup sequence.
@@ -423,7 +423,7 @@ section above for status/details.
 - [x] **Implemented and verified live against a real, freshly spawned
   beam** (not just a design): push over git's `ext::` transport, run
   through the same `tsh ssh` channel the client already uses - see
-  `client/src/tsh.rs`'s `prepare_git_target`/`push_repo` and DESIGN.md's
+  `client/src/tsh.rs`'s `prepare_git_target`/`push_repo` and docs/designs/DESIGN.md's
   "Repo delivery onto a beam" for the full design, including the
   branch-matching gotcha found while verifying this
   (`receive.denyCurrentBranch=updateInstead` silently no-ops instead of
@@ -508,7 +508,7 @@ section above for status/details.
   `ssh-agent-init`, so cloning starts without blocking reaching zellij,
   and is skippable via `BEAM_SHELL_SKIP_DEFAULT_CLONES=1` (for a future
   per-beam launcher that wants a different repo set):
-  - `git@github.com:gravitational/core.git` → `~/projects/core`
+  - `git@github.com:example-org/example-repo.git` → `~/projects/example-repo`
   - `git@github.com:timothyb89/teleport-harness.git` → `~/projects/teleport-harness`
   - `git@github.com:timothyb89/rdocker.git` → `~/projects/rdocker`
 
@@ -576,8 +576,8 @@ section above for status/details.
 ## Client-owned services and remote requests
 
 The design and phased implementation plan now live in
-`CLIENT_SERVICES_DESIGN.md`, based on the transport/Mutagen findings in
-`FOLDER_SYNC_SPIKE.md`. The governing boundary is that a Beam may submit a
+`docs/designs/CLIENT_SERVICES_DESIGN.md`, based on the transport/Mutagen findings in
+`docs/designs/FOLDER_SYNC_SPIKE.md`. The governing boundary is that a Beam may submit a
 typed request and observe status, but only the local `beams` client may approve
 and own a folder sync, port forward, or file copy. These are deliberately not
 bootstrap `Task`s.
@@ -772,7 +772,7 @@ bootstrap `Task`s.
   Mutagen tests. Keep separate long-lived `tsh` processes as the baseline;
   reconsider `russh` only after profiling identifies a real need.
   - [x] Record the process/credential findings, proposed daemon-owned master
-    design, and fallback rules in `OPENSSH_MULTIPLEXING_SPIKE.md`. Add
+    design, and fallback rules in `docs/designs/OPENSSH_MULTIPLEXING_SPIKE.md`. Add
     `client/tests/openssh-controlmaster-spike.sh` for command, PTY,
     concurrency, SCP, dynamic-forward/cancel, Mutagen-style options, and
     master-recreation checks. This Beam's ProxyCommand and host-CA path work,
@@ -783,7 +783,7 @@ bootstrap `Task`s.
     foreground interactive PTY before implementing or enabling
     `OpenSshTransport`.
 
-## SSH agent proxy (see `SSH_AGENT_PROXY_DESIGN.md`)
+## SSH agent proxy (see `docs/designs/SSH_AGENT_PROXY_DESIGN.md`)
 
 No private key goes to a Beam anymore: the Beam's `SSH_AUTH_SOCK` is
 `beam-bootstrapd`'s relay, and each signature is approved in the attached

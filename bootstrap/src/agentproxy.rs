@@ -1,4 +1,4 @@
-//! Beam-side SSH agent listener (see `SSH_AGENT_PROXY_DESIGN.md`).
+//! Beam-side SSH agent listener (see `docs/designs/SSH_AGENT_PROXY_DESIGN.md`).
 //!
 //! `beam-bootstrapd` listens on `ssh-agent.sock` next to its own socket
 //! (`~/.beam-bootstrap/ssh-agent.sock` by default) and relays agent use

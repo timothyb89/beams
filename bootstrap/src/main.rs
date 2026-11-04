@@ -53,7 +53,7 @@ enum Command {
     ListTasks,
     /// Instantiate and run a single templated task on demand, outside
     /// the fixed startup sequence. A stand-in for the daemon-backed
-    /// `beams task run` described in DESIGN.md - until that exists, this
+    /// `beams task run` described in docs/designs/DESIGN.md - until that exists, this
     /// runs the task directly, in-process, and does not check or resolve
     /// its declared dependencies against anything else.
     RunTask {
@@ -65,7 +65,7 @@ enum Command {
     /// task-status events to every connected client. Meant to be
     /// supervised by `beamctl start`, not run directly for day-to-day
     /// use yet - nothing drives this from the fixed startup sequence or
-    /// a TUI yet (see `DESIGN.md`'s migration plan).
+    /// a TUI yet (see `docs/designs/DESIGN.md`'s migration plan).
     Daemon {
         /// UDS socket path to listen on. Defaults to
         /// `~/.beam-bootstrap/daemon.sock`.
@@ -83,7 +83,7 @@ enum Command {
         socket: Option<String>,
     },
     /// Daemon-backed task operations - the agent-friendly, no-TUI-
-    /// required entry point `DESIGN.md`'s architecture diagram calls
+    /// required entry point `docs/designs/DESIGN.md`'s architecture diagram calls
     /// `beams task run ...`, and the CLI sugar for `run_manifest` that
     /// TODO.md had as a separate, still-open item - both landed as this
     /// one subcommand group once it became clear they're the same piece
@@ -109,7 +109,7 @@ enum Command {
         #[command(subcommand)]
         command: ClientCommand,
     },
-    /// Phase 0 spike (SSH_AGENT_PROXY_DESIGN.md): a filtering, logging
+    /// Phase 0 spike (docs/designs/SSH_AGENT_PROXY_DESIGN.md): a filtering, logging
     /// SSH agent listener in front of a local upstream agent.
     #[command(hide = true)]
     AgentProxySpike {
@@ -742,7 +742,7 @@ fn daemon_list_tasks(socket: Option<String>) -> i32 {
 /// `tasks::instantiate` mapping `run_task` uses in-process) and blocks,
 /// printing every `task_status` broadcast for it, until it reaches a
 /// terminal state - the agent-friendly on-demand entry point
-/// `DESIGN.md`'s architecture diagram calls `beams task run ...`.
+/// `docs/designs/DESIGN.md`'s architecture diagram calls `beams task run ...`.
 fn daemon_run_task(socket: Option<String>, task: TaskCommand) -> i32 {
     let socket_path = expand_tilde(&socket.unwrap_or_else(daemon::default_socket_path));
     let (name, params) = task_command_to_instance(task);

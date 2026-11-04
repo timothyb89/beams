@@ -23,7 +23,7 @@ use crate::graph::{self, Capability, Node};
 use crate::tasks::Task;
 
 /// Capability names provided/required by the steps below - see
-/// `DESIGN.md`'s "Task model". Centralized so dependent steps reference
+/// `docs/designs/DESIGN.md`'s "Task model". Centralized so dependent steps reference
 /// the same constant rather than retyping a string.
 pub mod cap {
     // Plain `&'static str`, not `Capability` (`Cow<'static, str>`) - call
@@ -69,7 +69,7 @@ pub mod resource {
 ///
 /// `provides`/`requires` make a step a `graph::Node`: dependencies are
 /// declared by capability, not by naming another step directly (see
-/// `DESIGN.md`). Steps with no dependents/dependencies just leave both at
+/// `docs/designs/DESIGN.md`). Steps with no dependents/dependencies just leave both at
 /// their default empty slice.
 ///
 /// `Send` so a `Box<dyn Step>`, adapted into a `Task` via `StepAsTask`,

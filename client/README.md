@@ -22,7 +22,7 @@ beams ssh [--repo ~/beams] [--purpose default] [--region REGION] [--login beams]
 3. Pushes `--repo`'s current branch onto the beam over git's `ext::`
    transport, run through the same `tsh ssh` channel used everywhere
    else here - no new credential, not the repo's own dedicated ssh
-   keypair (see `DESIGN.md`'s "Repo delivery onto a beam" for the full
+   keypair (see `docs/designs/DESIGN.md`'s "Repo delivery onto a beam" for the full
    design, including a real gotcha found verifying this against a live
    beam: the beam-side repo's checked-out branch has to match what gets
    pushed, or `receive.denyCurrentBranch=updateInstead` silently no-ops
@@ -441,7 +441,7 @@ prompt_timeout = 60        # seconds to approve a request (max 110)
 tasks = [
   { template = "install-toolchain-go" },
   { template = "install-toolchain-rust" },
-  { template = "clone-git-repo", params = { repo = "git@github.com:gravitational/core.git", dest = "~/projects/core" } },
+  { template = "clone-git-repo", params = { repo = "git@github.com:example-org/example-repo.git", dest = "~/projects/example-repo" } },
   { template = "clone-git-repo", params = { repo = "git@github.com:timothyb89/teleport-harness.git", dest = "~/projects/teleport-harness" } },
   { template = "clone-git-repo", params = { repo = "git@github.com:timothyb89/rdocker.git", dest = "~/projects/rdocker" } },
 ]
@@ -462,7 +462,7 @@ an "SSH key request" toast. Press the menu key to review it: what the
 workstation verified (host via your `known_hosts`, user, key) comes first,
 then what the Beam reported (command, reason, task), marked unverified.
 Deny is the default. With no `beams ssh` attached, requests are denied
-without asking. See `SSH_AGENT_PROXY_DESIGN.md`.
+without asking. See `docs/designs/SSH_AGENT_PROXY_DESIGN.md`.
 
 ## State
 
@@ -517,5 +517,5 @@ tsh config > /tmp/beams-ssh-config
 
 It exercises command, PTY, concurrent, SCP, dynamic-forward, cancellation,
 and master-recreation channels over one `ControlMaster`. See
-`../OPENSSH_MULTIPLEXING_SPIKE.md` for limitations and the remaining
+`../docs/designs/OPENSSH_MULTIPLEXING_SPIKE.md` for limitations and the remaining
 Teleport auth/MFA/recording matrix.

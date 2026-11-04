@@ -8,11 +8,11 @@ use anyhow::{bail, Context};
 /// fresh beam needs that git itself won't carry over: a prebuilt
 /// `beam-bootstrap` binary (no Rust toolchain on a fresh beam; see
 /// bootstrap/README.md). Everything else - every git-tracked file in
-/// `repo` - gets there via `tsh::push_repo` instead (see DESIGN.md's
+/// `repo` - gets there via `tsh::push_repo` instead (see docs/designs/DESIGN.md's
 /// "Repo delivery onto a beam").
 ///
 /// No SSH private key is ever copied: the beam's agent is a relay to the
-/// workstation's own agent (see SSH_AGENT_PROXY_DESIGN.md).
+/// workstation's own agent (see docs/designs/SSH_AGENT_PROXY_DESIGN.md).
 pub fn build(repo: &Path) -> anyhow::Result<PathBuf> {
     let tmp = std::env::temp_dir().join(format!("beams-client-stage-{}", std::process::id()));
     let dest_root = tmp.join("beams");

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end SSH agent proxy test without a real Beam (see
-# SSH_AGENT_PROXY_DESIGN.md). Everything runs locally:
+# docs/designs/SSH_AGENT_PROXY_DESIGN.md). Everything runs locally:
 #
 #   "Beam":        beam-bootstrap daemon (agent socket next to its UDS)
 #   bridge:        a fake `tsh` running the real `beam-bootstrap client-bridge`

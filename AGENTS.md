@@ -29,15 +29,16 @@ Plus:
 - `shell/` — fish config, starship config, zellij layout, all symlinked in.
 - `bot-onboarding/` — cluster-level (not per-beam) Teleport role/bot setup
   for the `k3s-bot`, applied once via `tctl`.
-- `.ssh/` — `known_hosts` (and a public key) linked into a beam's
-  `~/.ssh`. No private key goes to a beam: its `SSH_AUTH_SOCK` is
+- `docs/designs/` — design docs and spikes (see below).
+- `.ssh/` — workstation-local only now; nothing here is staged onto a beam
+  anymore. No private key ever goes to a beam: its `SSH_AUTH_SOCK` is
   `beam-bootstrapd`'s agent relay, and each use of a workstation key is
-  approved in `beams ssh` (see `SSH_AGENT_PROXY_DESIGN.md`).
+  approved in `beams ssh` (see `docs/designs/SSH_AGENT_PROXY_DESIGN.md`).
 
 ## Task runner
 
 `bootstrap/src/tasks/` holds templated, on-demand tasks (distinct from
-the fixed startup `steps/` — see `DESIGN.md`'s "Templates vs.
+the fixed startup `steps/` — see `docs/designs/DESIGN.md`'s "Templates vs.
 instances"). This is how to actually reach for one from an agent session,
 today, not just a description of the design:
 
@@ -102,9 +103,9 @@ today, not just a description of the design:
   real params and a check for "is this already done" — turn it into a
   new task template under `bootstrap/src/tasks/` instead of continuing
   to hand-roll it. That's the whole point of the task-graph design (see
-  `DESIGN.md`'s "Why"): one reusable definition, reachable the same way
+  `docs/designs/DESIGN.md`'s "Why"): one reusable definition, reachable the same way
   by this session, a later session, the TUI, and eventually `beams task
-  run` (see `DESIGN.md`'s architecture diagram — not implemented yet,
+  run` (see `docs/designs/DESIGN.md`'s architecture diagram — not implemented yet,
   tracked in `TODO.md`). Add it to `TODO.md` if you don't get to it
   immediately, so it isn't just forgotten chat context.
 
@@ -161,12 +162,12 @@ beam disappears, planned or not. That changes how work here should be
 sequenced:
 
 - **Start of session**: re-orient from the repo, not from memory of a
-  prior conversation — read `AGENTS.md` (this file), `DESIGN.md`,
+  prior conversation — read `AGENTS.md` (this file), `docs/designs/DESIGN.md`,
   `TODO.md`, and `git log` for recent commits before resuming work. Don't
   assume context from an earlier chat carried over.
 - **Write decisions down before or alongside implementing them, not
   after.** If a design discussion in conversation reaches a conclusion,
-  that conclusion isn't real until it's in `DESIGN.md`/`TODO.md` and
+  that conclusion isn't real until it's in `docs/designs/DESIGN.md`/`TODO.md` and
   committed — a beam disappearing mid-conversation loses anything that
   only exists as chat.
 - **Commit early and often, with discrete commits.** Don't batch a

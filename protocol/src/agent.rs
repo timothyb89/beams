@@ -1,6 +1,6 @@
 //! SSH agent wire protocol (draft-ietf-sshm-ssh-agent), just enough for the
 //! Beam-side agent listener and the workstation policy engine described in
-//! `SSH_AGENT_PROXY_DESIGN.md`.
+//! `docs/designs/SSH_AGENT_PROXY_DESIGN.md`.
 //!
 //! Everything here is pure parsing/encoding of untrusted bytes: no I/O policy
 //! and no cryptography. Signature verification and `known_hosts` lookups live

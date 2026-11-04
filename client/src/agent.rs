@@ -1,4 +1,4 @@
-//! Workstation half of the SSH agent proxy (see `SSH_AGENT_PROXY_DESIGN.md`).
+//! Workstation half of the SSH agent proxy (see `docs/designs/SSH_AGENT_PROXY_DESIGN.md`).
 //!
 //! The Beam relays agent traffic over its bridge; everything that decides
 //! anything lives here:

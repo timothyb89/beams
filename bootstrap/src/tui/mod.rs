@@ -1,5 +1,5 @@
 //! `beam-bootstrap tui`: a ratatui client for the daemon (`daemon.rs`),
-//! per `DESIGN.md`'s "UX" section - deferred/templated tasks with param
+//! per `docs/designs/DESIGN.md`'s "UX" section - deferred/templated tasks with param
 //! input on top, concurrent per-task progress rows plus an aggregate
 //! gauge on the bottom. See `app.rs` for the actual state/rendering, and
 //! `client.rs` for the socket transport; this module is just the

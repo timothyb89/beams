@@ -156,7 +156,7 @@ pub fn ssh_interactive(
 /// to the beam's `$HOME`) over the same Teleport-authenticated `tsh ssh`
 /// channel `ssh_exec` uses - not a new credential, and not the repo's
 /// own dedicated keypair under `.ssh/` (that one's for the *beam* to
-/// reach GitHub later, e.g. to clone `teleport`; see DESIGN.md's "Repo
+/// reach GitHub later, e.g. to clone `teleport`; see docs/designs/DESIGN.md's "Repo
 /// delivery onto a beam"). `%S` is git's own placeholder - it expands to
 /// `git-upload-pack`/`git-receive-pack` as appropriate; this function
 /// doesn't need to know which.

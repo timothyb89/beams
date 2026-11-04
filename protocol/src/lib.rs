@@ -22,7 +22,7 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// doesn't change `PROTOCOL_VERSION`.
 pub const CAPABILITY_FILE_FETCH: &str = "file_fetch";
 
-/// The workstation relays SSH agent requests (see `SSH_AGENT_PROXY_DESIGN.md`
+/// The workstation relays SSH agent requests (see `docs/designs/SSH_AGENT_PROXY_DESIGN.md`
 /// and the `Agent*` messages below).
 pub const CAPABILITY_SSH_AGENT: &str = "ssh_agent";
 

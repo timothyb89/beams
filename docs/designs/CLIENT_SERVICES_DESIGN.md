@@ -6,8 +6,8 @@ workstation validation, 2026-10-28.
 
 This design covers workstation-owned features that operate across a Beam's
 SSH connection: folder sync, port forwarding, and file transfer. It builds on
-the Mutagen findings in `FOLDER_SYNC_SPIKE.md` and the VM-side daemon/task TUI
-in `DESIGN.md`, but keeps a strict authority boundary between them:
+the Mutagen findings in `docs/designs/FOLDER_SYNC_SPIKE.md` and the VM-side daemon/task TUI
+in `docs/designs/DESIGN.md`, but keeps a strict authority boundary between them:
 
 > A Beam may request a service and observe its status. Only the user's local
 > `beams` client may approve, create, change, or destroy that service.
@@ -383,7 +383,7 @@ are separate future service variants with stronger confirmation text.
 
 Implementation: Mutagen sync sessions named from `beam_uuid` and `service_id`,
 using generated `ssh`/`scp` wrappers that dispatch through `tsh`, as proven in
-`FOLDER_SYNC_SPIKE.md`.
+`docs/designs/FOLDER_SYNC_SPIKE.md`.
 
 Initial defaults:
 
@@ -607,7 +607,7 @@ acceptance checks before changing this phase to fully complete.
 - Revisit approval rules, reverse/public forwards, SFTP, and git-bundle seeding
   as separate opt-in features.
 
-Exploratory result: `OPENSSH_MULTIPLEXING_SPIKE.md` records successful
+Exploratory result: `docs/designs/OPENSSH_MULTIPLEXING_SPIKE.md` records successful
 OpenSSH-to-Teleport proxy and host-certificate negotiation from this Beam,
 the tbot/PIV credential limitation that prevents a valid `beams` login here,
 the proposed fallback-capable backend, and a workstation harness covering the
