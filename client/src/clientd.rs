@@ -37,6 +37,10 @@ const BRIDGE_EVENT_QUEUE_CAPACITY: usize = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_MESSAGES_PER_WINDOW: usize = 120;
+/// How long a bridge must have been failing before the daemon asks `tsh`
+/// whether its Beam still exists, and how often it re-asks after that.
+const BRIDGE_GONE_CHECK_AFTER: Duration = Duration::from_secs(20);
+const BRIDGE_GONE_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RequestRecord {
@@ -318,11 +322,37 @@ struct Hub {
     forward_program: String,
     mutagen_program: String,
     mutagen_root: PathBuf,
+    beam_lister: BeamLister,
 }
 
 struct BridgeRuntime {
     record: BridgeRecord,
     commands: SyncSender<ClientToBeam>,
+    /// When the current run of failed connection attempts began.
+    failing_since: Option<Instant>,
+    last_existence_check: Option<Instant>,
+}
+
+impl BridgeRuntime {
+    fn new(record: BridgeRecord, commands: SyncSender<ClientToBeam>) -> Self {
+        Self {
+            record,
+            commands,
+            failing_since: None,
+            last_existence_check: None,
+        }
+    }
+}
+
+/// Lists the UUIDs of the Beams that currently exist. `Err` means "can't
+/// tell right now" (offline, logged out), never "none exist".
+type BeamLister = Box<dyn Fn() -> anyhow::Result<Vec<String>> + Send + Sync>;
+
+fn list_beam_uuids() -> anyhow::Result<Vec<String>> {
+    Ok(crate::tsh::list_beams()?
+        .into_iter()
+        .map(|beam| beam.uuid)
+        .collect())
 }
 
 struct ServiceRuntime {
@@ -374,6 +404,7 @@ impl Hub {
             forward_program,
             mutagen_program,
             mutagen_root,
+            beam_lister: Box::new(list_beam_uuids),
         }
     }
 
@@ -518,10 +549,7 @@ impl Hub {
         };
         bridges.insert(
             target.beam_uuid.clone(),
-            BridgeRuntime {
-                record: record.clone(),
-                commands,
-            },
+            BridgeRuntime::new(record.clone(), commands),
         );
         drop(bridges);
         self.broadcast(ServerEvent::BridgeStatus { bridge: record });
@@ -530,6 +558,59 @@ impl Hub {
         let weak = Arc::downgrade(self);
         thread::spawn(move || handle_bridge_events(weak, event_rx));
         Ok(())
+    }
+
+    /// Bridges otherwise live for the daemon's whole lifetime and retry
+    /// forever, so a Beam deleted after a `beams ssh` session would leave a
+    /// supervisor spawning `tsh ssh` against it indefinitely. Once a bridge
+    /// has been failing for a while, retire it if its Beam no longer exists:
+    /// drop the bridge (its supervisor exits when the command channel
+    /// closes), stop that Beam's forwards and copies, and pause its syncs
+    /// (pausing is reversible). A later `beams ssh` to the same Beam simply
+    /// creates a fresh bridge, so a wrong call here heals itself.
+    fn retire_bridge_if_beam_gone(self: &Arc<Self>, beam_uuid: &str) {
+        let Ok(existing) = (self.beam_lister)() else {
+            return;
+        };
+        if existing.iter().any(|uuid| uuid == beam_uuid) {
+            return;
+        }
+        let record = {
+            let mut bridges = self.bridges.lock().unwrap();
+            // It may have reconnected while `tsh beams ls` ran.
+            if !bridges
+                .get(beam_uuid)
+                .is_some_and(|bridge| bridge.failing_since.is_some())
+            {
+                return;
+            }
+            let mut bridge = bridges.remove(beam_uuid).expect("checked above");
+            bridge.record.status = "retired".to_string();
+            bridge.record.bridge_id = None;
+            bridge.record.message = Some("Beam no longer exists; bridge stopped".to_string());
+            bridge.record
+        };
+        self.broadcast(ServerEvent::BridgeStatus { bridge: record });
+
+        let services = self
+            .state
+            .lock()
+            .unwrap()
+            .services
+            .values()
+            .filter(|service| service.beam_uuid == beam_uuid && service.desired_running)
+            .filter_map(|service| {
+                let action = match service.spec.as_ref()? {
+                    ServiceRequestKind::LocalPortForward { .. }
+                    | ServiceRequestKind::FileCopy { .. } => ServiceAction::Stop,
+                    ServiceRequestKind::FolderSync { .. } => ServiceAction::Pause,
+                };
+                Some((service.service_id.clone(), action))
+            })
+            .collect::<Vec<_>>();
+        for (service_id, action) in services {
+            let _ = self.control_service(&service_id, action);
+        }
     }
 
     fn recover_services(self: &Arc<Self>, target: &crate::bridge::Target) {
@@ -1631,6 +1712,8 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                 bridge.record.status = "connected".to_string();
                 bridge.record.bridge_id = Some(bridge_id);
                 bridge.record.message = None;
+                bridge.failing_since = None;
+                bridge.last_existence_check = None;
                 (bridge.record.clone(), bridge.commands.clone())
             };
             let requests = hub
@@ -1687,7 +1770,7 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
             hub.broadcast(ServerEvent::BridgeStatus { bridge: record });
         }
         crate::bridge::Event::Disconnected { beam_uuid, message } => {
-            let record = {
+            let (record, check_existence) = {
                 let mut bridges = hub.bridges.lock().unwrap();
                 let Some(bridge) = bridges.get_mut(&beam_uuid) else {
                     return;
@@ -1695,9 +1778,27 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                 bridge.record.status = "reconnecting".to_string();
                 bridge.record.bridge_id = None;
                 bridge.record.message = Some(message);
-                bridge.record.clone()
+                let now = Instant::now();
+                let since = *bridge.failing_since.get_or_insert(now);
+                let check = now.duration_since(since) >= BRIDGE_GONE_CHECK_AFTER
+                    && bridge
+                        .last_existence_check
+                        .is_none_or(|last| now.duration_since(last) >= BRIDGE_GONE_CHECK_INTERVAL);
+                if check {
+                    bridge.last_existence_check = Some(now);
+                }
+                (bridge.record.clone(), check)
             };
             hub.broadcast(ServerEvent::BridgeStatus { bridge: record });
+            if check_existence {
+                // `tsh beams ls` can be slow; keep it off the event thread.
+                let weak = Arc::downgrade(hub);
+                thread::spawn(move || {
+                    if let Some(hub) = weak.upgrade() {
+                        hub.retire_bridge_if_beam_gone(&beam_uuid);
+                    }
+                });
+            }
         }
         crate::bridge::Event::Message { beam_uuid, message } => match message {
             BeamToClient::RequestSubmitted { request } => {
@@ -2498,8 +2599,8 @@ mod tests {
         let (commands, command_rx) = mpsc::sync_channel(16);
         hub.bridges.lock().unwrap().insert(
             beam_uuid.to_string(),
-            BridgeRuntime {
-                record: BridgeRecord {
+            BridgeRuntime::new(
+                BridgeRecord {
                     beam_id: "beam-name".to_string(),
                     beam_uuid: beam_uuid.to_string(),
                     login: "beams".to_string(),
@@ -2509,7 +2610,7 @@ mod tests {
                     message: None,
                 },
                 commands,
-            },
+            ),
         );
         (hub, command_rx)
     }
@@ -3114,5 +3215,72 @@ mod tests {
 
         drop(hub);
         let _ = fs::remove_file(program);
+    }
+
+    fn failing_bridge(beam_uuid: &str, existing: Vec<&'static str>) -> (Arc<Hub>, Receiver<ClientToBeam>) {
+        let (mut hub, command_rx) = hub_with_bridge(beam_uuid);
+        let existing: Vec<String> = existing.into_iter().map(str::to_string).collect();
+        Arc::get_mut(&mut hub).unwrap().beam_lister = Box::new(move || Ok(existing.clone()));
+        let failed_at = Instant::now() - BRIDGE_GONE_CHECK_AFTER - Duration::from_secs(1);
+        hub.bridges.lock().unwrap().get_mut(beam_uuid).unwrap().failing_since = Some(failed_at);
+        (hub, command_rx)
+    }
+
+    #[test]
+    fn bridges_to_deleted_beams_are_retired_after_failing_for_a_while() {
+        let (hub, command_rx) = failing_bridge("gone-uuid", vec!["other-uuid"]);
+        handle_bridge_event(
+            &hub,
+            crate::bridge::Event::Disconnected {
+                beam_uuid: "gone-uuid".to_string(),
+                message: "bridge exited with exit status: 1".to_string(),
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while hub.bridges.lock().unwrap().contains_key("gone-uuid") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!hub.bridges.lock().unwrap().contains_key("gone-uuid"));
+        // Dropping the command sender is what stops the bridge supervisor.
+        assert!(matches!(
+            command_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn bridges_are_kept_when_the_beam_exists_or_existence_is_unknown() {
+        let (hub, _rx) = failing_bridge("live-uuid", vec!["live-uuid"]);
+        hub.retire_bridge_if_beam_gone("live-uuid");
+        assert!(hub.bridges.lock().unwrap().contains_key("live-uuid"));
+
+        let (mut hub, _rx) = failing_bridge("unknown-uuid", vec![]);
+        Arc::get_mut(&mut hub).unwrap().beam_lister = Box::new(|| anyhow::bail!("not logged in"));
+        hub.retire_bridge_if_beam_gone("unknown-uuid");
+        assert!(hub.bridges.lock().unwrap().contains_key("unknown-uuid"));
+
+        // A bridge that reconnected while `tsh beams ls` ran is kept too.
+        let (hub, _rx) = failing_bridge("back-uuid", vec![]);
+        hub.bridges.lock().unwrap().get_mut("back-uuid").unwrap().failing_since = None;
+        hub.retire_bridge_if_beam_gone("back-uuid");
+        assert!(hub.bridges.lock().unwrap().contains_key("back-uuid"));
+    }
+
+    #[test]
+    fn recently_failed_bridges_are_not_checked_yet() {
+        let (hub, _rx) = failing_bridge("new-uuid", vec![]);
+        hub.bridges.lock().unwrap().get_mut("new-uuid").unwrap().failing_since = None;
+        handle_bridge_event(
+            &hub,
+            crate::bridge::Event::Disconnected {
+                beam_uuid: "new-uuid".to_string(),
+                message: "bridge exited".to_string(),
+            },
+        );
+        thread::sleep(Duration::from_millis(100));
+        let bridges = hub.bridges.lock().unwrap();
+        let bridge = bridges.get("new-uuid").expect("not retired");
+        assert!(bridge.failing_since.is_some());
+        assert!(bridge.last_existence_check.is_none());
     }
 }

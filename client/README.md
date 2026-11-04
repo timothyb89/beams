@@ -158,6 +158,14 @@ local frontends, retains all managed-shell tokens when that bridge reconnects,
 and supervises approved `tsh ssh -N -L` processes plus one-shot `tsh scp`
 jobs independently of the interactive terminal.
 
+A bridge only resets its retry backoff (250ms doubling to 5s) after the Beam
+actually answers its hello. Once a bridge has been failing for 20 seconds, the
+daemon checks `tsh beams ls` at most once a minute. If the Beam is gone, it
+retires the bridge, stops that Beam's forwards and copies, and pauses its folder
+syncs. If `tsh` can't list Beams (offline, logged out), the bridge keeps
+retrying. A later `beams ssh` to the same Beam starts a fresh bridge. The
+local menu only shows bridge status for its own session's Beam.
+
 Run it explicitly in the foreground for debugging:
 
 ```sh

@@ -7,7 +7,9 @@
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -99,16 +101,23 @@ fn supervise(
                     let _ = child.kill();
                     let _ = child.wait();
                 } else {
-                    retry = RETRY_MIN;
-                    if drive_child(
+                    let outcome = drive_child(
                         &target,
                         &commands,
                         &mut tokens,
                         &events,
                         &mut child,
                         &mut input,
-                    ) {
+                    );
+                    if outcome.stop {
                         return;
+                    }
+                    // Only a bridge that actually reached the Beam resets the
+                    // backoff. `tsh ssh` to a deleted Beam still spawns and
+                    // accepts the hello on stdin before failing, and resetting
+                    // on that made unreachable Beams retry every 250ms forever.
+                    if outcome.connected {
+                        retry = RETRY_MIN;
                     }
                 }
             }
@@ -150,6 +159,13 @@ fn start_child(
     Ok((child, input))
 }
 
+struct ChildOutcome {
+    /// The command channel closed: the daemon retired this bridge.
+    stop: bool,
+    /// The Beam answered with a matching hello at some point.
+    connected: bool,
+}
+
 fn drive_child(
     target: &Target,
     commands: &Receiver<ClientToBeam>,
@@ -157,13 +173,19 @@ fn drive_child(
     events: &SyncSender<Event>,
     child: &mut std::process::Child,
     input: &mut ChildStdin,
-) -> bool {
+) -> ChildOutcome {
+    let connected = Arc::new(AtomicBool::new(false));
+    let outcome = |stop: bool| ChildOutcome {
+        stop,
+        connected: connected.load(Ordering::SeqCst),
+    };
     let Some(output) = child.stdout.take() else {
-        return false;
+        return outcome(false);
     };
     let (reader_done_tx, reader_done_rx) = mpsc::channel();
     let beam_uuid = target.beam_uuid.clone();
     let event_tx = events.clone();
+    let reader_connected = Arc::clone(&connected);
     thread::spawn(move || {
         let mut reader = BufReader::new(output);
         while let Ok(Some(message)) = read_message(&mut reader) {
@@ -172,10 +194,13 @@ fn drive_child(
                     protocol,
                     version,
                     bridge_id,
-                } if protocol == PROTOCOL && *version == PROTOCOL_VERSION => Event::Connected {
-                    beam_uuid: beam_uuid.clone(),
-                    bridge_id: bridge_id.clone(),
-                },
+                } if protocol == PROTOCOL && *version == PROTOCOL_VERSION => {
+                    reader_connected.store(true, Ordering::SeqCst);
+                    Event::Connected {
+                        beam_uuid: beam_uuid.clone(),
+                        bridge_id: bridge_id.clone(),
+                    }
+                }
                 BeamToClient::Hello {
                     protocol, version, ..
                 } => {
@@ -214,7 +239,7 @@ fn drive_child(
             Err(TryRecvError::Disconnected) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return true;
+                return outcome(true);
             }
         }
         if reader_done_rx.try_recv().is_ok() {
@@ -226,7 +251,7 @@ fn drive_child(
                     beam_uuid: target.beam_uuid.clone(),
                     message: format!("bridge exited with {status}"),
                 });
-                return false;
+                return outcome(false);
             }
             Ok(None) => {}
             Err(err) => {
@@ -246,7 +271,7 @@ fn drive_child(
         beam_uuid: target.beam_uuid.clone(),
         message: "bridge connection closed".to_string(),
     });
-    false
+    outcome(false)
 }
 
 fn drain_disconnected_commands(commands: &Receiver<ClientToBeam>, tokens: &mut BTreeSet<String>) {
@@ -393,6 +418,53 @@ exit 1
         );
 
         drop(commands);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A Beam that never answers (deleted, unreachable) must back off
+    /// rather than respawn `tsh ssh` every `RETRY_MIN`, even though the
+    /// child accepts the hello on stdin before exiting.
+    #[test]
+    fn supervisor_backs_off_when_the_beam_never_answers() {
+        let dir = std::env::temp_dir().join(format!(
+            "beams-bridge-backoff-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake_tsh = dir.join("fake-tsh");
+        let starts = dir.join("starts");
+        std::fs::write(
+            &fake_tsh,
+            format!(
+                "#!/bin/sh\nIFS= read -r hello\necho start >> '{}'\nexit 1\n",
+                starts.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_tsh, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let (event_tx, _event_rx) = mpsc::sync_channel(256);
+        let commands = spawn_with_program(
+            Target {
+                beam_id: "gone-beam".to_string(),
+                beam_uuid: "gone-uuid".to_string(),
+                login: "beams".to_string(),
+            },
+            "client-id".to_string(),
+            "session-token".to_string(),
+            event_tx,
+            fake_tsh.display().to_string(),
+        );
+        // Backoff 250ms, 500ms, 1s, 2s: about four starts in 2.5s. Without
+        // backoff it would be eight or more.
+        thread::sleep(Duration::from_millis(2500));
+        drop(commands);
+        let count = std::fs::read_to_string(&starts)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        assert!((1..=5).contains(&count), "{count} bridge starts in 2.5s");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

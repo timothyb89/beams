@@ -35,7 +35,7 @@ use beams_protocol::{
     ServiceRequestKind, ServiceStatus,
 };
 
-use crate::clientd::{Frontend, RequestRecord, ServerEvent, ServiceRecord};
+use crate::clientd::{BridgeRecord, Frontend, RequestRecord, ServerEvent, ServiceRecord};
 use crate::terminal_model::TerminalModel;
 
 mod form;
@@ -928,18 +928,7 @@ impl DaemonView {
                     changed = true;
                 }
                 Ok(ServerEvent::BridgeStatus { bridge }) => {
-                    self.bridge_statuses
-                        .insert(bridge.beam_uuid.clone(), bridge.status.clone());
-                    self.message = format!(
-                        "bridge to {}: {}{}",
-                        bridge.beam_id,
-                        bridge.status,
-                        bridge
-                            .message
-                            .as_deref()
-                            .map(|message| format!(" ({message})"))
-                            .unwrap_or_default()
-                    );
+                    self.apply_bridge_status(bridge);
                     changed = true;
                 }
                 Ok(ServerEvent::Hello { .. } | ServerEvent::Pong) => {}
@@ -952,6 +941,30 @@ impl DaemonView {
                     return true;
                 }
             }
+        }
+    }
+
+    fn apply_bridge_status(&mut self, bridge: BridgeRecord) {
+        if bridge.status == "retired" {
+            self.bridge_statuses.remove(&bridge.beam_uuid);
+        } else {
+            self.bridge_statuses
+                .insert(bridge.beam_uuid.clone(), bridge.status.clone());
+        }
+        // The daemon is shared by every `beams ssh` session and
+        // broadcasts every Beam's bridge; only this session's
+        // Beam belongs in its status line.
+        if self.beam_uuid.as_deref() == Some(bridge.beam_uuid.as_str()) {
+            self.message = format!(
+                "bridge to {}: {}{}",
+                bridge.beam_id,
+                bridge.status,
+                bridge
+                    .message
+                    .as_deref()
+                    .map(|message| format!(" ({message})"))
+                    .unwrap_or_default()
+            );
         }
     }
 
@@ -2622,5 +2635,27 @@ mod tests {
             .modifier
             .contains(ratatui::style::Modifier::DIM));
         assert!(screen_text(&terminal).contains("Beams local menu"));
+    }
+
+    #[test]
+    fn bridge_status_for_other_beams_does_not_take_over_the_status_line() {
+        let daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        let bridge = |beam_id: &str, beam_uuid: &str, status: &str| BridgeRecord {
+            beam_id: beam_id.to_string(),
+            beam_uuid: beam_uuid.to_string(),
+            login: "beams".to_string(),
+            status: status.to_string(),
+            session_count: 1,
+            bridge_id: None,
+            message: Some("bridge exited".to_string()),
+        };
+        view.apply_bridge_status(bridge("beam-a", "beam-a-uuid", "connected"));
+        assert_eq!(view.message, "bridge to beam-a: connected (bridge exited)");
+        view.apply_bridge_status(bridge("old-beam", "old-uuid", "reconnecting"));
+        assert_eq!(view.message, "bridge to beam-a: connected (bridge exited)");
+        assert_eq!(view.bridge_statuses.len(), 2);
+        view.apply_bridge_status(bridge("old-beam", "old-uuid", "retired"));
+        assert_eq!(view.bridge_statuses.len(), 1, "retired bridges are forgotten");
     }
 }

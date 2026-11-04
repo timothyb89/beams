@@ -616,6 +616,14 @@ bootstrap `Task`s.
   bracketed paste); a line editor with a visible cursor, horizontal
   scrolling, and fish-style workstation path completion. Service selection
   is clamped consistently for display and actions.
+- [x] Bridges to deleted Beams: the daemon kept one reconnecting bridge per
+  Beam for its whole lifetime, and reset the backoff whenever `tsh` merely
+  spawned, so each deleted Beam respawned `tsh ssh` every ~250ms forever.
+  The local menu also showed every Beam's bridge status in its own status
+  line. The backoff now resets only after a real hello. Bridges failing for
+  20s are retired once `tsh beams ls` confirms the Beam is gone, which also
+  stops that Beam's forwards and copies and pauses its syncs. The menu
+  filters bridge status to its own Beam.
 - [ ] Local menu home screen: Enter still closes the menu instead of opening
   an actions menu for the selected service, and `t` (terminate) acts without
   a confirmation step. Consider a proper table and per-request queue view
