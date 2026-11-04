@@ -2843,7 +2843,7 @@ fn default_log_path() -> anyhow::Result<PathBuf> {
     Ok(config_dir()?.join("beams-client/daemon.log"))
 }
 
-fn config_dir() -> anyhow::Result<PathBuf> {
+pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
     match std::env::var("XDG_CONFIG_HOME") {
         Ok(dir) if !dir.is_empty() => Ok(PathBuf::from(dir)),
         _ => Ok(PathBuf::from(std::env::var("HOME").context("HOME is not set")?).join(".config")),

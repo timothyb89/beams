@@ -121,8 +121,17 @@ Forms behave like ordinary text inputs: `Tab`/`Shift-Tab` (or `↓`/`↑`) move
 between fields; `←`/`→`, `Home`/`End`, `Backspace`/`Delete`, and the readline
 chords `Ctrl-A`/`E`/`U`/`K`/`W` edit text; pasted text lands in the focused
 field; `Space` or `←`/`→` change toggles and choices. Workstation path fields
-show a dimmed completion from the local filesystem, and `→` at the end of the
-text accepts it. Relative and `~` workstation paths are resolved against the
+show a dimmed completion from the local filesystem (`→` at the end of the
+text accepts it) and a dropdown of the typed directory's entries,
+fuzzy-filtered by the segment being typed (`dl` finds `Downloads`; hidden
+entries appear once the segment starts with `.`). In the dropdown, `↓`/`↑`
+(or `Ctrl-N`/`Ctrl-P`, `PageDown`/`PageUp`) highlight an entry and `Enter`
+takes it; `Tab` completes the common prefix first, then the highlighted or
+best entry, and moves to the next field once the path is complete; `Esc`
+hides the list until the text changes. A directory entry keeps the list open
+on its contents. While a path field is empty the dropdown offers recently
+used workstation directories, kept in
+`~/.config/beams-client/recent-paths.json`. Relative and `~` workstation paths are resolved against the
 directory `beams ssh` was started from. Validation errors appear under the
 offending field and the form stays open with its input intact; `Enter`
 submits and `Esc` cancels. Menu keys are decoded from plain bytes, `ESC [`

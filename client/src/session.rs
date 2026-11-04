@@ -40,6 +40,8 @@ use crate::terminal_model::TerminalModel;
 
 mod form;
 mod keys;
+mod picker;
+mod recent;
 mod ui;
 
 use form::{ChoiceOption, Completion, Field, Form, FormEvent};
@@ -300,6 +302,7 @@ fn drive(
     let mut deferred = DeferredOutput::default();
     let mut output_finished = false;
     let mut daemon_view = DaemonView::new(local_daemon);
+    daemon_view.recents = recent::RecentPaths::load_default();
     let mut approval_takeover_guard = None;
     let mut palette_terminal = None;
     macro_rules! redraw_palette {
@@ -501,6 +504,8 @@ struct DaemonView {
     message: String,
     /// Feedback from the most recent menu action.
     notice: Option<Notice>,
+    /// Workstation directories offered by empty path fields.
+    recents: recent::RecentPaths,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -923,6 +928,18 @@ fn daemon_frontend(local_daemon: &mut LocalDaemon) -> Result<&mut Frontend, Stri
         .ok_or_else(|| "the local daemon connection is unavailable".to_string())
 }
 
+/// The workstation path a submitted form used, for the recents list, and
+/// whether it names a directory.
+fn used_local_path(kind: &FormKind, form: &Form) -> Option<(std::path::PathBuf, bool)> {
+    let is_dir = match kind {
+        FormKind::Forward => return None,
+        FormKind::Copy(_) | FormKind::CopyApproval { .. } => false,
+        FormKind::Sync | FormKind::SyncApproval { .. } => true,
+    };
+    let text = form.text("local_path");
+    (!text.is_empty()).then(|| (form::resolve_local_path(&text), is_dir))
+}
+
 /// Validates and submits `form`. `Ok(Some(notice))` closes the form,
 /// `Ok(None)` means field errors were set, `Err` is a form-level error.
 fn submit_form(
@@ -1036,6 +1053,7 @@ impl DaemonView {
                 presented_approval_requests: BTreeSet::new(),
                 notice: None,
                 message: "connected".to_string(),
+                recents: Default::default(),
             },
             None => Self {
                 beam_uuid,
@@ -1057,6 +1075,7 @@ impl DaemonView {
                     .unavailable
                     .clone()
                     .unwrap_or_else(|| "unavailable".to_string()),
+                recents: Default::default(),
             },
         }
     }
@@ -1315,7 +1334,8 @@ impl DaemonView {
         });
     }
 
-    fn open_form(&mut self, kind: FormKind, form: Form) {
+    fn open_form(&mut self, kind: FormKind, mut form: Form) {
+        form.set_recents(self.recents.directories());
         self.notice = None;
         self.screen = Screen::Form { kind, form };
     }
@@ -1336,7 +1356,11 @@ impl DaemonView {
                         form.clear_errors();
                         match submit_form(kind, form, local_daemon) {
                             Ok(Some(notice)) => {
+                                let used = used_local_path(kind, form);
                                 self.screen = Screen::Home;
+                                if let Some((path, is_dir)) = used {
+                                    self.recents.record(&path, is_dir);
+                                }
                                 self.notify(notice, false);
                             }
                             Ok(None) => {}
@@ -2739,8 +2763,17 @@ mod tests {
         view: &DaemonView,
         model: Option<&TerminalModel>,
     ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        render_sized(view, model, 100, 30)
+    }
+
+    fn render_sized(
+        view: &DaemonView,
+        model: Option<&TerminalModel>,
+        width: u16,
+        height: u16,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| ui::draw(frame, &info(), EscapeKey::default(), view, model))
             .unwrap();
@@ -2882,6 +2915,106 @@ mod tests {
             !text.contains("LocalPortForward"),
             "debug output leaked:\n{text}"
         );
+    }
+
+    #[test]
+    fn path_dropdown_draws_under_the_field_and_recents_are_recorded() {
+        let dir = std::env::temp_dir().join(format!("beams-dropdown-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for name in ["Downloads", "Documents", "deploy-logs", "src"] {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+        }
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        view.handle_key(Key::Char('m'), &mut daemon);
+        type_keys(&mut view, &mut daemon, &format!("{}/dl", dir.display()));
+        let terminal = render(&view, None);
+        let text = screen_text(&terminal);
+        if std::env::var_os("BEAMS_PRINT_RENDER").is_some() {
+            println!("{text}");
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let field = lines
+            .iter()
+            .position(|line| line.contains("Workstation dir"))
+            .unwrap();
+        assert!(
+            lines[field + 1].contains('╭'),
+            "popup under the field:\n{text}"
+        );
+        // "d…-l" hits a word boundary, so it outranks "D…l".
+        assert!(lines[field + 2].contains("deploy-logs/"), "{text}");
+        assert!(lines[field + 3].contains("Downloads/"), "{text}");
+        assert!(
+            !lines[field + 1].ends_with("╮╮"),
+            "stays inside the dialog:\n{text}"
+        );
+        assert!(
+            text.contains("Tab complete") && text.contains("Esc hide list"),
+            "{text}"
+        );
+
+        view.handle_key(Key::Down, &mut daemon);
+        view.handle_key(Key::Down, &mut daemon);
+        view.handle_key(Key::Enter, &mut daemon);
+        let Screen::Form { form, .. } = &view.screen else {
+            panic!("Enter on a highlighted entry stays in the form");
+        };
+        assert_eq!(
+            form.text("local_path"),
+            format!("{}/Downloads/", dir.display())
+        );
+        // The managed test daemon has no live frontend, so submitting fails
+        // at the daemon; nothing is recorded for a failed submit.
+        type_keys(&mut view, &mut daemon, "\r");
+        assert!(view.recents.directories().is_empty());
+        let form = Form::new(
+            "t",
+            "go",
+            vec![form::Field::text("local_path", "P").value(&format!("{}/src", dir.display()))],
+        );
+        let used = used_local_path(&FormKind::Sync, &form).unwrap();
+        view.recents.record(&used.0, used.1);
+        assert_eq!(
+            view.recents.directories(),
+            vec![format!("{}/src/", dir.display())]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn path_dropdown_fits_a_short_terminal_and_follows_the_highlight() {
+        let dir = std::env::temp_dir().join(format!("beams-dropdown-short-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for index in 0..12 {
+            std::fs::create_dir_all(dir.join(format!("dir-{index:02}"))).unwrap();
+        }
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        view.handle_key(Key::Char('d'), &mut daemon);
+        type_keys(&mut view, &mut daemon, "/remote/file");
+        view.handle_key(Key::Tab, &mut daemon);
+        type_keys(&mut view, &mut daemon, &format!("{}/", dir.display()));
+        for _ in 0..10 {
+            view.handle_key(Key::Down, &mut daemon);
+        }
+        let terminal = render_sized(&view, None, 90, 16);
+        let text = screen_text(&terminal);
+        if std::env::var_os("BEAMS_PRINT_RENDER").is_some() {
+            println!("{text}");
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        let bottom = lines
+            .iter()
+            .rposition(|line| line.contains('╰') && line.contains('╯'))
+            .unwrap();
+        assert!(bottom < lines.len(), "{text}");
+        assert!(
+            text.contains("› dir-09/"),
+            "highlight scrolled into view:\n{text}"
+        );
+        assert!(text.contains(" of 12"), "footer kept:\n{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

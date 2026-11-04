@@ -51,13 +51,24 @@ done
 
 set +e
 # zellij enables enhanced keyboard reporting on capable outer terminals.
-# Exercise Ctrl-] in its Kitty CSI-u form, then open/cancel the forward modal.
+# Exercise Ctrl-] in its Kitty CSI-u form, then open/cancel the forward modal,
+# then type a partial workstation path into the download form so the path
+# dropdown lists the matching directory (Esc hides it, Esc cancels).
+mkdir -p "$TEST_DIR/picker/Downloads-smoke"
 {
     printf 'hello\r\033[93;5u'
     sleep 0.1
     printf 'f'
     sleep 0.1
     printf '8080\t18080\033'
+    sleep 0.1
+    printf 'd'
+    sleep 0.1
+    printf '/remote/file\t%s/dsmk' "$TEST_DIR/picker"
+    sleep 0.2
+    printf '\033'
+    sleep 0.1
+    printf '\033'
     sleep 0.1
     printf 'q'
 } |
@@ -82,6 +93,9 @@ fi
 strings "$TRANSCRIPT" | grep -q "Beams local menu"
 strings "$TRANSCRIPT" | grep -q "Forward a Beam port"
 strings "$TRANSCRIPT" | grep -q "automatic"
+# Match highlights style characters individually, so drop SGR sequences
+# before looking for the dropdown entry.
+sed 's/\x1b\[[0-9;]*m//g' "$TRANSCRIPT" | grep -q "Downloads-smoke/"
 strings "$TRANSCRIPT" | grep -q "REMOTE READY"
 strings "$TRANSCRIPT" | grep -q "REMOTE TITLE"
 strings "$TRANSCRIPT" | grep -q "24 100"

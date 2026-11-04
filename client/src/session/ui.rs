@@ -17,7 +17,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::form::Input;
+use super::form::{Dropdown, Input};
 use super::{ConnectionInfo, DaemonView, EscapeKey, Menu, Row, Screen};
 use crate::clientd::{RequestRecord, ServiceRecord};
 use crate::terminal_model::TerminalModel;
@@ -500,20 +500,31 @@ fn hints(view: &DaemonView, escape_key: EscapeKey) -> Vec<(String, String)> {
             add("q", "close");
         }
         Screen::Form { form, .. } => {
-            if form.fields.len() > 1 {
-                add("Tab", "next");
-                add("⇧Tab", "previous");
-            }
-            match form.focused().map(|field| &field.input) {
-                Some(Input::Toggle { .. }) => add("Space", "toggle"),
-                Some(Input::Choice { .. }) => add("←→", "change"),
-                Some(Input::Text { suggestion, .. }) if !suggestion.is_empty() => {
-                    add("→", "complete")
+            if let Some(picker) = form.focused().and_then(|field| field.dropdown()) {
+                add("↑↓", "choose");
+                add("Tab", "complete");
+                if picker.highlighted.is_some() {
+                    add("Enter", "take");
+                } else {
+                    add("Enter", form.submit_label);
                 }
-                _ => {}
+                add("Esc", "hide list");
+            } else {
+                if form.fields.len() > 1 {
+                    add("Tab", "next");
+                    add("⇧Tab", "previous");
+                }
+                match form.focused().map(|field| &field.input) {
+                    Some(Input::Toggle { .. }) => add("Space", "toggle"),
+                    Some(Input::Choice { .. }) => add("←→", "change"),
+                    Some(Input::Text { suggestion, .. }) if !suggestion.is_empty() => {
+                        add("→", "complete")
+                    }
+                    _ => {}
+                }
+                add("Enter", form.submit_label);
+                add("Esc", "cancel");
             }
-            add("Enter", form.submit_label);
-            add("Esc", "cancel");
         }
         Screen::Menu(_) => {
             add("↑↓", "select");
@@ -805,17 +816,23 @@ pub fn draw(
     let chrome = 2 + 1 + hint_lines.len();
     let max_body = usize::from(area.height).saturating_sub(chrome).max(1);
 
-    let (title, body, cursor) = match &view.screen {
+    let (title, body, cursor, dropdown) = match &view.screen {
         Screen::Home => (
             "Beams local menu".to_string(),
             home_body(view, inner_width, max_body),
             None,
+            None,
         ),
         Screen::Form { form, .. } => {
-            let (body, cursor) = form.render(inner_width);
-            (form.title.clone(), body, cursor)
+            let rendered = form.render(inner_width);
+            (
+                form.title.clone(),
+                rendered.lines,
+                rendered.cursor,
+                rendered.dropdown,
+            )
         }
-        Screen::Menu(menu) => (menu.title.clone(), menu_body(menu, inner_width), None),
+        Screen::Menu(menu) => (menu.title.clone(), menu_body(menu, inner_width), None, None),
     };
 
     let height = (body.len().min(max_body) + chrome).min(usize::from(area.height)) as u16;
@@ -872,6 +889,58 @@ pub fn draw(
             frame.set_cursor_position((body_area.x + col, body_area.y + row));
         }
     }
+    if let Some(dropdown) = dropdown {
+        if let Some(field_row) = dropdown.row.checked_sub(scroll) {
+            if field_row < body_area.height {
+                draw_dropdown(frame, area, body_area, field_row, &dropdown);
+            }
+        }
+    }
+}
+
+/// Draws a field's dropdown as a bordered popup just under the field (or
+/// above it when the terminal is too short below), over the rest of the
+/// dialog.
+fn draw_dropdown(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    body: Rect,
+    field_row: u16,
+    dropdown: &Dropdown<'_>,
+) {
+    let field_y = body.y + field_row;
+    let wanted = dropdown.wanted_rows() as u16 + 2;
+    let below = area.bottom().saturating_sub(field_y + 1);
+    let above = field_y.saturating_sub(area.y);
+    let (y, height) = if wanted <= below || below >= above {
+        (field_y + 1, wanted.min(below))
+    } else {
+        let height = wanted.min(above);
+        (field_y - height, height)
+    };
+    if height < 3 {
+        return;
+    }
+    // The border sits one column left of the field text so entries line up
+    // with what's typed.
+    let x = (body.x + dropdown.col).saturating_sub(1).max(area.x);
+    let width = (dropdown.width + 2).min(area.right().saturating_sub(x));
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme::dim());
+    let inner = block.inner(rect);
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(
+        Paragraph::new(dropdown.lines(usize::from(inner.height))),
+        inner,
+    );
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {

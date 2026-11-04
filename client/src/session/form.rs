@@ -13,7 +13,11 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::keys::Key;
+use super::picker::{Picker, Source};
 use super::ui::{theme, wrap};
+
+/// Dropdown rows shown at once (PageUp/PageDown move by this much).
+pub const DROPDOWN_ROWS: usize = 8;
 
 /// A single-line editable text buffer with a cursor.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -160,6 +164,8 @@ pub enum Input {
         /// Completion suffix shown dimmed after the text (fish-style);
         /// Right/End at the end of the text accepts it.
         suggestion: String,
+        /// The path dropdown, for fields with a completion kind.
+        picker: Option<Picker>,
     },
     Toggle {
         on: bool,
@@ -191,6 +197,7 @@ impl Field {
                 digits_only: false,
                 completion: None,
                 suggestion: String::new(),
+                picker: None,
             },
             error: None,
         }
@@ -252,10 +259,138 @@ impl Field {
     }
 
     pub fn complete(mut self, kind: Completion) -> Self {
-        if let Input::Text { completion, .. } = &mut self.input {
+        if let Input::Text {
+            completion, picker, ..
+        } = &mut self.input
+        {
             *completion = Some(kind);
+            *picker = Some(Picker::new(kind));
         }
         self
+    }
+
+    /// The dropdown, if it's showing.
+    pub fn dropdown(&self) -> Option<&Picker> {
+        match &self.input {
+            Input::Text {
+                picker: Some(picker),
+                ..
+            } if picker.visible() => Some(picker),
+            _ => None,
+        }
+    }
+
+    /// Brings the dropdown and the inline suggestion up to date with the
+    /// text (which builders such as `value` set without either).
+    fn refresh_picker(&mut self) {
+        if let Input::Text {
+            edit,
+            completion: Some(kind),
+            suggestion,
+            picker: Some(picker),
+            ..
+        } = &mut self.input
+        {
+            let text = edit.text();
+            if picker.refresh(&text) {
+                *suggestion = if edit.at_end() {
+                    path_suggestion(&text, *kind)
+                } else {
+                    String::new()
+                };
+            }
+        }
+    }
+
+    fn set_text(&mut self, text: &str) {
+        if let Input::Text {
+            edit,
+            completion,
+            suggestion,
+            ..
+        } = &mut self.input
+        {
+            *edit = LineEdit::new(text);
+            *suggestion = match completion {
+                Some(kind) => path_suggestion(text, *kind),
+                None => String::new(),
+            };
+        }
+        self.error = None;
+        self.refresh_picker();
+    }
+
+    /// Keys the open dropdown takes before the form sees them: ↑/↓ and
+    /// PageUp/PageDown highlight, Tab completes, Enter takes a highlighted
+    /// entry, Esc hides the dropdown.
+    fn dropdown_key(&mut self, key: &Key) -> bool {
+        let Input::Text {
+            edit,
+            suggestion,
+            picker: Some(picker),
+            ..
+        } = &mut self.input
+        else {
+            return false;
+        };
+        if !picker.visible() {
+            return false;
+        }
+        let chosen = match key {
+            Key::Down | Key::Ctrl('n') => {
+                picker.highlight_next(1);
+                return true;
+            }
+            Key::PageDown => {
+                picker.highlight_next(DROPDOWN_ROWS);
+                return true;
+            }
+            Key::Up | Key::Ctrl('p') if picker.highlighted.is_some() => {
+                picker.highlight_previous(1);
+                return true;
+            }
+            Key::PageUp if picker.highlighted.is_some() => {
+                picker.highlight_previous(DROPDOWN_ROWS);
+                return true;
+            }
+            Key::Esc => {
+                picker.dismissed = true;
+                return true;
+            }
+            Key::Enter => match picker.highlighted {
+                Some(index) => index,
+                None => return false,
+            },
+            Key::Tab => {
+                // Like a shell, an unambiguous common prefix completes
+                // first; otherwise the highlighted (or best) entry does.
+                if picker.highlighted.is_none() && !suggestion.is_empty() && edit.at_end() {
+                    let text = format!("{}{}", edit.text(), suggestion);
+                    self.set_text(&text);
+                    return true;
+                }
+                let index = picker.highlighted.unwrap_or(0);
+                if picker.items[index].replacement == edit.text() {
+                    // Already complete: let Tab move to the next field.
+                    return false;
+                }
+                index
+            }
+            _ => return false,
+        };
+        let item = picker.items[chosen].clone();
+        self.set_text(&item.replacement);
+        if !item.is_dir {
+            // A chosen file is final; the next Enter submits.
+            if let Input::Text {
+                picker: Some(picker),
+                ..
+            } = &mut self.input
+            {
+                picker.dismissed = true;
+            }
+        }
+        true
     }
 
     fn handle(&mut self, key: &Key) -> bool {
@@ -330,7 +465,7 @@ pub struct Form {
 
 impl Form {
     pub fn new(title: impl Into<String>, submit_label: &'static str, fields: Vec<Field>) -> Self {
-        Self {
+        let mut form = Self {
             title: title.into(),
             intro: Vec::new(),
             fields,
@@ -338,7 +473,9 @@ impl Form {
             submit_label,
             focus: 0,
             error: None,
-        }
+        };
+        form.refresh_focused();
+        form
     }
 
     pub fn intro(mut self, text: impl Into<String>, warn: bool) -> Self {
@@ -352,6 +489,40 @@ impl Form {
     }
 
     pub fn handle_key(&mut self, key: &Key) -> FormEvent {
+        let event = self.dispatch_key(key);
+        self.refresh_focused();
+        event
+    }
+
+    /// Gives every path field's dropdown the recently used directories.
+    pub fn set_recents(&mut self, recents: Vec<String>) {
+        for field in &mut self.fields {
+            if let Input::Text {
+                picker: Some(picker),
+                ..
+            } = &mut field.input
+            {
+                picker.set_recents(recents.clone());
+            }
+        }
+        self.refresh_focused();
+    }
+
+    /// Brings the focused field's dropdown up to date with its text.
+    fn refresh_focused(&mut self) {
+        if let Some(field) = self.fields.get_mut(self.focus) {
+            field.refresh_picker();
+        }
+    }
+
+    fn dispatch_key(&mut self, key: &Key) -> FormEvent {
+        if self
+            .fields
+            .get_mut(self.focus)
+            .is_some_and(|field| field.dropdown_key(key))
+        {
+            return FormEvent::Handled;
+        }
         let count = self.fields.len();
         match key {
             Key::Esc => return FormEvent::Cancel,
@@ -414,6 +585,7 @@ impl Form {
                 .all(|field| field.error.is_none())
             {
                 self.focus = index;
+                self.refresh_focused();
             }
         }
     }
@@ -426,12 +598,13 @@ impl Form {
         self.fields.get(self.focus)
     }
 
-    /// Renders the form body into `width` columns. Returns the lines plus
-    /// the terminal cursor position (row, column) within them, if the
-    /// focused field is a text field.
-    pub fn render(&self, width: usize) -> (Vec<Line<'static>>, Option<(u16, u16)>) {
+    /// Renders the form body into `width` columns: the lines, the terminal
+    /// cursor position (row, column) within them if the focused field is a
+    /// text field, and the focused field's open dropdown.
+    pub fn render(&self, width: usize) -> RenderedForm<'_> {
         let mut lines = Vec::new();
         let mut cursor = None;
+        let mut dropdown = None;
 
         for (text, warn) in &self.intro {
             let style = if *warn {
@@ -492,7 +665,10 @@ impl Form {
                         spans.push(Span::styled(shown, box_style.patch(theme::placeholder())));
                     } else {
                         spans.push(Span::styled(visible, box_style));
-                        if focused && !suggestion.is_empty() {
+                        let highlighting = field
+                            .dropdown()
+                            .is_some_and(|picker| picker.highlighted.is_some());
+                        if focused && !suggestion.is_empty() && !highlighting {
                             let shown = truncate(suggestion, value_width.saturating_sub(used));
                             used += shown.width();
                             spans.push(Span::styled(shown, box_style.patch(theme::placeholder())));
@@ -504,6 +680,17 @@ impl Form {
                     ));
                     if focused {
                         cursor = Some((lines.len() as u16, (indent + cursor_col) as u16));
+                        // The popup's left border sits in the gap before
+                        // the value and its right border at the value's
+                        // last column, leaving `value_width - 1` inside.
+                        let inner = value_width.saturating_sub(1);
+                        dropdown = field.dropdown().map(|picker| Dropdown {
+                            row: lines.len() as u16,
+                            col: indent as u16,
+                            width: inner as u16,
+                            picker,
+                            tab_takes_best: suggestion.is_empty(),
+                        });
                     }
                 }
                 Input::Toggle {
@@ -582,8 +769,132 @@ impl Form {
                 lines.push(Line::from(Span::styled(line, theme::error())));
             }
         }
-        (lines, cursor)
+        RenderedForm {
+            lines,
+            cursor,
+            dropdown,
+        }
     }
+}
+
+pub struct RenderedForm<'a> {
+    pub lines: Vec<Line<'static>>,
+    pub cursor: Option<(u16, u16)>,
+    pub dropdown: Option<Dropdown<'a>>,
+}
+
+/// A dropdown to draw over the form, anchored under the field at `row`
+/// (a line index into the form body) with its text starting at `col`;
+/// `width` is the space inside its border.
+pub struct Dropdown<'a> {
+    pub row: u16,
+    pub col: u16,
+    pub width: u16,
+    picker: &'a Picker,
+    /// Tab takes the best entry (rather than a common prefix).
+    tab_takes_best: bool,
+}
+
+impl Dropdown<'_> {
+    /// The rows wanted with unlimited space: entries plus a position
+    /// footer when they don't all fit.
+    pub fn wanted_rows(&self) -> usize {
+        let total = self.picker.items.len();
+        DROPDOWN_ROWS.min(total) + usize::from(total > DROPDOWN_ROWS)
+    }
+
+    /// The dropdown's lines in at most `max_rows` rows, scrolled to keep
+    /// the highlighted entry visible.
+    pub fn lines(&self, max_rows: usize) -> Vec<Line<'static>> {
+        dropdown_lines(
+            self.picker,
+            usize::from(self.width),
+            self.tab_takes_best,
+            max_rows,
+        )
+    }
+}
+
+fn dropdown_lines(
+    picker: &Picker,
+    width: usize,
+    tab_takes_best: bool,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let total = picker.items.len();
+    let mut rows = DROPDOWN_ROWS.min(total).min(max_rows);
+    if rows < total && rows == max_rows {
+        // Keep a row for the position footer.
+        rows = rows.saturating_sub(1);
+    }
+    if rows == 0 {
+        return Vec::new();
+    }
+    let start = picker
+        .highlighted
+        .map(|index| index.saturating_sub(rows - 1))
+        .unwrap_or(0);
+    let mut lines: Vec<Line<'static>> = picker.items[start..start + rows]
+        .iter()
+        .enumerate()
+        .map(|(offset, item)| {
+            let index = start + offset;
+            let highlighted = picker.highlighted == Some(index);
+            let base = if highlighted {
+                theme::selected_row()
+            } else {
+                Style::default()
+            };
+            let tag = match (&item.source, highlighted) {
+                (Source::Recent, _) => "recent",
+                (_, true) => "enter",
+                _ if index == 0 && picker.highlighted.is_none() && tab_takes_best => "tab",
+                _ => "",
+            };
+            let label_width = width.saturating_sub(2 + tag.width() + 1);
+            let name_style = if item.is_dir {
+                base.patch(theme::accent())
+            } else {
+                base
+            };
+            let mut spans = vec![Span::styled(
+                if highlighted { "› " } else { "  " },
+                base.patch(theme::accent()),
+            )];
+            let mut used = 2;
+            let shown = truncate(&item.label, label_width);
+            let cut = shown.chars().count() < item.label.chars().count();
+            let shown = if cut {
+                let mut keep = truncate(&item.label, label_width.saturating_sub(1));
+                keep.push('…');
+                keep
+            } else {
+                shown
+            };
+            for (char_index, ch) in shown.chars().enumerate() {
+                let style = if item.positions.contains(&char_index)
+                    && !(cut && char_index + 1 == shown.chars().count())
+                {
+                    name_style.patch(theme::key())
+                } else {
+                    name_style
+                };
+                used += ch.width().unwrap_or(0);
+                spans.push(Span::styled(ch.to_string(), style));
+            }
+            let pad = width.saturating_sub(used + tag.width());
+            spans.push(Span::styled(" ".repeat(pad), base));
+            spans.push(Span::styled(tag, base.patch(theme::dim())));
+            Line::from(spans)
+        })
+        .collect();
+    if total > rows {
+        lines.push(Line::from(Span::styled(
+            format!("  {}–{} of {total}", start + 1, start + rows),
+            theme::dim(),
+        )));
+    }
+    lines
 }
 
 fn truncate(text: &str, width: usize) -> String {
@@ -803,7 +1114,7 @@ mod tests {
             ],
         );
         form.handle_key(&Key::Char('8'));
-        let (lines, cursor) = form.render(40);
+        let RenderedForm { lines, cursor, .. } = form.render(40);
         assert_eq!(lines.len(), 2);
         // "› " + "Beam port" + "  " = 13 columns, then one typed digit.
         assert_eq!(cursor, Some((0, 14)));
@@ -866,5 +1177,122 @@ mod tests {
             resolve_local_path("rel"),
             std::env::current_dir().unwrap().join("rel")
         );
+    }
+
+    fn picker_dir() -> (PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("beams-form-picker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Downloads/inner")).unwrap();
+        std::fs::create_dir_all(dir.join("Documents")).unwrap();
+        std::fs::write(dir.join("Downloads/report.csv"), "").unwrap();
+        let base = format!("{}/", dir.display());
+        (dir, base)
+    }
+
+    fn path_form(value: &str) -> Form {
+        Form::new(
+            "t",
+            "go",
+            vec![
+                Field::text("local_path", "Path")
+                    .value(value)
+                    .complete(Completion::Paths),
+                Field::text("other", "Other"),
+            ],
+        )
+    }
+
+    fn type_text(form: &mut Form, text: &str) {
+        for ch in text.chars() {
+            form.handle_key(&Key::Char(ch));
+        }
+    }
+
+    #[test]
+    fn dropdown_fuzzy_filters_and_tab_completes_the_best_match() {
+        let (dir, base) = picker_dir();
+        let mut form = path_form(&base);
+        assert!(
+            form.focused().unwrap().dropdown().is_some(),
+            "lists the directory"
+        );
+        type_text(&mut form, "dl");
+        let picker = form.focused().unwrap().dropdown().unwrap();
+        assert_eq!(picker.items[0].label, "Downloads/");
+        assert_eq!(form.handle_key(&Key::Tab), FormEvent::Handled);
+        assert_eq!(form.text("local_path"), format!("{base}Downloads/"));
+        assert_eq!(form.focus, 0, "completing doesn't move focus");
+
+        // Arrow to an entry and take it with Enter, which doesn't submit.
+        form.handle_key(&Key::Down);
+        form.handle_key(&Key::Down);
+        let picker = form.focused().unwrap().dropdown().unwrap();
+        assert_eq!(picker.items[1].label, "report.csv");
+        assert_eq!(form.handle_key(&Key::Enter), FormEvent::Handled);
+        assert_eq!(
+            form.text("local_path"),
+            format!("{base}Downloads/report.csv")
+        );
+        assert!(
+            form.focused().unwrap().dropdown().is_none(),
+            "a file is final"
+        );
+        assert_eq!(form.handle_key(&Key::Enter), FormEvent::Submit);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dropdown_tab_prefers_the_common_prefix_and_then_moves_on() {
+        let (dir, base) = picker_dir();
+        let mut form = path_form(&format!("{base}D"));
+        // "Documents" and "Downloads" share only "Do".
+        form.handle_key(&Key::Tab);
+        assert_eq!(form.text("local_path"), format!("{base}Do"));
+        type_text(&mut form, "c");
+        form.handle_key(&Key::Tab);
+        assert_eq!(form.text("local_path"), format!("{base}Documents/"));
+        // Nothing left in Documents: the list closes and Tab moves on.
+        assert!(form.focused().unwrap().dropdown().is_none());
+        form.handle_key(&Key::Tab);
+        assert_eq!(form.focus, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dropdown_esc_hides_and_arrows_return_to_form_navigation() {
+        let (dir, base) = picker_dir();
+        let mut form = path_form(&base);
+        form.handle_key(&Key::Down);
+        assert_eq!(form.focus, 0, "Down goes into the list");
+        form.handle_key(&Key::Up);
+        assert_eq!(form.focus, 0, "Up from the first row goes back to the text");
+        assert_eq!(form.handle_key(&Key::Esc), FormEvent::Handled);
+        assert!(form.focused().unwrap().dropdown().is_none());
+        assert_eq!(form.handle_key(&Key::Down), FormEvent::Handled);
+        assert_eq!(form.focus, 1, "hidden list: Down moves focus again");
+        form.handle_key(&Key::Up);
+        assert_eq!(form.handle_key(&Key::Esc), FormEvent::Cancel);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn empty_path_fields_offer_recent_directories() {
+        let mut form = path_form("");
+        assert!(form.focused().unwrap().dropdown().is_none());
+        form.set_recents(vec!["~/Downloads/".to_string(), "/srv/".to_string()]);
+        let rendered = form.render(60);
+        let dropdown = rendered.dropdown.expect("recents shown");
+        assert_eq!(dropdown.row, 0);
+        assert_eq!(dropdown.wanted_rows(), 2);
+        let lines = dropdown.lines(10);
+        assert_eq!(lines.len(), 2);
+        let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            first.contains("~/Downloads/") && first.contains("recent"),
+            "{first}"
+        );
+        form.handle_key(&Key::Down);
+        form.handle_key(&Key::Enter);
+        assert_eq!(form.text("local_path"), "~/Downloads/");
     }
 }

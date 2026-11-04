@@ -640,6 +640,17 @@ bootstrap `Task`s.
   identity. `Enter` opens a request decision menu or a service's details and
   state-appropriate actions. Terminate/cancel ask first, defaulting to "Keep
   it". A takeover selects the new request.
+- [x] Workstation path picker: path fields get a fuzzy-filtered dropdown of
+  the typed directory (Tab/arrows/Enter, opens upward or shrinks on short
+  terminals) and offer recently used directories while empty.
+- [ ] `beams fetch file... [destination]` on the Beam: a `beams` entry point
+  for beam-side commands, a multi-file download request (absolute paths plus
+  total size, glob-expanded by the shell), withdraw-on-Ctrl-C, and
+  byte-progress reporting from the growing temp file.
+- [ ] Non-blocking toasts: a bottom-right notice drawn over live remote
+  output (repainted after output bursts, cells restored from the shadow
+  model) for incoming requests and copy progress, instead of an input
+  takeover; `Ctrl-]` opens straight into the request.
 - [x] Phase 2: `beams daemon` is the single-instance per-user workstation
   daemon, auto-started by `beams ssh` (with `--no-client-daemon` as a
   troubleshooting escape hatch). `client/src/clientd.rs` provides a mode-0600
