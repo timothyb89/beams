@@ -23,4 +23,4 @@ spec:
         # and encoded in hexadecimal. This value will also be checked when a TPM
         # has submitted an EKCert, and the public key in the EKCert will be used
         # for this check.
-        ek_public_hash: 99cbccc5b851e0ab82b673547c8b040ed23fcbccf466f320420a8ee718877e11
+        ek_public_hash: <sha256 hex of your workstation's TPM EKPub, see `tctl` docs or `tpm identify`>

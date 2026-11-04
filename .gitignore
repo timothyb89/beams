@@ -1,9 +1,8 @@
-.ssh/*_id_*
-!.ssh/*_id_*.pub
+# Workstation-local; no longer staged into beams since the ssh-agent relay
+# replaced key copying (see docs/designs/SSH_AGENT_PROXY_DESIGN.md).
+.ssh/*
 /bootstrap/target/
 
 /protocol/target/
 /protocol/Cargo.lock
 /.claude/worktrees/
-# Written by the pre-relay ssh-agent-init; no longer used.
-.ssh/agent.env
