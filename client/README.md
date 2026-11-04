@@ -86,19 +86,36 @@ Requests belonging to other managed Beams do not take over this session.
 `--escape-key none` retains strict passthrough and disables automatic takeover
 along with the manual menu.
 
-The menu shows connection/bridge state, any pending remote request, and the
-local services for the current Beam, each in plain language with a colored
-status. A pending proposal is described in full; `y` approves and `n` rejects
-it. `f` opens a form for a client-initiated port forward (Beam port, optional
-workstation port), `u`/`d` open an upload/download form (workstation path,
-Beam path, overwrite toggle), and `m` opens a folder-sync form (directories,
-mode, VCS/ignore rules). Remote file-copy and folder-sync requests open a
-path-confirmation form first: the Beam-provided value is only a hint and
-cannot select a workstation path by itself. `↑`/`↓` (or `j`/`k`) select a
-service; the footer lists only the actions the selected service supports
-(`s` stop, `r` restart, `p` pause, `e` resume, `t` terminate). Completed,
-failed, cancelled, or interrupted copies are terminal; create a new job
-instead of restarting one.
+The menu shows connection/bridge state, then one selectable list: every
+pending remote request for the current Beam (oldest first), then that
+Beam's local services, each with a colored status. `↑`/`↓` (or `j`/`k`,
+`Home`/`End`) move the selection. Selection follows the row itself, so a
+request decided elsewhere or a service that disappears doesn't shift it onto
+a different row. When a new request opens the menu by itself, that request
+is selected.
+
+- `Enter` on a request opens its full description with Approve / Reject /
+  Decide later. `y`/`n` decide the selected request directly, or the oldest
+  one when a service is selected.
+- `Enter` on a service opens its details (full endpoint, status, last
+  message, ignore rules, service id) and the actions that make sense in its
+  current state: no stop for a stopped forward, resume only when paused.
+  The same actions also have shortcuts on the home screen: `s` stop,
+  `r` restart, `p` pause, `e` resume, `t` terminate.
+- Irreversible actions ask first, with "Keep it" pre-selected, so `Enter`
+  alone never destroys anything. That covers terminating a folder sync
+  (removes its Mutagen session) and cancelling a file copy (the job can't be
+  resumed).
+- `f` opens a form for a client-initiated port forward (Beam port, optional
+  workstation port). `u`/`d` open an upload/download form (workstation path,
+  Beam path, overwrite toggle). `m` opens a folder-sync form (directories,
+  mode, VCS/ignore rules).
+- Approving a remote file-copy or folder-sync request opens a
+  path-confirmation form first. The Beam-provided value is only a hint and
+  cannot select a workstation path by itself.
+
+`q` or `Esc` closes the menu. Completed, failed, cancelled, or interrupted
+copies are terminal; create a new job instead of restarting one.
 
 Forms behave like ordinary text inputs: `Tab`/`Shift-Tab` (or `↓`/`↑`) move
 between fields; `←`/`→`, `Home`/`End`, `Backspace`/`Delete`, and the readline

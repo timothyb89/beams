@@ -32,7 +32,7 @@ use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
 use beams_protocol::{
     FileCopyDirection, FolderSyncMode, OverwritePolicy, RequestStatus, ServiceAction,
-    ServiceRequestKind, ServiceStatus,
+    ServiceRequestKind,
 };
 
 use crate::clientd::{BridgeRecord, Frontend, RequestRecord, ServerEvent, ServiceRecord};
@@ -490,7 +490,11 @@ struct DaemonView {
     request_records: BTreeMap<String, RequestRecord>,
     service_records: BTreeMap<String, ServiceRecord>,
     bridge_statuses: BTreeMap<String, String>,
-    selected_service: usize,
+    /// The selected home-screen row (see `selected_index`).
+    selected: usize,
+    selected_key: Option<RowKey>,
+    /// First-seen order of requests, for listing approvals oldest first.
+    request_arrival: BTreeMap<String, u64>,
     screen: Screen,
     presented_approval_requests: BTreeSet<String>,
     /// Connection status of the local daemon and this session's bridge.
@@ -509,6 +513,7 @@ struct Notice {
 enum Screen {
     Home,
     Form { kind: FormKind, form: Form },
+    Menu(Menu),
 }
 
 /// Which action submitting the current form performs.
@@ -519,6 +524,217 @@ enum FormKind {
     CopyApproval { request_id: String },
     Sync,
     SyncApproval { request_id: String },
+}
+
+/// One selectable row on the home screen.
+#[derive(Clone, Copy)]
+enum Row<'a> {
+    Request(&'a RequestRecord),
+    Service(&'a ServiceRecord),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RowKey {
+    Request(String),
+    Service(String),
+}
+
+impl Row<'_> {
+    fn key(&self) -> RowKey {
+        match self {
+            Row::Request(request) => RowKey::Request(request.request_id.clone()),
+            Row::Service(service) => RowKey::Service(service.service_id.clone()),
+        }
+    }
+}
+
+const ALL_ACTIONS: [ServiceAction; 5] = [
+    ServiceAction::Stop,
+    ServiceAction::Restart,
+    ServiceAction::Pause,
+    ServiceAction::Resume,
+    ServiceAction::Terminate,
+];
+
+/// What choosing a menu item does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MenuAction {
+    Back,
+    Approve(String),
+    Reject(String),
+    Control {
+        service_id: String,
+        action: ServiceAction,
+    },
+    /// Ask before running a destructive service action.
+    Confirm {
+        service_id: String,
+        action: ServiceAction,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct MenuItem {
+    label: String,
+    /// A shortcut that chooses this item directly.
+    key: Option<char>,
+    danger: bool,
+    action: MenuAction,
+}
+
+/// A small modal list of choices: request decisions, service actions, and
+/// confirmations.
+#[derive(Clone, Debug)]
+struct Menu {
+    title: String,
+    /// `(text, warn)` lines above the items.
+    intro: Vec<(String, bool)>,
+    items: Vec<MenuItem>,
+    selected: usize,
+}
+
+impl Menu {
+    /// Returns the chosen action, if this key chose one.
+    fn handle_key(&mut self, key: &Key) -> Option<MenuAction> {
+        let count = self.items.len();
+        match key {
+            Key::Esc | Key::Char('q' | 'Q') => return Some(MenuAction::Back),
+            Key::Up | Key::Char('k') | Key::BackTab if count > 0 => {
+                self.selected = (self.selected + count - 1) % count
+            }
+            Key::Down | Key::Char('j') | Key::Tab if count > 0 => {
+                self.selected = (self.selected + 1) % count
+            }
+            Key::Enter => {
+                return self
+                    .items
+                    .get(self.selected)
+                    .map(|item| item.action.clone())
+            }
+            Key::Char(ch) => {
+                let ch = ch.to_ascii_lowercase();
+                return self
+                    .items
+                    .iter()
+                    .find(|item| item.key == Some(ch))
+                    .map(|item| item.action.clone());
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+fn back_item(label: &str) -> MenuItem {
+    MenuItem {
+        label: label.to_string(),
+        key: None,
+        danger: false,
+        action: MenuAction::Back,
+    }
+}
+
+fn request_menu(request: &RequestRecord) -> Menu {
+    let needs_path = matches!(
+        request.request.as_ref().map(|request| &request.kind),
+        Some(ServiceRequestKind::FileCopy { .. } | ServiceRequestKind::FolderSync { .. })
+    );
+    Menu {
+        title: "Remote request".to_string(),
+        intro: ui::describe_request(request),
+        items: vec![
+            MenuItem {
+                label: if needs_path {
+                    "Approve - confirm the workstation path next".to_string()
+                } else {
+                    "Approve".to_string()
+                },
+                key: Some('y'),
+                danger: false,
+                action: MenuAction::Approve(request.request_id.clone()),
+            },
+            MenuItem {
+                label: "Reject".to_string(),
+                key: Some('n'),
+                danger: false,
+                action: MenuAction::Reject(request.request_id.clone()),
+            },
+            back_item("Decide later"),
+        ],
+        selected: 0,
+    }
+}
+
+fn service_menu(service: &ServiceRecord) -> Menu {
+    let mut intro: Vec<(String, bool)> = ui::service_details(service)
+        .into_iter()
+        .map(|line| (line, false))
+        .collect();
+    let mut items: Vec<MenuItem> = ui::available_actions(service)
+        .into_iter()
+        .map(|action| MenuItem {
+            label: ui::capitalize(ui::action_description(service, action)),
+            key: Some(ui::action_key(action)),
+            danger: ui::needs_confirmation(service, action),
+            action: if ui::needs_confirmation(service, action) {
+                MenuAction::Confirm {
+                    service_id: service.service_id.clone(),
+                    action,
+                }
+            } else {
+                MenuAction::Control {
+                    service_id: service.service_id.clone(),
+                    action,
+                }
+            },
+        })
+        .collect();
+    if items.is_empty() {
+        intro.push((
+            "This service has finished; start a new one instead.".to_string(),
+            false,
+        ));
+    }
+    items.push(back_item("Back"));
+    Menu {
+        title: ui::service_title(service).to_string(),
+        intro,
+        items,
+        selected: 0,
+    }
+}
+
+/// Destructive actions default to "keep it": Enter alone never destroys.
+fn confirm_menu(service: &ServiceRecord, action: ServiceAction) -> Menu {
+    let (_, endpoint) = ui::describe_service(service);
+    Menu {
+        title: format!(
+            "{}?",
+            ui::capitalize(ui::action_description(service, action))
+        ),
+        intro: vec![
+            (endpoint, false),
+            (ui::confirmation_warning(service, action).to_string(), true),
+        ],
+        items: vec![
+            MenuItem {
+                label: "Keep it".to_string(),
+                key: Some('n'),
+                danger: false,
+                action: MenuAction::Back,
+            },
+            MenuItem {
+                label: ui::capitalize(ui::action_description(service, action)),
+                key: Some('y'),
+                danger: true,
+                action: MenuAction::Control {
+                    service_id: service.service_id.clone(),
+                    action,
+                },
+            },
+        ],
+        selected: 0,
+    }
 }
 
 const SYNC_MODES: [FolderSyncMode; 4] = [
@@ -642,8 +858,8 @@ fn approval_form(
             .value(&hint)
             .complete(completion)],
     );
-    for sentence in ui::describe_request(request) {
-        form = form.intro(sentence, false);
+    for (sentence, warn) in ui::describe_request(request) {
+        form = form.intro(sentence, warn);
     }
     form.intro(
         "The Beam can only suggest a workstation path. Confirm or edit the real one before approving.",
@@ -813,7 +1029,9 @@ impl DaemonView {
                 request_records: BTreeMap::new(),
                 service_records: BTreeMap::new(),
                 bridge_statuses: BTreeMap::new(),
-                selected_service: 0,
+                selected: 0,
+                selected_key: None,
+                request_arrival: BTreeMap::new(),
                 screen: Screen::Home,
                 presented_approval_requests: BTreeSet::new(),
                 notice: None,
@@ -829,7 +1047,9 @@ impl DaemonView {
                 request_records: BTreeMap::new(),
                 service_records: BTreeMap::new(),
                 bridge_statuses: BTreeMap::new(),
-                selected_service: 0,
+                selected: 0,
+                selected_key: None,
+                request_arrival: BTreeMap::new(),
                 screen: Screen::Home,
                 presented_approval_requests: BTreeSet::new(),
                 notice: None,
@@ -891,6 +1111,9 @@ impl DaemonView {
                     self.frontends = frontends;
                     self.requests = requests.len();
                     self.services = services.len();
+                    for request in &requests {
+                        self.note_request_arrival(&request.request_id);
+                    }
                     self.request_records = requests
                         .into_iter()
                         .map(|request| (request.request_id.clone(), request))
@@ -916,6 +1139,7 @@ impl DaemonView {
                     changed = true;
                 }
                 Ok(ServerEvent::RequestChanged { request }) => {
+                    self.note_request_arrival(&request.request_id);
                     self.request_records
                         .insert(request.request_id.clone(), request);
                     self.requests = self.request_records.len();
@@ -974,42 +1198,114 @@ impl DaemonView {
         }
     }
 
-    fn pending_request(&self) -> Option<&RequestRecord> {
-        self.request_records.values().find(|request| {
-            request.status == RequestStatus::PendingApproval
-                && self.beam_uuid.as_deref() == Some(request.beam_uuid.as_str())
-        })
-    }
-
-    /// Marks newly pending approvals for this session's Beam as presented.
-    /// The caller uses the true return value to preempt normal SSH output once;
-    /// closing the menu without deciding must not make it repeatedly reopen.
-    fn take_approval_attention(&mut self) -> bool {
-        let new_requests = self
+    /// Pending approvals for this session's Beam, oldest first.
+    fn pending_requests(&self) -> Vec<&RequestRecord> {
+        let mut pending: Vec<&RequestRecord> = self
             .request_records
             .values()
             .filter(|request| {
                 request.status == RequestStatus::PendingApproval
                     && self.beam_uuid.as_deref() == Some(request.beam_uuid.as_str())
-                    && !self
-                        .presented_approval_requests
-                        .contains(&request.request_id)
             })
-            .map(|request| request.request_id.clone())
-            .collect::<Vec<_>>();
-        let changed = !new_requests.is_empty();
-        self.presented_approval_requests.extend(new_requests);
-        changed
+            .collect();
+        pending.sort_by_key(|request| {
+            self.request_arrival
+                .get(&request.request_id)
+                .copied()
+                .unwrap_or(u64::MAX)
+        });
+        pending
+    }
+
+    /// The request y/n act on: the selected one, else the oldest pending.
+    fn pending_request(&self) -> Option<&RequestRecord> {
+        match self.selected_row() {
+            Some(Row::Request(request)) => Some(request),
+            _ => self.pending_requests().first().copied(),
+        }
     }
 
     fn pending_count(&self) -> usize {
-        self.request_records
-            .values()
+        self.pending_requests().len()
+    }
+
+    /// Records first-seen order so pending approvals list oldest first
+    /// (request ids are random, so map order means nothing).
+    fn note_request_arrival(&mut self, request_id: &str) {
+        if !self.request_arrival.contains_key(request_id) {
+            let next = self.request_arrival.len() as u64;
+            self.request_arrival.insert(request_id.to_string(), next);
+        }
+    }
+
+    /// Marks newly pending approvals for this session's Beam as presented,
+    /// selecting the oldest new one. The caller uses the true return value
+    /// to preempt normal SSH output once; closing the menu without deciding
+    /// must not make it repeatedly reopen.
+    fn take_approval_attention(&mut self) -> bool {
+        let new_requests = self
+            .pending_requests()
+            .into_iter()
             .filter(|request| {
-                request.status == RequestStatus::PendingApproval
-                    && self.beam_uuid.as_deref() == Some(request.beam_uuid.as_str())
+                !self
+                    .presented_approval_requests
+                    .contains(&request.request_id)
             })
-            .count()
+            .map(|request| request.request_id.clone())
+            .collect::<Vec<_>>();
+        let Some(first) = new_requests.first() else {
+            return false;
+        };
+        self.selected_key = Some(RowKey::Request(first.clone()));
+        self.presented_approval_requests.extend(new_requests);
+        true
+    }
+
+    /// Every selectable home-screen row: pending approvals, then services.
+    fn rows(&self) -> Vec<Row<'_>> {
+        self.pending_requests()
+            .into_iter()
+            .map(Row::Request)
+            .chain(self.visible_services().into_iter().map(Row::Service))
+            .collect()
+    }
+
+    /// The selected row's index. Selection follows the row's identity, so
+    /// deciding a request or a service disappearing doesn't silently move it
+    /// onto a different row; if the row is gone, the nearest index is used.
+    fn selected_index(&self) -> usize {
+        let rows = self.rows();
+        self.selected_key
+            .as_ref()
+            .and_then(|key| rows.iter().position(|row| &row.key() == key))
+            .unwrap_or(self.selected)
+            .min(rows.len().saturating_sub(1))
+    }
+
+    fn selected_row(&self) -> Option<Row<'_>> {
+        self.rows().get(self.selected_index()).copied()
+    }
+
+    fn selected_service(&self) -> Option<&ServiceRecord> {
+        match self.selected_row() {
+            Some(Row::Service(service)) => Some(service),
+            _ => None,
+        }
+    }
+
+    fn select(&mut self, index: usize) {
+        let key = self.rows().get(index).map(Row::key);
+        self.selected = index;
+        self.selected_key = key;
+    }
+
+    fn select_next(&mut self) {
+        let count = self.rows().len();
+        self.select((self.selected_index() + 1).min(count.saturating_sub(1)));
+    }
+
+    fn select_previous(&mut self) {
+        self.select(self.selected_index().saturating_sub(1));
     }
 
     fn notify(&mut self, text: impl Into<String>, error: bool) {
@@ -1024,32 +1320,70 @@ impl DaemonView {
         self.screen = Screen::Form { kind, form };
     }
 
+    fn open_menu(&mut self, menu: Menu) {
+        self.notice = None;
+        self.screen = Screen::Menu(menu);
+    }
+
     /// Handles one key while the menu is open. Returns whether the menu
     /// should close.
     fn handle_key(&mut self, key: Key, local_daemon: &mut LocalDaemon) -> bool {
-        if let Screen::Form { kind, form } = &mut self.screen {
-            match form.handle_key(&key) {
-                FormEvent::Cancel => self.screen = Screen::Home,
-                FormEvent::Submit => {
-                    form.clear_errors();
-                    match submit_form(kind, form, local_daemon) {
-                        Ok(Some(notice)) => {
-                            self.screen = Screen::Home;
-                            self.notify(notice, false);
+        match &mut self.screen {
+            Screen::Form { kind, form } => {
+                match form.handle_key(&key) {
+                    FormEvent::Cancel => self.screen = Screen::Home,
+                    FormEvent::Submit => {
+                        form.clear_errors();
+                        match submit_form(kind, form, local_daemon) {
+                            Ok(Some(notice)) => {
+                                self.screen = Screen::Home;
+                                self.notify(notice, false);
+                            }
+                            Ok(None) => {}
+                            Err(err) => form.error = Some(err),
                         }
-                        Ok(None) => {}
-                        Err(err) => form.error = Some(err),
                     }
+                    FormEvent::Handled | FormEvent::Ignored => {}
                 }
-                FormEvent::Handled | FormEvent::Ignored => {}
+                return false;
             }
-            return false;
+            Screen::Menu(menu) => {
+                if let Some(action) = menu.handle_key(&key) {
+                    self.screen = Screen::Home;
+                    self.run_menu_action(action, local_daemon);
+                }
+                return false;
+            }
+            Screen::Home => {}
         }
 
         match key {
-            Key::Char('q' | 'Q') | Key::Esc | Key::Enter => return true,
-            Key::Char('y' | 'Y') => self.approve_or_prompt(local_daemon),
-            Key::Char('n' | 'N') => self.decide(local_daemon, false),
+            Key::Char('q' | 'Q') | Key::Esc => return true,
+            Key::Enter => match self.selected_row() {
+                Some(Row::Request(request)) => {
+                    let menu = request_menu(request);
+                    self.open_menu(menu);
+                }
+                Some(Row::Service(service)) => {
+                    let menu = service_menu(service);
+                    self.open_menu(menu);
+                }
+                None => {}
+            },
+            Key::Char('y' | 'Y') => match self.pending_request() {
+                Some(request) => {
+                    let request_id = request.request_id.clone();
+                    self.approve(&request_id, local_daemon);
+                }
+                None => self.notify("no request is waiting for approval", true),
+            },
+            Key::Char('n' | 'N') => match self.pending_request() {
+                Some(request) => {
+                    let request_id = request.request_id.clone();
+                    self.decide(&request_id, false, local_daemon);
+                }
+                None => self.notify("no request is waiting for approval", true),
+            },
             Key::Char('f' | 'F') => self.open_form(FormKind::Forward, forward_form()),
             Key::Char('u' | 'U') => self.open_form(
                 FormKind::Copy(FileCopyDirection::Upload),
@@ -1062,19 +1396,34 @@ impl DaemonView {
             Key::Char('m' | 'M') => self.open_form(FormKind::Sync, sync_form()),
             Key::Char('j' | 'J') | Key::Down => self.select_next(),
             Key::Char('k' | 'K') | Key::Up => self.select_previous(),
+            Key::Home => self.select(0),
+            Key::End => self.select(self.rows().len().saturating_sub(1)),
             Key::Char(ch) => {
                 let ch = ch.to_ascii_lowercase();
-                if let Some(action) = [
-                    ServiceAction::Stop,
-                    ServiceAction::Restart,
-                    ServiceAction::Pause,
-                    ServiceAction::Resume,
-                    ServiceAction::Terminate,
-                ]
-                .into_iter()
-                .find(|action| ui::action_key(*action) == ch)
-                {
-                    self.control_selected(local_daemon, action);
+                let Some(action) = ALL_ACTIONS
+                    .into_iter()
+                    .find(|action| ui::action_key(*action) == ch)
+                else {
+                    return false;
+                };
+                let Some(service) = self.selected_service() else {
+                    self.notify("select a service first", true);
+                    return false;
+                };
+                if !ui::available_actions(service).contains(&action) {
+                    self.notify(
+                        format!(
+                            "{} isn't available for this service right now",
+                            ui::action_label(action)
+                        ),
+                        true,
+                    );
+                } else if ui::needs_confirmation(service, action) {
+                    let menu = confirm_menu(service, action);
+                    self.open_menu(menu);
+                } else {
+                    let service_id = service.service_id.clone();
+                    self.control(&service_id, action, local_daemon);
                 }
             }
             _ => {}
@@ -1082,12 +1431,30 @@ impl DaemonView {
         false
     }
 
-    fn approve_or_prompt(&mut self, local_daemon: &mut LocalDaemon) {
-        let Some(request) = self.pending_request() else {
-            self.notify("no request is waiting for approval", true);
+    fn run_menu_action(&mut self, action: MenuAction, local_daemon: &mut LocalDaemon) {
+        match action {
+            MenuAction::Back => {}
+            MenuAction::Approve(request_id) => self.approve(&request_id, local_daemon),
+            MenuAction::Reject(request_id) => self.decide(&request_id, false, local_daemon),
+            MenuAction::Control { service_id, action } => {
+                self.control(&service_id, action, local_daemon)
+            }
+            MenuAction::Confirm { service_id, action } => {
+                if let Some(service) = self.service_records.get(&service_id) {
+                    let menu = confirm_menu(service, action);
+                    self.open_menu(menu);
+                }
+            }
+        }
+    }
+
+    /// Approves `request_id`, first asking for the real workstation path
+    /// when the Beam could only suggest one.
+    fn approve(&mut self, request_id: &str, local_daemon: &mut LocalDaemon) {
+        let Some(request) = self.request_records.get(request_id) else {
+            self.notify("that request is gone", true);
             return;
         };
-        let request_id = request.request_id.clone();
         match request.request.as_ref().map(|request| &request.kind) {
             Some(ServiceRequestKind::FileCopy { .. }) => {
                 let form = approval_form(
@@ -1096,7 +1463,12 @@ impl DaemonView {
                     "Workstation path",
                     Completion::Paths,
                 );
-                self.open_form(FormKind::CopyApproval { request_id }, form);
+                self.open_form(
+                    FormKind::CopyApproval {
+                        request_id: request_id.to_string(),
+                    },
+                    form,
+                );
             }
             Some(ServiceRequestKind::FolderSync { .. }) => {
                 let form = approval_form(
@@ -1105,9 +1477,14 @@ impl DaemonView {
                     "Workstation dir",
                     Completion::Directories,
                 );
-                self.open_form(FormKind::SyncApproval { request_id }, form);
+                self.open_form(
+                    FormKind::SyncApproval {
+                        request_id: request_id.to_string(),
+                    },
+                    form,
+                );
             }
-            _ => self.decide(local_daemon, true),
+            _ => self.decide(request_id, true, local_daemon),
         }
     }
 
@@ -1118,19 +1495,12 @@ impl DaemonView {
             .count()
     }
 
-    fn decide(&mut self, local_daemon: &mut LocalDaemon, approve: bool) {
-        let Some(request_id) = self
-            .pending_request()
-            .map(|request| request.request_id.clone())
-        else {
-            self.notify("no request is waiting for approval", true);
-            return;
-        };
+    fn decide(&mut self, request_id: &str, approve: bool, local_daemon: &mut LocalDaemon) {
         let Some(frontend) = &mut local_daemon.frontend else {
             self.notify("the local daemon connection is unavailable", true);
             return;
         };
-        match frontend.decide_request(&request_id, approve) {
+        match frontend.decide_request(request_id, approve) {
             Ok(()) => self.notify(
                 format!("{} request", if approve { "approved" } else { "rejected" }),
                 false,
@@ -1147,60 +1517,13 @@ impl DaemonView {
             .collect()
     }
 
-    /// `selected_service`, clamped to the current list - services can
-    /// disappear between key presses.
-    fn selected_index(&self) -> usize {
-        self.selected_service
-            .min(self.visible_services().len().saturating_sub(1))
-    }
-
-    fn selected_service(&self) -> Option<&ServiceRecord> {
-        self.visible_services().get(self.selected_index()).copied()
-    }
-
-    fn select_next(&mut self) {
-        let count = self.visible_services().len();
-        self.selected_service = (self.selected_index() + 1).min(count.saturating_sub(1));
-    }
-
-    fn select_previous(&mut self) {
-        self.selected_service = self.selected_index().saturating_sub(1);
-    }
-
-    fn control_selected(&mut self, local_daemon: &mut LocalDaemon, action: ServiceAction) {
-        let Some(service) = self.selected_service() else {
-            self.notify("no service is selected", true);
-            return;
-        };
-        if !ui::supported_actions(service).contains(&action) {
-            self.notify(
-                format!(
-                    "{} isn't available for this service",
-                    ui::action_label(action)
-                ),
-                true,
-            );
-            return;
-        }
-        if action == ServiceAction::Stop
-            && matches!(
-                service.status,
-                ServiceStatus::Stopped | ServiceStatus::Error
-            )
-        {
-            self.notify("the selected service has already stopped", true);
-            return;
-        }
-        let service_id = service.service_id.clone();
+    fn control(&mut self, service_id: &str, action: ServiceAction, local_daemon: &mut LocalDaemon) {
         let Some(frontend) = &mut local_daemon.frontend else {
             self.notify("the local daemon connection is unavailable", true);
             return;
         };
-        match frontend.control_service(&service_id, action) {
-            Ok(()) => self.notify(
-                format!("{} requested for {service_id}", ui::action_label(action)),
-                false,
-            ),
+        match frontend.control_service(service_id, action) {
+            Ok(()) => self.notify(format!("{} requested", ui::action_label(action)), false),
             Err(err) => self.notify(format!("could not control the service: {err}"), true),
         }
     }
@@ -2512,7 +2835,7 @@ mod tests {
         view.handle_key(Key::Up, &mut daemon);
         assert_eq!(view.selected_index(), 0);
 
-        view.selected_service = 1;
+        view.select(1);
         view.service_records.remove("svc-2");
         assert_eq!(view.selected_service().unwrap().service_id, "svc-1");
         let text = screen_text(&render(&view, None));
@@ -2543,12 +2866,14 @@ mod tests {
         for expected in [
             "Beams local menu",
             "client-123",
-            "Approval needed",
+            "Awaiting approval",
+            "pending",
             "Forward workstation port 15432 to 127.0.0.1:5432 in the Beam.",
+            "TYPE",
             "localhost:13000 → 127.0.0.1:3000",
             "running",
+            "Enter review",
             "y approve",
-            "s stop",
             "beams@beam-a",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in\n{text}");
@@ -2662,6 +2987,185 @@ mod tests {
         assert_eq!(view.message, "bridge to beam-a: connected (bridge exited)");
         assert_eq!(view.bridge_statuses.len(), 2);
         view.apply_bridge_status(bridge("old-beam", "old-uuid", "retired"));
-        assert_eq!(view.bridge_statuses.len(), 1, "retired bridges are forgotten");
+        assert_eq!(
+            view.bridge_statuses.len(),
+            1,
+            "retired bridges are forgotten"
+        );
+    }
+
+    fn pending_forward(request_id: &str, remote_port: u16) -> RequestRecord {
+        serde_json::from_value(serde_json::json!({
+            "request_id": request_id,
+            "beam_uuid": "beam-a-uuid",
+            "kind": "local_port_forward",
+            "status": "pending_approval",
+            "request": {"request_id": request_id, "kind": forward_spec(remote_port, 0)},
+        }))
+        .unwrap()
+    }
+
+    fn add_request(view: &mut DaemonView, request: RequestRecord) {
+        view.note_request_arrival(&request.request_id);
+        view.request_records
+            .insert(request.request_id.clone(), request);
+    }
+
+    #[test]
+    fn every_pending_request_is_listed_oldest_first_and_takeover_selects_the_new_one() {
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        // Ids sort the other way round from arrival.
+        add_request(&mut view, pending_forward("zz-first", 1111));
+        assert!(view.take_approval_attention());
+        add_request(&mut view, pending_forward("aa-second", 2222));
+        view.service_records.insert(
+            "svc-1".to_string(),
+            service("svc-1", "beam-a-uuid", forward_spec(80, 8080), "running"),
+        );
+
+        let ids: Vec<&str> = view
+            .pending_requests()
+            .iter()
+            .map(|request| request.request_id.as_str())
+            .collect();
+        assert_eq!(ids, ["zz-first", "aa-second"]);
+
+        assert!(view.take_approval_attention());
+        assert_eq!(view.pending_request().unwrap().request_id, "aa-second");
+        let text = screen_text(&render(&view, None));
+        assert!(text.contains("Awaiting approval  2"), "{text}");
+        assert!(text.contains(":2222"), "{text}");
+        assert!(text.contains(":1111"), "{text}");
+
+        // Selection follows the row: deciding the first request elsewhere
+        // doesn't move it onto a different one.
+        view.request_records.remove("zz-first");
+        assert_eq!(view.pending_request().unwrap().request_id, "aa-second");
+        view.handle_key(Key::Down, &mut daemon);
+        assert_eq!(view.selected_service().unwrap().service_id, "svc-1");
+        // With a service selected, y/n still act on the oldest request.
+        assert_eq!(view.pending_request().unwrap().request_id, "aa-second");
+    }
+
+    #[test]
+    fn enter_opens_a_request_menu_and_esc_returns_home() {
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        add_request(&mut view, pending_forward("req", 5432));
+        assert!(
+            !view.handle_key(Key::Enter, &mut daemon),
+            "Enter no longer closes"
+        );
+        let Screen::Menu(menu) = &view.screen else {
+            panic!("Enter did not open the request menu");
+        };
+        assert_eq!(menu.items[0].action, MenuAction::Approve("req".to_string()));
+        let text = screen_text(&render(&view, None));
+        assert!(
+            text.contains("Remote request") && text.contains("Reject"),
+            "{text}"
+        );
+        view.handle_key(Key::Esc, &mut daemon);
+        assert!(matches!(view.screen, Screen::Home));
+        // `n` in the menu rejects; without a daemon that surfaces an error.
+        view.handle_key(Key::Enter, &mut daemon);
+        view.handle_key(Key::Char('n'), &mut daemon);
+        assert!(matches!(view.screen, Screen::Home));
+        assert!(view.notice.as_ref().is_some_and(|notice| notice.error));
+    }
+
+    #[test]
+    fn destructive_service_actions_need_confirmation_defaulting_to_keep() {
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        view.service_records.insert(
+            "sync".to_string(),
+            service(
+                "sync",
+                "beam-a-uuid",
+                serde_json::json!({"kind": "folder_sync", "remote_path": "/r",
+                    "local_path_hint": "/l", "mode": "two-way-safe",
+                    "ignore_vcs": true, "ignores": []}),
+                "running",
+            ),
+        );
+
+        // The `t` shortcut asks first, and Enter alone keeps the sync.
+        view.handle_key(Key::Char('t'), &mut daemon);
+        let Screen::Menu(menu) = &view.screen else {
+            panic!("terminate did not ask for confirmation");
+        };
+        assert_eq!(menu.title, "Terminate the sync?");
+        assert_eq!(menu.items[menu.selected].action, MenuAction::Back);
+        view.handle_key(Key::Enter, &mut daemon);
+        assert!(matches!(view.screen, Screen::Home));
+        assert!(view.notice.is_none(), "nothing was sent");
+
+        // Through the actions menu: Enter on the service, pick terminate.
+        view.handle_key(Key::Enter, &mut daemon);
+        let Screen::Menu(menu) = &view.screen else {
+            panic!("Enter did not open the service menu");
+        };
+        let labels: Vec<&str> = menu.items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, ["Pause syncing", "Terminate the sync", "Back"]);
+        let text = screen_text(&render(&view, None));
+        assert!(
+            text.contains("Service id: sync") && text.contains("Status: running"),
+            "{text}"
+        );
+        view.handle_key(Key::Char('t'), &mut daemon);
+        assert!(matches!(&view.screen, Screen::Menu(menu) if menu.title == "Terminate the sync?"));
+        view.handle_key(Key::Char('y'), &mut daemon);
+        assert!(matches!(view.screen, Screen::Home));
+        assert_eq!(
+            view.notice.as_ref().map(|notice| notice.text.as_str()),
+            Some("the local daemon connection is unavailable"),
+            "confirming sends the action"
+        );
+    }
+
+    #[test]
+    fn available_actions_follow_service_state() {
+        let forward = |status| service("f", "beam-a-uuid", forward_spec(80, 8080), status);
+        assert_eq!(
+            ui::available_actions(&forward("running")),
+            [ServiceAction::Stop, ServiceAction::Restart]
+        );
+        assert_eq!(
+            ui::available_actions(&forward("stopped")),
+            [ServiceAction::Restart]
+        );
+        let sync = |status| {
+            service(
+                "s",
+                "beam-a-uuid",
+                serde_json::json!({"kind": "folder_sync", "remote_path": "/r",
+                    "mode": "two-way-safe", "ignore_vcs": true, "ignores": []}),
+                status,
+            )
+        };
+        assert_eq!(
+            ui::available_actions(&sync("paused")),
+            [ServiceAction::Resume, ServiceAction::Terminate]
+        );
+        let copy = |status| {
+            service(
+                "c",
+                "beam-a-uuid",
+                serde_json::json!({"kind": "file_copy", "direction": "upload",
+                    "remote_path": "/r", "overwrite": "deny"}),
+                status,
+            )
+        };
+        assert_eq!(
+            ui::available_actions(&copy("running")),
+            [ServiceAction::Stop]
+        );
+        assert!(ui::needs_confirmation(
+            &copy("running"),
+            ServiceAction::Stop
+        ));
+        assert!(ui::available_actions(&copy("stopped")).is_empty());
     }
 }

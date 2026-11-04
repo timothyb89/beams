@@ -635,10 +635,11 @@ bootstrap `Task`s.
   ignores a newer `target/debug/beams` (`beams daemon status` points this
   out; `beams daemon restart` from the new binary switches it). A cross-path
   "newer build wins" rule would need an orderable build stamp.
-- [ ] Local menu home screen: Enter still closes the menu instead of opening
-  an actions menu for the selected service, and `t` (terminate) acts without
-  a confirmation step. Consider a proper table and per-request queue view
-  when several approvals are pending (only the first is shown today).
+- [x] Local menu home screen: one selectable list of every pending request
+  (oldest first) plus services, with column headers. Selection tracks row
+  identity. `Enter` opens a request decision menu or a service's details and
+  state-appropriate actions. Terminate/cancel ask first, defaulting to "Keep
+  it". A takeover selects the new request.
 - [x] Phase 2: `beams daemon` is the single-instance per-user workstation
   daemon, auto-started by `beams ssh` (with `--no-client-daemon` as a
   troubleshooting escape hatch). `client/src/clientd.rs` provides a mode-0600
