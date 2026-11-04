@@ -16,21 +16,14 @@ use crate::sshagent::discover_ssh_auth_sock;
 /// can reach). Skips if `dest` is already a git checkout.
 ///
 /// For an ssh-style repo URL (`git@...`/`ssh://...`), `requires` the
-/// `wait_ssh_agent_unlock` task's capability - `bin/ssh-agent-init`'s
-/// actual interactive unlock still runs entirely outside this binary
-/// (see `AGENTS.md`), but that task can at least wait for it to have
-/// happened before this one tries to use the key. An https:// or local
-/// filesystem `repo` has no such requirement.
+/// `wait_ssh_agent` task's capability (the workstation is sharing a key
+/// through the agent relay), and runs `git` with the relay as its
+/// `SSH_AUTH_SOCK` (see `sshagent`: the daemon's own environment has
+/// none). An https:// or local filesystem `repo` has no such requirement.
 ///
-/// Waiting for the unlock isn't enough on its own, though: `run()` also
-/// passes `git` an explicit `SSH_AUTH_SOCK` via `sshagent`, for the same
-/// reason `wait_ssh_agent_unlock` needs it - this runs inside
-/// `beam-bootstrapd`, whose own environment never has one (see
-/// `sshagent`'s module doc comment). Found live, one task after fixing
-/// `wait_ssh_agent_unlock` itself: it correctly reported the agent
-/// unlocked, then the clone right after it failed anyway with `git@
-/// github.com: Permission denied (publickey)` - `git`'s own `ssh`
-/// subprocess had no socket to find the now-unlocked key through either.
+/// Each use of the key is approved on the workstation; a clone run by the
+/// workstation's startup manifest may be covered by its startup grant,
+/// which is why `run()` also passes `BEAMS_TASK_RUN`.
 pub struct CloneGitRepo {
     pub repo: String,
     pub dest: PathBuf,
@@ -60,7 +53,7 @@ impl Task for CloneGitRepo {
 
     fn requires(&self) -> Vec<Capability> {
         if self.needs_ssh_agent() {
-            vec![super::cap::SSH_AGENT_UNLOCKED.into()]
+            vec![super::cap::SSH_AGENT_READY.into()]
         } else {
             Vec::new()
         }
@@ -262,11 +255,11 @@ mod tests {
 
         let ssh_shorthand =
             CloneGitRepo { repo: "git@github.com:org/repo.git".into(), dest: PathBuf::from("/tmp/z") };
-        assert_eq!(ssh_shorthand.requires(), vec![Capability::from(crate::tasks::cap::SSH_AGENT_UNLOCKED)]);
+        assert_eq!(ssh_shorthand.requires(), vec![Capability::from(crate::tasks::cap::SSH_AGENT_READY)]);
 
         let ssh_url =
             CloneGitRepo { repo: "ssh://git@github.com/org/repo.git".into(), dest: PathBuf::from("/tmp/w") };
-        assert_eq!(ssh_url.requires(), vec![Capability::from(crate::tasks::cap::SSH_AGENT_UNLOCKED)]);
+        assert_eq!(ssh_url.requires(), vec![Capability::from(crate::tasks::cap::SSH_AGENT_READY)]);
     }
 
     #[test]

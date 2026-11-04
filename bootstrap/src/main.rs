@@ -288,10 +288,9 @@ enum TaskCommand {
     /// Install code-server and background it as a beamctl service (see
     /// `tasks::install_code_server`). No params.
     InstallCodeServer,
-    /// Wait for `bin/ssh-agent-init`'s interactive unlock to have added
-    /// the key to the running ssh-agent (see
-    /// `tasks::wait_ssh_agent_unlock`). No params.
-    WaitSshAgentUnlock,
+    /// Wait until the workstation shares an SSH key through the agent relay
+    /// (see `tasks::wait_ssh_agent`). No params.
+    WaitSshAgent,
 }
 
 /// Whether this process was started as `beams` (`~/beams/bin/beams`).
@@ -623,7 +622,7 @@ fn task_command_to_instance(command: TaskCommand) -> (&'static str, Value) {
         TaskCommand::InstallToolchainGo => (tasks::install_toolchain_go::InstallToolchainGo::NAME, json!({})),
         TaskCommand::InstallToolchainRust => (tasks::install_toolchain_rust::InstallToolchainRust::NAME, json!({})),
         TaskCommand::InstallCodeServer => (tasks::install_code_server::InstallCodeServer::NAME, json!({})),
-        TaskCommand::WaitSshAgentUnlock => (tasks::wait_ssh_agent_unlock::WaitSshAgentUnlock::NAME, json!({})),
+        TaskCommand::WaitSshAgent => (tasks::wait_ssh_agent::WaitSshAgent::NAME, json!({})),
     }
 }
 

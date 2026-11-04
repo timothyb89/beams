@@ -98,6 +98,29 @@ impl GrantConfig {
     }
 }
 
+impl StartupConfig {
+    /// The tasks to submit: `tasks`, plus a leading `wait-ssh-agent` when an
+    /// ssh-style clone needs the key and none was listed (`clone-git-repo`
+    /// requires what it provides).
+    pub fn manifest_tasks(&self) -> Vec<ManifestTask> {
+        let needs_key = self.tasks.iter().any(|task| {
+            task.template == "clone-git-repo"
+                && matches!(task.params.get("repo"), Some(ManifestParam::Str(repo))
+                    if repo.starts_with("git@") || repo.starts_with("ssh://"))
+        });
+        let has_wait = self
+            .tasks
+            .iter()
+            .any(|task| task.template == "wait-ssh-agent" || task.template == "wait-ssh-agent-unlock");
+        let mut tasks = Vec::with_capacity(self.tasks.len() + 1);
+        if needs_key && !has_wait {
+            tasks.push(ManifestTask { template: "wait-ssh-agent".to_string(), params: Default::default() });
+        }
+        tasks.extend(self.tasks.iter().cloned());
+        tasks
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     #[serde(default)]
@@ -273,10 +296,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.tasks[2].params.get("pr"), Some(&ManifestParam::Int(12)));
-        let grant = config.ssh_grant.unwrap();
+        let grant = config.ssh_grant.clone().unwrap();
         assert_eq!(grant.user, "git");
         assert_eq!(grant.window(), MAX_GRANT_WINDOW);
         assert_eq!(grant.max_uses_for(&config.tasks), 1 + GRANT_SPARE_USES);
+        let submitted = config.manifest_tasks();
+        assert_eq!(submitted[0].template, "wait-ssh-agent", "added for the ssh clone");
+        assert_eq!(submitted.len(), 4);
+        assert_eq!(StartupConfig::default().manifest_tasks().len(), 2, "nothing added without ssh clones");
         assert!(StartupConfig::parse("[startup]\ntask = []\n").is_err(), "typos are errors");
         assert!(StartupConfig::parse("[startup]\ntasks = []\n").unwrap().tasks.is_empty());
     }

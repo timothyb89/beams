@@ -12,21 +12,18 @@ use crate::sshagent::discover_ssh_auth_sock;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Waits for `bin/ssh-agent-init`'s interactive unlock (run in its own
-/// zellij pane, entirely outside this binary - see `AGENTS.md` and
-/// `clone_git_repo`'s doc comment) to actually add the key to the running
-/// ssh-agent, by polling `ssh-add -l` until it lists at least one
-/// identity. Provides `cap::SSH_AGENT_UNLOCKED`, the capability
-/// `clone_git_repo` requires for an ssh-style repo URL.
+/// Waits until the SSH agent relay (`agentproxy`) lists at least one key,
+/// i.e. until a `beams ssh` session is attached and the workstation has
+/// shared an allowed key (`[ssh_agent] allowed_keys`, see `beams
+/// agent-keys`), by polling `ssh-add -l` against it. Provides
+/// `cap::SSH_AGENT_READY`, which `clone_git_repo` requires for an
+/// ssh-style repo URL.
 ///
-/// Doesn't itself start the agent or prompt for a passphrase - just waits
-/// for someone else (a human, in the dedicated pane) to have already done
-/// so. Errors out after `TIMEOUT` rather than waiting forever, so a
-/// manifest that includes this (e.g. the default startup clones) fails
-/// visibly instead of hanging if the key is never unlocked.
-pub struct WaitSshAgentUnlock;
+/// Errors out after `TIMEOUT` rather than waiting forever, so a manifest
+/// that includes it fails visibly if no key is ever shared.
+pub struct WaitSshAgent;
 
-impl WaitSshAgentUnlock {
+impl WaitSshAgent {
     fn ssh_add_bin() -> String {
         std::env::var("BEAM_BOOTSTRAP_SSH_ADD_BIN").unwrap_or_else(|_| "ssh-add".to_string())
     }
@@ -39,18 +36,10 @@ impl WaitSshAgentUnlock {
         env_duration_ms("BEAM_BOOTSTRAP_SSH_WAIT_TIMEOUT_MS").unwrap_or(TIMEOUT)
     }
 
-    /// `ssh-add -l` exits 0 with at least one key listed once unlocked,
-    /// exits 1 ("The agent has no identities.") when the agent is up but
-    /// empty (locked, for this repo's one-key usage), and exits 2 if it
-    /// can't even reach an agent (not started yet). Only the exit-0 case
-    /// counts as unlocked - the other two both just mean "keep waiting".
-    ///
-    /// Critically, this always runs `ssh-add` with an explicit
-    /// `SSH_AUTH_SOCK` from `sshagent::discover_ssh_auth_sock` rather
-    /// than whatever this process already inherited - see that module's
-    /// doc comment for why relying on the inherited environment here
-    /// never worked at all (not "sometimes races the unlock", just
-    /// unconditionally broken).
+    /// `ssh-add -l` exits 0 with at least one key listed, 1 ("The agent has
+    /// no identities.") while no key is shared, and 2 if it can't reach the
+    /// relay at all (daemon not up yet). Only exit 0 counts. Always uses the
+    /// relay's socket (`sshagent`), never this process's inherited one.
     fn has_identity() -> bool {
         let mut cmd = Command::new(Self::ssh_add_bin());
         cmd.arg("-l");
@@ -65,13 +54,13 @@ fn env_duration_ms(var: &str) -> Option<Duration> {
     std::env::var(var).ok()?.parse::<u64>().ok().map(Duration::from_millis)
 }
 
-impl Task for WaitSshAgentUnlock {
+impl Task for WaitSshAgent {
     fn id(&self) -> String {
         Self::NAME.to_string()
     }
 
     fn provides(&self) -> Vec<Capability> {
-        vec![super::cap::SSH_AGENT_UNLOCKED.into()]
+        vec![super::cap::SSH_AGENT_READY.into()]
     }
 
     fn run(&self) -> anyhow::Result<Option<String>> {
@@ -80,7 +69,7 @@ impl Task for WaitSshAgentUnlock {
 
     fn run_with_progress(&self, progress: &dyn Fn(&str)) -> anyhow::Result<Option<String>> {
         if Self::has_identity() {
-            return Ok(Some("ssh-agent already unlocked".to_string()));
+            return Ok(Some("the workstation is sharing an SSH key".to_string()));
         }
 
         let start = Instant::now();
@@ -88,22 +77,23 @@ impl Task for WaitSshAgentUnlock {
         loop {
             std::thread::sleep(Self::poll_interval());
             if Self::has_identity() {
-                return Ok(Some(format!("ssh-agent unlocked after {}s", start.elapsed().as_secs())));
+                return Ok(Some(format!("the workstation shared an SSH key after {}s", start.elapsed().as_secs())));
             }
             let elapsed = start.elapsed();
             if elapsed >= timeout {
                 anyhow::bail!(
-                    "timed out after {}s waiting for the ssh-agent to be unlocked",
+                    "timed out after {}s waiting for the workstation to share an SSH key (attach with \
+                     `beams ssh`, and allow a key there: `beams agent-keys`)",
                     timeout.as_secs()
                 );
             }
-            progress(&format!("waiting for ssh-agent unlock ({}s elapsed)...", elapsed.as_secs()));
+            progress(&format!("waiting for the workstation to share an SSH key ({}s)...", elapsed.as_secs()));
         }
     }
 }
 
-impl Template for WaitSshAgentUnlock {
-    const NAME: &'static str = "wait-ssh-agent-unlock";
+impl Template for WaitSshAgent {
+    const NAME: &'static str = "wait-ssh-agent";
 }
 
 #[cfg(test)]
@@ -149,8 +139,8 @@ mod tests {
         std::env::set_var("BEAM_BOOTSTRAP_SSH_WAIT_TIMEOUT_MS", "100");
 
         let start = Instant::now();
-        let message = WaitSshAgentUnlock.run().unwrap().unwrap();
-        assert!(message.contains("already unlocked"));
+        let message = WaitSshAgent.run().unwrap().unwrap();
+        assert!(message.contains("is sharing"));
         assert!(start.elapsed() < Duration::from_millis(500), "should not have polled/slept at all");
 
         std::env::remove_var("BEAM_BOOTSTRAP_SSH_ADD_BIN");
@@ -178,7 +168,7 @@ mod tests {
         });
 
         let progress_calls = std::sync::atomic::AtomicUsize::new(0);
-        let message = WaitSshAgentUnlock
+        let message = WaitSshAgent
             .run_with_progress(&|_| {
                 progress_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             })
@@ -186,7 +176,7 @@ mod tests {
             .unwrap();
         flip.join().unwrap();
 
-        assert!(message.contains("unlocked after"), "unexpected message: {message}");
+        assert!(message.contains("shared an SSH key after"), "unexpected message: {message}");
         assert!(
             progress_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "should have reported progress at least once while waiting"
@@ -208,7 +198,7 @@ mod tests {
         std::env::set_var("BEAM_BOOTSTRAP_SSH_WAIT_POLL_MS", "10");
         std::env::set_var("BEAM_BOOTSTRAP_SSH_WAIT_TIMEOUT_MS", "50");
 
-        let err = WaitSshAgentUnlock.run().unwrap_err();
+        let err = WaitSshAgent.run().unwrap_err();
         assert!(err.to_string().contains("timed out"), "unexpected error: {err}");
 
         std::env::remove_var("BEAM_BOOTSTRAP_SSH_ADD_BIN");
@@ -219,50 +209,32 @@ mod tests {
 
     #[test]
     fn provides_the_shared_capability_constant() {
-        assert_eq!(WaitSshAgentUnlock.provides(), vec![Capability::from(super::super::cap::SSH_AGENT_UNLOCKED)]);
+        assert_eq!(WaitSshAgent.provides(), vec![Capability::from(super::super::cap::SSH_AGENT_READY)]);
     }
 
-    /// Regression test for the real bug found live on a beam: this
-    /// process's own `SSH_AUTH_SOCK` (if any - cleared here so the test
-    /// can't accidentally pass by inheriting *this* process's real one)
-    /// must not matter - `has_identity` has to find the socket via
-    /// `agent_env_path`'s file and pass it through explicitly, the way
-    /// `beam-bootstrapd`'s own near-empty environment needs. The fake
-    /// `ssh-add` here only succeeds if it actually received the sock
-    /// path discovered from the file as `SSH_AUTH_SOCK` - a regression
-    /// back to relying on inherited env would fail this with an empty
-    /// (unset) value instead.
+    /// `ssh-add` must be pointed at the relay socket from `sshagent`, not
+    /// at whatever `SSH_AUTH_SOCK` this process inherited.
     #[test]
-    fn discovers_ssh_auth_sock_from_the_agent_env_file_not_inherited_env() {
+    fn asks_the_relay_socket_not_the_inherited_agent() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = scratch_dir("discovers-sock-from-file");
-
+        let tmp = scratch_dir("asks-the-relay");
         let saved_sock = std::env::var("SSH_AUTH_SOCK").ok();
-        std::env::remove_var("SSH_AUTH_SOCK");
-
-        let expected_sock = tmp.join("agent.sock").display().to_string();
-        let agent_env_file = tmp.join("agent.env");
-        fs::write(&agent_env_file, format!("SSH_AUTH_SOCK={expected_sock}; export SSH_AUTH_SOCK;\nSSH_AGENT_PID=1; export SSH_AGENT_PID;\n")).unwrap();
-        std::env::set_var("BEAM_BOOTSTRAP_SSH_AGENT_ENV_FILE", &agent_env_file);
+        std::env::set_var("SSH_AUTH_SOCK", "/some/other/agent.sock");
+        let relay = tmp.join("ssh-agent.sock").display().to_string();
+        std::env::set_var("BEAM_BOOTSTRAP_SSH_AUTH_SOCK", &relay);
 
         let script = tmp.join("ssh-add");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n[ \"$SSH_AUTH_SOCK\" = \"{expected_sock}\" ] && exit 0 || exit 2\n"
-            ),
-        )
-        .unwrap();
+        fs::write(&script, format!("#!/bin/sh\n[ \"$SSH_AUTH_SOCK\" = \"{relay}\" ] && exit 0 || exit 2\n")).unwrap();
         let mut perms = fs::metadata(&script).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&script, perms).unwrap();
         std::env::set_var("BEAM_BOOTSTRAP_SSH_ADD_BIN", &script);
 
-        let message = WaitSshAgentUnlock.run().unwrap().unwrap();
-        assert!(message.contains("already unlocked"), "unexpected message: {message}");
+        let message = WaitSshAgent.run().unwrap().unwrap();
+        assert!(message.contains("is sharing"), "unexpected message: {message}");
 
         std::env::remove_var("BEAM_BOOTSTRAP_SSH_ADD_BIN");
-        std::env::remove_var("BEAM_BOOTSTRAP_SSH_AGENT_ENV_FILE");
+        std::env::remove_var("BEAM_BOOTSTRAP_SSH_AUTH_SOCK");
         match saved_sock {
             Some(sock) => std::env::set_var("SSH_AUTH_SOCK", sock),
             None => std::env::remove_var("SSH_AUTH_SOCK"),

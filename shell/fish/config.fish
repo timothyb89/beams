@@ -6,13 +6,11 @@ set -g fish_greeting
 
 # Fish is the beam's default login shell, so this runs for *every* fish
 # invocation - an interactive login and a noninteractive `tsh ssh ... --
-# cmd` exec alike. ssh-agent-init.fish always ensures the agent is running,
-# and only opportunistically prompts to unlock the key when it's actually
-# interactive (a real tty) - so a noninteractive command never blocks on a
-# password prompt, it just runs against whatever the agent already holds.
-if test -f "$HOME/bin/ssh-agent-init.fish"
-    source "$HOME/bin/ssh-agent-init.fish"
-end
+# cmd` exec alike. The SSH agent is beam-bootstrapd's relay: it holds no
+# keys, and each use of one is approved on the workstation (in the attached
+# `beams ssh`). Say why when you use it: `SSH_KEY_REASON="..." git clone ...`.
+set -gx SSH_AUTH_SOCK $HOME/.beam-bootstrap/ssh-agent.sock
+set -gx TELEPORT_ADD_KEYS_TO_AGENT no
 
 if type -q starship
     starship init fish | source

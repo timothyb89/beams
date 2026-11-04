@@ -51,7 +51,6 @@ SSH_AUTH_SOCK="$W/local-agent.sock" ssh-add -q "$W/id_allowed" "$W/id_hidden"
 rm -f "$W/id_allowed" "$W/id_hidden"   # only the agent holds them
 ALLOWED_FP=$(ssh-keygen -lf "$W/id_allowed.pub" | awk '{print $2}')
 HIDDEN_FP=$(ssh-keygen -lf "$W/id_hidden.pub" | awk '{print $2}')
-printf '[ssh_agent]\nallowed_keys = ["%s"]\nprompt_timeout = 20\n' "$ALLOWED_FP" >"$W/config/beams-client/config.toml"
 
 # --- target sshd, known (hashed) only to the workstation ---------------------
 ssh-keygen -q -t ed25519 -N '' -f "$W/hostkey"
@@ -78,6 +77,26 @@ git -C "$W" clone -q "$W/repo.git" seed 2>/dev/null
 git -C "$W/seed" -c user.name=s -c user.email=s@example.com commit -q --allow-empty -m seed
 git -C "$W/seed" push -q origin HEAD:main 2>/dev/null
 git -C "$W/repo.git" symbolic-ref HEAD refs/heads/main
+
+ME=$(id -un)
+SSHOPTS="-F /dev/null -o UserKnownHostsFile=$W/vm/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o IdentityFile=none -p $PORT"
+
+# Workstation config: the allowed key, and a startup manifest that clones
+# over ssh under a grant for the target sshd.
+cat >"$W/config/beams-client/config.toml" <<EOF
+[ssh_agent]
+allowed_keys = ["$ALLOWED_FP"]
+prompt_timeout = 20
+
+[startup]
+tasks = [
+  { template = "clone-git-repo", params = { repo = "ssh://$ME@127.0.0.1:$PORT$W/repo.git", dest = "$W/startup-clone" } },
+]
+
+[startup.ssh_grant]
+hosts = ["[127.0.0.1]:$PORT"]
+user = "$ME"
+EOF
 
 # --- fake tsh: only the bridge is needed ---------------------------------------
 cat >"$W/bin/tsh" <<EOF
@@ -129,7 +148,8 @@ start_frontend() { # decision
 }
 stop_frontend() { kill "$FRONTEND_PID" 2>/dev/null; wait "$FRONTEND_PID" 2>/dev/null; sleep 0.5; }
 
-"$BOOTSTRAP" daemon --socket "$W/vm/daemon.sock" >"$W/vm.log" 2>&1 &
+# The startup clone's git inherits the Beam daemon's environment.
+GIT_SSH_COMMAND="ssh $SSHOPTS" "$BOOTSTRAP" daemon --socket "$W/vm/daemon.sock" >"$W/vm.log" 2>&1 &
 pids+=($!)
 for _ in $(seq 100); do [ -S "$W/vm/ssh-agent.sock" ] && break; sleep 0.1; done
 check "Beam daemon serves an agent socket" test -S "$W/vm/ssh-agent.sock"
@@ -140,8 +160,6 @@ pids+=($!)
 
 # --- "on the Beam" ---------------------------------------------------------------
 export SSH_AUTH_SOCK="$W/vm/ssh-agent.sock" BEAMS_SESSION_TOKEN=smoke-token
-SSHOPTS="-F /dev/null -o UserKnownHostsFile=$W/vm/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o IdentityFile=none -p $PORT"
-ME=$(id -un)
 
 check "no keys listed before a frontend attaches" bash -c "[ \"\$(ssh-add -l 2>&1)\" = 'The agent has no identities.' ]"
 
@@ -151,11 +169,20 @@ check "frontend attached: only the allowed key is listed" \
     bash -c "grep -qF '$ALLOWED_FP' <<<'$listed' && ! grep -qF '$HIDDEN_FP' <<<'$listed'"
 check "key management is refused" bash -c "! ssh-add -D 2>/dev/null"
 
+# The first connect sent the startup manifest; its clone runs under the grant.
+for _ in $(seq 100); do [ -d "$W/startup-clone/.git" ] && break; sleep 0.2; done
+check "startup clone over ssh succeeded" test -d "$W/startup-clone/.git"
+check "startup clone was signed by the grant" grep -q '"granted":"startup grant, 1 of 3"' "$W/prompts.log"
+check "startup clone never prompted" bash -c "! grep '\"status\":\"pending_approval\"' '$W/prompts.log' | grep -q 'manifest-'"
+for _ in $(seq 50); do grep -q 'ended: startup finished' "$W/local.log" && break; sleep 0.2; done
+check "grant ended when startup finished" grep -q 'ended: startup finished' "$W/local.log"
+
 SSH_KEY_REASON="smoke: plain login" ssh $SSHOPTS "$ME@127.0.0.1" true
 check "approved ssh login succeeds" test $? -eq 0
 check "prompt named the verified host via hashed known_hosts" \
     grep -q '"host":{"status":"verified","name":"\[127.0.0.1\]:'"$PORT"'"}' "$W/prompts.log"
-check "prompt carried the claimed reason" grep -q '"reason":"smoke: plain login"' "$W/prompts.log"
+check "a login outside startup still prompted" \
+    grep -q '"status":"pending_approval".*"reason":"smoke: plain login"' "$W/prompts.log"
 check "request ended signed" grep -q '"status":"running","request":null,"action":null,"message":"signed"' "$W/prompts.log"
 
 GIT_SSH_COMMAND="ssh $SSHOPTS" SSH_KEY_REASON="smoke: clone" \

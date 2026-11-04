@@ -1,15 +1,17 @@
 #!/bin/bash
 # ~/bin/beam-shell
 #
-# Convenience entrypoint for working on a beam: makes sure the ssh-agent is
-# running (never blocks - see step 2 below), kicks off beam-bootstrap in
-# the background logging to ~/.beam-bootstrap.log, then attaches to (or
-# creates) a "beam" zellij session with a layout that keeps that log
-# visible in a side pane, a pane that handles the actual interactive key
-# unlock whenever you get to it, and a right-hand pane running
-# `beam-bootstrap tui` against the daemon this script also starts
-# synchronously (step 1) - see shell/zellij/beam-shell.kdl. Safe to run
+# Convenience entrypoint for working on a beam: starts the bootstrap daemon
+# (which also serves the SSH agent relay - see step 2), kicks off
+# beam-bootstrap in the background logging to ~/.beam-bootstrap.log, then
+# attaches to (or creates) a "beam" zellij session with a layout that keeps
+# that log visible in a side pane next to a pane running `beam-bootstrap
+# tui` against the daemon - see shell/zellij/beam-shell.kdl. Safe to run
 # repeatedly - everything it does is idempotent.
+#
+# Startup tasks (repo clones, toolchains) are no longer submitted from
+# here: the workstation's `beams` client sends its `[startup]` config over
+# the bridge once it connects.
 
 set -euo pipefail
 
@@ -33,9 +35,9 @@ BOOTSTRAP_BIN="$REPO/bootstrap/target/x86_64-unknown-linux-musl/release/beam-boo
 export BEAM_BOOTSTRAP_BIN="$BOOTSTRAP_BIN"
 
 # 1. make sure ~/.ssh and ~/bin are in place before anything below needs
-#    them - ssh-agent-init's default key path, and the stable key the repo
-#    carries (link-files force-replaces beams' own default ~/.ssh with
-#    it) - and that zellij and fish are both installed, since step 4 below
+#    them (link-files force-replaces beams' own default ~/.ssh with the
+#    repo's, which carries known_hosts) - and that zellij and fish are
+#    both installed, since step 4 below
 #    execs zellij immediately rather than waiting on the backgrounded full
 #    run (and zellij needs fish to already exist to use it for new panes -
 #    see step 4's default_shell override). A beam that's already been
@@ -66,74 +68,13 @@ else
     echo "beam-shell: beam-bootstrap binary not found under $REPO/bootstrap/target - skipping" >>"$LOG"
 fi
 
-# 2. make sure the ssh-agent itself is running - but *not* the interactive
-#    key unlock that's normally step 4 of ssh-agent-init, which belongs to
-#    the dedicated "ssh-agent" pane in the zellij layout instead (so it's
-#    available whenever you get to it, rather than blocking getting into
-#    zellij at all). Redirecting stdin from /dev/null for just this one
-#    command makes ssh-agent-init's own `[ -t 0 ]` interactivity check
-#    false, same as any other noninteractive caller - it'll still find or
-#    start the agent, just skip the unlock. Sourced (not exec'd) so the
-#    agent's env ends up exported here, in beam-shell's own process,
-#    which `exec zellij` below then hands down to every pane zellij spawns
-#    - the dedicated pane just needs to run ssh-agent-init again itself
-#    (ensure is instant once the agent's already up; unlock proceeds
-#    normally there, since that pane *does* have a real tty).
-# ssh-agent-init references $SSH_AUTH_SOCK etc. without ${VAR:-} guards,
-# fine for a normal interactive shell but not under our `set -u` - relax
-# it just for this sourced call.
-set +u
-# shellcheck disable=SC1091
-source "$HOME/bin/ssh-agent-init" </dev/null
-set -u
-
-# Exported past the `exec zellij` below so every pane zellij spawns off
-# fish's config.fish (the main shell pane, any later ctrl+t tab) inherits
-# it - that's what makes ssh-agent-init.fish skip its own interactive
-# unlock there (see that file), leaving the passphrase prompt to the
-# dedicated "ssh-agent" pane in shell/zellij/beam-shell.kdl, which
-# explicitly unsets this first so it still prompts.
-export BEAM_SHELL_SSH_UNLOCK_DELEGATED=1
-
-# 2.5. submit the default startup manifest to the daemon (already up from
-#      step 1) - backgrounded like step 3 below, so it doesn't block
-#      reaching zellij. Two groups, each independently skippable:
-#      - toolchains (`BEAM_SHELL_SKIP_DEFAULT_TOOLCHAINS=1` to skip): Go
-#        and Rust installs. Both idempotent, so on an already-set-up beam
-#        they just skip.
-#      - clones (`BEAM_SHELL_SKIP_DEFAULT_CLONES=1` to skip): the usual
-#        repos, behind `wait-ssh-agent-unlock` since they're ssh:// URLs
-#        (see `tasks::clone_git_repo`) - so they wait for the dedicated
-#        "ssh-agent" pane's interactive unlock rather than racing it.
-#      The daemon starts every entry as soon as its own dependencies are
-#      met, so the toolchain installs don't wait on the ssh unlock (or
-#      vice versa). Progress is visible via $LOG and the tui pane either
-#      way. Everything but the clones is a `run_once` template (see
-#      `tasks::TemplateInfo`), so the tui leaves those out of its template
-#      list - their runs still show up in its progress list.
-if [ -x "$BOOTSTRAP_BIN" ]; then
-    DEFAULT_ENTRIES=()
-    if [ -z "${BEAM_SHELL_SKIP_DEFAULT_TOOLCHAINS:-}" ]; then
-        DEFAULT_ENTRIES+=(
-            '{"template": "install-toolchain-go", "params": {}}'
-            '{"template": "install-toolchain-rust", "params": {}}'
-        )
-    fi
-    if [ -z "${BEAM_SHELL_SKIP_DEFAULT_CLONES:-}" ]; then
-        DEFAULT_ENTRIES+=(
-            '{"template": "wait-ssh-agent-unlock", "params": {}}'
-            '{"template": "clone-git-repo", "params": {"repo": "git@github.com:gravitational/core.git", "dest": "~/projects/core"}}'
-            '{"template": "clone-git-repo", "params": {"repo": "git@github.com:timothyb89/teleport-harness.git", "dest": "~/projects/teleport-harness"}}'
-            '{"template": "clone-git-repo", "params": {"repo": "git@github.com:timothyb89/rdocker.git", "dest": "~/projects/rdocker"}}'
-        )
-    fi
-    if [ "${#DEFAULT_ENTRIES[@]}" -gt 0 ]; then
-        DEFAULT_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/beam-shell-default-tasks.XXXXXX.json")"
-        { echo "["; (IFS=$'\n'; echo "${DEFAULT_ENTRIES[*]}" | sed '$!s/$/,/'); echo "]"; } >"$DEFAULT_MANIFEST"
-        ( "$BOOTSTRAP_BIN" task run-manifest --file "$DEFAULT_MANIFEST" >>"$LOG" 2>&1
-          rm -f "$DEFAULT_MANIFEST" ) &
-    fi
-fi
+# 2. every process started from here (zellij and its panes) uses the
+#    daemon's SSH agent relay, which holds no keys: each signature is
+#    approved on the workstation, in the attached `beams ssh` session (see
+#    SSH_AGENT_PROXY_DESIGN.md). fish's config.fish sets the same for
+#    shells started any other way.
+export SSH_AUTH_SOCK="$HOME/.beam-bootstrap/ssh-agent.sock"
+export TELEPORT_ADD_KEYS_TO_AGENT=no
 
 # 3. kick off the full bootstrap run in the background; the log pane in
 #    the zellij layout tails $LOG.

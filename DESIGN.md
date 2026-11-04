@@ -94,7 +94,8 @@ A task declares the capabilities (named, string-keyed facts) it
 **provides** and the capabilities it **requires**. The scheduler topo-sorts
 on capabilities, not on fixed task IDs:
 
-- `ssh-agent-init` provides `ssh-agent-unlocked`.
+- `wait-ssh-agent` provides `ssh-agent-ready` (the workstation is sharing
+  a key through the agent relay).
 - `clone-git-repo` (templated, see below), when instantiated with
   `dest=~/projects/core`, provides `repo-cloned:~/projects/core`.
 - A `checkout-pr-worktree` instance requires `repo-cloned:<base_path>` —
@@ -229,8 +230,7 @@ forms are sugar on top of it, not parallel paths.
 
 Today's `shell/zellij/beam-shell.kdl` layout's tab template applies to
 *every* new tab in the session, which is why opening a second tab
-re-shows the bootstrap-log-tail pane (and the ssh-agent-unlock pane,
-which just exits immediately since the key's already unlocked by then).
+re-shows the bootstrap-log-tail pane.
 Fix: give the layout an explicit template for the **first** tab only, and
 let tabs opened afterward fall back to zellij's plain builtin default
 rather than inheriting a session-wide default tab template. The

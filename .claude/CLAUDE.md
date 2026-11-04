@@ -1,4 +1,21 @@
 
+## SSH keys on a Beam
+
+On a Beam, `SSH_AUTH_SOCK` is a relay: the private key stays on the user's
+workstation, and the user approves each use of it in their terminal. Before
+running anything that uses the key (`git clone`/`fetch`/`push` over SSH,
+`ssh` to a host, SSH commit signing), set `SSH_KEY_REASON` to a short,
+honest, one-line reason; it's shown in the approval prompt:
+
+```sh
+SSH_KEY_REASON="Fetch the PR branch the user asked me to review" git fetch origin pull/123/head
+```
+
+Expect the command to wait (up to a minute) for approval. A failure such as
+`agent refused operation` or `Permission denied (publickey)` means the user
+declined or isn't at their terminal: don't retry in a loop or look for
+other keys or agents; tell the user what you needed and why.
+
 ## Teleport AI use policy
 
 Note that Teleport's AI use policy requires that no AI written code is

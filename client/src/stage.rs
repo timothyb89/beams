@@ -4,23 +4,19 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 
-/// Builds a temp directory named `beams/` containing exactly the two
-/// things a fresh beam needs that git itself won't carry over: the ssh
-/// private key, and a prebuilt `beam-bootstrap` binary (no Rust
-/// toolchain on a fresh beam; see bootstrap/README.md). Everything else
-/// - every git-tracked file in `repo` - gets there via `tsh::push_repo`
-/// instead (see DESIGN.md's "Repo delivery onto a beam"); this used to
-/// stage *all* of it for one big `scp -r`, back when that was the only
-/// transport.
+/// Builds a temp directory named `beams/` containing the one thing a
+/// fresh beam needs that git itself won't carry over: a prebuilt
+/// `beam-bootstrap` binary (no Rust toolchain on a fresh beam; see
+/// bootstrap/README.md). Everything else - every git-tracked file in
+/// `repo` - gets there via `tsh::push_repo` instead (see DESIGN.md's
+/// "Repo delivery onto a beam").
+///
+/// No SSH private key is ever copied: the beam's agent is a relay to the
+/// workstation's own agent (see SSH_AGENT_PROXY_DESIGN.md).
 pub fn build(repo: &Path) -> anyhow::Result<PathBuf> {
     let tmp = std::env::temp_dir().join(format!("beams-client-stage-{}", std::process::id()));
     let dest_root = tmp.join("beams");
     fs::create_dir_all(&dest_root).with_context(|| format!("creating {}", dest_root.display()))?;
-
-    let key = repo.join(".ssh/beams_id_ed25519");
-    if key.exists() {
-        copy_preserving_mode(&key, &dest_root.join(".ssh/beams_id_ed25519"))?;
-    }
 
     let bin = find_bootstrap_bin(repo)?;
     let rel = bin.strip_prefix(repo).unwrap_or(&bin);

@@ -25,12 +25,14 @@ Two halves:
 
 Plus:
 - `bin/` — scripts symlinked into a beam's `$HOME` (`beam-shell`,
-  `ssh-agent-init`).
+  `beams`).
 - `shell/` — fish config, starship config, zellij layout, all symlinked in.
 - `bot-onboarding/` — cluster-level (not per-beam) Teleport role/bot setup
   for the `k3s-bot`, applied once via `tctl`.
-- `.ssh/` — the shared ephemeral key both halves use (private key
-  git-ignored; only pushed to a beam, never committed).
+- `.ssh/` — `known_hosts` (and a public key) linked into a beam's
+  `~/.ssh`. No private key goes to a beam: its `SSH_AUTH_SOCK` is
+  `beam-bootstrapd`'s agent relay, and each use of a workstation key is
+  approved in `beams ssh` (see `SSH_AGENT_PROXY_DESIGN.md`).
 
 ## Task runner
 

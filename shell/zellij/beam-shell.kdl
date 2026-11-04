@@ -11,10 +11,8 @@
 // (`~/.cache/zellij/contract_version_1/session_info/<name>/session-layout.kdl`),
 // which showed this file's old flat form as the session's literal
 // `new_tab_template`. That's the bug: every new tab re-ran the
-// log-tail/ssh-agent setup pointlessly (the ssh-agent pane just exits
-// immediately once the key's already unlocked, but it's still wrong to
-// re-show it, and the log tail has nothing to do with whatever a new
-// tab is actually for).
+// log-tail setup pointlessly (the log tail has nothing to do with
+// whatever a new tab is actually for).
 //
 // Fix: give the first tab its content explicitly (`tab { ... }` below)
 // and define a separate, minimal `new_tab_template` - zellij's actual
@@ -28,27 +26,9 @@ layout {
             plugin location="tab-bar"
         }
         pane split_direction="vertical" {
-            pane split_direction="horizontal" size="70%" {
-                pane
-                // Ensures the ssh-agent is running and unlocks its key.
-                // Not focused by default - it doesn't need to be.
-                // Finding/starting the agent never blocks
-                // (bin/ssh-agent-init), and the password prompt for the
-                // key itself just sits there waiting in its own pane
-                // until you switch over and answer it, whenever that
-                // is; nothing else depends on it being unlocked
-                // immediately. `close_on_exit` closes the pane itself
-                // the moment ssh-agent-init finishes (unlocked, or left
-                // alone if noninteractive/no key) - nothing to clean up
-                // once it's done. The main pane's own shell skips this
-                // unlock itself (see ssh-agent-init.fish /
-                // BEAM_SHELL_SSH_UNLOCK_DELEGATED) so this is the one
-                // place the passphrase prompt actually shows up.
-                pane size="25%" name="ssh-agent" close_on_exit=true {
-                    command "bash"
-                    args "-lc" "unset BEAM_SHELL_SSH_UNLOCK_DELEGATED; \"$HOME/bin/ssh-agent-init\""
-                }
-            }
+            // The main shell. SSH key use goes through the daemon's agent
+            // relay and is approved on the workstation (no unlock pane).
+            pane size="70%" focus=true
             // Right-hand side: `beam-bootstrap tui` (see
             // bootstrap/src/tui/) stacked with the bootstrap log tail.
             // `stacked=true` collapses every pane but one to a single

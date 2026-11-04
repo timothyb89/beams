@@ -338,14 +338,13 @@ as a `code-server` beamctl service bound to `127.0.0.1:8080`. It needs
 editor extension) - run all three via `task run`, or in one
 `run-manifest` call since the graph resolves the dependency either way.
 
-Another: `wait-ssh-agent-unlock` polls `ssh-add -l` until the key
-`bin/ssh-agent-init`'s interactive unlock (run entirely outside this
-binary, in its own zellij pane) adds is actually present, erroring out
-after a ~10 minute timeout rather than waiting forever. `clone-git-repo`
-requires its capability automatically for an ssh-style `repo` (`git@...`
-or `ssh://...`) - `bin/beam-shell`'s default-clones manifest is the
-main consumer, but any manifest cloning over ssh gets the same ordering
-for free.
+Another: `wait-ssh-agent` (formerly `wait-ssh-agent-unlock`, still
+accepted) polls `ssh-add -l` against the daemon's SSH agent relay until the
+workstation is sharing a key (a `beams ssh` session is attached and a key
+is allowed), erroring out after a ~10 minute timeout rather than waiting
+forever. `clone-git-repo` requires its capability automatically for an
+ssh-style `repo` (`git@...` or `ssh://...`), and the workstation adds it to
+its startup manifest whenever that has ssh clones.
 Reaching it is then a separate, manual step, same as any other published
 app: `tsh beams publish $BEAM_ALIAS` (per `~/AGENTS.md`'s "Publishing
 apps from beam" - port 8080 is the only one forwarded, which is why
@@ -365,8 +364,8 @@ lines tall: status glyph + task id, then the task's latest progress or
 result message at full width (or, while pending, which of its
 dependencies it's still waiting on), plus an aggregate gauge
 (`done/total, N running`) above them. `run_once` templates (toolchain
-installs, `wait-ssh-agent-unlock` - things `bin/beam-shell` already runs
-at startup) are left out of the template list; their runs still show up
+installs, `wait-ssh-agent` - things the startup manifest already runs)
+are left out of the template list; their runs still show up
 in the task list, and `task run` still reaches them. `r`
 refreshes the template list, `tab` (outside a form) switches focus
 between the template list and the task list for scrolling, the scroll
@@ -406,13 +405,12 @@ cargo build
 ## bin/beam-shell
 
 A convenience entrypoint for day-to-day use, once `cargo build --release`
-has produced the binary (or `cargo build` for a debug one): makes sure the
-ssh-agent is running (never blocks - see "ssh-agent" below), runs
+has produced the binary (or `cargo build` for a debug one): starts the
+bootstrap daemon (which also serves the SSH agent relay), runs
 `beam-bootstrap` in the background logging to `~/.beam-bootstrap.log`,
 then attaches to (or creates) a `beam` zellij session
-(`shell/zellij/beam-shell.kdl`) with three panes: the main one, a log pane
-tailing `~/.beam-bootstrap.log`, and an `ssh-agent` pane that handles the
-actual interactive key unlock whenever you get to it:
+(`shell/zellij/beam-shell.kdl`) with the main pane next to the bootstrap
+TUI and a log pane tailing `~/.beam-bootstrap.log`:
 
 ```sh
 ~/bin/beam-shell
@@ -421,35 +419,21 @@ actual interactive key unlock whenever you get to it:
 Safe to run repeatedly - it's just the attach-or-create flow each time, and
 `beam-bootstrap` is idempotent.
 
-It also submits a default startup manifest to the daemon, in the
-background: `install-toolchain-go` + `install-toolchain-rust` (skip with
-`BEAM_SHELL_SKIP_DEFAULT_TOOLCHAINS=1`) and `wait-ssh-agent-unlock` + the
-usual repo clones (skip with `BEAM_SHELL_SKIP_DEFAULT_CLONES=1`). The
-toolchain installs don't wait on the ssh unlock - only the clones do.
+Startup tasks (toolchains, repo clones) come from the workstation: the
+`beams` client sends its `[startup]` config (see `client/README.md`) over
+the bridge the first time it connects to a beam.
 
-### ssh-agent: async unlock, noninteractive-safe
+### SSH agent: a relay, no keys on the beam
 
-`bin/ssh-agent-init` (and its fish port, `.fish`) always finds or starts the
-agent first - safe to source from anywhere, interactive or not. It only
-attempts to unlock and `ssh-add` the key (which may prompt for a
-passphrase) when stdin/stdout are both a real tty; otherwise it leaves the
-key as-is rather than blocking on a prompt nobody can answer.
+`beam-bootstrapd` listens on `~/.beam-bootstrap/ssh-agent.sock` (next to
+its own socket) and relays agent requests to the workstation over the
+client bridge; the private key never leaves the workstation's own agent,
+and the user approves each signature in `beams ssh` (see
+`SSH_AGENT_PROXY_DESIGN.md`). `beam-shell` and `config.fish` set
+`SSH_AUTH_SOCK` to it for every shell, interactive or not; tasks run by the
+daemon (clones, PR checkouts, `wait-ssh-agent`) pass it explicitly (see
+`src/sshagent.rs`). With no `beams ssh` attached the relay lists no keys,
+so `ssh`/`git` fail fast with `Permission denied (publickey)` rather than
+hang. Set `SSH_KEY_REASON="..."` on a command to say why it needs the key;
+it's shown (as unverified) in the approval prompt.
 
-`beam-shell` sources it once, with stdin redirected from `/dev/null` so
-the interactivity check reads false even though beam-shell itself is
-running on a real terminal - deliberately forcing the noninteractive
-("ensure only, never unlock") path. That's sourced (not exec'd), so the
-agent's env ends up exported in beam-shell's own process - which `exec
-zellij` then hands down to every pane zellij spawns. The zellij layout's
-dedicated `ssh-agent` pane runs `ssh-agent-init` again on its own, this
-time with no redirect: the agent's already up (inherited from beam-shell,
-so this is instant), and this pane *does* have a real tty, so the unlock
-prompt runs there - whenever you switch over to it. Nothing else needs to
-wait on that; the agent itself is already reachable to every pane from the
-moment zellij starts, unlocked or not.
-
-`config.fish` also sources it unconditionally on every fish start - since
-fish is the beam's default login shell, that covers both an interactive
-login *and* a noninteractive `tsh ssh ... -- cmd` exec, so commands run
-that way work against whatever the agent already holds without ever
-hitting a password prompt.

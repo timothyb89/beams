@@ -333,6 +333,7 @@ pub fn serve(socket_path: &Path) -> anyhow::Result<()> {
     // it (say, another agent already owns the path) leaves the rest of the
     // daemon working.
     let agent_socket = socket_path.with_file_name("ssh-agent.sock");
+    crate::sshagent::set_relay_socket(agent_socket.clone());
     {
         let hub = Arc::clone(&hub);
         thread::spawn(move || {

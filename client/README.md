@@ -422,6 +422,48 @@ doesn't leave the others half-done. `tsh beams add` isn't wrapped:
 `beams ssh` (or `beams ssh --purpose <name>`) is the spawn path, since
 it also tracks the purpose and bootstraps the beam.
 
+## Configuration: SSH keys and startup tasks
+
+`~/.config/beams-client/config.toml` (re-read on use; a missing file means
+the defaults below):
+
+```toml
+[ssh_agent]
+# Keys from this terminal's SSH agent that Beams may *ask* to use
+# (`beams agent-keys` lists them; `--allow` adds one). Empty or missing:
+# Beams see no keys at all.
+allowed_keys = ["SHA256:..."]
+prompt_timeout = 60        # seconds to approve a request (max 110)
+
+[startup]
+# Sent to each new Beam once, the first time `beams ssh` connects to it.
+# Default without this section: the Go and Rust toolchains.
+tasks = [
+  { template = "install-toolchain-go" },
+  { template = "install-toolchain-rust" },
+  { template = "clone-git-repo", params = { repo = "git@github.com:gravitational/core.git", dest = "~/projects/core" } },
+  { template = "clone-git-repo", params = { repo = "git@github.com:timothyb89/teleport-harness.git", dest = "~/projects/teleport-harness" } },
+  { template = "clone-git-repo", params = { repo = "git@github.com:timothyb89/rdocker.git", dest = "~/projects/rdocker" } },
+]
+
+[startup.ssh_grant]
+# Lets those startup clones use the key without a prompt: logins to these
+# hosts (as your known_hosts names them, and verified against it) as
+# `user`, for at most `max_uses` signatures (default: one per ssh clone
+# plus two) within `window_secs` (default 600), ending early once startup
+# finishes. Each use shows a toast; revoke it from the menu.
+hosts = ["github.com"]
+user = "git"
+```
+
+There's no private key on a Beam: its `SSH_AUTH_SOCK` relays to the agent of
+the `beams ssh` terminal attached to it, and every other use of a key shows
+an "SSH key request" toast. Press the menu key to review it: what the
+workstation verified (host via your `known_hosts`, user, key) comes first,
+then what the Beam reported (command, reason, task), marked unverified.
+Deny is the default. With no `beams ssh` attached, requests are denied
+without asking. See `SSH_AGENT_PROXY_DESIGN.md`.
+
 ## State
 
 No server-side way exists to label a beam, so `~/.config/beams-client/state.json`

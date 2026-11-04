@@ -19,7 +19,7 @@
 #
 # `~/bin` is included too even though it's already added to bash's PATH
 # via ~/.profile's Debian-default block - fish doesn't source that file
-# at all, so without this, `beam-shell`/`ssh-agent-init` would only be
+# at all, so without this, `beam-shell`/`beams` would only be
 # reachable by bare name from bash, not fish (the beam's own default
 # shell). `~/.cargo/bin` isn't listed here - rustup's own installer
 # already wires that in for both bash and fish on its own.

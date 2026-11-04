@@ -563,7 +563,7 @@ fn ssh(
             tsh::push_repo(repo, login, &fresh.uuid, REMOTE_REPO_PATH, &branch)?;
 
             eprintln!(
-                "beams: copying the ssh key and bootstrap binary to {}...",
+                "beams: copying the bootstrap binary to {}...",
                 fresh.id
             );
             let staging = stage::build(repo)?;

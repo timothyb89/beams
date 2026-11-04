@@ -1949,8 +1949,9 @@ impl Hub {
             request_id.clone(),
             (beam_uuid.to_string(), config.ssh_grant.clone().filter(|g| !g.hosts.is_empty()), budget),
         );
-        eprintln!("startup: {beam_uuid}: submitting {} task(s)", config.tasks.len());
-        let _ = commands.try_send(ClientToBeam::RunManifest { request_id, tasks: config.tasks });
+        let tasks = config.manifest_tasks();
+        eprintln!("startup: {beam_uuid}: submitting {} task(s)", tasks.len());
+        let _ = commands.try_send(ClientToBeam::RunManifest { request_id, tasks });
     }
 
     /// The Beam started our startup manifest: issue its grant, if any.
@@ -4729,8 +4730,8 @@ mod tests {
 
         connect_capable(&hub);
         let (request_id, tasks) = next_manifest(&commands).expect("startup manifest sent on first connect");
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].template, "clone-git-repo");
+        let templates: Vec<&str> = tasks.iter().map(|task| task.template.as_str()).collect();
+        assert_eq!(templates, vec!["wait-ssh-agent", "clone-git-repo"]);
         connect_capable(&hub);
         assert!(next_manifest(&commands).is_none(), "never resent to the same Beam");
 

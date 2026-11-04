@@ -27,7 +27,7 @@ pub mod clone_git_repo;
 pub mod install_code_server;
 pub mod install_toolchain_go;
 pub mod install_toolchain_rust;
-pub mod wait_ssh_agent_unlock;
+pub mod wait_ssh_agent;
 
 
 use anyhow::{bail, Context};
@@ -40,14 +40,14 @@ use clone_git_repo::CloneGitRepo;
 use install_code_server::InstallCodeServer;
 use install_toolchain_go::InstallToolchainGo;
 use install_toolchain_rust::InstallToolchainRust;
-use wait_ssh_agent_unlock::WaitSshAgentUnlock;
+use wait_ssh_agent::WaitSshAgent;
 
 /// Capability names provided/required by templates below - mirrors
 /// `steps::cap`'s role for fixed steps. Centralized so a dependent
 /// template references the same constant rather than retyping the
 /// string.
 pub mod cap {
-    pub const SSH_AGENT_UNLOCKED: &str = "ssh-agent-unlocked";
+    pub const SSH_AGENT_READY: &str = "ssh-agent-ready";
 }
 
 /// One declared parameter of a template - just enough for a client (the
@@ -197,7 +197,7 @@ pub fn templates() -> Vec<TemplateInfo> {
         // and not everyone wants it) - hiding it would leave no way to
         // launch it from the TUI at all.
         TemplateInfo { template: InstallCodeServer::NAME, params: &[], run_once: false },
-        TemplateInfo { template: WaitSshAgentUnlock::NAME, params: &[], run_once: true },
+        TemplateInfo { template: WaitSshAgent::NAME, params: &[], run_once: true },
     ]
 }
 
@@ -246,7 +246,8 @@ pub fn instantiate(name: &str, params: Value) -> anyhow::Result<Box<dyn Task>> {
         InstallToolchainGo::NAME => Ok(Box::new(InstallToolchainGo)),
         InstallToolchainRust::NAME => Ok(Box::new(InstallToolchainRust)),
         InstallCodeServer::NAME => Ok(Box::new(InstallCodeServer)),
-        WaitSshAgentUnlock::NAME => Ok(Box::new(WaitSshAgentUnlock)),
+        // The old name, from manifests written before the agent relay.
+        WaitSshAgent::NAME | "wait-ssh-agent-unlock" => Ok(Box::new(WaitSshAgent)),
         other => bail!("unknown template {other:?} (known: {})", names().join(", ")),
     }
 }
