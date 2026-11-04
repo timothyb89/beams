@@ -75,9 +75,9 @@ use std::thread;
 
 use anyhow::Context;
 use beams_protocol::{
-    ActionRequestProjection, BeamToClient, ClientToBeam, RequestProjection, RequestStatus,
+    ActionRequestProjection, BeamToClient, ClientToBeam, FetchSource, RequestProjection, RequestStatus,
     ServiceActionRequest, ServiceProjection, ServiceRequest, ServiceRequestKind, ServiceStatus,
-    PROTOCOL, PROTOCOL_VERSION,
+    CAPABILITY_FILE_FETCH, MAX_FETCH_SOURCES, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -125,6 +125,9 @@ struct BridgeRegistration {
     session_tokens: HashSet<String>,
     ready: bool,
     sender: Sender<String>,
+    /// Optional features the workstation advertised (see
+    /// `beams_protocol::CAPABILITIES`).
+    capabilities: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -154,6 +157,9 @@ struct ClientActionProjection {
 #[derive(Default)]
 struct ConnectionContext {
     bridge_id: Option<String>,
+    /// Requests this connection submitted that are tied to it: if it goes
+    /// away first (Ctrl-C in `beams fetch`), they're withdrawn.
+    tied_requests: Vec<String>,
 }
 
 impl Hub {
@@ -204,6 +210,28 @@ impl Hub {
             .to_string(),
         );
         Ok(())
+    }
+
+    /// Tells the owning workstation that the requester gave up on
+    /// `service_request_id`, unless the request already ended. The
+    /// workstation ignores a withdrawal for a finished service.
+    fn withdraw_request(&self, service_request_id: &str) {
+        let Some(projection) = self.client_requests.lock().unwrap().get(service_request_id).cloned() else {
+            return;
+        };
+        if matches!(projection.status, RequestStatus::Rejected | RequestStatus::Expired | RequestStatus::Failed) {
+            return;
+        }
+        let sender = self
+            .bridges
+            .lock()
+            .unwrap()
+            .get(&projection.bridge_id)
+            .filter(|bridge| bridge.capabilities.contains(CAPABILITY_FILE_FETCH))
+            .map(|bridge| bridge.sender.clone());
+        if let Some(sender) = sender {
+            send_bridge_event(&sender, &BeamToClient::RequestWithdrawn { request_id: service_request_id.to_string() });
+        }
     }
 
     fn unregister_bridge(&self, bridge_id: &str) {
@@ -315,6 +343,9 @@ fn handle_connection(hub: &Arc<Hub>, stream: UnixStream) -> anyhow::Result<()> {
     if let Some(bridge_id) = context.bridge_id {
         hub.unregister_bridge(&bridge_id);
     }
+    for service_request_id in &context.tied_requests {
+        hub.withdraw_request(service_request_id);
+    }
     hub.unregister(connection_id);
     drop(tx);
     let _ = writer.join();
@@ -361,7 +392,7 @@ fn handle_line(hub: &Arc<Hub>, line: &str, reply: &Sender<String>, context: &mut
             list_client_state(hub, request_id, reply);
         }
         "request_service" => {
-            request_service(hub, request_id, &request, reply);
+            request_service(hub, request_id, &request, reply, context);
         }
         "request_service_action" => {
             request_service_action(hub, request_id, &request, reply);
@@ -390,7 +421,7 @@ fn register_client_bridge(
             return;
         }
     };
-    let ClientToBeam::Hello { protocol, version, client_id, bridge_id, session_tokens } = message else {
+    let ClientToBeam::Hello { protocol, version, client_id, bridge_id, session_tokens, capabilities } = message else {
         let _ = reply.send(error_reply(request_id, "first bridge message must be hello"));
         return;
     };
@@ -413,6 +444,7 @@ fn register_client_bridge(
         session_tokens: session_tokens.into_iter().filter(|token| !token.is_empty()).collect(),
         ready: false,
         sender: reply.clone(),
+        capabilities: capabilities.into_iter().collect(),
     };
     if let Err(err) = hub.register_bridge(registration) {
         let _ = reply.send(error_reply(request_id, &err));
@@ -810,7 +842,13 @@ fn list_client_state(hub: &Hub, request_id: Option<&str>, reply: &Sender<String>
     );
 }
 
-fn request_service(hub: &Hub, request_id: Option<&str>, request: &Value, reply: &Sender<String>) {
+fn request_service(
+    hub: &Hub,
+    request_id: Option<&str>,
+    request: &Value,
+    reply: &Sender<String>,
+    context: &mut ConnectionContext,
+) {
     let session_token = request.get("session_token").and_then(Value::as_str).unwrap_or_default();
     let client_hint = request.get("client_id").and_then(Value::as_str);
     let service_request: ServiceRequest =
@@ -847,8 +885,27 @@ fn request_service(hub: &Hub, request_id: Option<&str>, request: &Value, reply: 
             let _ = reply.send(error_reply(request_id, "remote_path must not be empty"));
             return;
         }
+        ServiceRequestKind::FileFetch { sources, .. } => {
+            if let Err(message) = validate_fetch_sources(sources) {
+                let _ = reply.send(error_reply(request_id, &message));
+                return;
+            }
+        }
         _ => {}
     }
+    // The workstation bridge drops a frame over `MAX_FRAME_BYTES` as a
+    // protocol error, so never route one (with headroom for the envelope).
+    let encoded = serde_json::to_vec(&BeamToClient::RequestSubmitted { request: service_request.clone() })
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX);
+    if encoded > MAX_FRAME_BYTES - 1024 {
+        let _ = reply.send(error_reply(
+            request_id,
+            "the request is too large to send to the workstation; fetch fewer files at a time (or their parent directory)",
+        ));
+        return;
+    }
+    let needs_fetch = matches!(service_request.kind, ServiceRequestKind::FileFetch { .. });
 
     let matching: Vec<BridgeRegistration> = hub
         .bridges
@@ -859,6 +916,13 @@ fn request_service(hub: &Hub, request_id: Option<&str>, request: &Value, reply: 
         .cloned()
         .collect();
     let bridge = match matching.as_slice() {
+        [bridge] if needs_fetch && !bridge.capabilities.contains(CAPABILITY_FILE_FETCH) => {
+            let _ = reply.send(error_reply(
+                request_id,
+                "the beams client on your workstation is too old for `beams fetch`; update it, run `beams daemon restart` there, then reconnect with `beams ssh`",
+            ));
+            return;
+        }
         [bridge] => bridge.clone(),
         [] => {
             let client_connected = client_hint.is_some_and(|client_id| {
@@ -912,6 +976,9 @@ fn request_service(hub: &Hub, request_id: Option<&str>, request: &Value, reply: 
         return;
     }
 
+    if needs_fetch {
+        context.tied_requests.push(service_request.request_id.clone());
+    }
     let projection = hub
         .client_requests
         .lock()
@@ -929,6 +996,30 @@ fn request_service(hub: &Hub, request_id: Option<&str>, request: &Value, reply: 
         })
         .to_string(),
     );
+}
+
+fn validate_fetch_sources(sources: &[FetchSource]) -> Result<(), String> {
+    if sources.is_empty() {
+        return Err("a fetch needs at least one source".to_string());
+    }
+    if sources.len() > MAX_FETCH_SOURCES {
+        return Err(format!("a fetch can name at most {MAX_FETCH_SOURCES} sources"));
+    }
+    let mut names = HashSet::new();
+    for source in sources {
+        if !source.path.starts_with('/') {
+            return Err(format!("fetch source {:?} must be an absolute path", source.path));
+        }
+        // Every source lands in the destination under its own name.
+        let name = source.path.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
+        if name.is_empty() || name == "." || name == ".." {
+            return Err(format!("fetch source {:?} has no file name", source.path));
+        }
+        if !names.insert(name.to_string()) {
+            return Err(format!("two fetch sources are both named {name:?}"));
+        }
+    }
+    Ok(())
 }
 
 fn request_service_action(
@@ -1273,8 +1364,25 @@ mod tests {
         bridge_id: &str,
         token: &str,
     ) -> (UnixStream, BufReader<UnixStream>, thread::JoinHandle<()>) {
+        register_bridge_with(hub, client_id, bridge_id, token, true)
+    }
+
+    /// `current: false` registers the way a workstation that predates
+    /// capabilities does.
+    fn register_bridge_with(
+        hub: Arc<Hub>,
+        client_id: &str,
+        bridge_id: &str,
+        token: &str,
+        current: bool,
+    ) -> (UnixStream, BufReader<UnixStream>, thread::JoinHandle<()>) {
         let (mut stream, mut reader, handle) = connect_to(hub);
-        let hello = ClientToBeam::hello(client_id.to_string(), bridge_id.to_string(), vec![token.to_string()]);
+        let mut hello = ClientToBeam::hello(client_id.to_string(), bridge_id.to_string(), vec![token.to_string()]);
+        if !current {
+            if let ClientToBeam::Hello { capabilities, .. } = &mut hello {
+                capabilities.clear();
+            }
+        }
         send(
             &mut stream,
             &json!({
@@ -1544,6 +1652,79 @@ mod tests {
         assert_eq!(reply["request_id"], "9");
     }
 
+    fn fetch_request(request_id: &str) -> ServiceRequest {
+        ServiceRequest {
+            request_id: request_id.to_string(),
+            kind: ServiceRequestKind::FileFetch {
+                sources: vec![FetchSource { path: "/home/beams/out.log".to_string(), size: 3, is_dir: false }],
+                local_path_hint: None,
+                overwrite: beams_protocol::OverwritePolicy::Deny,
+            },
+        }
+    }
+
+    fn submit(requester: &mut UnixStream, token: &str, request: &ServiceRequest) {
+        send(
+            requester,
+            &json!({
+                "request_id": "submit",
+                "op": "request_service",
+                "session_token": token,
+                "request": request,
+            })
+            .to_string(),
+        );
+    }
+
+    #[test]
+    fn fetch_requests_need_a_workstation_that_supports_them() {
+        let hub = Arc::new(Hub::default());
+        let (_bridge, _bridge_reader, _handle) = register_bridge_with(Arc::clone(&hub), "client-a", "bridge-a", "token-a", false);
+        let (mut requester, mut reader, _requester_handle) = connect_to(Arc::clone(&hub));
+        submit(&mut requester, "token-a", &fetch_request("fetch-1"));
+        let error = recv_type(&mut reader, "error");
+        assert!(error["message"].as_str().unwrap().contains("too old for `beams fetch`"), "{error}");
+        assert!(hub.client_requests.lock().unwrap().is_empty(), "nothing was routed");
+
+        let mut huge = fetch_request("fetch-3");
+        if let ServiceRequestKind::FileFetch { sources, .. } = &mut huge.kind {
+            *sources = (0..150)
+                .map(|index| FetchSource { path: format!("/{}/{index}", "d".repeat(500)), size: 1, is_dir: false })
+                .collect();
+        }
+        submit(&mut requester, "token-a", &huge);
+        let error = recv_type(&mut reader, "error");
+        assert!(error["message"].as_str().unwrap().contains("too large"), "{error}");
+
+        let mut relative = fetch_request("fetch-2");
+        if let ServiceRequestKind::FileFetch { sources, .. } = &mut relative.kind {
+            sources[0].path = "out.log".to_string();
+        }
+        submit(&mut requester, "token-a", &relative);
+        let error = recv_type(&mut reader, "error");
+        assert!(error["message"].as_str().unwrap().contains("absolute"), "{error}");
+    }
+
+    #[test]
+    fn a_fetch_is_withdrawn_when_its_requester_disconnects() {
+        let hub = Arc::new(Hub::default());
+        let (_bridge, mut bridge_reader, _handle) = register_bridge(Arc::clone(&hub), "client-a", "bridge-a", "token-a");
+        let (mut requester, mut reader, requester_handle) = connect_to(Arc::clone(&hub));
+        submit(&mut requester, "token-a", &fetch_request("fetch-1"));
+        recv_type(&mut reader, "service_request_accepted");
+        let submitted = recv_type(&mut bridge_reader, "client_bridge_event");
+        assert_eq!(submitted["message"]["type"], "request_submitted");
+
+        // Ctrl-C in `beams fetch` closes its connection.
+        drop(reader);
+        requester.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(requester);
+        requester_handle.join().unwrap();
+        let withdrawn = recv_type(&mut bridge_reader, "client_bridge_event");
+        let message: BeamToClient = serde_json::from_value(withdrawn["message"].clone()).unwrap();
+        assert_eq!(message, BeamToClient::RequestWithdrawn { request_id: "fetch-1".to_string() });
+    }
+
     #[test]
     fn managed_session_token_routes_a_request_to_exactly_one_bridge() {
         let hub = Arc::new(Hub::default());
@@ -1630,6 +1811,7 @@ mod tests {
                     },
                     status: ServiceStatus::Running,
                     message: None,
+                    progress: None,
                 },
             },
         );

@@ -257,7 +257,38 @@ overwritten by a late restart snapshot. A Beam can submit proposals and
 observe decisions, but the bridge protocol has no VM-to-client approval
 message.
 
-Inside a managed Beam shell:
+Inside a managed Beam shell, `beams fetch` copies files or directories back
+to the workstation:
+
+```sh
+beams fetch report.csv                  # pick the destination locally
+beams fetch out/*.log ~/Downloads/logs/  # trailing argument: suggested destination
+beams fetch --to ./build-output dist     # same, explicitly
+```
+
+Globs are expanded by the Beam's shell; a last argument that doesn't exist in
+the Beam is the suggested destination (`--to` makes it explicit, and the Beam
+shell's expansion of `~` is turned back into `~` for the workstation).
+Nothing is copied until the workstation user approves the request in the local
+menu, whose "Save to" field is prefilled with the suggestion, else the most
+recently used directory, else `./` (the directory `beams ssh` was started
+from), and has the path dropdown. One plain file lands at the destination (or
+inside it, if that's a directory); several items, or a directory, land inside
+the destination directory, which is created if needed. Each item is copied
+with `tsh scp` (`-r` for directories) into a hidden sibling temp name and
+renamed into place; existing targets fail the fetch unless `--overwrite` was
+given. The command prints byte progress until the copy finishes and exits
+non-zero on rejection, expiry, failure, or cancellation. Ctrl-C withdraws the
+request: the Beam daemon notices the command's connection closing and tells
+the workstation, which drops it if still pending or cancels it if running.
+
+Fetch requests, the withdrawal message, and transfer progress are announced
+by capability in the bridge hello (`file_fetch`). The Beam refuses `beams
+fetch` with an "update your workstation" error when the connected workstation
+predates them, rather than sending a message an older daemon would treat as a
+protocol error.
+
+The other request types:
 
 ```sh
 beam-bootstrap client list

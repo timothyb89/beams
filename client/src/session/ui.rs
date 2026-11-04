@@ -236,6 +236,45 @@ pub fn describe_request(request: &RequestRecord) -> Vec<(String, bool)> {
             }
             lines
         }
+        ServiceRequestKind::FileFetch {
+            sources, overwrite, ..
+        } => {
+            let total: u64 = sources.iter().map(|source| source.size).sum();
+            let what = match sources.as_slice() {
+                [source] if !source.is_dir => "a file".to_string(),
+                [_] => "a directory".to_string(),
+                _ => format!("{} items", sources.len()),
+            };
+            let mut lines = vec![(
+                format!(
+                    "Copy {what} ({}) from the Beam to this workstation:",
+                    human_bytes(total)
+                ),
+                false,
+            )];
+            const LISTED: usize = 4;
+            for source in sources.iter().take(LISTED) {
+                lines.push((
+                    format!(
+                        "• {}{}  {}",
+                        source.path,
+                        if source.is_dir { "/" } else { "" },
+                        human_bytes(source.size)
+                    ),
+                    false,
+                ));
+            }
+            if sources.len() > LISTED {
+                lines.push((format!("• … and {} more", sources.len() - LISTED), false));
+            }
+            if *overwrite == OverwritePolicy::Replace {
+                lines.push((
+                    "Existing files at the destination will be replaced.".to_string(),
+                    true,
+                ));
+            }
+            lines
+        }
         ServiceRequestKind::FolderSync {
             remote_path,
             local_path_hint,
@@ -270,6 +309,41 @@ pub fn describe_request(request: &RequestRecord) -> Vec<(String, bool)> {
             }
             lines
         }
+    }
+}
+
+/// `1.2 MB`-style sizes (decimal units, like `ls -h --si`).
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else if value < 10.0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
+/// `41% · 2/5` for a transfer under way.
+pub fn progress_label(progress: &beams_protocol::TransferProgress) -> String {
+    let percent = if progress.bytes_total == 0 {
+        100
+    } else {
+        progress.bytes_done.min(progress.bytes_total) * 100 / progress.bytes_total
+    };
+    if progress.files_total > 1 {
+        format!(
+            "{percent}% · {}/{}",
+            progress.files_done, progress.files_total
+        )
+    } else {
+        format!("{percent}%")
     }
 }
 
@@ -312,6 +386,21 @@ pub fn describe_service(service: &ServiceRecord) -> (&'static str, String) {
                 },
             )
         }
+        Some(ServiceRequestKind::FileFetch { sources, .. }) => {
+            let what = match sources.as_slice() {
+                [source] => std::path::Path::new(&source.path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| source.path.clone()),
+                _ => format!("{} items", sources.len()),
+            };
+            let local = service.local_path.as_deref().unwrap_or("?");
+            let mut endpoint = format!("{what} → {local}");
+            if let (ServiceStatus::Running, Some(progress)) = (service.status, &service.progress) {
+                endpoint = format!("{} {endpoint}", progress_label(progress));
+            }
+            ("fetch", endpoint)
+        }
         Some(ServiceRequestKind::FolderSync {
             remote_path,
             local_path_hint,
@@ -329,12 +418,22 @@ pub fn describe_service(service: &ServiceRecord) -> (&'static str, String) {
     }
 }
 
+/// One-shot copies (`FileCopy` and `FileFetch`) behave alike in the menu.
+fn is_transfer(service: &ServiceRecord) -> bool {
+    matches!(
+        service.spec,
+        Some(ServiceRequestKind::FileCopy { .. } | ServiceRequestKind::FileFetch { .. })
+    )
+}
+
 pub fn supported_actions(service: &ServiceRecord) -> &'static [ServiceAction] {
     match service.spec {
         Some(ServiceRequestKind::LocalPortForward { .. }) => {
             &[ServiceAction::Stop, ServiceAction::Restart]
         }
-        Some(ServiceRequestKind::FileCopy { .. }) => &[ServiceAction::Stop],
+        Some(ServiceRequestKind::FileCopy { .. } | ServiceRequestKind::FileFetch { .. }) => {
+            &[ServiceAction::Stop]
+        }
         Some(ServiceRequestKind::FolderSync { .. }) => &[
             ServiceAction::Pause,
             ServiceAction::Resume,
@@ -351,7 +450,7 @@ pub fn available_actions(service: &ServiceRecord) -> Vec<ServiceAction> {
         service.status,
         ServiceStatus::Stopped | ServiceStatus::Error
     );
-    let is_copy = matches!(service.spec, Some(ServiceRequestKind::FileCopy { .. }));
+    let is_copy = is_transfer(service);
     supported_actions(service)
         .iter()
         .copied()
@@ -369,13 +468,11 @@ pub fn available_actions(service: &ServiceRecord) -> Vec<ServiceAction> {
 /// Actions that can't be undone ask first: terminating a sync removes its
 /// Mutagen session, and cancelling a copy can't be resumed.
 pub fn needs_confirmation(service: &ServiceRecord, action: ServiceAction) -> bool {
-    action == ServiceAction::Terminate
-        || (action == ServiceAction::Stop
-            && matches!(service.spec, Some(ServiceRequestKind::FileCopy { .. })))
+    action == ServiceAction::Terminate || (action == ServiceAction::Stop && is_transfer(service))
 }
 
 pub fn action_description(service: &ServiceRecord, action: ServiceAction) -> &'static str {
-    let is_copy = matches!(service.spec, Some(ServiceRequestKind::FileCopy { .. }));
+    let is_copy = is_transfer(service);
     match action {
         ServiceAction::Stop if is_copy => "cancel the copy",
         ServiceAction::Stop => "stop the forward",
@@ -391,7 +488,7 @@ pub fn confirmation_warning(service: &ServiceRecord, action: ServiceAction) -> &
         ServiceAction::Terminate => {
             "The Mutagen session is removed (files on both sides stay as they are). A terminated sync can't be resumed; create a new one instead."
         }
-        _ if matches!(service.spec, Some(ServiceRequestKind::FileCopy { .. })) => {
+        _ if is_transfer(service) => {
             "The partial transfer is discarded and the job can't be restarted; start a new copy instead."
         }
         _ => "This can't be undone.",
@@ -409,6 +506,7 @@ pub fn service_title(service: &ServiceRecord) -> &'static str {
             direction: FileCopyDirection::Download,
             ..
         }) => "Download",
+        Some(ServiceRequestKind::FileFetch { .. }) => "Fetch from the Beam",
         Some(ServiceRequestKind::FolderSync { .. }) => "Folder sync",
         None => "Service",
     }
@@ -423,6 +521,20 @@ pub fn service_details(service: &ServiceRecord) -> Vec<String> {
     ];
     if let Some(message) = service.message.as_deref().filter(|m| !m.is_empty()) {
         lines.push(capitalize(message));
+    }
+    if let Some(progress) = &service.progress {
+        lines.push(format!(
+            "Copied {} of {} ({} of {} items).",
+            human_bytes(progress.bytes_done.min(progress.bytes_total)),
+            human_bytes(progress.bytes_total),
+            progress.files_done,
+            progress.files_total
+        ));
+    }
+    if let Some(ServiceRequestKind::FileFetch { sources, .. }) = &service.spec {
+        for source in sources {
+            lines.push(format!("From {}", source.path));
+        }
     }
     if let Some(ServiceRequestKind::FolderSync {
         ignore_vcs,
@@ -448,6 +560,7 @@ fn request_kind_label(request: &RequestRecord) -> &'static str {
         (Some(service_request), _) => match &service_request.kind {
             ServiceRequestKind::LocalPortForward { .. } => "forward",
             ServiceRequestKind::FileCopy { direction, .. } => direction_label(*direction),
+            ServiceRequestKind::FileFetch { .. } => "fetch",
             ServiceRequestKind::FolderSync { .. } => "sync",
         },
         (None, Some(action)) => action_label(action.action),

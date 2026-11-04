@@ -23,7 +23,7 @@ use anyhow::{bail, Context};
 use beams_protocol::{
     ActionRequestProjection, BeamToClient, ClientToBeam, RequestProjection, RequestStatus,
     ServiceAction, ServiceActionRequest, ServiceProjection, ServiceRequest, ServiceRequestKind,
-    ServiceStatus, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
+    ServiceStatus, TransferProgress, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
@@ -33,6 +33,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(3);
 const START_RETRY: Duration = Duration::from_millis(50);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const EVENT_QUEUE_CAPACITY: usize = 256;
+/// The message on a request its Beam-side requester withdrew.
+const WITHDRAWN: &str = "withdrawn on the Beam";
 const BRIDGE_EVENT_QUEUE_CAPACITY: usize = 256;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const RATE_WINDOW: Duration = Duration::from_secs(1);
@@ -105,6 +107,9 @@ pub struct ServiceRecord {
     /// Workstation-only Mutagen session identity. Never included in Beam projections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mutagen_session: Option<String>,
+    /// Bytes and items copied so far, for transfers that report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<TransferProgress>,
 }
 
 fn default_login() -> String {
@@ -734,7 +739,8 @@ impl Hub {
             .filter_map(|service| {
                 let action = match service.spec.as_ref()? {
                     ServiceRequestKind::LocalPortForward { .. }
-                    | ServiceRequestKind::FileCopy { .. } => ServiceAction::Stop,
+                    | ServiceRequestKind::FileCopy { .. }
+                    | ServiceRequestKind::FileFetch { .. } => ServiceAction::Stop,
                     ServiceRequestKind::FolderSync { .. } => ServiceAction::Pause,
                 };
                 Some((service.service_id.clone(), action))
@@ -827,7 +833,9 @@ impl Hub {
                 && matches!(
                     request.request.as_ref().map(|request| &request.kind),
                     Some(
-                        ServiceRequestKind::FileCopy { .. } | ServiceRequestKind::FolderSync { .. }
+                        ServiceRequestKind::FileCopy { .. }
+                            | ServiceRequestKind::FileFetch { .. }
+                            | ServiceRequestKind::FolderSync { .. }
                     )
                 )
             {
@@ -1147,6 +1155,7 @@ impl Hub {
                 message: Some("starting workstation service".to_string()),
                 local_path: request.local_path.clone(),
                 mutagen_session,
+                progress: None,
             };
             state
                 .services
@@ -1198,6 +1207,32 @@ impl Hub {
                     .context("file-copy service has no approved workstation path")?;
                 let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
                 let actions = crate::copy::spawn(
+                    self.forward_program.clone(),
+                    crate::copy::Target {
+                        beam_uuid: target.beam_uuid.clone(),
+                        login: target.login.clone(),
+                    },
+                    service.service_id.clone(),
+                    spec,
+                    PathBuf::from(local_path),
+                    event_tx,
+                );
+                self.service_runtimes.lock().unwrap().insert(
+                    service.service_id.clone(),
+                    ServiceRuntime {
+                        actions: RuntimeActions::Copy(actions),
+                    },
+                );
+                let weak = Arc::downgrade(self);
+                thread::spawn(move || handle_copy_events(weak, event_rx));
+            }
+            ServiceRequestKind::FileFetch { .. } => {
+                let local_path = service
+                    .local_path
+                    .as_deref()
+                    .context("fetch has no approved workstation destination")?;
+                let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+                let actions = crate::copy::spawn_fetch(
                     self.forward_program.clone(),
                     crate::copy::Target {
                         beam_uuid: target.beam_uuid.clone(),
@@ -1272,12 +1307,15 @@ impl Hub {
                 ServiceRequestKind::LocalPortForward { .. },
                 ServiceAction::Stop | ServiceAction::Restart,
             )
-            | (ServiceRequestKind::FileCopy { .. }, ServiceAction::Stop)
+            | (
+                ServiceRequestKind::FileCopy { .. } | ServiceRequestKind::FileFetch { .. },
+                ServiceAction::Stop,
+            )
             | (
                 ServiceRequestKind::FolderSync { .. },
                 ServiceAction::Pause | ServiceAction::Resume | ServiceAction::Terminate,
             ) => {}
-            (ServiceRequestKind::FileCopy { .. }, _) => {
+            (ServiceRequestKind::FileCopy { .. } | ServiceRequestKind::FileFetch { .. }, _) => {
                 bail!("file-copy jobs only support cancellation")
             }
             (ServiceRequestKind::LocalPortForward { .. }, _) => {
@@ -1521,6 +1559,59 @@ impl Hub {
         }
     }
 
+    /// The Beam-side requester gave up (`beams fetch` interrupted): drop a
+    /// pending request, or stop the one-shot service it started.
+    fn withdraw_request(self: &Arc<Self>, beam_uuid: &str, request_id: &str) {
+        let (pending, service) = {
+            let mut state = self.state.lock().unwrap();
+            let Some(request) = state
+                .requests
+                .get_mut(request_id)
+                .filter(|request| request.beam_uuid == beam_uuid)
+            else {
+                return;
+            };
+            if request.status == RequestStatus::PendingApproval {
+                request.status = RequestStatus::Expired;
+                request.message = Some(WITHDRAWN.to_string());
+                (Some(request.clone()), None)
+            } else {
+                let service = state
+                    .services
+                    .values_mut()
+                    .find(|service| {
+                        service.request_id == request_id
+                            && matches!(
+                                service.spec,
+                                Some(ServiceRequestKind::FileFetch { .. } | ServiceRequestKind::FileCopy { .. })
+                            )
+                            && matches!(service.status, ServiceStatus::Starting | ServiceStatus::Running)
+                    })
+                    .map(|service| service.service_id.clone());
+                (None, service)
+            }
+        };
+        if let Some(updated) = pending {
+            if let Some(commands) = self
+                .bridges
+                .lock()
+                .unwrap()
+                .get(&updated.beam_uuid)
+                .map(|bridge| bridge.commands.clone())
+            {
+                let _ = commands.try_send(ClientToBeam::RequestStatus {
+                    request_id: updated.request_id.clone(),
+                    status: updated.status,
+                    message: updated.message.clone(),
+                });
+            }
+            let _ = self.save_state();
+            self.broadcast(ServerEvent::RequestChanged { request: updated });
+        } else if let Some(service_id) = service {
+            let _ = self.control_service(&service_id, ServiceAction::Stop);
+        }
+    }
+
     fn expire_request(&self, request_id: &str) {
         let updated = {
             let mut state = self.state.lock().unwrap();
@@ -1601,8 +1692,40 @@ fn service_projection(service: &ServiceRecord) -> Option<ServiceProjection> {
         request_id: service.request_id.clone(),
         kind: kind.clone(),
         status: service.status,
+        progress: service.progress,
         message: match kind {
             ServiceRequestKind::LocalPortForward { .. } => service.message.clone(),
+            // Like plain copies, never echo workstation paths to the Beam.
+            ServiceRequestKind::FileFetch { .. } => Some(
+                match service.status {
+                    ServiceStatus::Starting => "preparing fetch",
+                    ServiceStatus::Running => "fetch in progress",
+                    ServiceStatus::Stopping => "cancelling fetch",
+                    ServiceStatus::Stopped => {
+                        match service.message.as_deref() {
+                            Some("cancelled locally") => "fetch cancelled on the workstation",
+                            Some(WITHDRAWN) => "fetch withdrawn",
+                            Some(message) if message.contains("interrupted") => "fetch interrupted",
+                            _ => "fetch completed",
+                        }
+                    }
+                    ServiceStatus::Error => {
+                        if service
+                            .message
+                            .as_deref()
+                            .is_some_and(|message| message.contains("already exists"))
+                        {
+                            "something with that name already exists at the destination (retry with --overwrite to replace it)"
+                        } else {
+                            "fetch failed; see the workstation's local menu for details"
+                        }
+                    }
+                    ServiceStatus::Degraded => "fetch degraded",
+                    ServiceStatus::Unknown => "fetch status unknown",
+                    ServiceStatus::Paused => "fetch paused",
+                }
+                .to_string(),
+            ),
             ServiceRequestKind::FileCopy { .. } => Some(
                 match service.status {
                     ServiceStatus::Starting => "preparing file copy",
@@ -1672,6 +1795,25 @@ fn handle_copy_events(hub: Weak<Hub>, events: Receiver<crate::copy::Event>) {
         let Some(hub) = hub.upgrade() else {
             return;
         };
+        if let Some(progress) = event.progress {
+            // Progress ticks while running are published but not persisted
+            // (they arrive several times a second).
+            let tick = {
+                let mut state = hub.state.lock().unwrap();
+                state.services.get_mut(&event.service_id).and_then(|service| {
+                    service.progress = Some(progress);
+                    (service.status == ServiceStatus::Running && event.status == ServiceStatus::Running)
+                        .then(|| {
+                            service.message = event.message.clone();
+                            service.clone()
+                        })
+                })
+            };
+            if let Some(service) = tick {
+                hub.publish_service(&service);
+                continue;
+            }
+        }
         handle_service_update(
             &hub,
             event.service_id,
@@ -1809,7 +1951,11 @@ fn handle_service_update(
     }
     if matches!(
         service.spec,
-        Some(ServiceRequestKind::FileCopy { .. } | ServiceRequestKind::FolderSync { .. })
+        Some(
+            ServiceRequestKind::FileCopy { .. }
+                | ServiceRequestKind::FileFetch { .. }
+                | ServiceRequestKind::FolderSync { .. }
+        )
     ) && matches!(
         service.status,
         ServiceStatus::Stopped | ServiceStatus::Error
@@ -1969,6 +2115,9 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                         }
                     });
                 }
+            }
+            BeamToClient::RequestWithdrawn { request_id } => {
+                hub.withdraw_request(&beam_uuid, &request_id);
             }
             BeamToClient::ServiceActionRequested { request } => {
                 let beam_matches = hub
@@ -3030,6 +3179,7 @@ mod tests {
                 message: None,
                 local_path: Some("/tmp/destination".to_string()),
                 mutagen_session: None,
+                progress: None,
             },
         );
         assert!(state.mark_process_services_stopped_after_restart());
@@ -3063,6 +3213,7 @@ mod tests {
                 message: None,
                 local_path: Some("/tmp/project".to_string()),
                 mutagen_session: Some("beams-beam-uuid-sync".to_string()),
+                progress: None,
             },
         );
         assert!(state.mark_process_services_stopped_after_restart());
@@ -3097,6 +3248,7 @@ mod tests {
             message: Some(format!("failed while opening {local_path}")),
             local_path: Some(local_path.to_string()),
             mutagen_session: Some("session".to_string()),
+            progress: None,
         };
         let projection = service_projection(&service).unwrap();
         let encoded = serde_json::to_string(&projection).unwrap();

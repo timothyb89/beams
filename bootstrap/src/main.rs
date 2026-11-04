@@ -3,6 +3,7 @@ mod clientbridge;
 mod daemon;
 mod events;
 mod executor;
+mod fetch;
 mod graph;
 mod pathutil;
 mod releaseutil;
@@ -106,6 +107,10 @@ enum Command {
         #[command(subcommand)]
         command: ClientCommand,
     },
+    /// `beams fetch` under this binary's own name (normally run through
+    /// `~/beams/bin/beams`).
+    #[command(hide = true)]
+    Fetch(fetch::FetchArgs),
 }
 
 #[derive(Subcommand)]
@@ -264,7 +269,19 @@ enum TaskCommand {
     WaitSshAgentUnlock,
 }
 
+/// Whether this process was started as `beams` (`~/beams/bin/beams`).
+fn invoked_as_beams() -> bool {
+    std::env::args_os()
+        .next()
+        .map(std::path::PathBuf::from)
+        .and_then(|path| path.file_name().map(|name| name == "beams"))
+        .unwrap_or(false)
+}
+
 fn main() {
+    if invoked_as_beams() {
+        std::process::exit(fetch::run_beams_cli());
+    }
     let args = Args::parse();
     let exit_code = match args.command {
         Some(Command::ListTasks) => {
@@ -286,6 +303,7 @@ fn main() {
             0
         }
         Some(Command::Client { command }) => run_client_command(command),
+        Some(Command::Fetch(args)) => fetch::run_fetch(args),
         None => {
             run_bootstrap(&args);
             0 // run_bootstrap exits the process itself; see its own doc comment

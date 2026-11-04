@@ -366,7 +366,9 @@ fn forward_label(kind: &ServiceRequestKind) -> String {
             local_port: Some(local_port),
         } => format!("127.0.0.1:{local_port} -> {remote_host}:{remote_port}"),
         ServiceRequestKind::LocalPortForward { .. } => "local forward running".to_string(),
-        ServiceRequestKind::FileCopy { .. } => "invalid file-copy forward".to_string(),
+        ServiceRequestKind::FileCopy { .. } | ServiceRequestKind::FileFetch { .. } => {
+            "invalid file-copy forward".to_string()
+        }
         ServiceRequestKind::FolderSync { .. } => "invalid folder-sync forward".to_string(),
     }
 }

@@ -11,6 +11,20 @@ pub const PROTOCOL: &str = "beams-client-services";
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 
+/// Optional features a workstation advertises in its bridge hello. The Beam
+/// only sends a message or request kind that needs a capability to bridges
+/// that advertise it, so an older workstation (which would treat an unknown
+/// message as a protocol error) is never sent one. Adding a capability
+/// doesn't change `PROTOCOL_VERSION`.
+pub const CAPABILITY_FILE_FETCH: &str = "file_fetch";
+
+/// Every capability this build implements.
+pub const CAPABILITIES: &[&str] = &[CAPABILITY_FILE_FETCH];
+
+/// Most sources one fetch request may name (keeps requests well under
+/// `MAX_FRAME_BYTES`).
+pub const MAX_FETCH_SOURCES: usize = 200;
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestStatus {
@@ -180,6 +194,16 @@ pub enum ServiceRequestKind {
         local_path_hint: Option<String>,
         overwrite: OverwritePolicy,
     },
+    /// Beam files and directories to copy to one workstation destination
+    /// (`beams fetch`). Requires `CAPABILITY_FILE_FETCH`.
+    FileFetch {
+        sources: Vec<FetchSource>,
+        /// A suggested destination; the workstation user confirms or edits
+        /// it before approving.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_path_hint: Option<String>,
+        overwrite: OverwritePolicy,
+    },
     FolderSync {
         remote_path: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -201,9 +225,30 @@ impl ServiceRequestKind {
         match self {
             Self::LocalPortForward { .. } => "local_port_forward",
             Self::FileCopy { .. } => "file_copy",
+            Self::FileFetch { .. } => "file_fetch",
             Self::FolderSync { .. } => "folder_sync",
         }
     }
+}
+
+/// One `FileFetch` source as the Beam saw it when the request was made.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct FetchSource {
+    /// Absolute path in the Beam.
+    pub path: String,
+    /// Bytes (for a directory, the total of the regular files under it).
+    pub size: u64,
+    #[serde(default)]
+    pub is_dir: bool,
+}
+
+/// How far a transfer has got.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TransferProgress {
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub files_done: usize,
+    pub files_total: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -214,6 +259,8 @@ pub struct ServiceProjection {
     pub status: ServiceStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<TransferProgress>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -242,6 +289,9 @@ pub enum ClientToBeam {
         client_id: String,
         bridge_id: String,
         session_tokens: Vec<String>,
+        /// See `CAPABILITIES`; absent from workstations that predate them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
     AddSessionToken {
         session_token: String,
@@ -288,6 +338,10 @@ impl ClientToBeam {
             client_id: client_id.into(),
             bridge_id: bridge_id.into(),
             session_tokens,
+            capabilities: CAPABILITIES
+                .iter()
+                .map(|capability| capability.to_string())
+                .collect(),
         }
     }
 }
@@ -307,6 +361,12 @@ pub enum BeamToClient {
     },
     ServiceActionRequested {
         request: ServiceActionRequest,
+    },
+    /// Whoever made the request on the Beam gave up on it (e.g. Ctrl-C in
+    /// `beams fetch`): drop it if still pending, stop its one-shot service
+    /// if running. Requires `CAPABILITY_FILE_FETCH`.
+    RequestWithdrawn {
+        request_id: String,
     },
     Pong {
         nonce: String,
@@ -470,5 +530,49 @@ mod tests {
         assert_eq!(value["type"], "service_action_requested");
         assert_eq!(value["request"]["action"], "stop");
         assert!(serde_json::from_value::<ClientToBeam>(value).is_err());
+    }
+
+    #[test]
+    fn file_fetch_request_has_a_stable_tagged_shape() {
+        let request = ServiceRequest {
+            request_id: "request-9".to_string(),
+            kind: ServiceRequestKind::FileFetch {
+                sources: vec![FetchSource {
+                    path: "/home/beams/out.log".to_string(),
+                    size: 42,
+                    is_dir: false,
+                }],
+                local_path_hint: None,
+                overwrite: OverwritePolicy::Deny,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            json!({
+                "request_id": "request-9",
+                "kind": {
+                    "kind": "file_fetch",
+                    "sources": [{"path": "/home/beams/out.log", "size": 42, "is_dir": false}],
+                    "overwrite": "deny",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn hello_capabilities_are_optional_both_ways() {
+        let hello = serde_json::to_value(ClientToBeam::hello("c", "b", Vec::new())).unwrap();
+        assert_eq!(hello["capabilities"], json!(["file_fetch"]));
+        // A hello from a workstation that predates capabilities.
+        let old: ClientToBeam = serde_json::from_value(json!({
+            "type": "hello",
+            "protocol": PROTOCOL,
+            "version": PROTOCOL_VERSION,
+            "client_id": "c",
+            "bridge_id": "b",
+            "session_tokens": [],
+        }))
+        .unwrap();
+        assert!(matches!(old, ClientToBeam::Hello { capabilities, .. } if capabilities.is_empty()));
     }
 }

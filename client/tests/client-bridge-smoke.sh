@@ -51,9 +51,15 @@ import socket
 import sys
 
 if sys.argv[1] == "scp":
+    import os
     destination = sys.argv[-1]
-    with open(destination, "wb") as downloaded:
-        downloaded.write(b"beams-copy-smoke\n")
+    if "-r" in sys.argv:
+        os.makedirs(destination)
+        with open(os.path.join(destination, "inner.txt"), "wb") as downloaded:
+            downloaded.write(b"beams-fetch-dir-smoke\n")
+    else:
+        with open(destination, "wb") as downloaded:
+            downloaded.write(b"beams-copy-smoke\n")
     raise SystemExit(0)
 
 forward = sys.argv[sys.argv.index("-L") + 1]
@@ -210,6 +216,43 @@ elif mode in ("reject", "approve", "approve-copy"):
                 break
         else:
             raise RuntimeError("file-copy service did not complete")
+elif mode == "wait-pending":
+    while time.time() < deadline:
+        event = receive()
+        request = None
+        if event.get("type") == "snapshot":
+            request = next(
+                (r for r in event["requests"] if r["status"] == "pending_approval"),
+                None,
+            )
+        elif (
+            event.get("type") == "request_changed"
+            and event["request"]["status"] == "pending_approval"
+        ):
+            request = event["request"]
+        if request is not None:
+            print(request["request_id"])
+            break
+    else:
+        raise RuntimeError("pending request did not arrive")
+elif mode == "wait-request":
+    request_id, wanted = sys.argv[3:5]
+    while time.time() < deadline:
+        event = receive()
+        requests = []
+        if event.get("type") == "snapshot":
+            requests = event["requests"]
+        elif event.get("type") == "request_changed":
+            requests = [event["request"]]
+        match = next(
+            (r for r in requests if r["request_id"] == request_id and r["status"] == wanted),
+            None,
+        )
+        if match is not None:
+            print(match.get("message") or "")
+            break
+    else:
+        raise RuntimeError(f"request {request_id} did not reach {wanted}")
 elif mode == "assert-empty":
     while time.time() < deadline:
         event = receive()
@@ -428,6 +471,66 @@ if grep -Fq "$COPY_DEST" "$TEST_DIR/copy-request.out"; then
     exit 1
 fi
 python3 "$TEST_DIR/frontend.py" assert-empty "$LOCAL_A_SOCKET"
+
+# `beams fetch` with several sources and a destination that doesn't exist yet:
+# the workstation creates the directory and lands every item inside it, and
+# the Beam-side command exits 0 once all of them are installed.
+mkdir -p "$TEST_DIR/beam-src/logs"
+printf 'a\n' >"$TEST_DIR/beam-src/a.log"
+printf 'bb\n' >"$TEST_DIR/beam-src/b.log"
+printf 'ccc\n' >"$TEST_DIR/beam-src/logs/c.log"
+FETCH_DEST="$TEST_DIR/fetched"
+(
+    cd "$TEST_DIR/beam-src"
+    env \
+        BEAMS_CLIENT_ID="$(cat "$TEST_DIR/client-b-id")" \
+        BEAMS_SESSION_TOKEN=token-b \
+        "$ROOT/bootstrap/target/debug/beam-bootstrap" fetch \
+            --socket "$VM_SOCKET" a.log b.log logs ./suggested-dest/ \
+            >"$TEST_DIR/fetch.out" 2>&1
+) &
+FETCH_PID=$!
+python3 "$TEST_DIR/frontend.py" approve-copy "$LOCAL_B_SOCKET" "$FETCH_DEST" \
+    >"$TEST_DIR/fetch-service.json"
+wait "$FETCH_PID"
+grep -q "beams-copy-smoke" "$FETCH_DEST/a.log"
+grep -q "beams-copy-smoke" "$FETCH_DEST/b.log"
+grep -q "beams-fetch-dir-smoke" "$FETCH_DEST/logs/inner.txt"
+grep -q "fetched 3 items" "$TEST_DIR/fetch.out"
+python3 - "$TEST_DIR/fetch-service.json" <<'PY'
+import json
+import sys
+service = json.load(open(sys.argv[1]))
+assert service["spec"]["local_path_hint"] == "./suggested-dest/", service
+progress = service["progress"]
+assert progress["files_done"] == progress["files_total"] == 3, progress
+assert progress["bytes_total"] == 9, progress
+PY
+if ls -a "$FETCH_DEST" | grep -q beams-fetch; then
+    echo "fetch left temporary files behind" >&2
+    exit 1
+fi
+if grep -Fq "$FETCH_DEST" "$TEST_DIR/fetch.out"; then
+    echo "fetch status leaked the workstation path" >&2
+    exit 1
+fi
+
+# Ctrl-C while the fetch waits for approval withdraws it on the workstation.
+env \
+    BEAMS_CLIENT_ID="$(cat "$TEST_DIR/client-b-id")" \
+    BEAMS_SESSION_TOKEN=token-b \
+    "$ROOT/bootstrap/target/debug/beam-bootstrap" fetch \
+        --socket "$VM_SOCKET" "$TEST_DIR/beam-src/a.log" \
+        >"$TEST_DIR/withdrawn-fetch.out" 2>&1 &
+WITHDRAWN_PID=$!
+WITHDRAWN_ID=$(python3 "$TEST_DIR/frontend.py" wait-pending "$LOCAL_B_SOCKET")
+# (Background jobs of a non-interactive shell ignore SIGINT, so stand in
+# for Ctrl-C with SIGTERM: either way the command's daemon connection closes.)
+kill -TERM "$WITHDRAWN_PID"
+wait "$WITHDRAWN_PID" 2>/dev/null || true
+python3 "$TEST_DIR/frontend.py" wait-request "$LOCAL_B_SOCKET" "$WITHDRAWN_ID" expired \
+    >"$TEST_DIR/withdrawn-message"
+grep -q "withdrawn on the Beam" "$TEST_DIR/withdrawn-message"
 
 # Approving the same remote request creates a real loopback listener owned by
 # client B. Client A must remain an observer.

@@ -526,9 +526,19 @@ enum Screen {
 enum FormKind {
     Forward,
     Copy(FileCopyDirection),
-    CopyApproval { request_id: String },
+    CopyApproval {
+        request_id: String,
+    },
+    /// Choosing where a `beams fetch` lands; `into_dir` when it's several
+    /// items (or a directory), which go inside the destination.
+    FetchApproval {
+        request_id: String,
+        into_dir: bool,
+    },
     Sync,
-    SyncApproval { request_id: String },
+    SyncApproval {
+        request_id: String,
+    },
 }
 
 /// One selectable row on the home screen.
@@ -872,6 +882,42 @@ fn approval_form(
     )
 }
 
+/// Where a `beams fetch` should land. Prefilled with the Beam's suggestion,
+/// else the most recently used directory, else the directory `beams ssh`
+/// was started from; the dropdown helps change it.
+fn fetch_approval_form(request: &RequestRecord, into_dir: bool, recents: &[String]) -> Form {
+    let hint = match request.request.as_ref().map(|request| &request.kind) {
+        Some(ServiceRequestKind::FileFetch {
+            local_path_hint: Some(hint),
+            ..
+        }) => Some(hint.clone()),
+        _ => None,
+    };
+    let suggested = hint.is_some();
+    let value = hint
+        .or_else(|| recents.first().cloned())
+        .unwrap_or_else(|| "./".to_string());
+    let mut form = Form::new(
+        "Fetch from the Beam",
+        "fetch",
+        vec![Field::text("local_path", "Save to")
+            .value(&value)
+            .complete(Completion::Paths)],
+    );
+    for (sentence, warn) in ui::describe_request(request) {
+        form = form.intro(sentence, warn);
+    }
+    form = form.note(if into_dir {
+        "Everything goes inside the destination directory (created if needed)."
+    } else {
+        "Give a directory to keep the file's name, or a full path to rename it."
+    });
+    if suggested {
+        form = form.note("The destination is the Beam's suggestion; check it before fetching.");
+    }
+    form
+}
+
 fn required(form: &mut Form, id: &str, what: &str) -> String {
     let value = form.text(id);
     if value.is_empty() {
@@ -934,6 +980,10 @@ fn used_local_path(kind: &FormKind, form: &Form) -> Option<(std::path::PathBuf, 
     let is_dir = match kind {
         FormKind::Forward => return None,
         FormKind::Copy(_) | FormKind::CopyApproval { .. } => false,
+        FormKind::FetchApproval { into_dir, .. } => {
+            let text = form.text("local_path");
+            *into_dir || text.ends_with('/') || form::resolve_local_path(&text).is_dir()
+        }
         FormKind::Sync | FormKind::SyncApproval { .. } => true,
     };
     let text = form.text("local_path");
@@ -994,6 +1044,16 @@ fn submit_form(
                 .decide_file_copy(request_id, true, Some(&local))
                 .map_err(|err| format!("could not approve the copy: {err}"))?;
             Ok(Some(format!("approved file copy to {local}")))
+        }
+        FormKind::FetchApproval { request_id, .. } => {
+            let local = local_path(form, "local_path", "a workstation destination");
+            if form.has_errors() {
+                return Ok(None);
+            }
+            daemon_frontend(local_daemon)?
+                .decide_file_copy(request_id, true, Some(&local))
+                .map_err(|err| format!("could not approve the fetch: {err}"))?;
+            Ok(Some(format!("fetching to {local}")))
         }
         FormKind::Sync => {
             let local = local_path(form, "local_path", "a workstation directory");
@@ -1162,6 +1222,7 @@ impl DaemonView {
                     self.request_records
                         .insert(request.request_id.clone(), request);
                     self.requests = self.request_records.len();
+                    self.close_stale_approval();
                     changed = true;
                 }
                 Ok(ServerEvent::ServiceChanged { service }) => {
@@ -1340,6 +1401,31 @@ impl DaemonView {
         self.screen = Screen::Form { kind, form };
     }
 
+    /// Leaves an approval form whose request was decided elsewhere,
+    /// expired, or withdrawn by the Beam.
+    fn close_stale_approval(&mut self) {
+        let Screen::Form { kind, .. } = &self.screen else {
+            return;
+        };
+        let request_id = match kind {
+            FormKind::CopyApproval { request_id }
+            | FormKind::FetchApproval { request_id, .. }
+            | FormKind::SyncApproval { request_id } => request_id,
+            _ => return,
+        };
+        let Some(request) = self.request_records.get(request_id) else {
+            return;
+        };
+        if request.status != RequestStatus::PendingApproval {
+            let message = request
+                .message
+                .clone()
+                .unwrap_or_else(|| "the request is no longer pending".to_string());
+            self.screen = Screen::Home;
+            self.notify(format!("request closed: {message}"), true);
+        }
+    }
+
     fn open_menu(&mut self, menu: Menu) {
         self.notice = None;
         self.screen = Screen::Menu(menu);
@@ -1490,6 +1576,17 @@ impl DaemonView {
                 self.open_form(
                     FormKind::CopyApproval {
                         request_id: request_id.to_string(),
+                    },
+                    form,
+                );
+            }
+            Some(ServiceRequestKind::FileFetch { sources, .. }) => {
+                let into_dir = !matches!(sources.as_slice(), [source] if !source.is_dir);
+                let form = fetch_approval_form(request, into_dir, &self.recents.directories());
+                self.open_form(
+                    FormKind::FetchApproval {
+                        request_id: request_id.to_string(),
+                        into_dir,
                     },
                     form,
                 );
@@ -3136,6 +3233,85 @@ mod tests {
             "request": {"request_id": request_id, "kind": forward_spec(remote_port, 0)},
         }))
         .unwrap()
+    }
+
+    fn pending_fetch(request_id: &str, hint: Option<&str>) -> RequestRecord {
+        serde_json::from_value(serde_json::json!({
+            "request_id": request_id,
+            "beam_uuid": "beam-a-uuid",
+            "kind": "file_fetch",
+            "status": "pending_approval",
+            "request": {"request_id": request_id, "kind": {
+                "kind": "file_fetch",
+                "sources": [
+                    {"path": "/home/beams/out/a.log", "size": 1_200_000, "is_dir": false},
+                    {"path": "/home/beams/out/logs", "size": 300, "is_dir": true},
+                ],
+                "local_path_hint": hint,
+                "overwrite": "deny",
+            }},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn fetch_approval_prefills_the_destination_and_closes_when_withdrawn() {
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        view.recents.record(std::path::Path::new("/srv/drop"), true);
+
+        // No suggestion from the Beam: the most recent directory.
+        add_request(&mut view, pending_fetch("fetch-1", None));
+        view.handle_key(Key::Char('y'), &mut daemon);
+        let Screen::Form { kind, form } = &view.screen else {
+            panic!("approving a fetch asks where it goes");
+        };
+        assert!(matches!(
+            kind,
+            FormKind::FetchApproval { into_dir: true, .. }
+        ));
+        assert_eq!(form.text("local_path"), "/srv/drop/");
+        let text = screen_text(&render(&view, None));
+        if std::env::var_os("BEAMS_PRINT_RENDER").is_some() {
+            println!("{text}");
+        }
+        for expected in [
+            "Fetch from the Beam",
+            "Copy 2 items (1.2 MB) from the Beam",
+            "• /home/beams/out/a.log  1.2 MB",
+            "• /home/beams/out/logs/",
+            "Save to",
+            "inside the destination directory",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+        }
+
+        // The Beam withdraws it while the form is open.
+        let mut withdrawn = view.request_records["fetch-1"].clone();
+        withdrawn.status = RequestStatus::Expired;
+        withdrawn.message = Some("withdrawn on the Beam".to_string());
+        view.request_records
+            .insert("fetch-1".to_string(), withdrawn);
+        view.close_stale_approval();
+        assert!(matches!(view.screen, Screen::Home));
+        assert!(view
+            .notice
+            .as_ref()
+            .unwrap()
+            .text
+            .contains("withdrawn on the Beam"));
+
+        // A Beam suggestion wins over recents, and is flagged as such.
+        add_request(&mut view, pending_fetch("fetch-2", Some("~/Downloads/")));
+        view.approve("fetch-2", &mut daemon);
+        let Screen::Form { form, .. } = &view.screen else {
+            panic!("form expected");
+        };
+        assert_eq!(form.text("local_path"), "~/Downloads/");
+        assert!(form
+            .notes
+            .iter()
+            .any(|note| note.contains("Beam's suggestion")));
     }
 
     fn add_request(view: &mut DaemonView, request: RequestRecord) {

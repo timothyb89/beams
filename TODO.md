@@ -643,10 +643,10 @@ bootstrap `Task`s.
 - [x] Workstation path picker: path fields get a fuzzy-filtered dropdown of
   the typed directory (Tab/arrows/Enter, opens upward or shrinks on short
   terminals) and offer recently used directories while empty.
-- [ ] `beams fetch file... [destination]` on the Beam: a `beams` entry point
-  for beam-side commands, a multi-file download request (absolute paths plus
-  total size, glob-expanded by the shell), withdraw-on-Ctrl-C, and
-  byte-progress reporting from the growing temp file.
+- [x] `beams fetch PATH... [DEST]` on the Beam (`bin/beams` runs
+  beam-bootstrap as `beams`): a capability-gated multi-file `file_fetch`
+  request with sizes, a "Save to" approval form, per-item `tsh scp` into temp
+  names, byte progress back to the Beam, and withdraw-on-Ctrl-C.
 - [ ] Non-blocking toasts: a bottom-right notice drawn over live remote
   output (repainted after output bursts, cells restored from the shadow
   model) for incoming requests and copy progress, instead of an input

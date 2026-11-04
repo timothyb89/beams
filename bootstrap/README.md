@@ -268,6 +268,14 @@ Approval creates a workstation-owned `tsh ssh -N -L` process bound only to
 daemon; the Beam never receives a privileged command that can start it
 directly. Every remotely submitted request begins as `pending_approval`.
 
+`beams fetch PATH... [DEST]` (installed as `~/beams/bin/beams`, which runs
+this binary under the name `beams`; `beam-bootstrap fetch` is the same command)
+proposes a multi-file `file_fetch` request: absolute Beam paths with their
+sizes (directory totals included) and an optional destination suggestion. It
+stays attached, printing progress, until the copy finishes; closing its
+connection (Ctrl-C) withdraws the request. See `client/README.md` for the
+workstation side.
+
 Upload/download requests create one-shot workstation-owned `tsh scp` jobs.
 `--local-path-hint` is display-only (normally a basename): the local user must
 enter or confirm the real workstation path before approval, and that path is

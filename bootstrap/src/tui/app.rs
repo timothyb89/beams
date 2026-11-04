@@ -581,7 +581,9 @@ impl App {
             ServiceRequestKind::LocalPortForward { .. } => {
                 matches!(action, ServiceAction::Stop | ServiceAction::Restart)
             }
-            ServiceRequestKind::FileCopy { .. } => action == ServiceAction::Stop,
+            ServiceRequestKind::FileCopy { .. } | ServiceRequestKind::FileFetch { .. } => {
+                action == ServiceAction::Stop
+            }
             ServiceRequestKind::FolderSync { .. } => matches!(
                 action,
                 ServiceAction::Pause | ServiceAction::Resume | ServiceAction::Terminate
@@ -868,6 +870,16 @@ impl App {
                         remote_path,
                         overwrite
                     ),
+                    beams_protocol::ServiceRequestKind::FileFetch { sources, .. } => {
+                        let progress = service
+                            .progress
+                            .map(|p| format!(" {}/{} files", p.files_done, p.files_total))
+                            .unwrap_or_default();
+                        match sources.as_slice() {
+                            [source] => format!("fetch {}{progress}", source.path),
+                            _ => format!("fetch {} items{progress}", sources.len()),
+                        }
+                    }
                     beams_protocol::ServiceRequestKind::FolderSync {
                         remote_path,
                         local_path_hint,
