@@ -760,10 +760,13 @@ anything above
     --tcp` instead (raw TCP passthrough, no HTTP-aware reverse proxying)
     plus `tsh proxy app` locally as a workaround/isolation test - from a
     real (non-delegated) `tsh login` session, not this beam's own.
-- [ ] No cleanup/expiry helper on the client side beyond the 5-beam cap
-  check at spawn time — e.g. a `beams ls`/`beams rm` convenience wrapper
-  around `tsh beams ls/rm`, or a warning when a tracked purpose's beam is
-  close to its TTL even if not actively reused.
+- [x] `beams ls`/`rm`/`exec`/`scp`/`publish`/`unpublish`/`ide` wrap
+  `tsh beams ...`, accepting a beam id, uuid, or tracked purpose
+  (`client/src/beamcmd.rs`). `ls` shows purposes + time left and flags
+  stale purposes; `rm` forgets purposes for removed beams, `--prune`
+  forgets ones whose beam is already gone.
+- [ ] Still no proactive warning when a tracked purpose's beam is close
+  to its TTL (beyond `beams ls` showing time left).
 - [ ] Confirm whether `teleport-harness` (the actual consumer of the k3s
   workaround, per project.md) has been exercised end-to-end from a beam
   yet, or is still just a theoretical target.

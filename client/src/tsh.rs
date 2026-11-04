@@ -14,13 +14,26 @@ pub struct BeamInfo {
     #[allow(dead_code)]
     pub owner: String,
     pub expires: String,
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 /// `tsh beams ls --format=json`. Only lists beams owned by the current
 /// user (tsh's default; we never pass --all).
 pub fn list_beams() -> anyhow::Result<Vec<BeamInfo>> {
+    list_beams_with(&[])
+}
+
+/// `tsh beams ls --all --format=json` - every beam visible to the
+/// current user, not just their own.
+pub fn list_all_beams() -> anyhow::Result<Vec<BeamInfo>> {
+    list_beams_with(&["--all"])
+}
+
+fn list_beams_with(extra: &[&str]) -> anyhow::Result<Vec<BeamInfo>> {
     let output = Command::new("tsh")
         .args(["beams", "ls", "--format=json"])
+        .args(extra)
         .output()
         .context("running tsh beams ls")?;
     if !output.status.success() {

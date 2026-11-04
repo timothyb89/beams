@@ -273,6 +273,30 @@ beams sync terminate SERVICE_ID
 or degraded state. Pass `--include-vcs` to synchronize `.git` and other VCS
 metadata; otherwise Mutagen's VCS ignore is enabled.
 
+## Beam management wrappers
+
+The rest of `tsh beams ...` is wrapped too, so managing beams doesn't
+need copy-pasted ids. Anywhere tsh wants a beam id, these accept a
+*target*: a beam id, a beam uuid, or a tracked purpose name (see
+"State" below). Most default to the `default` purpose when no target is
+given. `rm` never defaults, since it's destructive.
+
+```sh
+beams ls [--all]                    # beams + tracked purpose(s) + time left; flags stale purposes
+beams rm <target>... [--prune]      # tsh beams rm, then forget purposes tracking it
+beams rm --prune                    # just forget purposes whose beam is already gone
+beams exec [target] [--login beams] -- <command>...
+beams scp [-r] [-q] <src> <dest>    # remote operands are TARGET:PATH, or :PATH for `default`
+beams publish [target] [--tcp]
+beams unpublish [target]
+beams ide [target] [--ide vscode|cursor|zed]
+```
+
+`rm` resolves every target before deleting anything, so a typo in one
+doesn't leave the others half-done. `tsh beams add` isn't wrapped:
+`beams ssh` (or `beams ssh --purpose <name>`) is the spawn path, since
+it also tracks the purpose and bootstraps the beam.
+
 ## State
 
 No server-side way exists to label a beam, so `~/.config/beams-client/state.json`

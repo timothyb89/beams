@@ -1,3 +1,4 @@
+mod beamcmd;
 mod bridge;
 mod clientd;
 mod copy;
@@ -105,6 +106,62 @@ enum Commands {
     Sync {
         #[command(subcommand)]
         command: SyncCommands,
+    },
+    /// List your beams, with the purpose each one is tracked for.
+    Ls {
+        /// Include beams owned by other users (`tsh beams ls --all`).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Delete beams and forget any purposes tracking them.
+    Rm {
+        /// Beam ids, uuids, or tracked purpose names.
+        #[arg(required_unless_present = "prune")]
+        targets: Vec<String>,
+        /// Also forget tracked purposes whose beam no longer exists.
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Run a command in a beam (`tsh beams exec`).
+    Exec {
+        /// Beam id, uuid, or tracked purpose (default: the `default` purpose).
+        target: Option<String>,
+        #[arg(long, default_value = DEFAULT_LOGIN)]
+        login: String,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Copy files to or from a beam (`tsh beams scp`). Remote operands
+    /// are `TARGET:PATH`, where TARGET is a beam id, uuid, or tracked
+    /// purpose; `:PATH` alone means the `default` purpose.
+    Scp {
+        #[arg(short, long)]
+        recursive: bool,
+        #[arg(short, long)]
+        quiet: bool,
+        src: String,
+        dest: String,
+    },
+    /// Publish a beam's port 8080 as a Teleport app (`tsh beams publish`).
+    Publish {
+        /// Beam id, uuid, or tracked purpose (default: the `default` purpose).
+        target: Option<String>,
+        /// Publish as a TCP app instead of an HTTP app.
+        #[arg(long)]
+        tcp: bool,
+    },
+    /// Unpublish a beam's previously published app (`tsh beams unpublish`).
+    Unpublish {
+        /// Beam id, uuid, or tracked purpose (default: the `default` purpose).
+        target: Option<String>,
+    },
+    /// Open an IDE with a remote session into a beam (`tsh beams ide`).
+    Ide {
+        /// Beam id, uuid, or tracked purpose (default: the `default` purpose).
+        target: Option<String>,
+        /// IDE to open (vscode, cursor, zed); tsh prompts when omitted.
+        #[arg(long)]
+        ide: Option<String>,
     },
 }
 
@@ -237,6 +294,13 @@ fn main() -> anyhow::Result<ExitCode> {
                 control_folder_sync(&service_id, ServiceAction::Terminate)?
             }
         },
+        Commands::Ls { all } => beamcmd::ls(all)?,
+        Commands::Rm { targets, prune } => beamcmd::rm(&targets, prune)?,
+        Commands::Exec { target, login, command } => beamcmd::exec(target.as_deref(), &login, &command)?,
+        Commands::Scp { recursive, quiet, src, dest } => beamcmd::scp(recursive, quiet, &src, &dest)?,
+        Commands::Publish { target, tcp } => beamcmd::publish(target.as_deref(), tcp)?,
+        Commands::Unpublish { target } => beamcmd::unpublish(target.as_deref())?,
+        Commands::Ide { target, ide } => beamcmd::ide(target.as_deref(), ide.as_deref())?,
     };
     Ok(ExitCode::from(code))
 }
