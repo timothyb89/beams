@@ -1,3 +1,4 @@
+mod agentspike;
 mod aptlock;
 mod clientbridge;
 mod daemon;
@@ -106,6 +107,29 @@ enum Command {
     Client {
         #[command(subcommand)]
         command: ClientCommand,
+    },
+    /// Phase 0 spike (SSH_AGENT_PROXY_DESIGN.md): a filtering, logging
+    /// SSH agent listener in front of a local upstream agent.
+    #[command(hide = true)]
+    AgentProxySpike {
+        /// Socket to listen on (point SSH_AUTH_SOCK here).
+        #[arg(long)]
+        listen: std::path::PathBuf,
+        /// Real agent socket to forward approved requests to.
+        #[arg(long)]
+        upstream: std::path::PathBuf,
+        /// Simulated approval latency before each signature.
+        #[arg(long, default_value_t = 0)]
+        delay_ms: u64,
+        /// Delay before answering identity listings.
+        #[arg(long, default_value_t = 0)]
+        delay_identities_ms: u64,
+        /// known_hosts file used to name verified host keys.
+        #[arg(long)]
+        known_hosts: Option<std::path::PathBuf>,
+        /// Only expose/sign with these SHA256 fingerprints (repeatable).
+        #[arg(long = "allow")]
+        allow: Vec<String>,
     },
     /// `beams fetch` under this binary's own name (normally run through
     /// `~/beams/bin/beams`).
@@ -304,6 +328,23 @@ fn main() {
         }
         Some(Command::Client { command }) => run_client_command(command),
         Some(Command::Fetch(args)) => fetch::run_fetch(args),
+        Some(Command::AgentProxySpike { listen, upstream, delay_ms, delay_identities_ms, known_hosts, allow }) => {
+            let config = agentspike::SpikeConfig {
+                listen,
+                upstream,
+                delay: std::time::Duration::from_millis(delay_ms),
+                delay_identities: std::time::Duration::from_millis(delay_identities_ms),
+                known_hosts,
+                allow: allow.into_iter().collect(),
+            };
+            match agentspike::run(config) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("agent-proxy-spike: {e:#}");
+                    1
+                }
+            }
+        }
         None => {
             run_bootstrap(&args);
             0 // run_bootstrap exits the process itself; see its own doc comment

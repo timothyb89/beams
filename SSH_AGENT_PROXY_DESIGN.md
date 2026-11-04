@@ -1,6 +1,6 @@
 # SSH agent proxy: workstation-held keys with per-use approval
 
-Status: design, 2026-11-04. Not implemented. Builds on the bridge, request
+Status: design, 2026-11-04. Phase 0 spike done (see "Phase 0 findings"). Builds on the bridge, request
 queue, and toast/menu UI described in `CLIENT_SERVICES_DESIGN.md`.
 
 ## Problem
@@ -74,8 +74,13 @@ identifier, and an `is_forwarding` flag. `beamsd`:
 3. on a sign request, parses the data as `SSH_MSG_USERAUTH_REQUEST` and
    requires its session identifier to match a recorded bind on the same
    connection;
-4. looks the host key up in the *workstation's* `known_hosts` (including
-   hashed entries) to get a hostname.
+4. looks the host key up in the *workstation's* `known_hosts` to get a
+   hostname. Plain entries name the key directly. Hashed entries (Debian's
+   `HashKnownHosts yes` default) can't be reversed: they can only *confirm* a
+   candidate name, so the Beam sends candidates parsed from the requesting
+   `ssh` command line (`[host]:port` spelling for non-22 ports). The Beam
+   gets no leverage from this, because a candidate counts only if the
+   user's own `known_hosts` matches it against the verified key.
 
 A signature produced this way only works in a session with that host key,
 so even a compromised Beam cannot use an approval for "github.com" anywhere
@@ -139,8 +144,9 @@ Workstation
   of the daemon). If the parent chain reaches the daemon's own pid with that
   marker set, the request is tagged with the run. This is advisory, like
   everything else here.
-- Keep `TELEPORT_ADD_KEYS_TO_AGENT=no` in the Beam environment so `tsh` doesn't
-  keep trying to add keys and failing.
+- `tsh` on a Beam authenticates with the tbot identity file and never
+  connected to the agent in the spike. `TELEPORT_ADD_KEYS_TO_AGENT=no` is
+  only a precaution.
 - Response timeout: if `beamsd` hasn't answered within the request's
   `expires_at` plus a margin, the listener answers `SSH_AGENT_FAILURE`.
 
@@ -403,9 +409,90 @@ has pushed at least one identity, still provides
   connection are recorded; the user-auth request's session id picks the
   right one. `is_forwarding = true` binds are shown, but never match grants.
 
+## Phase 0 findings (2026-11-04)
+
+Spike code: `beams-protocol`'s `agent` module (wire parsing, no
+dependencies) and `agent_crypto` module (feature `agent-crypto`:
+session-bind verification, fingerprints, plain and hashed `known_hosts`
+matching), plus a hidden `beam-bootstrap agent-proxy-spike` subcommand. The
+driver is `bootstrap/tests/ssh-agent-proxy-spike.sh`. It ran on a fresh,
+disposable Beam (Debian 13, OpenSSH 10.0p2, git 2.47) with generated keys,
+an unprivileged `sshd` on 127.0.0.1:2200, and github.com, and passed all
+24 checks. The verification half ran Beam-side only for convenience. The
+modules are ready to be used from `beamsd` as designed.
+
+What held up:
+
+- **Host verification works end to end.**
+  - Every ssh connection sent session-bind, and it verified.
+  - Against OpenSSH 10 servers the client signs with the
+    `publickey-hostbound-v00@openssh.com` method, whose signed data repeats
+    the host key. Both methods are parsed, and the hostbound key is checked
+    against the session-bind key.
+  - github.com verified and was named through plain `known_hosts` entries.
+    The local `sshd` was named through a *hashed* entry, using the
+    command-line candidate.
+- **Session-bind arrives before REQUEST_IDENTITIES**, on every connection.
+  So the verified host is known even when only listing keys. A later rule
+  could expose keys per host instead of per Beam.
+- **Payload classification:**
+  - user-auth (with the username);
+  - `SSHSIG` namespace `file` (`ssh-keygen -Y sign`) and `git`
+    (`git commit -S` with `gpg.format=ssh`).
+  - Each `ssh` process opens its own agent connection. ProxyJump-style
+    nesting produces separate connections, each with its own bind, and
+    parallel logins don't interfere.
+- **Refusals:** add identity, remove all, and lock are refused, and the
+  upstream agent is untouched. A key that isn't allowlisted is never listed
+  and can't be used to sign.
+- **Context from `/proc`:**
+  - Gathering it takes 0.1–0.3 ms, so doing it when the connection is
+    accepted costs nothing noticeable.
+  - For a git clone the chain is `ssh` ← `/bin/sh -c` (from
+    `GIT_SSH_COMMAND`) ← `git clone …` ← caller. `SSH_KEY_REASON` and
+    `BEAMS_TASK_RUN` are inherited by every process in it.
+  - An ANSI escape in the reason was stripped.
+- **Latency:**
+  - `git ls-remote` waited through a 45s simulated approval without
+    complaint; ssh and git have no agent timeout of their own.
+  - The real limit is the server's `LoginGraceTime`. With it set to 10s,
+    a 15s approval failed with "Connection closed by … port 2200".
+  - github.com kept an unauthenticated connection open through a 120s
+    stall before auth (the longest tried).
+  - OpenSSH's default grace time is also 120s. So the 60s default
+    `prompt_timeout` is safe, but approvals much past ~2 minutes will
+    fail on the server side whatever the client allows.
+
+Design adjustments:
+
+- **Display:** the requesting `ssh` argv is long and mostly options. The
+  review screen should show the destination and the remote command
+  (`git-upload-pack '<repo>'`) first, and elide the options. The spike
+  limits each argv element to 300 characters after sanitizing.
+- **Prompt timeout:** keep `prompt_timeout` ≤ 90s by default and document
+  the server grace-time ceiling. When a dialog expires it should say "the
+  server may have already given up", not just "expired".
+- **Falling back to key files:** `ssh`/`ssh-keygen` silently use a private
+  key file next to a given `.pub` when the agent doesn't offer that key. The
+  rollout must actually delete the staged `beams_id_ed25519` from existing
+  Beams. Otherwise the prompts give a false sense of safety.
+
+Not covered yet:
+
+- RSA and ECDSA *host* keys weren't exercised at all: GitHub and the test
+  `sshd` both negotiated Ed25519, and the unit tests only use Ed25519. Phase 2
+  should add RSA/ECDSA session-bind fixtures, captured from
+  `ssh -o HostKeyAlgorithms=…`.
+- Host *certificates* (`*-cert-v01@openssh.com` host keys) don't parse as
+  plain keys. They currently fall back to "verified key, unknown host", and
+  need `@cert-authority` handling if anyone uses them.
+- Context for a peer that has already exited (the `/proc` read races the
+  peer's exit) wasn't exercised. Reading at accept time made it moot in
+  every observed case.
+
 ## Phases
 
-0. **Beam-only spike.** A filtered listener in front of a throwaway local
+0. **Beam-only spike.** *Done; see "Phase 0 findings" above.* A filtered listener in front of a throwaway local
    `ssh-agent` on a Beam. Check: session-bind parsing and verification, user-auth
    and `SSHSIG` parsing, `/proc` context and `BEAMS_TASK_RUN` attribution,
    `git`/`ssh` behavior with a 30-60s delay before the signature, and

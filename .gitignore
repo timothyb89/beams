@@ -2,3 +2,6 @@
 !.ssh/*_id_*.pub
 /bootstrap/target/
 
+/protocol/target/
+/protocol/Cargo.lock
+/.claude/worktrees/

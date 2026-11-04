@@ -5,6 +5,10 @@
 //! cannot encode an approval: request decisions only exist in
 //! [`ClientToBeam`], whose sender is the workstation daemon.
 
+pub mod agent;
+#[cfg(feature = "agent-crypto")]
+pub mod agent_crypto;
+
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL: &str = "beams-client-services";
