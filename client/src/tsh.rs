@@ -143,7 +143,6 @@ pub fn ssh_interactive(
         &args,
         session::ConnectionInfo {
             beam_id,
-            beam_uuid: uuid,
             login,
         },
         escape_key,

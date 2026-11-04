@@ -86,26 +86,40 @@ Requests belonging to other managed Beams do not take over this session.
 `--escape-key none` retains strict passthrough and disables automatic takeover
 along with the manual menu.
 
-The menu shows connection/bridge state, typed remote requests, and local
-services for the current Beam. A pending port-forward proposal displays its
-requested local port (or automatic selection) and Beam endpoint; `y` approves
-and `n` rejects it. Press `f` to create a client-initiated forward, enter the
-required remote port and optional local port, then press enter. Press `u` or
-`d` to create a one-shot upload or download, enter the workstation and Beam
-file paths, and choose whether an existing destination may be replaced.
-Remote file-copy requests open a second local path-confirmation dialog:
-the Beam-provided value is only a hint and cannot select a workstation path
-by itself. `j`/`k` select a service, `s` stops a running forward or copy, and
-`r` restarts a forward. Completed, failed, cancelled, or interrupted copies
-are terminal; create a new job instead of restarting one.
+The menu shows connection/bridge state, any pending remote request, and the
+local services for the current Beam, each in plain language with a colored
+status. A pending proposal is described in full; `y` approves and `n` rejects
+it. `f` opens a form for a client-initiated port forward (Beam port, optional
+workstation port), `u`/`d` open an upload/download form (workstation path,
+Beam path, overwrite toggle), and `m` opens a folder-sync form (directories,
+mode, VCS/ignore rules). Remote file-copy and folder-sync requests open a
+path-confirmation form first: the Beam-provided value is only a hint and
+cannot select a workstation path by itself. `↑`/`↓` (or `j`/`k`) select a
+service; the footer lists only the actions the selected service supports
+(`s` stop, `r` restart, `p` pause, `e` resume, `t` terminate). Completed,
+failed, cancelled, or interrupted copies are terminal; create a new job
+instead of restarting one.
+
+Forms behave like ordinary text inputs: `Tab`/`Shift-Tab` (or `↓`/`↑`) move
+between fields; `←`/`→`, `Home`/`End`, `Backspace`/`Delete`, and the readline
+chords `Ctrl-A`/`E`/`U`/`K`/`W` edit text; pasted text lands in the focused
+field; `Space` or `←`/`→` change toggles and choices. Workstation path fields
+show a dimmed completion from the local filesystem, and `→` at the end of the
+text accepts it. Relative and `~` workstation paths are resolved against the
+directory `beams ssh` was started from. Validation errors appear under the
+offending field and the form stays open with its input intact; `Enter`
+submits and `Esc` cancels. Menu keys are decoded from plain bytes, `ESC [`
+and application-cursor `ESC O` sequences, Kitty CSI-u, and modifyOtherKeys,
+so they work whichever keyboard mode the remote application left the outer
+terminal in.
 
 The client does not nest another terminal alternate screen over remote zellij
 (alternate-screen state is not stackable). It drains up to 1 MiB of remote
 output while the menu is visible, restores that output on close, and briefly
 resizes/restores the child PTY with distinct notifications to make the remote
 application redraw. Every menu frame clears stale cells before painting, and
-service forms render as cleared modal panels, so local resizes and shorter
-updates do not retain content from an older frame. Terminal raw mode and cursor
+the dialog is drawn on a cleared panel, so local resizes and shorter updates
+do not retain content from an older frame. Terminal raw mode and cursor
 visibility are restored on normal exit, errors, and handled termination
 signals. Daemon request, bridge, and service events repaint an open menu
 immediately; closing and reopening it is not required to refresh status.
@@ -113,8 +127,9 @@ immediately; closing and reopening it is not required to refresh status.
 `--terminal-overlay` is an experimental alternative for testing local
 compositing. The client continuously feeds remote output into a `vt100`
 shadow screen while still passing the original bytes through unchanged. When
-the local menu is open, that captured screen is painted underneath a bounded
-approval or service dialog; remote output continues updating the shadow screen
+the local menu is open, that captured screen is painted, dimmed, underneath
+the same dialog the takeover mode draws (both modes share one renderer in
+`src/session/ui.rs`); remote output continues updating the shadow screen
 while it is hidden from the physical terminal. A persistent ratatui renderer
 updates only changed cells, avoiding the full-screen clear/redraw flicker of
 the first prototype. Closing an overlay restores the model without sending a
@@ -206,7 +221,7 @@ daemon restart without trusting an old PID. Stop/restart proposals from the
 remote TUI require the same local approval as creation.
 
 File copies support one regular file per job. They deny overwriting by
-default; select `Replace` in the menu or pass `--overwrite` explicitly to
+default; tick the overwrite toggle in the menu or pass `--overwrite` explicitly to
 replace an existing destination. Uploads first write a unique sibling file
 on the Beam, then atomically replace the destination or atomically create it
 with a hard link for no-overwrite mode. Downloads use the same sibling-temp

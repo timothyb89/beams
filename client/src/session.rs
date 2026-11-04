@@ -26,10 +26,6 @@ use crossterm::execute;
 use crossterm::terminal::{self, Clear, ClearType};
 use portable_pty::{native_pty_system, CommandBuilder, ExitStatus, MasterPty, PtyPair, PtySize};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear as RatatuiClear, Paragraph};
 use ratatui::Terminal;
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
@@ -41,6 +37,13 @@ use beams_protocol::{
 
 use crate::clientd::{Frontend, RequestRecord, ServerEvent, ServiceRecord};
 use crate::terminal_model::TerminalModel;
+
+mod form;
+mod keys;
+mod ui;
+
+use form::{ChoiceOption, Completion, Field, Form, FormEvent};
+use keys::{Decoded, Key};
 
 const LOOP_TICK: Duration = Duration::from_millis(25);
 const INPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
@@ -153,7 +156,6 @@ impl FromStr for EscapeKey {
 
 pub struct ConnectionInfo<'a> {
     pub beam_id: &'a str,
-    pub beam_uuid: &'a str,
     pub login: &'a str,
 }
 
@@ -387,43 +389,61 @@ fn drive(
         }
 
         let now = Instant::now();
-        let mut actions = input_router.flush_expired(escape_key, daemon_view.form_active(), now);
-        let poll_timeout = input_router.poll_timeout(now);
-        if stdin_ready(poll_timeout).context("polling terminal input")? {
-            let mut bytes = [0u8; 4096];
-            let read = io::stdin()
-                .read(&mut bytes)
-                .context("reading terminal input")?;
-            if read == 0 {
-                let _ = child.kill();
-                close_palette(
-                    master,
-                    terminal_state,
-                    &mut palette_terminal,
-                    &mut input_router.mode,
-                    &mut deferred,
-                    last_size,
-                    terminal_model,
-                    overlay_enabled,
-                )?;
-                return Ok(0);
+        let mut keys_handled = false;
+        let mut actions = Vec::new();
+        let mut stdin_closed = false;
+        {
+            // Menu keys are applied as they're decoded, not batched: a key
+            // can close the menu, and everything typed after it must then go
+            // to the remote session instead.
+            let mut on_key = |key: Key| -> bool {
+                keys_handled = true;
+                // A request can arrive while the user is typing into the
+                // remote shell. Don't let already-buffered keys approve or
+                // manipulate the newly opened menu; the prefix key still
+                // closes it immediately (handled by the router).
+                if approval_takeover_guard.is_some_and(|until| Instant::now() < until) {
+                    return false;
+                }
+                daemon_view.handle_key(key, local_daemon)
+            };
+            actions.extend(input_router.flush_expired(escape_key, now, &mut on_key));
+            let poll_timeout = input_router.poll_timeout(now);
+            if stdin_ready(poll_timeout).context("polling terminal input")? {
+                let mut bytes = [0u8; 4096];
+                let read = io::stdin()
+                    .read(&mut bytes)
+                    .context("reading terminal input")?;
+                if read == 0 {
+                    stdin_closed = true;
+                } else {
+                    actions.extend(input_router.route(
+                        escape_key,
+                        &bytes[..read],
+                        Instant::now(),
+                        &mut on_key,
+                    ));
+                }
             }
-
-            actions.extend(input_router.route(
-                escape_key,
-                daemon_view.form_active(),
-                &bytes[..read],
-                Instant::now(),
-            ));
+            if !stdin_closed {
+                actions.extend(input_router.flush_expired(escape_key, Instant::now(), &mut on_key));
+            }
         }
-        actions.extend(input_router.flush_expired(
-            escape_key,
-            daemon_view.form_active(),
-            Instant::now(),
-        ));
-        let now = Instant::now();
-        actions = guard_approval_takeover_input(actions, approval_takeover_guard, now);
-        if approval_takeover_guard.is_some_and(|until| now >= until) {
+        if stdin_closed {
+            let _ = child.kill();
+            close_palette(
+                master,
+                terminal_state,
+                &mut palette_terminal,
+                &mut input_router.mode,
+                &mut deferred,
+                last_size,
+                terminal_model,
+                overlay_enabled,
+            )?;
+            return Ok(0);
+        }
+        if approval_takeover_guard.is_some_and(|until| Instant::now() >= until) {
             approval_takeover_guard = None;
         }
 
@@ -452,83 +472,10 @@ fn drive(
                         overlay_enabled,
                     )?;
                 }
-                InputAction::ApprovePending => {
-                    daemon_view.approve_or_prompt(local_daemon);
-                    redraw_palette!();
-                }
-                InputAction::RejectPending => {
-                    daemon_view.decide(local_daemon, false);
-                    redraw_palette!();
-                }
-                InputAction::BeginForward => {
-                    daemon_view.forward_form = Some(ForwardForm::default());
-                    redraw_palette!();
-                }
-                InputAction::BeginUpload => {
-                    daemon_view.copy_form = Some(CopyForm::new(FileCopyDirection::Upload));
-                    redraw_palette!();
-                }
-                InputAction::BeginDownload => {
-                    daemon_view.copy_form = Some(CopyForm::new(FileCopyDirection::Download));
-                    redraw_palette!();
-                }
-                InputAction::BeginSync => {
-                    daemon_view.sync_form = Some(SyncForm::default());
-                    redraw_palette!();
-                }
-                InputAction::FormChar(byte) => {
-                    daemon_view.form_char(byte);
-                    redraw_palette!();
-                }
-                InputAction::FormBackspace => {
-                    daemon_view.form_backspace();
-                    redraw_palette!();
-                }
-                InputAction::FormNext => {
-                    daemon_view.form_next();
-                    redraw_palette!();
-                }
-                InputAction::SubmitForm => {
-                    daemon_view.submit_forward(local_daemon);
-                    redraw_palette!();
-                }
-                InputAction::CancelForm => {
-                    daemon_view.forward_form = None;
-                    daemon_view.copy_form = None;
-                    daemon_view.copy_approval_form = None;
-                    daemon_view.sync_form = None;
-                    daemon_view.sync_approval_form = None;
-                    redraw_palette!();
-                }
-                InputAction::StopService => {
-                    daemon_view.control_selected(local_daemon, ServiceAction::Stop);
-                    redraw_palette!();
-                }
-                InputAction::RestartService => {
-                    daemon_view.control_selected(local_daemon, ServiceAction::Restart);
-                    redraw_palette!();
-                }
-                InputAction::PauseService => {
-                    daemon_view.control_selected(local_daemon, ServiceAction::Pause);
-                    redraw_palette!();
-                }
-                InputAction::ResumeService => {
-                    daemon_view.control_selected(local_daemon, ServiceAction::Resume);
-                    redraw_palette!();
-                }
-                InputAction::TerminateService => {
-                    daemon_view.control_selected(local_daemon, ServiceAction::Terminate);
-                    redraw_palette!();
-                }
-                InputAction::NextService => {
-                    daemon_view.select_next();
-                    redraw_palette!();
-                }
-                InputAction::PreviousService => {
-                    daemon_view.select_previous();
-                    redraw_palette!();
-                }
             }
+        }
+        if keys_handled && input_router.mode == InputMode::Palette && palette_terminal.is_some() {
+            redraw_palette!();
         }
     }
 }
@@ -544,77 +491,42 @@ struct DaemonView {
     service_records: BTreeMap<String, ServiceRecord>,
     bridge_statuses: BTreeMap<String, String>,
     selected_service: usize,
-    forward_form: Option<ForwardForm>,
-    copy_form: Option<CopyForm>,
-    copy_approval_form: Option<CopyApprovalForm>,
-    sync_form: Option<SyncForm>,
-    sync_approval_form: Option<SyncApprovalForm>,
+    screen: Screen,
     presented_approval_requests: BTreeSet<String>,
+    /// Connection status of the local daemon and this session's bridge.
     message: String,
+    /// Feedback from the most recent menu action.
+    notice: Option<Notice>,
 }
 
-#[derive(Default)]
-struct ForwardForm {
-    remote_port: String,
-    local_port: String,
-    field: usize,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Notice {
+    text: String,
+    error: bool,
 }
 
-struct CopyForm {
-    direction: FileCopyDirection,
-    local_path: String,
-    remote_path: String,
-    overwrite: OverwritePolicy,
-    field: usize,
+/// What the local menu is currently showing.
+enum Screen {
+    Home,
+    Form { kind: FormKind, form: Form },
 }
 
-impl CopyForm {
-    fn new(direction: FileCopyDirection) -> Self {
-        Self {
-            direction,
-            local_path: String::new(),
-            remote_path: String::new(),
-            overwrite: OverwritePolicy::Deny,
-            field: 0,
-        }
-    }
+/// Which action submitting the current form performs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FormKind {
+    Forward,
+    Copy(FileCopyDirection),
+    CopyApproval { request_id: String },
+    Sync,
+    SyncApproval { request_id: String },
 }
 
-struct CopyApprovalForm {
-    request_id: String,
-    local_path: String,
-}
-
-struct SyncForm {
-    local_path: String,
-    remote_path: String,
-    mode: FolderSyncMode,
-    ignore_vcs: bool,
-    ignores: String,
-    field: usize,
-}
-
-impl Default for SyncForm {
-    fn default() -> Self {
-        Self {
-            local_path: String::new(),
-            remote_path: String::new(),
-            mode: FolderSyncMode::TwoWaySafe,
-            ignore_vcs: true,
-            ignores: String::new(),
-            field: 0,
-        }
-    }
-}
-
-fn next_sync_mode(mode: FolderSyncMode) -> FolderSyncMode {
-    match mode {
-        FolderSyncMode::TwoWaySafe => FolderSyncMode::TwoWayResolved,
-        FolderSyncMode::TwoWayResolved => FolderSyncMode::OneWaySafe,
-        FolderSyncMode::OneWaySafe => FolderSyncMode::OneWayReplica,
-        FolderSyncMode::OneWayReplica => FolderSyncMode::TwoWaySafe,
-    }
-}
+const SYNC_MODES: [FolderSyncMode; 4] = [
+    FolderSyncMode::TwoWaySafe,
+    FolderSyncMode::TwoWayResolved,
+    FolderSyncMode::OneWaySafe,
+    FolderSyncMode::OneWayReplica,
+];
 
 fn sync_mode_warning(mode: FolderSyncMode) -> &'static str {
     match mode {
@@ -631,9 +543,257 @@ fn sync_mode_warning(mode: FolderSyncMode) -> &'static str {
     }
 }
 
-struct SyncApprovalForm {
-    request_id: String,
-    local_path: String,
+fn forward_form() -> Form {
+    Form::new(
+        "Forward a Beam port",
+        "create",
+        vec![
+            Field::number("remote_port", "Beam port").placeholder("e.g. 8080"),
+            Field::number("local_port", "Workstation port").placeholder("automatic"),
+        ],
+    )
+    .intro(
+        "Listen on a workstation port and forward each connection to 127.0.0.1 in the Beam.",
+        false,
+    )
+}
+
+fn copy_form(direction: FileCopyDirection) -> Form {
+    let local = Field::text("local_path", "Workstation path")
+        .placeholder("e.g. ~/notes.txt")
+        .complete(Completion::Paths);
+    let remote = Field::text("remote_path", "Beam path").placeholder("e.g. /home/beams/notes.txt");
+    let overwrite = Field::toggle(
+        "overwrite",
+        "Overwrite",
+        false,
+        "replace an existing destination",
+        "fail if the destination exists",
+    );
+    match direction {
+        FileCopyDirection::Upload => Form::new(
+            "Upload a file to the Beam",
+            "upload",
+            vec![local, remote, overwrite],
+        ),
+        FileCopyDirection::Download => Form::new(
+            "Download a file from the Beam",
+            "download",
+            vec![remote, local, overwrite],
+        ),
+    }
+}
+
+fn sync_form() -> Form {
+    let modes = SYNC_MODES
+        .iter()
+        .map(|mode| ChoiceOption {
+            label: ui::mode_label(*mode),
+            help: sync_mode_warning(*mode),
+            warn: *mode != FolderSyncMode::TwoWaySafe,
+        })
+        .collect();
+    Form::new(
+        "Sync a folder with the Beam",
+        "create",
+        vec![
+            Field::text("local_path", "Workstation dir")
+                .placeholder("e.g. ~/src/project")
+                .complete(Completion::Directories),
+            Field::text("remote_path", "Beam dir").placeholder("e.g. /home/beams/projects/project"),
+            Field::choice("mode", "Mode", modes, 0),
+            Field::toggle(
+                "ignore_vcs",
+                "Ignore VCS",
+                true,
+                "skip .git and other VCS metadata",
+                "sync VCS metadata too",
+            ),
+            Field::text("ignores", "Ignore rules")
+                .placeholder("comma-separated, e.g. target, node_modules"),
+        ],
+    )
+    .note("Both directories must already exist.")
+}
+
+/// The path-confirmation form shown when approving a Beam-proposed copy or
+/// sync: the Beam can only suggest a workstation path, never choose it.
+fn approval_form(
+    request: &RequestRecord,
+    title: &str,
+    label: &'static str,
+    completion: Completion,
+) -> Form {
+    let hint = match request.request.as_ref().map(|request| &request.kind) {
+        Some(
+            ServiceRequestKind::FileCopy {
+                local_path_hint, ..
+            }
+            | ServiceRequestKind::FolderSync {
+                local_path_hint, ..
+            },
+        ) => local_path_hint.clone().unwrap_or_default(),
+        _ => String::new(),
+    };
+    let mut form = Form::new(
+        title,
+        "approve",
+        vec![Field::text("local_path", label)
+            .value(&hint)
+            .complete(completion)],
+    );
+    for sentence in ui::describe_request(request) {
+        form = form.intro(sentence, false);
+    }
+    form.intro(
+        "The Beam can only suggest a workstation path. Confirm or edit the real one before approving.",
+        true,
+    )
+}
+
+fn required(form: &mut Form, id: &str, what: &str) -> String {
+    let value = form.text(id);
+    if value.is_empty() {
+        form.set_error(id, format!("{what} is required"));
+    }
+    value
+}
+
+fn local_path(form: &mut Form, id: &str, what: &str) -> String {
+    let value = required(form, id, what);
+    if value.is_empty() {
+        return value;
+    }
+    form::resolve_local_path(&value)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn port(form: &mut Form, id: &str, optional: bool) -> Option<u16> {
+    let value = form.text(id);
+    if value.is_empty() {
+        if !optional {
+            form.set_error(id, "a port is required");
+        }
+        return None;
+    }
+    match value.parse::<u16>() {
+        Ok(port) if port > 0 => Some(port),
+        _ => {
+            form.set_error(id, "ports are 1-65535");
+            None
+        }
+    }
+}
+
+fn session_target(
+    local_daemon: &mut LocalDaemon,
+) -> Result<(&crate::bridge::Target, &mut Frontend), String> {
+    let managed = local_daemon
+        .managed_bridge
+        .as_ref()
+        .ok_or("this session has no managed Beam target")?;
+    let frontend = local_daemon
+        .frontend
+        .as_mut()
+        .ok_or("the local daemon connection is unavailable")?;
+    Ok((&managed.target, frontend))
+}
+
+fn daemon_frontend(local_daemon: &mut LocalDaemon) -> Result<&mut Frontend, String> {
+    local_daemon
+        .frontend
+        .as_mut()
+        .ok_or_else(|| "the local daemon connection is unavailable".to_string())
+}
+
+/// Validates and submits `form`. `Ok(Some(notice))` closes the form,
+/// `Ok(None)` means field errors were set, `Err` is a form-level error.
+fn submit_form(
+    kind: &FormKind,
+    form: &mut Form,
+    local_daemon: &mut LocalDaemon,
+) -> Result<Option<String>, String> {
+    match kind {
+        FormKind::Forward => {
+            let remote_port = port(form, "remote_port", false);
+            let local_port = port(form, "local_port", true);
+            let Some(remote_port) = remote_port.filter(|_| !form.has_errors()) else {
+                return Ok(None);
+            };
+            let (target, frontend) = session_target(local_daemon)?;
+            frontend
+                .create_port_forward(target, "127.0.0.1", remote_port, local_port)
+                .map_err(|err| format!("could not create the forward: {err}"))?;
+            Ok(Some(format!(
+                "forwarding workstation port {} → 127.0.0.1:{remote_port}",
+                local_port
+                    .map(|port| port.to_string())
+                    .unwrap_or_else(|| "(automatic)".to_string())
+            )))
+        }
+        FormKind::Copy(direction) => {
+            let local = local_path(form, "local_path", "a workstation path");
+            let remote = required(form, "remote_path", "a Beam path");
+            if form.has_errors() {
+                return Ok(None);
+            }
+            let overwrite = if form.toggle("overwrite") {
+                OverwritePolicy::Replace
+            } else {
+                OverwritePolicy::Deny
+            };
+            let (target, frontend) = session_target(local_daemon)?;
+            frontend
+                .create_file_copy(target, *direction, &local, &remote, overwrite)
+                .map_err(|err| format!("could not start the copy: {err}"))?;
+            Ok(Some(format!(
+                "starting {}",
+                ui::direction_label(*direction)
+            )))
+        }
+        FormKind::CopyApproval { request_id } => {
+            let local = local_path(form, "local_path", "a workstation path");
+            if form.has_errors() {
+                return Ok(None);
+            }
+            daemon_frontend(local_daemon)?
+                .decide_file_copy(request_id, true, Some(&local))
+                .map_err(|err| format!("could not approve the copy: {err}"))?;
+            Ok(Some(format!("approved file copy to {local}")))
+        }
+        FormKind::Sync => {
+            let local = local_path(form, "local_path", "a workstation directory");
+            let remote = required(form, "remote_path", "a Beam directory");
+            if form.has_errors() {
+                return Ok(None);
+            }
+            let ignores = form
+                .text("ignores")
+                .split(',')
+                .map(str::trim)
+                .filter(|ignore| !ignore.is_empty())
+                .map(str::to_string)
+                .collect();
+            let mode = SYNC_MODES[form.choice("mode").min(SYNC_MODES.len() - 1)];
+            let ignore_vcs = form.toggle("ignore_vcs");
+            let (target, frontend) = session_target(local_daemon)?;
+            frontend
+                .create_folder_sync(target, &local, &remote, mode, ignore_vcs, ignores)
+                .map_err(|err| format!("could not create the sync: {err}"))?;
+            Ok(Some("creating folder sync".to_string()))
+        }
+        FormKind::SyncApproval { request_id } => {
+            let local = local_path(form, "local_path", "a workstation directory");
+            if form.has_errors() {
+                return Ok(None);
+            }
+            daemon_frontend(local_daemon)?
+                .decide_folder_sync(request_id, true, Some(&local))
+                .map_err(|err| format!("could not approve the sync: {err}"))?;
+            Ok(Some(format!("approved folder sync with {local}")))
+        }
+    }
 }
 
 impl DaemonView {
@@ -654,12 +814,9 @@ impl DaemonView {
                 service_records: BTreeMap::new(),
                 bridge_statuses: BTreeMap::new(),
                 selected_service: 0,
-                forward_form: None,
-                copy_form: None,
-                copy_approval_form: None,
-                sync_form: None,
-                sync_approval_form: None,
+                screen: Screen::Home,
                 presented_approval_requests: BTreeSet::new(),
+                notice: None,
                 message: "connected".to_string(),
             },
             None => Self {
@@ -673,12 +830,9 @@ impl DaemonView {
                 service_records: BTreeMap::new(),
                 bridge_statuses: BTreeMap::new(),
                 selected_service: 0,
-                forward_form: None,
-                copy_form: None,
-                copy_approval_form: None,
-                sync_form: None,
-                sync_approval_form: None,
+                screen: Screen::Home,
                 presented_approval_requests: BTreeSet::new(),
+                notice: None,
                 message: local_daemon
                     .unavailable
                     .clone()
@@ -758,7 +912,7 @@ impl DaemonView {
                     changed = true;
                 }
                 Ok(ServerEvent::Error { message }) => {
-                    self.message = format!("daemon error: {message}");
+                    self.notify(format!("daemon error: {message}"), true);
                     changed = true;
                 }
                 Ok(ServerEvent::RequestChanged { request }) => {
@@ -829,35 +983,110 @@ impl DaemonView {
         changed
     }
 
-    fn form_active(&self) -> bool {
-        self.forward_form.is_some()
-            || self.copy_form.is_some()
-            || self.copy_approval_form.is_some()
-            || self.sync_form.is_some()
-            || self.sync_approval_form.is_some()
+    fn pending_count(&self) -> usize {
+        self.request_records
+            .values()
+            .filter(|request| {
+                request.status == RequestStatus::PendingApproval
+                    && self.beam_uuid.as_deref() == Some(request.beam_uuid.as_str())
+            })
+            .count()
+    }
+
+    fn notify(&mut self, text: impl Into<String>, error: bool) {
+        self.notice = Some(Notice {
+            text: text.into(),
+            error,
+        });
+    }
+
+    fn open_form(&mut self, kind: FormKind, form: Form) {
+        self.notice = None;
+        self.screen = Screen::Form { kind, form };
+    }
+
+    /// Handles one key while the menu is open. Returns whether the menu
+    /// should close.
+    fn handle_key(&mut self, key: Key, local_daemon: &mut LocalDaemon) -> bool {
+        if let Screen::Form { kind, form } = &mut self.screen {
+            match form.handle_key(&key) {
+                FormEvent::Cancel => self.screen = Screen::Home,
+                FormEvent::Submit => {
+                    form.clear_errors();
+                    match submit_form(kind, form, local_daemon) {
+                        Ok(Some(notice)) => {
+                            self.screen = Screen::Home;
+                            self.notify(notice, false);
+                        }
+                        Ok(None) => {}
+                        Err(err) => form.error = Some(err),
+                    }
+                }
+                FormEvent::Handled | FormEvent::Ignored => {}
+            }
+            return false;
+        }
+
+        match key {
+            Key::Char('q' | 'Q') | Key::Esc | Key::Enter => return true,
+            Key::Char('y' | 'Y') => self.approve_or_prompt(local_daemon),
+            Key::Char('n' | 'N') => self.decide(local_daemon, false),
+            Key::Char('f' | 'F') => self.open_form(FormKind::Forward, forward_form()),
+            Key::Char('u' | 'U') => self.open_form(
+                FormKind::Copy(FileCopyDirection::Upload),
+                copy_form(FileCopyDirection::Upload),
+            ),
+            Key::Char('d' | 'D') => self.open_form(
+                FormKind::Copy(FileCopyDirection::Download),
+                copy_form(FileCopyDirection::Download),
+            ),
+            Key::Char('m' | 'M') => self.open_form(FormKind::Sync, sync_form()),
+            Key::Char('j' | 'J') | Key::Down => self.select_next(),
+            Key::Char('k' | 'K') | Key::Up => self.select_previous(),
+            Key::Char(ch) => {
+                let ch = ch.to_ascii_lowercase();
+                if let Some(action) = [
+                    ServiceAction::Stop,
+                    ServiceAction::Restart,
+                    ServiceAction::Pause,
+                    ServiceAction::Resume,
+                    ServiceAction::Terminate,
+                ]
+                .into_iter()
+                .find(|action| ui::action_key(*action) == ch)
+                {
+                    self.control_selected(local_daemon, action);
+                }
+            }
+            _ => {}
+        }
+        false
     }
 
     fn approve_or_prompt(&mut self, local_daemon: &mut LocalDaemon) {
         let Some(request) = self.pending_request() else {
-            self.message = "no pending request to decide".to_string();
+            self.notify("no request is waiting for approval", true);
             return;
         };
+        let request_id = request.request_id.clone();
         match request.request.as_ref().map(|request| &request.kind) {
-            Some(ServiceRequestKind::FileCopy {
-                local_path_hint, ..
-            }) => {
-                self.copy_approval_form = Some(CopyApprovalForm {
-                    request_id: request.request_id.clone(),
-                    local_path: local_path_hint.clone().unwrap_or_default(),
-                });
+            Some(ServiceRequestKind::FileCopy { .. }) => {
+                let form = approval_form(
+                    request,
+                    "Approve file copy",
+                    "Workstation path",
+                    Completion::Paths,
+                );
+                self.open_form(FormKind::CopyApproval { request_id }, form);
             }
-            Some(ServiceRequestKind::FolderSync {
-                local_path_hint, ..
-            }) => {
-                self.sync_approval_form = Some(SyncApprovalForm {
-                    request_id: request.request_id.clone(),
-                    local_path: local_path_hint.clone().unwrap_or_default(),
-                });
+            Some(ServiceRequestKind::FolderSync { .. }) => {
+                let form = approval_form(
+                    request,
+                    "Approve folder sync",
+                    "Workstation dir",
+                    Completion::Directories,
+                );
+                self.open_form(FormKind::SyncApproval { request_id }, form);
             }
             _ => self.decide(local_daemon, true),
         }
@@ -875,325 +1104,63 @@ impl DaemonView {
             .pending_request()
             .map(|request| request.request_id.clone())
         else {
-            self.message = "no pending request to decide".to_string();
+            self.notify("no request is waiting for approval", true);
             return;
         };
         let Some(frontend) = &mut local_daemon.frontend else {
-            self.message = "local daemon connection is unavailable".to_string();
+            self.notify("the local daemon connection is unavailable", true);
             return;
         };
         match frontend.decide_request(&request_id, approve) {
-            Ok(()) => {
-                self.message = format!(
-                    "{} request {request_id}",
-                    if approve { "approving" } else { "rejecting" }
-                );
-            }
-            Err(err) => {
-                self.message = format!("could not send decision: {err}");
-            }
+            Ok(()) => self.notify(
+                format!("{} request", if approve { "approved" } else { "rejected" }),
+                false,
+            ),
+            Err(err) => self.notify(format!("could not send the decision: {err}"), true),
         }
     }
 
-    fn visible_services<'a>(&'a self, local_daemon: &'a LocalDaemon) -> Vec<&'a ServiceRecord> {
-        let beam_uuid = local_daemon
-            .managed_bridge
-            .as_ref()
-            .map(|managed| managed.target.beam_uuid.as_str());
+    /// Services belonging to this session's Beam, in a stable order.
+    fn visible_services(&self) -> Vec<&ServiceRecord> {
         self.service_records
             .values()
-            .filter(|service| Some(service.beam_uuid.as_str()) == beam_uuid)
+            .filter(|service| self.beam_uuid.as_deref() == Some(service.beam_uuid.as_str()))
             .collect()
     }
 
-    fn selected_service<'a>(&'a self, local_daemon: &'a LocalDaemon) -> Option<&'a ServiceRecord> {
-        let services = self.visible_services(local_daemon);
-        services
-            .get(self.selected_service.min(services.len().saturating_sub(1)))
-            .copied()
+    /// `selected_service`, clamped to the current list - services can
+    /// disappear between key presses.
+    fn selected_index(&self) -> usize {
+        self.selected_service
+            .min(self.visible_services().len().saturating_sub(1))
+    }
+
+    fn selected_service(&self) -> Option<&ServiceRecord> {
+        self.visible_services().get(self.selected_index()).copied()
     }
 
     fn select_next(&mut self) {
-        self.selected_service = self.selected_service.saturating_add(1);
+        let count = self.visible_services().len();
+        self.selected_service = (self.selected_index() + 1).min(count.saturating_sub(1));
     }
 
     fn select_previous(&mut self) {
-        self.selected_service = self.selected_service.saturating_sub(1);
-    }
-
-    fn form_char(&mut self, byte: u8) {
-        if let Some(form) = &mut self.sync_approval_form {
-            if byte.is_ascii_graphic() || byte == b' ' {
-                form.local_path.push(char::from(byte));
-            }
-            return;
-        }
-        if let Some(form) = &mut self.sync_form {
-            if form.field == 2 && byte == b' ' {
-                form.mode = next_sync_mode(form.mode);
-            } else if form.field == 3 && byte == b' ' {
-                form.ignore_vcs = !form.ignore_vcs;
-            } else if byte.is_ascii_graphic() || byte == b' ' {
-                match form.field {
-                    0 => form.local_path.push(char::from(byte)),
-                    1 => form.remote_path.push(char::from(byte)),
-                    4 => form.ignores.push(char::from(byte)),
-                    _ => {}
-                }
-            }
-            return;
-        }
-        if let Some(form) = &mut self.copy_approval_form {
-            if byte.is_ascii_graphic() || byte == b' ' {
-                form.local_path.push(char::from(byte));
-            }
-            return;
-        }
-        if let Some(form) = &mut self.copy_form {
-            if form.field == 2 && byte == b' ' {
-                form.overwrite = match form.overwrite {
-                    OverwritePolicy::Deny => OverwritePolicy::Replace,
-                    OverwritePolicy::Replace => OverwritePolicy::Deny,
-                };
-            } else if byte.is_ascii_graphic() || byte == b' ' {
-                if form.field == 0 {
-                    form.local_path.push(char::from(byte));
-                } else if form.field == 1 {
-                    form.remote_path.push(char::from(byte));
-                }
-            }
-            return;
-        }
-        let Some(form) = &mut self.forward_form else {
-            return;
-        };
-        if !byte.is_ascii_digit() {
-            return;
-        }
-        if form.field == 0 {
-            form.remote_port.push(char::from(byte));
-        } else {
-            form.local_port.push(char::from(byte));
-        }
-    }
-
-    fn form_backspace(&mut self) {
-        if let Some(form) = &mut self.sync_approval_form {
-            form.local_path.pop();
-            return;
-        }
-        if let Some(form) = &mut self.sync_form {
-            match form.field {
-                0 => {
-                    form.local_path.pop();
-                }
-                1 => {
-                    form.remote_path.pop();
-                }
-                4 => {
-                    form.ignores.pop();
-                }
-                _ => {}
-            }
-            return;
-        }
-        if let Some(form) = &mut self.copy_approval_form {
-            form.local_path.pop();
-            return;
-        }
-        if let Some(form) = &mut self.copy_form {
-            if form.field == 0 {
-                form.local_path.pop();
-            } else if form.field == 1 {
-                form.remote_path.pop();
-            }
-            return;
-        }
-        let Some(form) = &mut self.forward_form else {
-            return;
-        };
-        if form.field == 0 {
-            form.remote_port.pop();
-        } else {
-            form.local_port.pop();
-        }
-    }
-
-    fn form_next(&mut self) {
-        if let Some(form) = &mut self.sync_form {
-            form.field = (form.field + 1) % 5;
-            return;
-        }
-        if let Some(form) = &mut self.copy_form {
-            form.field = (form.field + 1) % 3;
-            return;
-        }
-        if let Some(form) = &mut self.forward_form {
-            form.field = (form.field + 1) % 2;
-        }
-    }
-
-    fn submit_forward(&mut self, local_daemon: &mut LocalDaemon) {
-        if let Some(form) = self.sync_approval_form.take() {
-            let Some(frontend) = &mut local_daemon.frontend else {
-                self.message = "local daemon connection is unavailable".to_string();
-                self.sync_approval_form = Some(form);
-                return;
-            };
-            match frontend.decide_folder_sync(&form.request_id, true, Some(&form.local_path)) {
-                Ok(()) => self.message = format!("approving folder sync {}", form.request_id),
-                Err(err) => {
-                    self.message = format!("could not approve folder sync: {err}");
-                    self.sync_approval_form = Some(form);
-                }
-            }
-            return;
-        }
-        if let Some(form) = self.sync_form.take() {
-            if form.local_path.is_empty() || form.remote_path.is_empty() {
-                self.message = "local and remote directories are required".to_string();
-                self.sync_form = Some(form);
-                return;
-            }
-            let Some(managed) = &local_daemon.managed_bridge else {
-                self.message = "this session has no managed Beam target".to_string();
-                return;
-            };
-            let Some(frontend) = &mut local_daemon.frontend else {
-                self.message = "local daemon connection is unavailable".to_string();
-                self.sync_form = Some(form);
-                return;
-            };
-            let ignores = form
-                .ignores
-                .split(',')
-                .map(str::trim)
-                .filter(|ignore| !ignore.is_empty())
-                .map(str::to_string)
-                .collect();
-            match frontend.create_folder_sync(
-                &managed.target,
-                &form.local_path,
-                &form.remote_path,
-                form.mode,
-                form.ignore_vcs,
-                ignores,
-            ) {
-                Ok(_) => self.message = "creating folder sync".to_string(),
-                Err(err) => {
-                    self.message = format!("could not create folder sync: {err}");
-                    self.sync_form = Some(form);
-                }
-            }
-            return;
-        }
-        if let Some(form) = self.copy_approval_form.take() {
-            let Some(frontend) = &mut local_daemon.frontend else {
-                self.message = "local daemon connection is unavailable".to_string();
-                self.copy_approval_form = Some(form);
-                return;
-            };
-            match frontend.decide_file_copy(&form.request_id, true, Some(&form.local_path)) {
-                Ok(()) => self.message = format!("approving file copy {}", form.request_id),
-                Err(err) => {
-                    self.message = format!("could not approve file copy: {err}");
-                    self.copy_approval_form = Some(form);
-                }
-            }
-            return;
-        }
-        if let Some(form) = self.copy_form.take() {
-            if form.local_path.is_empty() || form.remote_path.is_empty() {
-                self.message = "local and remote paths are required".to_string();
-                self.copy_form = Some(form);
-                return;
-            }
-            let Some(managed) = &local_daemon.managed_bridge else {
-                self.message = "this session has no managed Beam target".to_string();
-                return;
-            };
-            let Some(frontend) = &mut local_daemon.frontend else {
-                self.message = "local daemon connection is unavailable".to_string();
-                self.copy_form = Some(form);
-                return;
-            };
-            match frontend.create_file_copy(
-                &managed.target,
-                form.direction,
-                &form.local_path,
-                &form.remote_path,
-                form.overwrite,
-            ) {
-                Ok(_) => self.message = format!("starting {:?} job", form.direction),
-                Err(err) => {
-                    self.message = format!("could not create file copy: {err}");
-                    self.copy_form = Some(form);
-                }
-            }
-            return;
-        }
-        let Some(form) = self.forward_form.take() else {
-            return;
-        };
-        let remote_port = match form.remote_port.parse::<u16>() {
-            Ok(port) if port > 0 => port,
-            _ => {
-                self.message = "remote port must be between 1 and 65535".to_string();
-                self.forward_form = Some(form);
-                return;
-            }
-        };
-        let local_port = if form.local_port.is_empty() {
-            None
-        } else {
-            match form.local_port.parse::<u16>() {
-                Ok(port) if port > 0 => Some(port),
-                _ => {
-                    self.message = "local port must be empty or between 1 and 65535".to_string();
-                    self.forward_form = Some(form);
-                    return;
-                }
-            }
-        };
-        let Some(managed) = &local_daemon.managed_bridge else {
-            self.message = "this session has no managed Beam target".to_string();
-            return;
-        };
-        let Some(frontend) = &mut local_daemon.frontend else {
-            self.message = "local daemon connection is unavailable".to_string();
-            return;
-        };
-        match frontend.create_port_forward(&managed.target, "127.0.0.1", remote_port, local_port) {
-            Ok(()) => {
-                self.message = format!(
-                    "creating local port {} → 127.0.0.1:{remote_port}",
-                    local_port
-                        .map(|port| port.to_string())
-                        .unwrap_or_else(|| "automatic".to_string())
-                );
-            }
-            Err(err) => self.message = format!("could not create forward: {err}"),
-        }
+        self.selected_service = self.selected_index().saturating_sub(1);
     }
 
     fn control_selected(&mut self, local_daemon: &mut LocalDaemon, action: ServiceAction) {
-        let Some(service) = self.selected_service(local_daemon) else {
-            self.message = "no local service is selected".to_string();
+        let Some(service) = self.selected_service() else {
+            self.notify("no service is selected", true);
             return;
         };
-        let supported = match service.spec.as_ref() {
-            Some(ServiceRequestKind::LocalPortForward { .. }) => {
-                matches!(action, ServiceAction::Stop | ServiceAction::Restart)
-            }
-            Some(ServiceRequestKind::FileCopy { .. }) => action == ServiceAction::Stop,
-            Some(ServiceRequestKind::FolderSync { .. }) => matches!(
-                action,
-                ServiceAction::Pause | ServiceAction::Resume | ServiceAction::Terminate
-            ),
-            None => false,
-        };
-        if !supported {
-            self.message = "that action is not supported for the selected service".to_string();
+        if !ui::supported_actions(service).contains(&action) {
+            self.notify(
+                format!(
+                    "{} isn't available for this service",
+                    ui::action_label(action)
+                ),
+                true,
+            );
             return;
         }
         if action == ServiceAction::Stop
@@ -1202,17 +1169,20 @@ impl DaemonView {
                 ServiceStatus::Stopped | ServiceStatus::Error
             )
         {
-            self.message = "the selected service is already terminal".to_string();
+            self.notify("the selected service has already stopped", true);
             return;
         }
         let service_id = service.service_id.clone();
         let Some(frontend) = &mut local_daemon.frontend else {
-            self.message = "local daemon connection is unavailable".to_string();
+            self.notify("the local daemon connection is unavailable", true);
             return;
         };
         match frontend.control_service(&service_id, action) {
-            Ok(()) => self.message = format!("{action:?} requested for {service_id}"),
-            Err(err) => self.message = format!("could not control service: {err}"),
+            Ok(()) => self.notify(
+                format!("{} requested for {service_id}", ui::action_label(action)),
+                false,
+            ),
+            Err(err) => self.notify(format!("could not control the service: {err}"), true),
         }
     }
 }
@@ -1227,60 +1197,34 @@ enum InputMode {
     Palette,
 }
 
+/// What the session loop must do with routed input. Keys pressed while the
+/// menu is open never appear here: the router hands them straight to the
+/// menu (see `InputRouter::route`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum InputAction {
     Remote(Vec<u8>),
     OpenPalette,
     ClosePalette,
-    ApprovePending,
-    RejectPending,
-    BeginForward,
-    BeginUpload,
-    BeginDownload,
-    BeginSync,
-    FormChar(u8),
-    FormBackspace,
-    FormNext,
-    SubmitForm,
-    CancelForm,
-    StopService,
-    RestartService,
-    PauseService,
-    ResumeService,
-    TerminateService,
-    NextService,
-    PreviousService,
 }
 
-fn guard_approval_takeover_input(
-    actions: Vec<InputAction>,
-    guard_until: Option<Instant>,
-    now: Instant,
-) -> Vec<InputAction> {
-    if guard_until.is_some_and(|until| now < until) {
-        // A request can arrive while the user is typing into the remote shell.
-        // Do not let already-buffered keys accidentally approve or manipulate
-        // the newly opened local UI. Closing the takeover remains immediate.
-        actions
-            .into_iter()
-            .filter(|action| matches!(action, InputAction::ClosePalette))
-            .collect()
-    } else {
-        actions
-    }
-}
+/// Upper bound on a bracketed paste collected for a menu field.
+const MAX_PASTE_LEN: usize = 64 * 1024;
 
 /// Routes terminal input while preserving the original bytes sent to the
 /// remote PTY. Modern terminal applications such as zellij can enable the
 /// Kitty CSI-u or xterm modifyOtherKeys protocols; in those modes Ctrl-J is
 /// represented by a sequence such as `ESC [ 106 ; 5 u`, not byte `0x0a`.
-/// We decode only enough to recognize local menu keys and otherwise forward
-/// each complete sequence exactly as received.
+/// In passthrough mode we decode only enough to recognize the menu prefix
+/// and otherwise forward each complete sequence exactly as received. While
+/// the menu is open, each unit is decoded into a `keys::Key` and handed to
+/// the menu's key handler.
 #[derive(Debug)]
 struct InputRouter {
     mode: InputMode,
     pending: Vec<u8>,
     pending_since: Option<Instant>,
+    /// An in-progress bracketed paste while the menu is open.
+    paste: Option<Vec<u8>>,
 }
 
 impl Default for InputRouter {
@@ -1289,17 +1233,21 @@ impl Default for InputRouter {
             mode: InputMode::Passthrough,
             pending: Vec::new(),
             pending_since: None,
+            paste: None,
         }
     }
 }
 
 impl InputRouter {
+    /// Routes `input`. While the menu is open, each decoded key is passed to
+    /// `on_key`, which returns whether that key closes the menu; input after
+    /// a closing key is routed as passthrough again.
     fn route(
         &mut self,
         escape_key: EscapeKey,
-        form_active: bool,
         input: &[u8],
         now: Instant,
+        on_key: &mut dyn FnMut(Key) -> bool,
     ) -> Vec<InputAction> {
         let mut bytes = std::mem::take(&mut self.pending);
         self.pending_since = None;
@@ -1318,12 +1266,11 @@ impl InputRouter {
                 TerminalKeyParse::Sequence { len, logical } => {
                     self.route_key(
                         escape_key,
-                        form_active,
                         &bytes[offset..offset + len],
                         logical,
-                        true,
                         &mut actions,
                         &mut remote,
+                        on_key,
                     );
                     offset += len;
                 }
@@ -1331,12 +1278,11 @@ impl InputRouter {
                     let byte = bytes[offset];
                     self.route_key(
                         escape_key,
-                        form_active,
                         &bytes[offset..offset + 1],
                         Some(byte),
-                        false,
                         &mut actions,
                         &mut remote,
+                        on_key,
                     );
                     offset += 1;
                 }
@@ -1349,8 +1295,8 @@ impl InputRouter {
     fn flush_expired(
         &mut self,
         escape_key: EscapeKey,
-        form_active: bool,
         now: Instant,
+        on_key: &mut dyn FnMut(Key) -> bool,
     ) -> Vec<InputAction> {
         if self
             .pending_since
@@ -1366,12 +1312,11 @@ impl InputRouter {
         for byte in pending {
             self.route_key(
                 escape_key,
-                form_active,
                 &[byte],
                 Some(byte),
-                false,
                 &mut actions,
                 &mut remote,
+                on_key,
             );
         }
         flush_remote(&mut actions, &mut remote);
@@ -1388,101 +1333,61 @@ impl InputRouter {
             .unwrap_or(LOOP_TICK)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn route_key(
         &mut self,
         escape_key: EscapeKey,
-        form_active: bool,
         encoded: &[u8],
         logical: Option<u8>,
-        terminal_sequence: bool,
         actions: &mut Vec<InputAction>,
         remote: &mut Vec<u8>,
+        on_key: &mut dyn FnMut(Key) -> bool,
     ) {
-        let Some(byte) = logical else {
-            if self.mode == InputMode::Passthrough {
-                remote.extend_from_slice(encoded);
-            }
-            return;
-        };
-
-        match self.mode {
-            InputMode::Passthrough if escape_key.byte() == Some(byte) => {
+        if self.mode == InputMode::Passthrough {
+            if logical.is_some() && escape_key.byte() == logical {
                 flush_remote(actions, remote);
                 self.mode = InputMode::Palette;
                 actions.push(InputAction::OpenPalette);
-            }
-            InputMode::Passthrough => remote.extend_from_slice(encoded),
-            InputMode::Palette if form_active && byte == b'\x1b' => {
-                actions.push(InputAction::CancelForm);
-            }
-            InputMode::Palette if form_active && byte == b'\t' => {
-                actions.push(InputAction::FormNext);
-            }
-            InputMode::Palette if form_active && matches!(byte, b'\r' | b'\n') => {
-                actions.push(InputAction::SubmitForm);
-            }
-            InputMode::Palette if form_active && matches!(byte, b'\x08' | b'\x7f') => {
-                actions.push(InputAction::FormBackspace);
-            }
-            InputMode::Palette if form_active => {
-                actions.push(InputAction::FormChar(byte));
-            }
-            InputMode::Palette if escape_key.byte() == Some(byte) => {
-                self.mode = InputMode::Passthrough;
-                actions.push(InputAction::ClosePalette);
+            } else {
                 remote.extend_from_slice(encoded);
             }
-            InputMode::Palette if matches!(byte, b'q' | b'Q' | b'\x1b' | b'\r' | b'\n') => {
-                self.mode = InputMode::Passthrough;
-                actions.push(InputAction::ClosePalette);
+            return;
+        }
+
+        if let Some(paste) = &mut self.paste {
+            if keys::decode(encoded) == Some(Decoded::PasteEnd) {
+                let text = String::from_utf8_lossy(paste).into_owned();
+                self.paste = None;
+                self.menu_key(Key::Paste(text), actions, on_key);
+            } else if paste.len() < MAX_PASTE_LEN {
+                paste.extend_from_slice(encoded);
             }
-            InputMode::Palette if matches!(byte, b'y' | b'Y') => {
-                actions.push(InputAction::ApprovePending);
-            }
-            InputMode::Palette if matches!(byte, b'n' | b'N') => {
-                actions.push(InputAction::RejectPending);
-            }
-            InputMode::Palette if matches!(byte, b'f' | b'F') => {
-                actions.push(InputAction::BeginForward);
-            }
-            InputMode::Palette if matches!(byte, b'u' | b'U') => {
-                actions.push(InputAction::BeginUpload);
-            }
-            InputMode::Palette if matches!(byte, b'd' | b'D') => {
-                actions.push(InputAction::BeginDownload);
-            }
-            InputMode::Palette if matches!(byte, b'm' | b'M') => {
-                actions.push(InputAction::BeginSync);
-            }
-            InputMode::Palette if matches!(byte, b's' | b'S') => {
-                actions.push(InputAction::StopService);
-            }
-            InputMode::Palette if matches!(byte, b'r' | b'R') => {
-                actions.push(InputAction::RestartService);
-            }
-            InputMode::Palette if matches!(byte, b'p' | b'P') => {
-                actions.push(InputAction::PauseService);
-            }
-            InputMode::Palette if matches!(byte, b'e' | b'E') => {
-                actions.push(InputAction::ResumeService);
-            }
-            InputMode::Palette if matches!(byte, b't' | b'T') => {
-                actions.push(InputAction::TerminateService);
-            }
-            InputMode::Palette if matches!(byte, b'j' | b'J') => {
-                actions.push(InputAction::NextService);
-            }
-            InputMode::Palette if matches!(byte, b'k' | b'K') => {
-                actions.push(InputAction::PreviousService);
-            }
-            InputMode::Palette if terminal_sequence => {
-                // Ignore unsupported enhanced keys while the local menu owns
-                // the terminal instead of leaking their bytes remotely.
-            }
-            InputMode::Palette => {
-                // Future service forms will extend this tiny state machine.
-            }
+            return;
+        }
+        if logical.is_some() && escape_key.byte() == logical {
+            // The prefix pressed again closes the menu and sends it
+            // literally, so the remote side can still receive that key.
+            self.mode = InputMode::Passthrough;
+            actions.push(InputAction::ClosePalette);
+            remote.extend_from_slice(encoded);
+            return;
+        }
+        match keys::decode(encoded) {
+            Some(Decoded::Key(key)) => self.menu_key(key, actions, on_key),
+            Some(Decoded::PasteStart) => self.paste = Some(Vec::new()),
+            // Unsupported keys are dropped rather than leaked remotely.
+            Some(Decoded::PasteEnd) | None => {}
+        }
+    }
+
+    fn menu_key(
+        &mut self,
+        key: Key,
+        actions: &mut Vec<InputAction>,
+        on_key: &mut dyn FnMut(Key) -> bool,
+    ) {
+        if on_key(key) {
+            self.mode = InputMode::Passthrough;
+            actions.push(InputAction::ClosePalette);
         }
     }
 }
@@ -1500,12 +1405,47 @@ enum TerminalKeyParse {
     Sequence { len: usize, logical: Option<u8> },
 }
 
+/// Splits one input unit off the front of `input`: a single byte, a
+/// complete UTF-8 character, an SS3 (`ESC O x`) key, or a complete CSI
+/// sequence. `logical` is the control byte an enhanced-keyboard sequence
+/// stands for, used to recognize the menu prefix.
 fn parse_terminal_key(input: &[u8]) -> TerminalKeyParse {
-    if input.first() != Some(&b'\x1b') {
+    let Some(&first) = input.first() else {
+        return TerminalKeyParse::Incomplete;
+    };
+    if (0xc2..=0xf4).contains(&first) {
+        let need = match first {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            _ => 4,
+        };
+        let available = input.len().min(need);
+        if !input[1..available].iter().all(|byte| byte & 0xc0 == 0x80) {
+            return TerminalKeyParse::Byte;
+        }
+        if input.len() < need {
+            return TerminalKeyParse::Incomplete;
+        }
+        return TerminalKeyParse::Sequence {
+            len: need,
+            logical: None,
+        };
+    }
+    if first != b'\x1b' {
         return TerminalKeyParse::Byte;
     }
     if input.len() == 1 {
         return TerminalKeyParse::Incomplete;
+    }
+    if input[1] == b'O' {
+        return if input.len() < 3 {
+            TerminalKeyParse::Incomplete
+        } else {
+            TerminalKeyParse::Sequence {
+                len: 3,
+                logical: None,
+            }
+        };
     }
     if input[1] != b'[' {
         return TerminalKeyParse::Byte;
@@ -1579,24 +1519,35 @@ fn decode_terminal_key(codepoint: u32, modifiers: u32) -> Option<u8> {
     }
 }
 
+/// Test stand-in for the menu: records every key and closes on the keys the
+/// home screen closes on.
 #[cfg(test)]
-fn route_input(
+fn route_input_keys(
     mode: &mut InputMode,
     escape_key: EscapeKey,
-    form_active: bool,
     input: &[u8],
-) -> Vec<InputAction> {
+) -> (Vec<InputAction>, Vec<Key>) {
     let mut router = InputRouter {
         mode: *mode,
         ..InputRouter::default()
     };
-    let actions = router.route(escape_key, form_active, input, Instant::now());
+    let mut keys = Vec::new();
+    let actions = router.route(escape_key, input, Instant::now(), &mut |key: Key| {
+        let close = matches!(key, Key::Char('q') | Key::Esc | Key::Enter);
+        keys.push(key);
+        close
+    });
     assert!(
         router.pending.is_empty(),
         "test input ended in a partial sequence"
     );
     *mode = router.mode;
-    actions
+    (actions, keys)
+}
+
+#[cfg(test)]
+fn route_input(mode: &mut InputMode, escape_key: EscapeKey, input: &[u8]) -> Vec<InputAction> {
+    route_input_keys(mode, escape_key, input).0
 }
 
 #[derive(Default)]
@@ -1984,463 +1935,13 @@ fn draw_palette(
 ) -> anyhow::Result<()> {
     terminal
         .draw(|frame| {
-            let area = frame.area();
-            if overlay_enabled {
-                terminal_model.render(frame, area);
-                draw_overlay_palette(frame, area, daemon, escape_key);
-                return;
-            }
-            let [top, body, footer] = Layout::vertical([
-                Constraint::Length(3),
-                Constraint::Min(6),
-                Constraint::Length(3),
-            ])
-            .areas(area);
-
-            let heading = Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "Beams local menu",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!(
-                    " — {}@{} ({})",
-                    info.login, info.beam_id, info.beam_uuid
-                )),
-            ]))
-            .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL));
-            frame.render_widget(heading, top);
-
-            let daemon_color = if daemon.connected {
-                Color::Green
-            } else {
-                Color::Yellow
-            };
-            let client_id = daemon.client_id.as_deref().unwrap_or("-");
-            let mut body_text = vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "The managed SSH session is active.",
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(vec![
-                    Span::raw("local daemon: "),
-                    Span::styled(&daemon.message, Style::default().fg(daemon_color)),
-                ]),
-                Line::from(format!("client id: {client_id}")),
-                Line::from(format!(
-                    "{} frontend(s), {} request(s), {} service(s), {} connected bridge(s)",
-                    daemon.frontends,
-                    daemon.requests,
-                    daemon.services,
-                    daemon.connected_bridges()
-                )),
-            ];
-            if let Some(request) = daemon.pending_request() {
-                body_text.push(Line::from(""));
-                body_text.push(Line::from(Span::styled(
-                    "Remote request awaiting approval",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                if let Some(service_request) = &request.request {
-                    match &service_request.kind {
-                        ServiceRequestKind::LocalPortForward {
-                            remote_host,
-                            remote_port,
-                            local_port,
-                        } => {
-                            body_text.push(Line::from(format!(
-                                "local port {} → {}:{} in the Beam",
-                                local_port
-                                    .map(|port| port.to_string())
-                                    .unwrap_or_else(|| "automatic".to_string()),
-                                remote_host,
-                                remote_port
-                            )));
-                        }
-                        ServiceRequestKind::FileCopy {
-                            direction,
-                            remote_path,
-                            local_path_hint,
-                            overwrite,
-                        } => {
-                            body_text.push(Line::from(format!(
-                                "{:?} {} ↔ {} ({:?}); choose/confirm the workstation path locally",
-                                direction,
-                                local_path_hint.as_deref().unwrap_or("workstation path"),
-                                remote_path,
-                                overwrite
-                            )));
-                        }
-                        ServiceRequestKind::FolderSync {
-                            remote_path,
-                            local_path_hint,
-                            mode,
-                            ignore_vcs,
-                            ignores,
-                        } => {
-                            body_text.push(Line::from(format!(
-                                "sync {} ↔ {} ({mode:?}, VCS ignored: {ignore_vcs})",
-                                local_path_hint
-                                    .as_deref()
-                                    .unwrap_or("workstation directory"),
-                                remote_path
-                            )));
-                            if !ignores.is_empty() {
-                                body_text.push(Line::from(format!(
-                                    "ignore rules: {}",
-                                    ignores.join(", ")
-                                )));
-                            }
-                        }
-                    }
-                } else if let Some(action) = &request.action {
-                    body_text.push(Line::from(format!(
-                        "{:?} service {}",
-                        action.action, action.service_id
-                    )));
-                } else {
-                    body_text.push(Line::from(format!("service: {}", request.kind)));
-                }
-                body_text.push(Line::from("Press y to approve or n to reject."));
-            }
-            let services = daemon
-                .service_records
-                .values()
-                .filter(|service| service.beam_uuid == info.beam_uuid)
-                .collect::<Vec<_>>();
-            if !services.is_empty() {
-                body_text.push(Line::from(""));
-                body_text.push(Line::from(Span::styled(
-                    "Local services",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                let selected = daemon.selected_service.min(services.len() - 1);
-                for (index, service) in services.iter().enumerate() {
-                    let marker = if index == selected { "›" } else { " " };
-                    let endpoint = match &service.spec {
-                        Some(ServiceRequestKind::LocalPortForward {
-                            remote_host,
-                            remote_port,
-                            local_port,
-                        }) => format!(
-                            "127.0.0.1:{} → {}:{}",
-                            local_port
-                                .map(|port| port.to_string())
-                                .unwrap_or_else(|| "?".to_string()),
-                            remote_host,
-                            remote_port
-                        ),
-                        Some(ServiceRequestKind::FileCopy {
-                            direction,
-                            remote_path,
-                            local_path_hint,
-                            ..
-                        }) => format!(
-                            "{:?} {} ↔ {}",
-                            direction,
-                            local_path_hint.as_deref().unwrap_or("workstation path"),
-                            remote_path
-                        ),
-                        Some(ServiceRequestKind::FolderSync {
-                            remote_path,
-                            local_path_hint,
-                            mode,
-                            ..
-                        }) => format!(
-                            "sync {} ↔ {} ({mode:?})",
-                            local_path_hint
-                                .as_deref()
-                                .unwrap_or("workstation directory"),
-                            remote_path
-                        ),
-                        None => service.kind.clone(),
-                    };
-                    body_text.push(Line::from(format!(
-                        "{marker} {endpoint} [{:?}]{}",
-                        service.status,
-                        service
-                            .message
-                            .as_deref()
-                            .map(|message| format!(" — {message}"))
-                            .unwrap_or_default()
-                    )));
-                }
-            }
-            body_text.push(Line::from(""));
-            body_text.push(Line::from(
-                "Remote output continues to be drained while this menu is open.",
-            ));
-            frame.render_widget(
-                Paragraph::new(body_text)
-                    .alignment(Alignment::Center)
-                    .block(Block::default().borders(Borders::ALL).title("connection")),
-                body,
-            );
-
-            let literal = match escape_key {
-                EscapeKey::Byte(_) => {
-                    format!("{} again: send it remotely  •  ", escape_key.label())
-                }
-                EscapeKey::Disabled => String::new(),
-            };
-            let decision_keys = if daemon.pending_request().is_some() {
-                "y: approve  •  n: reject  •  "
-            } else {
-                ""
-            };
-            let service_keys = if daemon.form_active() {
-                ""
-            } else {
-                "f: forward  •  m: sync  •  u/d: copy  •  j/k: select  •  s/r/p/e/t: control  •  "
-            };
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "{decision_keys}{service_keys}{literal}q / Esc / Enter: close"
-                ))
-                .alignment(Alignment::Center)
-                .block(Block::default().borders(Borders::ALL)),
-                footer,
-            );
-
-            if let Some(form) = &daemon.forward_form {
-                let popup = centered_rect(area, 64, 9);
-                let selected = Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD);
-                let normal = Style::default();
-                let form_text = vec![
-                    Line::from(""),
-                    Line::from(vec![
-                        Span::styled(
-                            if form.field == 0 {
-                                "› remote port: "
-                            } else {
-                                "  remote port: "
-                            },
-                            if form.field == 0 { selected } else { normal },
-                        ),
-                        Span::raw(&form.remote_port),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            if form.field == 1 {
-                                "› local port (empty = automatic): "
-                            } else {
-                                "  local port (empty = automatic): "
-                            },
-                            if form.field == 1 { selected } else { normal },
-                        ),
-                        Span::raw(&form.local_port),
-                    ]),
-                    Line::from(""),
-                    Line::from("Tab changes field  •  Enter creates  •  Esc cancels"),
-                ];
-                frame.render_widget(RatatuiClear, popup);
-                frame.render_widget(
-                    Paragraph::new(form_text).alignment(Alignment::Left).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(" Create local port forward "),
-                    ),
-                    popup,
-                );
-            }
-            if let Some(form) = &daemon.copy_form {
-                let popup = centered_rect(area, 72, 11);
-                let selected = Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD);
-                let normal = Style::default();
-                let form_text = vec![
-                    Line::from(""),
-                    Line::from(vec![
-                        Span::styled(
-                            if form.field == 0 {
-                                "› workstation path: "
-                            } else {
-                                "  workstation path: "
-                            },
-                            if form.field == 0 { selected } else { normal },
-                        ),
-                        Span::raw(&form.local_path),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            if form.field == 1 {
-                                "› Beam path: "
-                            } else {
-                                "  Beam path: "
-                            },
-                            if form.field == 1 { selected } else { normal },
-                        ),
-                        Span::raw(&form.remote_path),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            if form.field == 2 {
-                                "› overwrite: "
-                            } else {
-                                "  overwrite: "
-                            },
-                            if form.field == 2 { selected } else { normal },
-                        ),
-                        Span::raw(format!("{:?} (space toggles)", form.overwrite)),
-                    ]),
-                    Line::from(""),
-                    Line::from("Tab changes field  •  Enter starts  •  Esc cancels"),
-                ];
-                frame.render_widget(RatatuiClear, popup);
-                frame.render_widget(
-                    Paragraph::new(form_text).alignment(Alignment::Left).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(format!(" {:?} file ", form.direction)),
-                    ),
-                    popup,
-                );
-            }
-            if let Some(form) = &daemon.copy_approval_form {
-                let popup = centered_rect(area, 72, 8);
-                let form_text = vec![
-                    Line::from(""),
-                    Line::from("The Beam supplied only a hint. Confirm the real local path:"),
-                    Line::from(vec![
-                        Span::styled(
-                            "› workstation path: ",
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(&form.local_path),
-                    ]),
-                    Line::from(""),
-                    Line::from("Enter approves  •  Esc cancels without deciding"),
-                ];
-                frame.render_widget(RatatuiClear, popup);
-                frame.render_widget(
-                    Paragraph::new(form_text).alignment(Alignment::Left).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(" Confirm file-copy path "),
-                    ),
-                    popup,
-                );
-            }
-            if let Some(form) = &daemon.sync_form {
-                let popup = centered_rect(area, 82, 15);
-                let selected = Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD);
-                let normal = Style::default();
-                let label = |field, text| {
-                    Span::styled(
-                        if form.field == field {
-                            format!("› {text}")
-                        } else {
-                            format!("  {text}")
-                        },
-                        if form.field == field {
-                            selected
-                        } else {
-                            normal
-                        },
-                    )
-                };
-                let form_text = vec![
-                    Line::from(""),
-                    Line::from(vec![
-                        label(0, "workstation directory: "),
-                        Span::raw(&form.local_path),
-                    ]),
-                    Line::from(vec![
-                        label(1, "Beam directory: "),
-                        Span::raw(&form.remote_path),
-                    ]),
-                    Line::from(vec![
-                        label(2, "mode: "),
-                        Span::raw(format!("{:?} (space cycles)", form.mode)),
-                    ]),
-                    Line::from(vec![
-                        label(3, "ignore VCS metadata: "),
-                        Span::raw(format!("{} (space toggles)", form.ignore_vcs)),
-                    ]),
-                    Line::from(vec![
-                        label(4, "ignore rules (comma-separated): "),
-                        Span::raw(&form.ignores),
-                    ]),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        sync_mode_warning(form.mode),
-                        Style::default().fg(if form.mode == FolderSyncMode::TwoWaySafe {
-                            Color::Green
-                        } else {
-                            Color::Yellow
-                        }),
-                    )),
-                    Line::from("Both directories must already exist."),
-                    Line::from("Tab changes field  •  Enter creates  •  Esc cancels"),
-                ];
-                frame.render_widget(RatatuiClear, popup);
-                frame.render_widget(
-                    Paragraph::new(form_text).alignment(Alignment::Left).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(" Create Mutagen folder sync "),
-                    ),
-                    popup,
-                );
-            }
-            if let Some(form) = &daemon.sync_approval_form {
-                let mode = daemon
-                    .pending_request()
-                    .and_then(|request| request.request.as_ref())
-                    .and_then(|request| match request.kind {
-                        ServiceRequestKind::FolderSync { mode, .. } => Some(mode),
-                        _ => None,
-                    })
-                    .unwrap_or(FolderSyncMode::TwoWaySafe);
-                let popup = centered_rect(area, 82, 10);
-                let form_text = vec![
-                    Line::from(""),
-                    Line::from("The Beam supplied only a hint. Confirm the real local directory:"),
-                    Line::from(vec![
-                        Span::styled(
-                            "› workstation directory: ",
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(&form.local_path),
-                    ]),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        sync_mode_warning(mode),
-                        Style::default().fg(if mode == FolderSyncMode::TwoWaySafe {
-                            Color::Green
-                        } else {
-                            Color::Yellow
-                        }),
-                    )),
-                    Line::from("Enter approves  •  Esc cancels without deciding"),
-                ];
-                frame.render_widget(RatatuiClear, popup);
-                frame.render_widget(
-                    Paragraph::new(form_text).alignment(Alignment::Left).block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(" Confirm folder-sync path "),
-                    ),
-                    popup,
-                );
-            }
+            ui::draw(
+                frame,
+                info,
+                escape_key,
+                daemon,
+                overlay_enabled.then_some(terminal_model),
+            )
         })
         .context("drawing local menu")?;
     Ok(())
@@ -2448,198 +1949,6 @@ fn draw_palette(
 
 fn new_palette_terminal() -> anyhow::Result<PaletteTerminal> {
     Terminal::new(CrosstermBackend::new(io::stdout())).context("creating local menu terminal")
-}
-
-fn draw_overlay_palette(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    daemon: &DaemonView,
-    escape_key: EscapeKey,
-) {
-    let approval = daemon.pending_request();
-    let popup = centered_rect(
-        area,
-        if approval.is_some() { 78 } else { 82 },
-        if approval.is_some() { 12 } else { 16 },
-    );
-    let mut lines = Vec::new();
-
-    if let Some(request) = approval {
-        lines.push(Line::from(Span::styled(
-            "A remote service is requesting permission",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(""));
-        if let Some(service_request) = &request.request {
-            match &service_request.kind {
-                ServiceRequestKind::LocalPortForward {
-                    remote_host,
-                    remote_port,
-                    local_port,
-                } => lines.push(Line::from(format!(
-                    "Forward {}:{} to local port {}.",
-                    remote_host,
-                    remote_port,
-                    local_port
-                        .map(|port| port.to_string())
-                        .unwrap_or_else(|| "automatic".to_string())
-                ))),
-                ServiceRequestKind::FileCopy {
-                    direction,
-                    remote_path,
-                    local_path_hint,
-                    overwrite,
-                } => lines.push(Line::from(format!(
-                    "{direction:?} {} ↔ {} ({overwrite:?})",
-                    local_path_hint.as_deref().unwrap_or("workstation path"),
-                    remote_path
-                ))),
-                ServiceRequestKind::FolderSync {
-                    remote_path,
-                    local_path_hint,
-                    mode,
-                    ..
-                } => lines.push(Line::from(format!(
-                    "Sync {} ↔ {} ({mode:?})",
-                    local_path_hint
-                        .as_deref()
-                        .unwrap_or("workstation directory"),
-                    remote_path
-                ))),
-            }
-        } else if let Some(action) = &request.action {
-            lines.push(Line::from(format!(
-                "{:?} service {}",
-                action.action, action.service_id
-            )));
-        } else {
-            lines.push(Line::from(format!("service: {}", request.kind)));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from("y approve  •  n reject  •  Esc close"));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "Beam background services",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(format!(
-            "local daemon: {}",
-            daemon.message
-        )));
-        if let Some(client_id) = &daemon.client_id {
-            lines.push(Line::from(format!("client id: {client_id}")));
-        }
-        lines.push(Line::from(""));
-
-        if let Some(form) = &daemon.copy_approval_form {
-            lines.push(Line::from("Confirm workstation path for file copy:"));
-            lines.push(Line::from(format!("  {}", form.local_path)));
-            lines.push(Line::from(""));
-            lines.push(Line::from("Enter approve  •  Esc cancel"));
-        } else if let Some(form) = &daemon.sync_approval_form {
-            lines.push(Line::from("Confirm workstation directory for sync:"));
-            lines.push(Line::from(format!("  {}", form.local_path)));
-            lines.push(Line::from(""));
-            lines.push(Line::from("Enter approve  •  Esc cancel"));
-        } else if let Some(form) = &daemon.forward_form {
-            lines.push(Line::from(format!(
-                "remote port: {}",
-                if form.remote_port.is_empty() {
-                    "?"
-                } else {
-                    &form.remote_port
-                }
-            )));
-            lines.push(Line::from(format!(
-                "local port (empty = automatic): {}",
-                if form.local_port.is_empty() {
-                    "automatic"
-                } else {
-                    &form.local_port
-                }
-            )));
-            lines.push(Line::from("Tab changes field  •  Enter creates  •  Esc cancels"));
-        } else if let Some(form) = &daemon.copy_form {
-            lines.push(Line::from(format!(
-                "{:?} file — {} ↔ {}",
-                form.direction, form.local_path, form.remote_path
-            )));
-        } else if let Some(form) = &daemon.sync_form {
-            lines.push(Line::from(format!(
-                "Sync — {} ↔ {} ({:?})",
-                form.local_path, form.remote_path, form.mode
-            )));
-        } else {
-            let services = daemon
-                .service_records
-                .values()
-                .filter(|service| {
-                    daemon.beam_uuid.as_deref() == Some(service.beam_uuid.as_str())
-                })
-                .collect::<Vec<_>>();
-            if services.is_empty() {
-                lines.push(Line::from("No background services are running."));
-            } else {
-                for (index, service) in services.iter().take(8).enumerate() {
-                    let marker = if index == daemon.selected_service {
-                        "›"
-                    } else {
-                        " "
-                    };
-                    let description = service
-                        .spec
-                        .as_ref()
-                        .map(|spec| format!("{spec:?}"))
-                        .unwrap_or_else(|| service.kind.clone());
-                    lines.push(Line::from(format!(
-                        "{marker} {description} [{:?}]",
-                        service.status
-                    )));
-                }
-            }
-        }
-        lines.push(Line::from(""));
-        let literal = match escape_key {
-            EscapeKey::Byte(_) => format!("{} again sends it remotely  •  ", escape_key.label()),
-            EscapeKey::Disabled => String::new(),
-        };
-        lines.push(Line::from(format!(
-            "f forward  •  m sync  •  u/d copy  •  j/k select  •  {}q / Esc close",
-            literal
-        )));
-    }
-
-    frame.render_widget(RatatuiClear, popup);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .alignment(Alignment::Left)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(if approval.is_some() {
-                        " Approve remote request "
-                    } else {
-                        " Beam background services "
-                    }),
-            ),
-        popup,
-    );
-}
-
-fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    }
 }
 
 #[cfg(test)]
@@ -2663,7 +1972,7 @@ mod tests {
         let mut mode = InputMode::Passthrough;
         let input = b"\x1b[<0;12;9Mhello\x00\xff";
         assert_eq!(
-            route_input(&mut mode, EscapeKey::default(), false, input),
+            route_input(&mut mode, EscapeKey::default(), input),
             vec![InputAction::Remote(input.to_vec())]
         );
         assert_eq!(mode, InputMode::Passthrough);
@@ -2673,13 +1982,13 @@ mod tests {
     fn prefix_opens_palette_and_second_prefix_sends_literal() {
         let mut mode = InputMode::Passthrough;
         assert_eq!(
-            route_input(&mut mode, EscapeKey::default(), false, b"\x1d"),
+            route_input(&mut mode, EscapeKey::default(), b"\x1d"),
             vec![InputAction::OpenPalette]
         );
         assert_eq!(mode, InputMode::Palette);
 
         assert_eq!(
-            route_input(&mut mode, EscapeKey::default(), false, b"\x1d"),
+            route_input(&mut mode, EscapeKey::default(), b"\x1d"),
             vec![InputAction::ClosePalette, InputAction::Remote(vec![0x1d])]
         );
         assert_eq!(mode, InputMode::Passthrough);
@@ -2690,13 +1999,13 @@ mod tests {
         let kitty_ctrl_bracket = b"\x1b[93;5u";
         let mut mode = InputMode::Passthrough;
         assert_eq!(
-            route_input(&mut mode, EscapeKey::default(), false, kitty_ctrl_bracket),
+            route_input(&mut mode, EscapeKey::default(), kitty_ctrl_bracket),
             vec![InputAction::OpenPalette]
         );
         assert_eq!(mode, InputMode::Palette);
 
         assert_eq!(
-            route_input(&mut mode, EscapeKey::default(), false, kitty_ctrl_bracket),
+            route_input(&mut mode, EscapeKey::default(), kitty_ctrl_bracket),
             vec![
                 InputAction::ClosePalette,
                 InputAction::Remote(kitty_ctrl_bracket.to_vec()),
@@ -2710,13 +2019,15 @@ mod tests {
         let now = Instant::now();
         let mut router = InputRouter::default();
         assert_eq!(
-            router.route(EscapeKey::Byte(b'\n'), false, b"\x1b[106;5u", now,),
+            router.route(EscapeKey::Byte(b'\n'), b"\x1b[106;5u", now, &mut |_| false),
             vec![InputAction::OpenPalette]
         );
 
         router.mode = InputMode::Passthrough;
         assert_eq!(
-            router.route(EscapeKey::Byte(b'\n'), false, b"\x1b[27;5;106~", now,),
+            router.route(EscapeKey::Byte(b'\n'), b"\x1b[27;5;106~", now, &mut |_| {
+                false
+            }),
             vec![InputAction::OpenPalette]
         );
     }
@@ -2726,7 +2037,7 @@ mod tests {
         let mut mode = InputMode::Passthrough;
         let input = b"\x1b[<0;12;9M\x1b[200~pasted\x1b[201~";
         assert_eq!(
-            route_input(&mut mode, EscapeKey::default(), false, input),
+            route_input(&mut mode, EscapeKey::default(), input),
             vec![InputAction::Remote(input.to_vec())]
         );
     }
@@ -2736,15 +2047,15 @@ mod tests {
         let now = Instant::now();
         let mut router = InputRouter::default();
         assert_eq!(
-            router.route(EscapeKey::default(), false, b"\x1b[93;", now),
+            router.route(EscapeKey::default(), b"\x1b[93;", now, &mut |_| false),
             Vec::<InputAction>::new()
         );
         assert_eq!(
             router.route(
                 EscapeKey::default(),
-                false,
                 b"5u",
                 now + Duration::from_millis(1),
+                &mut |_| false,
             ),
             vec![InputAction::OpenPalette]
         );
@@ -2752,7 +2063,7 @@ mod tests {
         router.mode = InputMode::Passthrough;
         let mouse = b"\x1b[<0;12;9M";
         assert_eq!(
-            router.route(EscapeKey::default(), false, mouse, now),
+            router.route(EscapeKey::default(), mouse, now, &mut |_| false),
             vec![InputAction::Remote(mouse.to_vec())]
         );
     }
@@ -2762,11 +2073,15 @@ mod tests {
         let now = Instant::now();
         let mut router = InputRouter::default();
         assert_eq!(
-            router.route(EscapeKey::default(), false, b"\x1b", now),
+            router.route(EscapeKey::default(), b"\x1b", now, &mut |_| false),
             Vec::<InputAction>::new()
         );
         assert_eq!(
-            router.flush_expired(EscapeKey::default(), false, now + INPUT_SEQUENCE_TIMEOUT,),
+            router.flush_expired(
+                EscapeKey::default(),
+                now + INPUT_SEQUENCE_TIMEOUT,
+                &mut |_| false
+            ),
             vec![InputAction::Remote(vec![b'\x1b'])]
         );
     }
@@ -2775,10 +2090,49 @@ mod tests {
     fn palette_routes_local_approval_keys_without_sending_them_remotely() {
         let mut mode = InputMode::Palette;
         assert_eq!(
-            route_input(&mut mode, EscapeKey::default(), false, b"yn"),
-            vec![InputAction::ApprovePending, InputAction::RejectPending]
+            route_input_keys(&mut mode, EscapeKey::default(), b"yn"),
+            (Vec::new(), vec![Key::Char('y'), Key::Char('n')])
         );
         assert_eq!(mode, InputMode::Palette);
+    }
+
+    #[test]
+    fn palette_decodes_arrows_utf8_and_bracketed_paste_into_keys() {
+        let mut mode = InputMode::Palette;
+        let (actions, keys) = route_input_keys(
+            &mut mode,
+            EscapeKey::default(),
+            "\x1b[A\x1bOB\x1b[Zé\x1b[200~a\x1db\x1b[201~".as_bytes(),
+        );
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(
+            keys,
+            vec![
+                Key::Up,
+                Key::Down,
+                Key::BackTab,
+                Key::Char('é'),
+                // The prefix inside a paste is text, not a menu close.
+                Key::Paste("a\x1db".to_string()),
+            ]
+        );
+        assert_eq!(mode, InputMode::Palette);
+    }
+
+    #[test]
+    fn passthrough_keeps_utf8_and_ss3_bytes_exact_across_reads() {
+        let now = Instant::now();
+        let mut router = InputRouter::default();
+        let bytes = "é\x1bOA".as_bytes();
+        assert_eq!(
+            router.route(EscapeKey::default(), &bytes[..1], now, &mut |_| false),
+            Vec::<InputAction>::new()
+        );
+        assert_eq!(
+            router.route(EscapeKey::default(), &bytes[1..], now, &mut |_| false),
+            vec![InputAction::Remote(bytes.to_vec())],
+            "the held lead byte is emitted with the rest of its character"
+        );
     }
 
     #[test]
@@ -2841,33 +2195,10 @@ mod tests {
     }
 
     #[test]
-    fn approval_takeover_guard_drops_buffered_actions_but_allows_close() {
-        let now = Instant::now();
-        let actions = vec![
-            InputAction::ApprovePending,
-            InputAction::BeginForward,
-            InputAction::ClosePalette,
-            InputAction::Remote(b"remote".to_vec()),
-        ];
-        assert_eq!(
-            guard_approval_takeover_input(
-                actions.clone(),
-                Some(now + APPROVAL_TAKEOVER_GUARD),
-                now,
-            ),
-            vec![InputAction::ClosePalette]
-        );
-        assert_eq!(
-            guard_approval_takeover_input(actions.clone(), Some(now), now),
-            actions
-        );
-    }
-
-    #[test]
     fn input_before_and_after_a_prefix_keeps_its_order() {
         let mut mode = InputMode::Passthrough;
         assert_eq!(
-            route_input(&mut mode, EscapeKey::default(), false, b"before\x1dqafter"),
+            route_input(&mut mode, EscapeKey::default(), b"before\x1dqafter"),
             vec![
                 InputAction::Remote(b"before".to_vec()),
                 InputAction::OpenPalette,
@@ -2882,7 +2213,7 @@ mod tests {
     fn disabled_prefix_is_pure_passthrough() {
         let mut mode = InputMode::Passthrough;
         assert_eq!(
-            route_input(&mut mode, EscapeKey::Disabled, false, b"a\x1dz"),
+            route_input(&mut mode, EscapeKey::Disabled, b"a\x1dz"),
             vec![InputAction::Remote(b"a\x1dz".to_vec())]
         );
         assert_eq!(mode, InputMode::Passthrough);
@@ -3009,5 +2340,287 @@ mod tests {
         let status = child.wait().unwrap();
         assert!(status.success());
         assert!(rest.contains("40 100"), "resized output: {rest:?}");
+    }
+
+    // ---- local menu: screens, forms, and rendering ----
+
+    fn managed_daemon() -> LocalDaemon {
+        LocalDaemon {
+            frontend: None,
+            unavailable: None,
+            managed_bridge: Some(ManagedBridge {
+                target: crate::bridge::Target {
+                    beam_id: "beam-a".to_string(),
+                    beam_uuid: "beam-a-uuid".to_string(),
+                    login: "beams".to_string(),
+                },
+                session_token: "token".to_string(),
+            }),
+            reconnect_after: Instant::now() + Duration::from_secs(3600),
+        }
+    }
+
+    fn service(id: &str, beam_uuid: &str, spec: serde_json::Value, status: &str) -> ServiceRecord {
+        serde_json::from_value(serde_json::json!({
+            "service_id": id,
+            "beam_uuid": beam_uuid,
+            "kind": spec["kind"],
+            "spec": spec,
+            "status": status,
+        }))
+        .unwrap()
+    }
+
+    fn forward_spec(remote_port: u16, local_port: u16) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "local_port_forward",
+            "remote_host": "127.0.0.1",
+            "remote_port": remote_port,
+            "local_port": local_port,
+        })
+    }
+
+    fn type_keys(view: &mut DaemonView, daemon: &mut LocalDaemon, text: &str) {
+        for ch in text.chars() {
+            view.handle_key(Key::Char(ch), daemon);
+        }
+    }
+
+    fn info() -> ConnectionInfo<'static> {
+        ConnectionInfo {
+            beam_id: "beam-a",
+            login: "beams",
+        }
+    }
+
+    fn render(
+        view: &DaemonView,
+        model: Option<&TerminalModel>,
+    ) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| ui::draw(frame, &info(), EscapeKey::default(), view, model))
+            .unwrap();
+        terminal
+    }
+
+    fn screen_text(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[test]
+    fn home_keys_open_forms_and_close_the_menu() {
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        assert!(!view.handle_key(Key::Char('f'), &mut daemon));
+        assert!(matches!(
+            view.screen,
+            Screen::Form {
+                kind: FormKind::Forward,
+                ..
+            }
+        ));
+        // `q` is text inside a form, not a close.
+        assert!(!view.handle_key(Key::Char('q'), &mut daemon));
+        assert!(!view.handle_key(Key::Esc, &mut daemon));
+        assert!(matches!(view.screen, Screen::Home));
+        assert!(view.handle_key(Key::Char('q'), &mut daemon));
+        assert!(view.handle_key(Key::Esc, &mut daemon));
+    }
+
+    #[test]
+    fn forward_form_reports_field_errors_then_daemon_errors_in_place() {
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        view.handle_key(Key::Char('f'), &mut daemon);
+        view.handle_key(Key::Enter, &mut daemon);
+        let Screen::Form { form, .. } = &view.screen else {
+            panic!("form closed on a validation error");
+        };
+        assert_eq!(form.fields[0].error.as_deref(), Some("a port is required"));
+
+        type_keys(&mut view, &mut daemon, "99999");
+        view.handle_key(Key::Enter, &mut daemon);
+        let Screen::Form { form, .. } = &view.screen else {
+            panic!("form closed on a validation error");
+        };
+        assert_eq!(form.fields[0].error.as_deref(), Some("ports are 1-65535"));
+
+        for _ in 0..5 {
+            view.handle_key(Key::Backspace, &mut daemon);
+        }
+        type_keys(&mut view, &mut daemon, "8080");
+        view.handle_key(Key::Enter, &mut daemon);
+        let Screen::Form { form, .. } = &view.screen else {
+            panic!("form closed although the daemon is unavailable");
+        };
+        assert!(!form.has_errors());
+        assert_eq!(
+            form.error.as_deref(),
+            Some("the local daemon connection is unavailable")
+        );
+        assert_eq!(form.text("remote_port"), "8080", "input survives the error");
+    }
+
+    #[test]
+    fn service_selection_is_clamped_for_both_display_and_actions() {
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        for (id, uuid) in [
+            ("svc-1", "beam-a-uuid"),
+            ("svc-2", "beam-a-uuid"),
+            ("other", "beam-b-uuid"),
+        ] {
+            view.service_records.insert(
+                id.to_string(),
+                service(id, uuid, forward_spec(80, 8080), "running"),
+            );
+        }
+        for _ in 0..5 {
+            view.handle_key(Key::Down, &mut daemon);
+        }
+        assert_eq!(view.selected_index(), 1);
+        assert_eq!(view.selected_service().unwrap().service_id, "svc-2");
+        view.handle_key(Key::Up, &mut daemon);
+        assert_eq!(view.selected_index(), 0);
+
+        view.selected_service = 1;
+        view.service_records.remove("svc-2");
+        assert_eq!(view.selected_service().unwrap().service_id, "svc-1");
+        let text = screen_text(&render(&view, None));
+        assert!(text.contains("› forward"), "{text}");
+    }
+
+    #[test]
+    fn home_screen_renders_requests_and_services_in_plain_language() {
+        let daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        view.client_id = Some("client-123".to_string());
+        view.service_records.insert(
+            "svc-1".to_string(),
+            service("svc-1", "beam-a-uuid", forward_spec(3000, 13000), "running"),
+        );
+        view.request_records.insert(
+            "req-1".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "request_id": "req-1",
+                "beam_uuid": "beam-a-uuid",
+                "kind": "local_port_forward",
+                "status": "pending_approval",
+                "request": {"request_id": "req-1", "kind": forward_spec(5432, 15432)},
+            }))
+            .unwrap(),
+        );
+        let text = screen_text(&render(&view, None));
+        for expected in [
+            "Beams local menu",
+            "client-123",
+            "Approval needed",
+            "Forward workstation port 15432 to 127.0.0.1:5432 in the Beam.",
+            "localhost:13000 → 127.0.0.1:3000",
+            "running",
+            "y approve",
+            "s stop",
+            "beams@beam-a",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+        }
+        assert!(
+            !text.contains("LocalPortForward"),
+            "debug output leaked:\n{text}"
+        );
+    }
+
+    #[test]
+    fn sync_form_shows_every_field_with_the_cursor_in_the_focused_one() {
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        view.handle_key(Key::Char('m'), &mut daemon);
+        type_keys(&mut view, &mut daemon, "/nonexistent-beams-dir");
+        let mut terminal = render(&view, None);
+        let text = screen_text(&terminal);
+        for expected in [
+            "Sync a folder with the Beam",
+            "Workstation dir",
+            "/nonexistent-beams-dir",
+            "Beam dir",
+            "two-way, safe",
+            "Ignore VCS",
+            "[x] skip .git",
+            "Ignore rules",
+            "comma-separated",
+            "Both directories must already exist.",
+            "Enter create",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+        }
+        let cursor = terminal.get_cursor_position().unwrap();
+        let row: String = (0..100)
+            .map(|x| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((x, cursor.y))
+                    .unwrap()
+                    .symbol()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            row.contains("Workstation dir"),
+            "cursor on wrong row: {row}"
+        );
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((cursor.x - 1, cursor.y))
+                .unwrap()
+                .symbol(),
+            "r",
+            "cursor sits just after the typed text"
+        );
+
+        // Moving to the mode choice shows its warning for non-default modes.
+        view.handle_key(Key::Tab, &mut daemon);
+        view.handle_key(Key::Tab, &mut daemon);
+        view.handle_key(Key::Right, &mut daemon);
+        let text = screen_text(&render(&view, None));
+        assert!(text.contains("‹ two-way, workstation wins ›"), "{text}");
+        assert!(
+            text.contains("Workstation content wins conflicts"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn overlay_mode_draws_the_dimmed_remote_screen_behind_the_same_dialog() {
+        let daemon = managed_daemon();
+        let view = DaemonView::new(&daemon);
+        let mut model = TerminalModel::new(PtySize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+        model.process(b"remote zellij content");
+        let terminal = render(&view, Some(&model));
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "r");
+        assert!(buffer
+            .cell((0, 0))
+            .unwrap()
+            .modifier
+            .contains(ratatui::style::Modifier::DIM));
+        assert!(screen_text(&terminal).contains("Beams local menu"));
     }
 }

@@ -606,6 +606,20 @@ bootstrap `Task`s.
   for OSC title and clipboard requests, bracketed paste, mouse encodings,
   alternate-screen transitions, wide/combining characters, resize, and
   input/query response behavior before considering this path for default use.
+- [x] Local menu overhaul: one renderer (`client/src/session/ui.rs`) for both
+  takeover and overlay modes (the overlay previously had a cut-down copy that
+  hid most copy/sync form fields and printed services with `{:?}`); a
+  generic form model (`session/form.rs`: text/number/toggle/choice fields,
+  focus, per-field errors) replacing five ad-hoc `Option<...Form>` structs;
+  real menu key decoding (`session/keys.rs`: arrows, Shift-Tab, Home/End,
+  Delete, readline chords, UTF-8, SS3 cursor keys, Kitty/modifyOtherKeys,
+  bracketed paste); a line editor with a visible cursor, horizontal
+  scrolling, and fish-style workstation path completion. Service selection
+  is clamped consistently for display and actions.
+- [ ] Local menu home screen: Enter still closes the menu instead of opening
+  an actions menu for the selected service, and `t` (terminate) acts without
+  a confirmation step. Consider a proper table and per-request queue view
+  when several approvals are pending (only the first is shown today).
 - [x] Phase 2: `beams daemon` is the single-instance per-user workstation
   daemon, auto-started by `beams ssh` (with `--no-client-daemon` as a
   troubleshooting escape hatch). `client/src/clientd.rs` provides a mode-0600

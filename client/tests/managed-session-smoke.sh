@@ -77,16 +77,11 @@ if [ "$STATUS" -ne 7 ]; then
     exit 1
 fi
 
-if [ "${BEAMS_TEST_OVERLAY:-0}" = 1 ]; then
-    strings "$TRANSCRIPT" | grep -q "Beam background services"
-else
-    strings "$TRANSCRIPT" | grep -q "Beams local menu"
-fi
-if [ "${BEAMS_TEST_OVERLAY:-0}" = 1 ]; then
-    strings "$TRANSCRIPT" | grep -q "automatic"
-else
-    strings "$TRANSCRIPT" | grep -q "local port (empty = automatic)"
-fi
+# Both modes share one renderer: the home dialog, then the forward form
+# with its "automatic" local-port placeholder.
+strings "$TRANSCRIPT" | grep -q "Beams local menu"
+strings "$TRANSCRIPT" | grep -q "Forward a Beam port"
+strings "$TRANSCRIPT" | grep -q "automatic"
 strings "$TRANSCRIPT" | grep -q "REMOTE READY"
 strings "$TRANSCRIPT" | grep -q "REMOTE TITLE"
 strings "$TRANSCRIPT" | grep -q "24 100"
