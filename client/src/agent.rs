@@ -94,6 +94,64 @@ impl Config {
         !self.allowed_keys.is_empty()
     }
 
+    /// Whether `config.toml` has an `[ssh_agent]` section at all (an empty
+    /// `allowed_keys` there is a deliberate "no"; a missing section means
+    /// the user was never asked).
+    pub fn configured() -> bool {
+        Self::path()
+            .ok()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+            .is_some_and(|doc| doc.get("ssh_agent").is_some())
+    }
+
+    /// Replaces `[ssh_agent] allowed_keys` in `config.toml`, keeping the
+    /// rest of the file (comments, other sections) as it was.
+    pub fn write_allowed_keys(keys: &[String]) -> anyhow::Result<PathBuf> {
+        let path = Self::path()?;
+        Self::write_allowed_keys_to(&path, keys)?;
+        Ok(path)
+    }
+
+    pub fn write_allowed_keys_to(path: &Path, keys: &[String]) -> anyhow::Result<()> {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+        let mut doc: toml_edit::DocumentMut =
+            text.parse().with_context(|| format!("parsing {}", path.display()))?;
+        if doc.get("ssh_agent").and_then(|item| item.as_table()).is_none() {
+            doc["ssh_agent"] = toml_edit::table();
+        }
+        let mut list = toml_edit::Array::new();
+        for key in keys {
+            list.push(key.as_str());
+        }
+        doc["ssh_agent"]["allowed_keys"] = toml_edit::value(list);
+        // Validate before replacing the file.
+        Self::parse(&doc.to_string()).context("the updated config would not parse")?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let tmp = path.with_extension("toml.tmp");
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&tmp)
+                .with_context(|| format!("writing {}", tmp.display()))?;
+            file.write_all(doc.to_string().as_bytes())?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+        Ok(())
+    }
+
     pub fn prompt_timeout(&self) -> Duration {
         self.prompt_timeout
             .map(Duration::from_secs)
@@ -106,22 +164,69 @@ impl Config {
     }
 }
 
-/// `beams agent-keys`: the keys in this terminal's agent, marked by
-/// whether Beams may use them, and how to allow one.
+/// This terminal's agent socket.
+pub fn own_agent_socket() -> Option<String> {
+    std::env::var("SSH_AUTH_SOCK").ok().filter(|s| !s.is_empty())
+}
+
+/// `beams agent-keys [--allow N|FP] [--deny N|FP]`: list the keys in this
+/// terminal's agent (numbered), marked by whether Beams may use them, and
+/// optionally change that.
+pub fn agent_keys_command(allow: Option<&str>, deny: Option<&str>) -> anyhow::Result<u8> {
+    if allow.is_some() || deny.is_some() {
+        let sock = own_agent_socket()
+            .context("SSH_AUTH_SOCK is not set: start an ssh-agent and add your key first")?;
+        let keys = local_identities(&sock)?;
+        let resolve = |choice: &str| -> anyhow::Result<String> {
+            if choice.starts_with("SHA256:") {
+                return Ok(choice.to_string());
+            }
+            let index: usize = choice.parse().with_context(|| format!("{choice:?} is neither a key number nor a fingerprint"))?;
+            keys.get(index.wrapping_sub(1))
+                .and_then(|key| agent_crypto::fingerprint(&key.key_blob))
+                .with_context(|| format!("no key number {index} in this agent (see `beams agent-keys`)"))
+        };
+        let mut allowed = Config::load()?.allowed_keys;
+        if let Some(choice) = allow {
+            let fingerprint = resolve(choice)?;
+            if !allowed.contains(&fingerprint) {
+                allowed.push(fingerprint.clone());
+            }
+            println!("Beams may now ask to use {fingerprint}.");
+        }
+        if let Some(choice) = deny {
+            let fingerprint = resolve(choice)?;
+            allowed.retain(|key| key != &fingerprint);
+            println!("Beams can no longer use {fingerprint}.");
+        }
+        let path = Config::write_allowed_keys(&allowed)?;
+        println!("Updated {}.", path.display());
+        // Running daemons re-read the config, but only push keys to Beams
+        // when a session attaches; nudge it so this applies now.
+        if let Ok(mut frontend) = crate::clientd::Frontend::connect(&crate::clientd::default_socket_path()?) {
+            let _ = frontend.refresh_agent_keys();
+        }
+        println!();
+    }
+    print_keys()
+}
+
+/// The keys in this terminal's agent, marked by whether Beams may use them,
+/// and how to allow one.
 pub fn print_keys() -> anyhow::Result<u8> {
     let path = Config::path()?;
     let config = Config::load()?;
-    let Some(sock) = std::env::var("SSH_AUTH_SOCK").ok().filter(|s| !s.is_empty()) else {
+    let Some(sock) = own_agent_socket() else {
         bail!("SSH_AUTH_SOCK is not set: start an ssh-agent and add your key first");
     };
     let keys = local_identities(&sock)?;
     if keys.is_empty() {
         println!("The agent at {sock} has no keys; add one with `ssh-add`.");
     }
-    for key in &keys {
+    for (index, key) in keys.iter().enumerate() {
         let fingerprint = agent_crypto::fingerprint(&key.key_blob).unwrap_or_else(|| "(unparsed key)".to_string());
         let mark = if config.allows(&key.key_blob) { "allowed" } else { "-" };
-        println!("{mark:8} {fingerprint}  {}", clean(&key.comment));
+        println!("{:>2}  {mark:8} {fingerprint}  {}", index + 1, clean(&key.comment));
     }
     for allowed in &config.allowed_keys {
         if !keys.iter().any(|k| agent_crypto::fingerprint(&k.key_blob).as_deref() == Some(allowed.as_str())) {
@@ -132,11 +237,9 @@ pub fn print_keys() -> anyhow::Result<u8> {
     if config.enabled() {
         println!("Beams may ask to use the allowed keys; each use needs your approval in `beams ssh`.");
     } else {
-        println!("The SSH agent proxy is off. To let Beams ask to use a key, add to {}:", path.display());
-        println!();
-        println!("  [ssh_agent]");
-        println!("  allowed_keys = [\"SHA256:...\"]");
+        println!("No key is shared with Beams, so they can't use git or ssh with your keys.");
     }
+    println!("Change it with `beams agent-keys --allow N` / `--deny N` (or edit {}).", path.display());
     Ok(0)
 }
 
@@ -674,6 +777,37 @@ mod tests {
         let (_, p) = evaluate(&config_for(&user), &request, &[], &AgentContext::default(), "", &[], 0).unwrap();
         assert_eq!(p.operation, AgentOperation::Signature { namespace: "git".into() });
         assert_eq!(p.summary(), "SSH key: sign (git)");
+    }
+
+    #[test]
+    fn writing_allowed_keys_keeps_the_rest_of_the_file() {
+        let dir = std::env::temp_dir().join(format!("beams-agent-config-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("beams-client/config.toml");
+
+        // Created from nothing.
+        Config::write_allowed_keys_to(&path, &["SHA256:a".to_string()]).unwrap();
+        assert_eq!(Config::load_from(&path).unwrap().allowed_keys, vec!["SHA256:a".to_string()]);
+
+        // An existing file keeps its comments and other sections.
+        fs::write(
+            &path,
+            "# my settings\n[startup]\ntasks = [] # none\n\n[ssh_agent]\nprompt_timeout = 30 # slow\nallowed_keys = [\"SHA256:old\"]\n",
+        )
+        .unwrap();
+        Config::write_allowed_keys_to(&path, &["SHA256:b".to_string(), "SHA256:c".to_string()]).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my settings") && text.contains("tasks = [] # none") && text.contains("# slow"), "{text}");
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.allowed_keys, vec!["SHA256:b".to_string(), "SHA256:c".to_string()]);
+        assert_eq!(config.prompt_timeout, Some(30));
+        assert!(crate::startup::StartupConfig::load_from(&path).unwrap().tasks.is_empty());
+
+        // An explicit empty list is "configured, sharing nothing".
+        Config::write_allowed_keys_to(&path, &[]).unwrap();
+        assert!(!Config::load_from(&path).unwrap().enabled());
+        assert!(fs::read_to_string(&path).unwrap().contains("[ssh_agent]"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

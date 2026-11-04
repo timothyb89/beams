@@ -179,7 +179,15 @@ enum Commands {
     },
     /// List the keys in this terminal's SSH agent and whether Beams may use
     /// them (`[ssh_agent] allowed_keys` in the client config).
-    AgentKeys,
+    AgentKeys {
+        /// Let Beams ask to use this key (its number from the listing, or
+        /// its SHA256 fingerprint).
+        #[arg(long, value_name = "N|FINGERPRINT")]
+        allow: Option<String>,
+        /// Stop sharing this key with Beams.
+        #[arg(long, value_name = "N|FINGERPRINT")]
+        deny: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -277,7 +285,7 @@ fn main() -> anyhow::Result<ExitCode> {
                 approval_takeover,
             },
         )?,
-        Commands::AgentKeys => agent::print_keys()?,
+        Commands::AgentKeys { allow, deny } => agent::agent_keys_command(allow.as_deref(), deny.as_deref())?,
         Commands::Daemon { socket, action } => match action {
             None => {
                 clientd::serve(socket)?;

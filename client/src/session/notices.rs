@@ -20,6 +20,8 @@ const REQUEST_TOAST_FOR: Duration = Duration::from_secs(20);
 /// their toast stays up for as long as they can be approved.
 const AGENT_TOAST_FOR: Duration = Duration::from_secs(120);
 const DONE_TOAST_FOR: Duration = Duration::from_secs(5);
+/// `first_seen` key for the key-setup offer.
+const KEY_SETUP_ID: &str = "\u{0}key-setup";
 const FAILED_TOAST_FOR: Duration = Duration::from_secs(10);
 /// Inner width the toast lines are cut to.
 const LINE_WIDTH: usize = 48;
@@ -41,6 +43,8 @@ pub struct ToastPolicy {
 pub enum Subject {
     Request(String),
     Service(String),
+    /// The one-time "share an SSH key?" offer.
+    KeySetup,
 }
 
 impl ToastPolicy {
@@ -103,6 +107,32 @@ impl ToastPolicy {
                 ],
             };
             return Some((toast, Subject::Request(newest.request_id.clone())));
+        }
+
+        // Offer to share a key, once, while nothing more urgent is up.
+        if view.offer_key_setup {
+            let seen = *self.first_seen.entry(KEY_SETUP_ID.to_string()).or_insert(now);
+            if now.saturating_duration_since(seen) < REQUEST_TOAST_FOR {
+                let open = match escape_key {
+                    EscapeKey::Byte(_) => escape_key.label(),
+                    EscapeKey::Disabled => return None,
+                };
+                let toast = Toast {
+                    tone: Tone::Info,
+                    title: "Share an SSH key with Beams?".to_string(),
+                    lines: vec![
+                        Line::from(Span::styled(
+                            ui::ellipsize("None is shared, so git over ssh won't work here.", LINE_WIDTH),
+                            theme::label_focused(),
+                        )),
+                        Line::from(vec![
+                            Span::styled(open, theme::key()),
+                            Span::styled(" to choose", theme::dim()),
+                        ]),
+                    ],
+                };
+                return Some((toast, Subject::KeySetup));
+            }
         }
 
         // A startup grant just signed something: a passive notice.

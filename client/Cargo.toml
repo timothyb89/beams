@@ -23,6 +23,7 @@ vt100 = "0.18.1"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml_edit = { version = "0.22", default-features = false, features = ["parse", "display"] }
 
 [dev-dependencies]
 signature = "2"

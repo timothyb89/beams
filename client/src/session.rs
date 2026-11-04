@@ -334,6 +334,13 @@ fn drive(
     let mut output_finished = false;
     let mut daemon_view = DaemonView::new(local_daemon);
     daemon_view.recents = recent::RecentPaths::load_default();
+    // Offer to share a key once, if that was never set up and this
+    // terminal's agent has keys to offer (only meaningful with a daemon).
+    daemon_view.offer_key_setup = local_daemon.frontend.is_some()
+        && !crate::agent::Config::configured()
+        && crate::agent::own_agent_socket()
+            .and_then(|sock| crate::agent::local_identities(&sock).ok())
+            .is_some_and(|keys| !keys.is_empty());
     let mut approval_takeover_guard = None;
     let mut palette_terminal = None;
     macro_rules! redraw_palette {
@@ -530,8 +537,15 @@ fn drive(
                     // The prefix while a request's toast is up goes straight
                     // to that request.
                     daemon_view.reviewing_from_toast = false;
-                    if let Some(notices::Subject::Request(request_id)) = toast_subject.take() {
-                        daemon_view.review_request(&request_id, local_daemon);
+                    match toast_subject.take() {
+                        Some(notices::Subject::Request(request_id)) => {
+                            daemon_view.review_request(&request_id, local_daemon);
+                        }
+                        Some(notices::Subject::KeySetup) => {
+                            daemon_view.reviewing_from_toast = true;
+                            daemon_view.open_agent_keys_menu();
+                        }
+                        _ => {}
                     }
                     toast_policy.mark_reviewed(&daemon_view);
                     redraw_palette!();
@@ -589,6 +603,9 @@ struct DaemonView {
     /// request's menu opens, so typing that was meant for the shell can't
     /// approve a signature.
     input_guard_until: Option<Instant>,
+    /// `[ssh_agent]` was never configured and this terminal's agent has
+    /// keys: offer (once) to share one.
+    offer_key_setup: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -664,6 +681,12 @@ enum MenuAction {
     Approve(String),
     Reject(String),
     RevokeGrant(String),
+    /// Let Beams ask to use this key (fingerprint).
+    AllowKey(String),
+    /// Stop sharing this key.
+    DenyKey(String),
+    /// Record "share no keys", so the offer isn't made again.
+    DeclineKeys,
     Control {
         service_id: String,
         action: ServiceAction,
@@ -788,6 +811,60 @@ fn request_menu(request: &RequestRecord) -> Menu {
             back_item("Decide later"),
         ],
         selected: 0,
+    }
+}
+
+/// The SSH keys menu (home `a`, or the setup toast): this terminal's agent
+/// keys, each allowable or revocable for Beams.
+fn agent_keys_menu() -> Menu {
+    let configured = crate::agent::Config::configured();
+    let config = crate::agent::Config::load().unwrap_or_default();
+    let keys = crate::agent::own_agent_socket()
+        .ok_or_else(|| "this terminal has no SSH agent (SSH_AUTH_SOCK is unset)".to_string())
+        .and_then(|sock| crate::agent::local_identities(&sock).map_err(|err| format!("{err:#}")));
+    let mut intro = vec![(
+        "Beams have no SSH keys of their own. Shared keys stay in this terminal's agent, and you approve each use."
+            .to_string(),
+        false,
+    )];
+    let mut items = Vec::new();
+    match keys {
+        Ok(keys) if !keys.is_empty() => {
+            for (index, key) in keys.iter().take(9).enumerate() {
+                let Some(fingerprint) = beams_protocol::agent_crypto::fingerprint(&key.key_blob) else {
+                    continue;
+                };
+                let name = if key.comment.is_empty() {
+                    fingerprint.clone()
+                } else {
+                    format!("{} ({})", crate::agent::clean(&key.comment), ui::ellipsize(&fingerprint, 20))
+                };
+                let allowed = config.allowed_keys.contains(&fingerprint);
+                items.push(MenuItem {
+                    label: if allowed { format!("Stop sharing {name}") } else { format!("Share {name}") },
+                    key: char::from_digit(index as u32 + 1, 10),
+                    danger: allowed,
+                    action: if allowed { MenuAction::DenyKey(fingerprint) } else { MenuAction::AllowKey(fingerprint) },
+                });
+            }
+        }
+        Ok(_) => intro.push(("This terminal's agent has no keys; add one with `ssh-add` first.".to_string(), true)),
+        Err(why) => intro.push((format!("Can't list keys: {why}."), true)),
+    }
+    if !configured {
+        items.push(MenuItem {
+            label: "Don't share any (don't ask again)".to_string(),
+            key: Some('x'),
+            danger: false,
+            action: MenuAction::DeclineKeys,
+        });
+    }
+    items.push(back_item(if configured { "Back" } else { "Not now" }));
+    Menu {
+        title: "SSH keys for Beams".to_string(),
+        intro,
+        selected: if configured { items.len() - 1 } else { 0 },
+        items,
     }
 }
 
@@ -1245,6 +1322,7 @@ impl DaemonView {
                 recents: Default::default(),
                 reviewing_from_toast: false,
                 input_guard_until: None,
+                offer_key_setup: false,
             },
             None => Self {
                 beam_uuid,
@@ -1270,6 +1348,7 @@ impl DaemonView {
                 recents: Default::default(),
                 reviewing_from_toast: false,
                 input_guard_until: None,
+                offer_key_setup: false,
             },
         }
     }
@@ -1590,6 +1669,25 @@ impl DaemonView {
         self.screen = Screen::Menu(menu);
     }
 
+    fn open_agent_keys_menu(&mut self) {
+        self.offer_key_setup = false;
+        let menu = agent_keys_menu();
+        self.open_menu(menu);
+    }
+
+    /// Writes a new `allowed_keys` and has the daemon push keys again.
+    fn set_allowed_keys(&mut self, keys: Vec<String>, done: String, local_daemon: &mut LocalDaemon) {
+        match crate::agent::Config::write_allowed_keys(&keys) {
+            Ok(_) => {
+                if let Some(frontend) = &mut local_daemon.frontend {
+                    let _ = frontend.refresh_agent_keys();
+                }
+                self.notify(done, false);
+            }
+            Err(err) => self.notify(format!("could not update the SSH key config: {err:#}"), true),
+        }
+    }
+
     /// Opens a request's decision menu, guarding SSH key requests against
     /// stray keys (see `input_guard_until`).
     fn open_request_menu(&mut self, request_id: &str) {
@@ -1692,6 +1790,7 @@ impl DaemonView {
                 copy_form(FileCopyDirection::Download),
             ),
             Key::Char('m' | 'M') => self.open_form(FormKind::Sync, sync_form()),
+            Key::Char('a' | 'A') => self.open_agent_keys_menu(),
             Key::Char('j' | 'J') | Key::Down => self.select_next(),
             Key::Char('k' | 'K') | Key::Up => self.select_previous(),
             Key::Home => self.select(0),
@@ -1734,6 +1833,25 @@ impl DaemonView {
             MenuAction::Back => {}
             MenuAction::Approve(request_id) => self.approve(&request_id, local_daemon),
             MenuAction::Reject(request_id) => self.decide(&request_id, false, local_daemon),
+            MenuAction::AllowKey(fingerprint) => {
+                let mut keys = crate::agent::Config::load().unwrap_or_default().allowed_keys;
+                if !keys.contains(&fingerprint) {
+                    keys.push(fingerprint.clone());
+                }
+                self.set_allowed_keys(keys, format!("Beams may now ask to use {fingerprint}"), local_daemon);
+            }
+            MenuAction::DenyKey(fingerprint) => {
+                let mut keys = crate::agent::Config::load().unwrap_or_default().allowed_keys;
+                keys.retain(|key| key != &fingerprint);
+                self.set_allowed_keys(keys, format!("stopped sharing {fingerprint}"), local_daemon);
+            }
+            MenuAction::DeclineKeys => {
+                self.set_allowed_keys(
+                    Vec::new(),
+                    "no keys shared; press a to change that later".to_string(),
+                    local_daemon,
+                );
+            }
             MenuAction::RevokeGrant(grant_id) => match &mut local_daemon.frontend {
                 Some(frontend) => match frontend.revoke_grant(&grant_id) {
                     Ok(()) => self.notify("startup SSH key grant revoked", false),
@@ -3728,6 +3846,83 @@ mod tests {
             },
         }))
         .unwrap()
+    }
+
+    /// Answers identity listings with one generated key.
+    fn fake_agent_with_one_key(dir: &std::path::Path) -> (String, String) {
+        use beams_protocol::agent as wire;
+        use ssh_key::{rand_core::OsRng, Algorithm, PrivateKey};
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let blob = key.public_key().to_bytes().unwrap();
+        let fingerprint = beams_protocol::agent_crypto::fingerprint(&blob).unwrap();
+        let path = dir.join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let blob = blob.clone();
+                std::thread::spawn(move || {
+                    while let Ok(Some(_)) = wire::read_message(&mut conn) {
+                        let reply = wire::encode_identities_answer(&[wire::Identity {
+                            key_blob: blob.clone(),
+                            comment: "laptop key".into(),
+                        }]);
+                        if wire::write_message(&mut conn, &reply).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (path.display().to_string(), fingerprint)
+    }
+
+    #[test]
+    fn key_setup_is_offered_once_and_writes_the_choice_to_the_config() {
+        let dir = std::env::temp_dir().join(format!("beams-key-setup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sock, fingerprint) = fake_agent_with_one_key(&dir);
+        // Only this test reads these (agent_keys_menu and Config::path).
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+        std::env::set_var("SSH_AUTH_SOCK", &sock);
+        assert!(!crate::agent::Config::configured());
+
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        view.offer_key_setup = true;
+        let mut policy = notices::ToastPolicy::default();
+        let (toast, subject) = policy.current(&view, EscapeKey::Byte(0x1d), Instant::now()).unwrap();
+        assert_eq!(toast.title, "Share an SSH key with Beams?");
+        assert_eq!(subject, notices::Subject::KeySetup);
+
+        view.open_agent_keys_menu();
+        assert!(!view.offer_key_setup, "offered once");
+        let Screen::Menu(menu) = &view.screen else { panic!("keys menu") };
+        assert_eq!(menu.title, "SSH keys for Beams");
+        assert_eq!(menu.items[0].action, MenuAction::AllowKey(fingerprint.clone()));
+        assert!(menu.items[0].label.starts_with("Share laptop key"), "{}", menu.items[0].label);
+        assert_eq!(menu.items[0].key, Some('1'));
+        assert_eq!(menu.items[1].action, MenuAction::DeclineKeys);
+        assert_eq!(menu.items[2].label, "Not now");
+
+        view.handle_key(Key::Char('1'), &mut daemon);
+        assert_eq!(crate::agent::Config::load().unwrap().allowed_keys, vec![fingerprint.clone()]);
+        assert!(crate::agent::Config::configured());
+
+        // Now shared: the menu offers to stop, and no "don't ask" any more.
+        view.handle_key(Key::Char('a'), &mut daemon);
+        let Screen::Menu(menu) = &view.screen else { panic!("keys menu") };
+        assert_eq!(menu.items[0].action, MenuAction::DenyKey(fingerprint.clone()));
+        assert!(!menu.items.iter().any(|item| item.action == MenuAction::DeclineKeys));
+        assert_eq!(menu.items[menu.selected].label, "Back");
+        view.handle_key(Key::Char('1'), &mut daemon);
+        assert!(crate::agent::Config::load().unwrap().allowed_keys.is_empty());
+        assert!(crate::agent::Config::configured(), "an explicit empty list stays configured");
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("SSH_AUTH_SOCK");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

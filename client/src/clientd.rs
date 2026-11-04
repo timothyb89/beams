@@ -198,6 +198,8 @@ enum ClientMessage {
     RevokeGrant {
         grant_id: String,
     },
+    /// `[ssh_agent] allowed_keys` changed: push keys to every Beam again.
+    RefreshAgentKeys,
     /// Version-independent control op (see `daemonctl`): accepted as the
     /// first message on a connection, without a hello. Never change it.
     Status,
@@ -2999,6 +3001,10 @@ impl Frontend {
         Ok(request_id)
     }
 
+    pub fn refresh_agent_keys(&mut self) -> anyhow::Result<()> {
+        write_json(&mut self.write_half, &ClientMessage::RefreshAgentKeys).context("refreshing shared SSH keys")
+    }
+
     pub fn revoke_grant(&mut self, grant_id: &str) -> anyhow::Result<()> {
         write_json(&mut self.write_half, &ClientMessage::RevokeGrant { grant_id: grant_id.to_string() })
             .context("revoking SSH key grant")
@@ -3502,6 +3508,12 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                     }
                     ClientMessage::RevokeGrant { grant_id } => {
                         hub.end_grants_where(|g| g.grant_id == grant_id, "revoked by local user");
+                    }
+                    ClientMessage::RefreshAgentKeys => {
+                        let beams: Vec<String> = hub.agent.lock().unwrap().capable.iter().cloned().collect();
+                        for beam in beams {
+                            hub.refresh_agent_identities(&beam);
+                        }
                     }
                     ClientMessage::Hello { .. } => {
                         let _ = tx.try_send(ServerEvent::Error {

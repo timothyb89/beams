@@ -676,6 +676,7 @@ fn hints(view: &DaemonView, escape_key: EscapeKey) -> Vec<(String, String)> {
             add("u", "upload");
             add("d", "download");
             add("m", "sync");
+            add("a", "ssh keys");
             if let EscapeKey::Byte(_) = escape_key {
                 add(&escape_key.label(), "send literally");
             }
