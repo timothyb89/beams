@@ -713,15 +713,34 @@ fn run_fetch(
     for (source, final_path) in sources.iter().zip(&layout.targets) {
         let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
         let temp = parent.join(format!(".beams-fetch-{}.part", Uuid::new_v4()));
+        // Directories are copied *into* a fresh temp directory: `tsh scp -r`
+        // always nests the source inside the destination (even one that
+        // doesn't exist yet), unlike OpenSSH, so pre-creating it gives one
+        // layout either way: `temp/<name>`.
+        let (copy_to, fetched) = if source.is_dir {
+            fs::create_dir(&temp).with_context(|| format!("creating {}", temp.display()))?;
+            let name = Path::new(&source.path)
+                .file_name()
+                .context("Beam directory has no name")?;
+            (temp.clone(), temp.join(name))
+        } else {
+            (temp.clone(), temp.clone())
+        };
         let diagnostics = Arc::new(Mutex::new(VecDeque::new()));
         let remote = format!("{remote_host}:{}", source.path);
-        let mut child = spawn_scp_with(
+        let mut child = match spawn_scp_with(
             program,
             source.is_dir,
             remote.as_ref(),
-            temp.as_os_str(),
+            copy_to.as_os_str(),
             Arc::clone(&diagnostics),
-        )?;
+        ) {
+            Ok(child) => child,
+            Err(err) => {
+                remove_local(&temp);
+                return Err(err);
+            }
+        };
         let done_before = progress.bytes_done;
         let cancelled = monitor_with_progress(&mut child, commands, || {
             let current = done_before + local_size(&temp).min(source.size);
@@ -744,14 +763,19 @@ fn run_fetch(
             bail!("{}", child_failure("fetch", status, &diagnostics));
         }
         let installed = if source.is_dir {
-            install_directory(&temp, final_path, *overwrite)
+            if fetched.is_dir() {
+                install_directory(&fetched, final_path, *overwrite)
+            } else {
+                Err(anyhow::anyhow!(
+                    "the copied directory is missing from {}",
+                    temp.display()
+                ))
+            }
         } else {
-            install_download(&temp, final_path, *overwrite)
+            install_download(&fetched, final_path, *overwrite)
         };
-        if let Err(err) = installed {
-            remove_local(&temp);
-            return Err(err);
-        }
+        remove_local(&temp);
+        installed?;
         progress.bytes_done = done_before + source.size;
         progress.files_done += 1;
         reporter.send(

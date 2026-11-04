@@ -1856,7 +1856,7 @@ fn handle_service_update(
     status: ServiceStatus,
     message: Option<String>,
 ) {
-    let (service, completed_actions) = {
+    let (service, completed_actions, request_changed) = {
         let mut state = hub.state.lock().unwrap();
         let Some(service) = state.services.get_mut(&service_id) else {
             return;
@@ -1878,6 +1878,10 @@ fn handle_service_update(
             service.desired_running = false;
         }
         let service = service.clone();
+        let request_status_before = state
+            .requests
+            .get(&service.request_id)
+            .map(|request| request.status);
 
         if matches!(
             service.status,
@@ -1932,18 +1936,28 @@ fn handle_service_update(
                 }
             })
             .collect::<Vec<_>>();
-        (service, completed_actions)
+        let request_changed = state
+            .requests
+            .get(&service.request_id)
+            .map(|request| request.status)
+            != request_status_before;
+        (service, completed_actions, request_changed)
     };
     let _ = hub.save_state();
     hub.publish_service(&service);
-    if let Some(request) = hub
-        .state
-        .lock()
-        .unwrap()
-        .requests
-        .get(&service.request_id)
-        .cloned()
-    {
+    // Only on a real change: the Beam rejects a repeated status (e.g.
+    // running -> running) as an invalid transition.
+    let request = request_changed
+        .then(|| {
+            hub.state
+                .lock()
+                .unwrap()
+                .requests
+                .get(&service.request_id)
+                .cloned()
+        })
+        .flatten();
+    if let Some(request) = request {
         hub.publish_request(&request, false);
     }
     for request in completed_actions {

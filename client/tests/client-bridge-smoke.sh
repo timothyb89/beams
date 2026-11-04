@@ -54,8 +54,12 @@ if sys.argv[1] == "scp":
     import os
     destination = sys.argv[-1]
     if "-r" in sys.argv:
-        os.makedirs(destination)
-        with open(os.path.join(destination, "inner.txt"), "wb") as downloaded:
+        # Like `tsh scp -r`: the source directory always lands *inside* the
+        # destination, which is created if it doesn't exist.
+        source_name = os.path.basename(sys.argv[-2].rstrip("/"))
+        inner = os.path.join(destination, source_name)
+        os.makedirs(inner)
+        with open(os.path.join(inner, "inner.txt"), "wb") as downloaded:
             downloaded.write(b"beams-fetch-dir-smoke\n")
     else:
         with open(destination, "wb") as downloaded:

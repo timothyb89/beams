@@ -1338,6 +1338,8 @@ impl DaemonView {
         };
         self.selected_key = Some(RowKey::Request(first.clone()));
         self.presented_approval_requests.extend(new_requests);
+        // The previous action's feedback is stale by now.
+        self.notice = None;
         true
     }
 
