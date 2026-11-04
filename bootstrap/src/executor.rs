@@ -113,6 +113,38 @@ pub fn run_with(
     resources: &Resources,
     on_event: &(dyn Fn(Event) + Sync),
 ) -> anyhow::Result<bool> {
+    run_tagged(tasks, resources, None, on_event)
+}
+
+thread_local! {
+    static TASK_RUN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `<tag>/<task id>` while a task of a tagged run (`run_tagged`) runs on
+/// this thread. Tasks put it in their subprocesses' environment as
+/// `BEAMS_TASK_RUN`, which the SSH agent relay reports to the workstation
+/// (advisory: it's how a startup grant tells its own clones apart from
+/// anything else using the key during its window).
+pub fn current_task_run() -> Option<String> {
+    TASK_RUN.with(|run| run.borrow().clone())
+}
+
+/// Runs `f` with `current_task_run()` set to `run`.
+pub fn with_task_run<T>(run: Option<String>, f: impl FnOnce() -> T) -> T {
+    TASK_RUN.with(|slot| *slot.borrow_mut() = run);
+    let out = f();
+    TASK_RUN.with(|slot| *slot.borrow_mut() = None);
+    out
+}
+
+/// `run_with`, tagging each task's thread with `<tag>/<task id>` (see
+/// `current_task_run`).
+pub fn run_tagged(
+    tasks: Vec<Box<dyn Task>>,
+    resources: &Resources,
+    tag: Option<&str>,
+    on_event: &(dyn Fn(Event) + Sync),
+) -> anyhow::Result<bool> {
     let deps = graph::resolve_deps(&tasks)?;
     let ids: Vec<String> = tasks.iter().map(|t| t.id()).collect();
     let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); tasks.len()];
@@ -135,9 +167,12 @@ pub fn run_with(
                 let task = slots[i].take().expect("task scheduled twice");
                 let done = DoneSignal { tx: done_tx.clone(), index: i, ok: false };
                 running += 1;
+                let run = tag.map(|tag| format!("{tag}/{}", task.id()));
                 scope.spawn(move || {
                     let mut done = done;
-                    done.ok = resources.with_held(task.as_ref(), || run_one(task.as_ref(), on_event));
+                    done.ok = with_task_run(run, || {
+                        resources.with_held(task.as_ref(), || run_one(task.as_ref(), on_event))
+                    });
                 });
             }
             if running == 0 {
@@ -170,6 +205,45 @@ pub fn run_with(
         }
     });
     Ok(overall_ok)
+}
+
+#[cfg(test)]
+mod task_run_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct Recorder {
+        id: &'static str,
+        seen: std::sync::Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    impl Task for Recorder {
+        fn id(&self) -> String {
+            self.id.to_string()
+        }
+        fn run(&self) -> anyhow::Result<Option<String>> {
+            self.seen.lock().unwrap().push(current_task_run());
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn tagged_runs_expose_tag_and_task_id_to_each_task() {
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let tasks: Vec<Box<dyn Task>> = vec![
+            Box::new(Recorder { id: "a", seen: seen.clone() }),
+            Box::new(Recorder { id: "b:dest=/x/y", seen: seen.clone() }),
+        ];
+        assert!(run_tagged(tasks, &Resources::default(), Some("manifest-7"), &|_| {}).unwrap());
+        let mut got = seen.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(got, vec![Some("manifest-7/a".to_string()), Some("manifest-7/b:dest=/x/y".to_string())]);
+
+        seen.lock().unwrap().clear();
+        let tasks: Vec<Box<dyn Task>> = vec![Box::new(Recorder { id: "c", seen: seen.clone() })];
+        assert!(run_with(tasks, &Resources::default(), &|_| {}).unwrap());
+        assert_eq!(seen.lock().unwrap().clone(), vec![None]);
+    }
 }
 
 /// Sends this task's completion on drop, so a task thread that panics

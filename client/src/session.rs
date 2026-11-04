@@ -567,6 +567,8 @@ struct DaemonView {
     services: usize,
     request_records: BTreeMap<String, RequestRecord>,
     service_records: BTreeMap<String, ServiceRecord>,
+    /// Usable startup SSH key grants, by id.
+    grants: BTreeMap<String, crate::startup::GrantRecord>,
     bridge_statuses: BTreeMap<String, String>,
     /// The selected home-screen row (see `selected_index`).
     selected: usize,
@@ -626,12 +628,14 @@ enum FormKind {
 #[derive(Clone, Copy)]
 enum Row<'a> {
     Request(&'a RequestRecord),
+    Grant(&'a crate::startup::GrantRecord),
     Service(&'a ServiceRecord),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RowKey {
     Request(String),
+    Grant(String),
     Service(String),
 }
 
@@ -639,6 +643,7 @@ impl Row<'_> {
     fn key(&self) -> RowKey {
         match self {
             Row::Request(request) => RowKey::Request(request.request_id.clone()),
+            Row::Grant(grant) => RowKey::Grant(grant.grant_id.clone()),
             Row::Service(service) => RowKey::Service(service.service_id.clone()),
         }
     }
@@ -658,6 +663,7 @@ enum MenuAction {
     Back,
     Approve(String),
     Reject(String),
+    RevokeGrant(String),
     Control {
         service_id: String,
         action: ServiceAction,
@@ -782,6 +788,23 @@ fn request_menu(request: &RequestRecord) -> Menu {
             back_item("Decide later"),
         ],
         selected: 0,
+    }
+}
+
+fn grant_menu(grant: &crate::startup::GrantRecord) -> Menu {
+    Menu {
+        title: "Startup SSH key grant".to_string(),
+        intro: grant.describe(crate::agent::now_ms()),
+        items: vec![
+            MenuItem {
+                label: "Revoke now".to_string(),
+                key: Some('r'),
+                danger: true,
+                action: MenuAction::RevokeGrant(grant.grant_id.clone()),
+            },
+            back_item("Keep"),
+        ],
+        selected: 1,
     }
 }
 
@@ -1210,6 +1233,7 @@ impl DaemonView {
                 services: 0,
                 request_records: BTreeMap::new(),
                 service_records: BTreeMap::new(),
+                grants: BTreeMap::new(),
                 bridge_statuses: BTreeMap::new(),
                 selected: 0,
                 selected_key: None,
@@ -1231,6 +1255,7 @@ impl DaemonView {
                 services: 0,
                 request_records: BTreeMap::new(),
                 service_records: BTreeMap::new(),
+                grants: BTreeMap::new(),
                 bridge_statuses: BTreeMap::new(),
                 selected: 0,
                 selected_key: None,
@@ -1293,7 +1318,12 @@ impl DaemonView {
                     requests,
                     services,
                     bridges,
+                    grants,
                 }) => {
+                    self.grants = grants
+                        .into_iter()
+                        .map(|grant| (grant.grant_id.clone(), grant))
+                        .collect();
                     self.client_id = Some(client_id);
                     self.connected = true;
                     self.frontends = frontends;
@@ -1342,6 +1372,14 @@ impl DaemonView {
                 }
                 Ok(ServerEvent::BridgeStatus { bridge }) => {
                     self.apply_bridge_status(bridge);
+                    changed = true;
+                }
+                Ok(ServerEvent::GrantChanged { grant }) => {
+                    if grant.ended.is_some() {
+                        self.grants.remove(&grant.grant_id);
+                    } else {
+                        self.grants.insert(grant.grant_id.clone(), grant);
+                    }
                     changed = true;
                 }
                 Ok(
@@ -1452,12 +1490,22 @@ impl DaemonView {
         true
     }
 
-    /// Every selectable home-screen row: pending approvals, then services.
+    /// Every selectable home-screen row: pending approvals, startup SSH key
+    /// grants, then services.
     fn rows(&self) -> Vec<Row<'_>> {
         self.pending_requests()
             .into_iter()
             .map(Row::Request)
+            .chain(self.visible_grants().into_iter().map(Row::Grant))
             .chain(self.visible_services().into_iter().map(Row::Service))
+            .collect()
+    }
+
+    /// This session's Beam's usable grants.
+    fn visible_grants(&self) -> Vec<&crate::startup::GrantRecord> {
+        self.grants
+            .values()
+            .filter(|grant| self.beam_uuid.as_deref() == Some(grant.beam_uuid.as_str()))
             .collect()
     }
 
@@ -1605,6 +1653,10 @@ impl DaemonView {
                     let request_id = request.request_id.clone();
                     self.open_request_menu(&request_id);
                 }
+                Some(Row::Grant(grant)) => {
+                    let menu = grant_menu(grant);
+                    self.open_menu(menu);
+                }
                 Some(Row::Service(service)) => {
                     let menu = service_menu(service);
                     self.open_menu(menu);
@@ -1682,6 +1734,13 @@ impl DaemonView {
             MenuAction::Back => {}
             MenuAction::Approve(request_id) => self.approve(&request_id, local_daemon),
             MenuAction::Reject(request_id) => self.decide(&request_id, false, local_daemon),
+            MenuAction::RevokeGrant(grant_id) => match &mut local_daemon.frontend {
+                Some(frontend) => match frontend.revoke_grant(&grant_id) {
+                    Ok(()) => self.notify("startup SSH key grant revoked", false),
+                    Err(err) => self.notify(format!("could not revoke the grant: {err}"), true),
+                },
+                None => self.notify("the local daemon connection is unavailable", true),
+            },
             MenuAction::Control { service_id, action } => {
                 self.control(&service_id, action, local_daemon)
             }
@@ -3669,6 +3728,48 @@ mod tests {
             },
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn startup_grants_are_listed_revocable_and_announce_each_use() {
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        view.grants.insert(
+            "g1".to_string(),
+            crate::startup::GrantRecord {
+                grant_id: "g1".into(),
+                beam_uuid: "beam-a-uuid".into(),
+                manifest_id: "manifest-1".into(),
+                hosts: vec!["github.com".into()],
+                user: "git".into(),
+                uses: 1,
+                max_uses: 5,
+                expires_at_ms: crate::agent::now_ms() + 300_000,
+                ended: None,
+            },
+        );
+        let text = screen_text(&render(&view, None));
+        assert!(text.contains("SSH key grants") && text.contains("Startup: github.com as git · 1 of 5 used"), "{text}");
+        view.handle_key(Key::Enter, &mut daemon);
+        let Screen::Menu(menu) = &view.screen else {
+            panic!("Enter on a grant opens its menu");
+        };
+        assert_eq!(menu.items[0].action, MenuAction::RevokeGrant("g1".to_string()));
+        assert_eq!(menu.items[menu.selected].label, "Keep", "keeping is the default");
+
+        // A use shows a passive toast.
+        let mut used = pending_agent("used-1");
+        used.status = RequestStatus::Running;
+        used.agent.as_mut().unwrap().granted = Some("startup grant, 2 of 5".into());
+        add_request(&mut view, used);
+        view.screen = Screen::Home;
+        let mut policy = notices::ToastPolicy::default();
+        let (toast, _) = policy.current(&view, EscapeKey::Byte(0x1d), Instant::now()).unwrap();
+        assert_eq!(toast.title, "SSH key used");
+        let detail: String = toast.lines[1].spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(detail, "startup grant, 2 of 5");
+        let later = Instant::now() + Duration::from_secs(30);
+        assert!(policy.current(&view, EscapeKey::Byte(0x1d), later).is_none(), "the notice goes away");
     }
 
     #[test]

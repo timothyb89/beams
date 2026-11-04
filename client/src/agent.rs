@@ -255,6 +255,9 @@ pub struct AgentPrompt {
     pub claimed: Claimed,
     /// When the request is denied unless approved (Unix ms).
     pub expires_at_ms: u64,
+    /// Set when a grant approved it without asking ("startup grant, 2 of 5").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -418,7 +421,7 @@ pub fn evaluate(
         SignPayload::SshSig { namespace, .. } => AgentOperation::Signature { namespace: clean(&namespace) },
         SignPayload::Unknown { reason } => return Err(format!("unrecognized signature payload ({reason})")),
     };
-    Ok((body, AgentPrompt { key_fingerprint, key_comment, operation, claimed, expires_at_ms }))
+    Ok((body, AgentPrompt { key_fingerprint, key_comment, operation, claimed, expires_at_ms, granted: None }))
 }
 
 /// The user's known-hosts files, concatenated (missing ones skipped).

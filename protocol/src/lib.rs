@@ -26,8 +26,11 @@ pub const CAPABILITY_FILE_FETCH: &str = "file_fetch";
 /// and the `Agent*` messages below).
 pub const CAPABILITY_SSH_AGENT: &str = "ssh_agent";
 
+/// The Beam runs a workstation-supplied startup manifest (`RunManifest`).
+pub const CAPABILITY_STARTUP_MANIFEST: &str = "startup_manifest";
+
 /// Every capability this build implements.
-pub const CAPABILITIES: &[&str] = &[CAPABILITY_FILE_FETCH, CAPABILITY_SSH_AGENT];
+pub const CAPABILITIES: &[&str] = &[CAPABILITY_FILE_FETCH, CAPABILITY_SSH_AGENT, CAPABILITY_STARTUP_MANIFEST];
 
 /// Bounds on the advisory process context attached to an agent request, so
 /// a request always fits in `MAX_FRAME_BYTES`.
@@ -344,6 +347,13 @@ pub enum ClientToBeam {
     AgentIdentities {
         keys: Vec<AgentKey>,
     },
+    /// Run these bootstrap tasks (the workstation's `[startup]` config) as
+    /// one manifest. Answered with `ManifestAccepted`/`ManifestRejected`,
+    /// then `ManifestFinished`. Requires `CAPABILITY_STARTUP_MANIFEST`.
+    RunManifest {
+        request_id: String,
+        tasks: Vec<ManifestTask>,
+    },
     /// The reply to an `AgentSignRequest`: a raw agent message body
     /// (`SSH_AGENT_SIGN_RESPONSE` or `SSH_AGENT_FAILURE`), base64.
     AgentResponse {
@@ -354,6 +364,23 @@ pub enum ClientToBeam {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+}
+
+/// One entry of a startup manifest: a task template and its params.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ManifestTask {
+    pub template: String,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, ManifestParam>,
+}
+
+/// A task parameter value (templates only take these three kinds).
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum ManifestParam {
+    Bool(bool),
+    Int(i64),
+    Str(String),
 }
 
 /// A public key the Beam-side agent may list.
@@ -468,6 +495,23 @@ pub enum BeamToClient {
     /// Agent connection `conn_id` closed; forget its session binds.
     AgentConnClosed {
         conn_id: String,
+    },
+    /// A `RunManifest` was accepted and started as `manifest_id`. Its
+    /// tasks run with `BEAMS_TASK_RUN=<manifest_id>/<task id>` in their
+    /// environment.
+    ManifestAccepted {
+        request_id: String,
+        manifest_id: String,
+        task_ids: Vec<String>,
+    },
+    ManifestRejected {
+        request_id: String,
+        message: String,
+    },
+    /// Every task of `manifest_id` has finished (or been blocked).
+    ManifestFinished {
+        manifest_id: String,
+        ok: bool,
     },
 }
 
@@ -658,7 +702,7 @@ mod tests {
     #[test]
     fn hello_capabilities_are_optional_both_ways() {
         let hello = serde_json::to_value(ClientToBeam::hello("c", "b", Vec::new())).unwrap();
-        assert_eq!(hello["capabilities"], json!(["file_fetch", "ssh_agent"]));
+        assert_eq!(hello["capabilities"], json!(["file_fetch", "ssh_agent", "startup_manifest"]));
         // A hello from a workstation that predates capabilities.
         let old: ClientToBeam = serde_json::from_value(json!({
             "type": "hello",

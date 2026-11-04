@@ -89,6 +89,11 @@ impl Task for CloneGitRepo {
                 cmd.env("SSH_AUTH_SOCK", sock);
             }
         }
+        // Lets the workstation match this clone's key use to the startup
+        // manifest that asked for it (see `executor::current_task_run`).
+        if let Some(run) = crate::executor::current_task_run() {
+            cmd.env("BEAMS_TASK_RUN", run);
+        }
         // Reduces each raw update (`run_streaming` already splits git's
         // own `\r`-delimited ticks into one call per tick - see that
         // function's doc comment) down to just the phase name and

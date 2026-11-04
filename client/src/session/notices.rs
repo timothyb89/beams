@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use beams_protocol::{ServiceRequestKind, ServiceStatus};
+use beams_protocol::{RequestStatus, ServiceRequestKind, ServiceStatus};
 use ratatui::text::{Line, Span};
 
 use super::toast::{Toast, Tone};
@@ -103,6 +103,37 @@ impl ToastPolicy {
                 ],
             };
             return Some((toast, Subject::Request(newest.request_id.clone())));
+        }
+
+        // A startup grant just signed something: a passive notice.
+        if let Some(record) = view
+            .request_records
+            .values()
+            .filter(|r| r.agent.as_ref().is_some_and(|p| p.granted.is_some()))
+            .filter(|r| r.status == RequestStatus::Running && view.beam_uuid.as_deref() == Some(r.beam_uuid.as_str()))
+            .filter_map(|r| {
+                let seen = *self.first_seen.entry(r.request_id.clone()).or_insert(now);
+                (now.saturating_duration_since(seen) < DONE_TOAST_FOR).then_some((seen, r))
+            })
+            .max_by_key(|(seen, _)| *seen)
+            .map(|(_, r)| r)
+        {
+            let prompt = record.agent.as_ref().expect("filtered above");
+            let toast = Toast {
+                tone: Tone::Info,
+                title: "SSH key used".to_string(),
+                lines: vec![
+                    Line::from(Span::styled(
+                        ui::ellipsize(&prompt.summary(), LINE_WIDTH),
+                        theme::label_focused(),
+                    )),
+                    Line::from(Span::styled(
+                        ui::ellipsize(prompt.granted.as_deref().unwrap_or_default(), LINE_WIDTH),
+                        theme::dim(),
+                    )),
+                ],
+            };
+            return Some((toast, Subject::Request(record.request_id.clone())));
         }
 
         let transfers = self.observe(view, now);

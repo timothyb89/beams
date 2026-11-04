@@ -1,5 +1,6 @@
 mod agent;
 mod beamcmd;
+mod startup;
 mod bridge;
 mod clientd;
 mod copy;

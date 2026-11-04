@@ -657,6 +657,7 @@ fn hints(view: &DaemonView, escape_key: EscapeKey) -> Vec<(String, String)> {
                     add("y", "approve");
                     add("n", "reject");
                 }
+                Some(Row::Grant(_)) => add("Enter", "revoke or keep"),
                 Some(Row::Service(service)) => {
                     add("Enter", "actions");
                     for action in available_actions(service) {
@@ -853,6 +854,23 @@ fn home_body(view: &DaemonView, width: usize, max_rows: usize) -> Vec<Line<'stat
         }
     }
 
+    let grants = view.visible_grants();
+    if !grants.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled("SSH key grants", theme::heading())));
+        let now = crate::agent::now_ms();
+        for (index, grant) in grants.iter().enumerate() {
+            let left = grant.expires_at_ms.saturating_sub(now) / 1000;
+            lines.push(list_row(
+                selected == requests.len() + index,
+                "ssh key",
+                &grant.summary(),
+                (&format!("{}m left", left.div_ceil(60)), theme::warn()),
+                width,
+            ));
+        }
+    }
+
     lines.push(Line::default());
     let services = view.visible_services();
     let mut heading = vec![Span::styled("Services", theme::heading())];
@@ -878,8 +896,8 @@ fn home_body(view: &DaemonView, width: usize, max_rows: usize) -> Vec<Line<'stat
         theme::dim(),
     )));
 
-    // Service rows follow the request rows in selection order.
-    let selected_service = selected.checked_sub(requests.len());
+    // Service rows follow the request and grant rows in selection order.
+    let selected_service = selected.checked_sub(requests.len() + grants.len());
     let selected_message = selected_service
         .and_then(|index| services.get(index))
         .and_then(|service| service.message.as_deref())

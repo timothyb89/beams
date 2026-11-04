@@ -77,7 +77,7 @@ use anyhow::Context;
 use beams_protocol::{
     ActionRequestProjection, BeamToClient, ClientToBeam, FetchSource, RequestProjection, RequestStatus,
     ServiceActionRequest, ServiceProjection, ServiceRequest, ServiceRequestKind, ServiceStatus,
-    CAPABILITY_FILE_FETCH, CAPABILITY_SSH_AGENT, MAX_FETCH_SOURCES, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
+    CAPABILITY_FILE_FETCH, CAPABILITY_SSH_AGENT, ManifestParam, ManifestTask, MAX_FETCH_SOURCES, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -513,7 +513,7 @@ fn register_client_bridge(
 }
 
 fn client_bridge_message(
-    hub: &Hub,
+    hub: &Arc<Hub>,
     request_id: Option<&str>,
     request: &Value,
     reply: &Sender<String>,
@@ -837,6 +837,10 @@ fn client_bridge_message(
         }
         ClientToBeam::Ping { nonce } => {
             send_bridge_event(reply, &BeamToClient::Pong { nonce });
+        }
+        ClientToBeam::RunManifest { request_id: manifest_request_id, tasks } => {
+            run_bridge_manifest(hub, manifest_request_id, tasks, reply);
+            let _ = reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
         }
         ClientToBeam::AgentIdentities { keys } => match hub.agent.set_identities(bridge_id, &keys) {
             Ok(()) => {
@@ -1295,6 +1299,46 @@ fn build_manifest(entries: Vec<ManifestEntry>) -> Result<Vec<Box<dyn Task>>, Str
         .collect()
 }
 
+/// `RunManifest` from a workstation bridge: the same as a local
+/// `run_manifest`, answered with typed bridge messages instead.
+fn run_bridge_manifest(hub: &Arc<Hub>, request_id: String, tasks: Vec<ManifestTask>, reply: &Sender<String>) {
+    let entries = tasks
+        .into_iter()
+        .map(|task| ManifestEntry {
+            template: task.template,
+            params: Value::Object(
+                task.params
+                    .into_iter()
+                    .map(|(name, param)| {
+                        let value = match param {
+                            ManifestParam::Bool(b) => Value::from(b),
+                            ManifestParam::Int(i) => Value::from(i),
+                            ManifestParam::Str(s) => Value::from(s),
+                        };
+                        (name, value)
+                    })
+                    .collect(),
+            ),
+        })
+        .collect();
+    let finished_reply = reply.clone();
+    let started = start_manifest(hub, entries, move |manifest_id, ok| {
+        send_bridge_event(&finished_reply, &BeamToClient::ManifestFinished { manifest_id: manifest_id.to_string(), ok });
+    });
+    let message = match started {
+        Ok((manifest_id, plan)) => {
+            eprintln!("daemon: workstation startup manifest started as {manifest_id}");
+            BeamToClient::ManifestAccepted {
+                request_id,
+                manifest_id,
+                task_ids: plan.into_iter().map(|planned| planned.task_id).collect(),
+            }
+        }
+        Err(message) => BeamToClient::ManifestRejected { request_id, message },
+    };
+    send_bridge_event(reply, &message);
+}
+
 fn run_manifest(hub: &Arc<Hub>, request_id: Option<&str>, tasks_value: Value, reply: &Sender<String>) {
     let entries: Vec<ManifestEntry> = match serde_json::from_value(tasks_value) {
         Ok(entries) => entries,
@@ -1303,14 +1347,32 @@ fn run_manifest(hub: &Arc<Hub>, request_id: Option<&str>, tasks_value: Value, re
             return;
         }
     };
-
-    let instances = match build_manifest(entries) {
-        Ok(instances) => instances,
+    match start_manifest(hub, entries, |_, _| {}) {
+        Ok((manifest_id, plan)) => {
+            let _ = reply.send(
+                json!({
+                    "request_id": request_id,
+                    "type": "accepted",
+                    "manifest_id": manifest_id,
+                    "tasks": plan,
+                })
+                .to_string(),
+            );
+        }
         Err(message) => {
             let _ = reply.send(error_reply(request_id, &message));
-            return;
         }
-    };
+    }
+}
+
+/// Validates and starts a manifest on its own thread, returning its id and
+/// plan; `on_finish(manifest_id, ok)` runs once every task is done.
+fn start_manifest(
+    hub: &Arc<Hub>,
+    entries: Vec<ManifestEntry>,
+    on_finish: impl FnOnce(&str, bool) + Send + 'static,
+) -> Result<(String, Vec<executor::PlannedTask>), String> {
+    let instances = build_manifest(entries)?;
 
     // Resolved against *this manifest's own* instances only - see the
     // module doc comment on why a dependency on an earlier, separate
@@ -1318,35 +1380,23 @@ fn run_manifest(hub: &Arc<Hub>, request_id: Option<&str>, tasks_value: Value, re
     // the `accepted` reply's `waves` list below - `executor::run` (which
     // actually runs these) resolves the same graph again itself, per
     // `executor::plan`'s own doc comment.
-    let plan = match executor::plan(&instances) {
-        Ok(plan) => plan,
-        Err(err) => {
-            let _ = reply.send(error_reply(request_id, &err.to_string()));
-            return;
-        }
-    };
+    let plan = executor::plan(&instances).map_err(|err| err.to_string())?;
 
     let manifest_id = hub.next_manifest_id();
-    let _ = reply.send(
-        json!({
-            "request_id": request_id,
-            "type": "accepted",
-            "manifest_id": manifest_id,
-            "tasks": plan,
-        })
-        .to_string(),
-    );
-
     let hub = Arc::clone(hub);
+    let id = manifest_id.clone();
     thread::spawn(move || {
-        hub.broadcast(&json!({"type": "manifest_status", "manifest_id": manifest_id, "status": "start"}).to_string());
-        let on_event = |event: executor::Event| hub.broadcast(&task_event_line(event, Some(&manifest_id)));
+        hub.broadcast(&json!({"type": "manifest_status", "manifest_id": id, "status": "start"}).to_string());
+        let on_event = |event: executor::Event| hub.broadcast(&task_event_line(event, Some(&id)));
         // Already validated above (same instances) - the only way this
         // fails is a graph error, which `plan` already ruled out.
-        let ok = executor::run_with(instances, &hub.resources, &on_event).expect("graph already validated above");
+        let ok = executor::run_tagged(instances, &hub.resources, Some(&id), &on_event)
+            .expect("graph already validated above");
         let status = if ok { "ok" } else { "error" };
-        hub.broadcast(&json!({"type": "manifest_status", "manifest_id": manifest_id, "status": status}).to_string());
+        hub.broadcast(&json!({"type": "manifest_status", "manifest_id": id, "status": status}).to_string());
+        on_finish(&id, ok);
     });
+    Ok((manifest_id, plan))
 }
 
 /// The `task_status` broadcast for one executor event - shared by
@@ -1576,6 +1626,70 @@ mod tests {
         assert_eq!(done["status"], "ok");
         assert!(dest.join(".git").exists());
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_workstation_startup_manifest_runs_and_reports_back_over_the_bridge() {
+        let tmp = scratch_dir("bridge-manifest");
+        let source = tmp.join("source");
+        let dest = tmp.join("dest");
+        make_source_repo_with_pr(&source, 1);
+        let hub = Arc::new(Hub::default());
+        let (mut bridge, mut reader, _handle) = register_bridge(Arc::clone(&hub), "client-a", "bridge-a", "token-a");
+
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("repo".to_string(), ManifestParam::Str(source.display().to_string()));
+        params.insert("dest".to_string(), ManifestParam::Str(dest.display().to_string()));
+        send(
+            &mut bridge,
+            &json!({
+                "request_id": "m1",
+                "op": "client_bridge_message",
+                "message": ClientToBeam::RunManifest {
+                    request_id: "startup-1".into(),
+                    tasks: vec![ManifestTask { template: "clone-git-repo".into(), params }],
+                },
+            })
+            .to_string(),
+        );
+        let bridge_message = |reader: &mut BufReader<UnixStream>| -> BeamToClient {
+            loop {
+                let value = recv(reader);
+                if value["type"] == "client_bridge_event" {
+                    return serde_json::from_value(value["message"].clone()).unwrap();
+                }
+            }
+        };
+        let BeamToClient::ManifestAccepted { request_id, manifest_id, task_ids } = bridge_message(&mut reader) else {
+            panic!("expected ManifestAccepted");
+        };
+        assert_eq!(request_id, "startup-1");
+        assert_eq!(task_ids.len(), 1);
+        assert!(task_ids[0].starts_with("clone-git-repo:"));
+        assert_eq!(
+            bridge_message(&mut reader),
+            BeamToClient::ManifestFinished { manifest_id, ok: true }
+        );
+        assert!(dest.join(".git").exists());
+
+        // An unknown template is rejected up front.
+        send(
+            &mut bridge,
+            &json!({
+                "request_id": "m2",
+                "op": "client_bridge_message",
+                "message": ClientToBeam::RunManifest {
+                    request_id: "startup-2".into(),
+                    tasks: vec![ManifestTask { template: "no-such-template".into(), params: Default::default() }],
+                },
+            })
+            .to_string(),
+        );
+        assert!(matches!(
+            bridge_message(&mut reader),
+            BeamToClient::ManifestRejected { request_id, .. } if request_id == "startup-2"
+        ));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
