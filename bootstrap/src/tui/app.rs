@@ -996,7 +996,7 @@ impl App {
                 let header = Line::from(vec![
                     Span::styled(row.state.glyph(spinner_frame), Style::default().fg(row.state.color())),
                     Span::raw(" "),
-                    Span::styled(row.task_id.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(abbreviate_home(&row.task_id), Style::default().add_modifier(Modifier::BOLD)),
                 ]);
                 let detail_style = match row.state {
                     TaskState::Error | TaskState::Blocked => Style::default().fg(row.state.color()),
@@ -1009,7 +1009,7 @@ impl App {
         let list = List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("tasks")
+                .title("progress")
                 .border_style(focus_style(self.focus == Focus::Log)),
         );
         let mut list_state = ListState::default().with_offset(self.progress_offset);
@@ -1066,6 +1066,16 @@ impl App {
             ]);
             frame.render_widget(Paragraph::new(line), *row_area);
         }
+    }
+}
+
+/// `$HOME/...` -> `~/...` anywhere in a task id (e.g. a clone's
+/// `dest=/home/beams/projects/core`), purely for display - the sidebar is
+/// narrow and the home prefix carries no information.
+fn abbreviate_home(task_id: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && home != "/" => task_id.replace(&format!("{home}/"), "~/"),
+        _ => task_id.to_string(),
     }
 }
 
