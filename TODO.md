@@ -647,6 +647,17 @@ bootstrap `Task`s.
   beam-bootstrap as `beams`): a capability-gated multi-file `file_fetch`
   request with sizes, a "Save to" approval form, per-item `tsh scp` into temp
   names, byte progress back to the Beam, and withdraw-on-Ctrl-C.
+- [ ] Faster fetches of many files: stream `tar -cf - -C <parent> <names>`
+  over one `tsh ssh` into a local `tar -x` in the temp directory (counting
+  piped bytes for progress) instead of one `tsh scp` per source. One
+  connection for globs, and no per-file SFTP round trips through the proxy
+  for directory trees. Keep scp for a single plain file. Later options:
+  ControlMaster connection reuse, one-off Mutagen syncs.
+- [ ] A workstation daemon crash mid-fetch can leave a hidden
+  `.beams-fetch-*.part` in the destination; clean these up when an
+  interrupted copy is noticed at startup.
+- [ ] Some client unit tests remove their `/tmp/beams-*` scratch dirs only
+  on success; use a drop guard so failures don't leak them.
 - [ ] Non-blocking toasts: a bottom-right notice drawn over live remote
   output (repainted after output bursts, cells restored from the shadow
   model) for incoming requests and copy progress, instead of an input
