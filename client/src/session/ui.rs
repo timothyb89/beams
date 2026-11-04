@@ -181,6 +181,9 @@ fn port_or_automatic(port: Option<u16>) -> String {
 /// Human-readable sentences describing a pending request, each flagged
 /// when it's a warning (a destructive sync mode, an overwrite).
 pub fn describe_request(request: &RequestRecord) -> Vec<(String, bool)> {
+    if let Some(prompt) = &request.agent {
+        return prompt.describe();
+    }
     let Some(service_request) = &request.request else {
         return vec![(
             match &request.action {
@@ -368,6 +371,9 @@ pub fn transfer_subject(kind: &ServiceRequestKind) -> String {
 
 /// One line for a toast: what a pending request wants.
 pub fn request_summary(request: &RequestRecord) -> String {
+    if let Some(prompt) = &request.agent {
+        return prompt.summary();
+    }
     let Some(service_request) = &request.request else {
         return match &request.action {
             Some(action) => format!("{} a service", capitalize(action_label(action.action))),
@@ -615,6 +621,9 @@ pub fn service_details(service: &ServiceRecord) -> Vec<String> {
 }
 
 fn request_kind_label(request: &RequestRecord) -> &'static str {
+    if request.agent.is_some() {
+        return "ssh key";
+    }
     match (&request.request, &request.action) {
         (Some(service_request), _) => match &service_request.kind {
             ServiceRequestKind::LocalPortForward { .. } => "forward",

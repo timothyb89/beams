@@ -725,6 +725,30 @@ fn back_item(label: &str) -> MenuItem {
 }
 
 fn request_menu(request: &RequestRecord) -> Menu {
+    if let Some(prompt) = &request.agent {
+        // Deny is the default: keys typed into the shell while the menu
+        // opens must not approve a signature.
+        return Menu {
+            title: "SSH key request".to_string(),
+            intro: prompt.describe(),
+            items: vec![
+                MenuItem {
+                    label: "Allow once".to_string(),
+                    key: Some('y'),
+                    danger: false,
+                    action: MenuAction::Approve(request.request_id.clone()),
+                },
+                MenuItem {
+                    label: "Deny".to_string(),
+                    key: Some('n'),
+                    danger: false,
+                    action: MenuAction::Reject(request.request_id.clone()),
+                },
+                back_item("Decide later"),
+            ],
+            selected: 1,
+        };
+    }
     let needs_path = matches!(
         request.request.as_ref().map(|request| &request.kind),
         Some(ServiceRequestKind::FileCopy { .. } | ServiceRequestKind::FolderSync { .. })
@@ -2757,6 +2781,7 @@ mod tests {
                     action: None,
                     message: None,
                     local_path: None,
+                    agent: None,
                 },
             );
         }
@@ -2780,6 +2805,7 @@ mod tests {
                 action: None,
                 message: None,
                 local_path: None,
+                agent: None,
             },
         );
         assert!(view.take_approval_attention());

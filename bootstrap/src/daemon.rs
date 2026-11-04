@@ -77,11 +77,12 @@ use anyhow::Context;
 use beams_protocol::{
     ActionRequestProjection, BeamToClient, ClientToBeam, FetchSource, RequestProjection, RequestStatus,
     ServiceActionRequest, ServiceProjection, ServiceRequest, ServiceRequestKind, ServiceStatus,
-    CAPABILITY_FILE_FETCH, MAX_FETCH_SOURCES, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
+    CAPABILITY_FILE_FETCH, CAPABILITY_SSH_AGENT, MAX_FETCH_SOURCES, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::agentproxy::{self, AgentBridges, AgentState};
 use crate::executor;
 use crate::tasks::{self, Task};
 
@@ -101,6 +102,7 @@ struct Hub {
     client_requests: Mutex<BTreeMap<String, ClientRequestProjection>>,
     client_action_requests: Mutex<BTreeMap<String, ClientActionProjection>>,
     client_services: Mutex<BTreeMap<String, OwnedServiceProjection>>,
+    agent: AgentState,
 }
 
 impl Default for Hub {
@@ -114,7 +116,42 @@ impl Default for Hub {
             client_requests: Mutex::new(BTreeMap::new()),
             client_action_requests: Mutex::new(BTreeMap::new()),
             client_services: Mutex::new(BTreeMap::new()),
+            agent: AgentState::default(),
         }
+    }
+}
+
+impl AgentBridges for Hub {
+    fn agent_state(&self) -> &AgentState {
+        &self.agent
+    }
+
+    fn route_agent(&self, session_token: Option<&str>) -> Result<String, String> {
+        let bridges = self.bridges.lock().unwrap();
+        let capable: Vec<&BridgeRegistration> = bridges
+            .values()
+            .filter(|bridge| bridge.ready && bridge.capabilities.contains(CAPABILITY_SSH_AGENT))
+            .collect();
+        if let Some(token) = session_token {
+            if let [bridge] = capable
+                .iter()
+                .filter(|bridge| bridge.session_tokens.contains(token))
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                return Ok(bridge.bridge_id.clone());
+            }
+        }
+        match capable.as_slice() {
+            [bridge] => Ok(bridge.bridge_id.clone()),
+            [] => Err("no managed beams client is connected".to_string()),
+            _ => Err("several beams clients are connected and none owns this shell's session".to_string()),
+        }
+    }
+
+    fn send_agent(&self, bridge_id: &str, message: &BeamToClient) -> bool {
+        let sender = self.bridges.lock().unwrap().get(bridge_id).map(|bridge| bridge.sender.clone());
+        sender.is_some_and(|sender| send_bridge_event(&sender, message))
     }
 }
 
@@ -235,6 +272,7 @@ impl Hub {
     }
 
     fn unregister_bridge(&self, bridge_id: &str) {
+        self.agent.forget_bridge(bridge_id);
         let removed = self.bridges.lock().unwrap().remove(bridge_id);
         if let Some(registration) = removed {
             let changed = {
@@ -290,6 +328,19 @@ pub fn serve(socket_path: &Path) -> anyhow::Result<()> {
 
     let listener = UnixListener::bind(socket_path).with_context(|| format!("binding {}", socket_path.display()))?;
     let hub = Arc::new(Hub::default());
+
+    // The SSH agent relay lives next to the daemon socket. Failing to start
+    // it (say, another agent already owns the path) leaves the rest of the
+    // daemon working.
+    let agent_socket = socket_path.with_file_name("ssh-agent.sock");
+    {
+        let hub = Arc::clone(&hub);
+        thread::spawn(move || {
+            if let Err(err) = agentproxy::serve(&agent_socket, hub) {
+                eprintln!("daemon: ssh agent relay not started: {err:#}");
+            }
+        });
+    }
 
     for stream in listener.incoming() {
         let stream = stream.context("accepting connection")?;
@@ -786,6 +837,28 @@ fn client_bridge_message(
         }
         ClientToBeam::Ping { nonce } => {
             send_bridge_event(reply, &BeamToClient::Pong { nonce });
+        }
+        ClientToBeam::AgentIdentities { keys } => match hub.agent.set_identities(bridge_id, &keys) {
+            Ok(()) => {
+                let _ = reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
+            }
+            Err(err) => {
+                let _ = reply.send(error_reply(request_id, &err));
+            }
+        },
+        ClientToBeam::AgentResponse { request_id: agent_request_id, message, note } => {
+            if let Some(note) = note {
+                eprintln!("ssh-agent: request {agent_request_id}: {note}");
+            }
+            match hub.agent.complete(bridge_id, &agent_request_id, &message) {
+                Ok(()) => {
+                    let _ =
+                        reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
+                }
+                Err(err) => {
+                    let _ = reply.send(error_reply(request_id, &err));
+                }
+            }
         }
     }
 }

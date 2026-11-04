@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-beams-protocol = { path = "../protocol" }
+beams-protocol = { path = "../protocol", features = ["agent-crypto"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -22,3 +22,8 @@ signal-hook = "0.3"
 vt100 = "0.18.1"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+
+[dev-dependencies]
+signature = "2"
+ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519", "rand_core", "getrandom"] }

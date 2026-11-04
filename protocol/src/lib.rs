@@ -22,8 +22,18 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// doesn't change `PROTOCOL_VERSION`.
 pub const CAPABILITY_FILE_FETCH: &str = "file_fetch";
 
+/// The workstation relays SSH agent requests (see `SSH_AGENT_PROXY_DESIGN.md`
+/// and the `Agent*` messages below).
+pub const CAPABILITY_SSH_AGENT: &str = "ssh_agent";
+
 /// Every capability this build implements.
-pub const CAPABILITIES: &[&str] = &[CAPABILITY_FILE_FETCH];
+pub const CAPABILITIES: &[&str] = &[CAPABILITY_FILE_FETCH, CAPABILITY_SSH_AGENT];
+
+/// Bounds on the advisory process context attached to an agent request, so
+/// a request always fits in `MAX_FRAME_BYTES`.
+pub const MAX_AGENT_CHAIN: usize = 6;
+pub const MAX_AGENT_ARGV: usize = 32;
+pub const MAX_AGENT_TEXT: usize = 300;
 
 /// Most sources one fetch request may name (keeps requests well under
 /// `MAX_FRAME_BYTES`).
@@ -328,6 +338,62 @@ pub enum ClientToBeam {
     Ping {
         nonce: String,
     },
+    /// The keys the Beam-side agent may list, replacing any earlier set. An
+    /// empty list means "no keys" (no frontend attached, or the proxy is
+    /// disabled). Requires `CAPABILITY_SSH_AGENT`.
+    AgentIdentities {
+        keys: Vec<AgentKey>,
+    },
+    /// The reply to an `AgentSignRequest`: a raw agent message body
+    /// (`SSH_AGENT_SIGN_RESPONSE` or `SSH_AGENT_FAILURE`), base64.
+    AgentResponse {
+        request_id: String,
+        message: String,
+        /// Why it failed, for the Beam's log (the agent protocol has no way
+        /// to tell the requester).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+}
+
+/// A public key the Beam-side agent may list.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct AgentKey {
+    /// Public key blob, base64.
+    pub blob: String,
+    pub comment: String,
+}
+
+/// Advisory context the Beam gathered about the process using the agent.
+/// Everything here can be forged by anything on the Beam; the workstation
+/// shows it as "reported by the Beam" and never bases a decision on it.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct AgentContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// The requesting process first, then its parents (at most
+    /// `MAX_AGENT_CHAIN`).
+    #[serde(default)]
+    pub chain: Vec<AgentProcess>,
+    /// Nearest `SSH_KEY_REASON` up the chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Nearest `BEAMS_TASK_RUN` up the chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_run: Option<String>,
+    /// Destinations named by `ssh` command lines in the chain, spelled the
+    /// way `known_hosts` would (`host` or `[host]:port`). Only ever used to
+    /// *confirm* a hashed `known_hosts` entry for a verified host key.
+    #[serde(default)]
+    pub host_candidates: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct AgentProcess {
+    pub pid: u32,
+    pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 impl ClientToBeam {
@@ -359,6 +425,10 @@ pub enum BeamToClient {
         protocol: String,
         version: u32,
         bridge_id: String,
+        /// See `CAPABILITIES`. The workstation only sends a capability's
+        /// messages to Beams that list it; absent from older Beams.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
     RequestSubmitted {
         request: ServiceRequest,
@@ -378,6 +448,27 @@ pub enum BeamToClient {
     Error {
         message: String,
     },
+    /// A `session-bind@openssh.com` extension seen on Beam-side agent
+    /// connection `conn_id` (raw agent message body, base64). The Beam has
+    /// already acknowledged it; the workstation verifies it and keeps it for
+    /// that connection's later sign requests. Requires `CAPABILITY_SSH_AGENT`.
+    AgentSessionBind {
+        conn_id: String,
+        message: String,
+    },
+    /// An `SSH_AGENTC_SIGN_REQUEST` (raw agent message body, base64) waiting
+    /// for an `AgentResponse`. Requires `CAPABILITY_SSH_AGENT`.
+    AgentSignRequest {
+        request_id: String,
+        conn_id: String,
+        message: String,
+        #[serde(default)]
+        context: AgentContext,
+    },
+    /// Agent connection `conn_id` closed; forget its session binds.
+    AgentConnClosed {
+        conn_id: String,
+    },
 }
 
 impl BeamToClient {
@@ -386,6 +477,7 @@ impl BeamToClient {
             protocol: PROTOCOL.to_string(),
             version: PROTOCOL_VERSION,
             bridge_id: bridge_id.into(),
+            capabilities: CAPABILITIES.iter().map(|capability| capability.to_string()).collect(),
         }
     }
 }
@@ -566,7 +658,7 @@ mod tests {
     #[test]
     fn hello_capabilities_are_optional_both_ways() {
         let hello = serde_json::to_value(ClientToBeam::hello("c", "b", Vec::new())).unwrap();
-        assert_eq!(hello["capabilities"], json!(["file_fetch"]));
+        assert_eq!(hello["capabilities"], json!(["file_fetch", "ssh_agent"]));
         // A hello from a workstation that predates capabilities.
         let old: ClientToBeam = serde_json::from_value(json!({
             "type": "hello",

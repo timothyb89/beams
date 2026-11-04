@@ -9,7 +9,6 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +22,8 @@ use beams_protocol::agent_crypto;
 use serde::Serialize;
 use serde_json::json;
 
+use crate::agentproxy::{host_candidates, peer_cred, process_chain, ProcInfo};
+
 pub struct SpikeConfig {
     pub listen: PathBuf,
     pub upstream: PathBuf,
@@ -33,9 +34,6 @@ pub struct SpikeConfig {
     /// Fingerprints exposed to clients; empty = expose everything upstream has.
     pub allow: BTreeSet<String>,
 }
-
-const MAX_CHAIN: usize = 6;
-const MAX_TEXT: usize = 300;
 
 pub fn run(config: SpikeConfig) -> anyhow::Result<()> {
     if config.listen.exists() {
@@ -80,19 +78,6 @@ fn log(event: &str, mut fields: serde_json::Value) {
         );
     }
     println!("{fields}");
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct ProcInfo {
-    pid: u32,
-    ppid: u32,
-    start_time: u64,
-    argv: Vec<String>,
-    cwd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    task_run: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -311,161 +296,4 @@ fn call_upstream(upstream: &mut Option<UnixStream>, path: &Path, body: &[u8]) ->
     agent::read_message(stream)
         .context("reading upstream")?
         .ok_or_else(|| anyhow::anyhow!("upstream closed"))
-}
-
-fn peer_cred(conn: &UnixStream) -> Option<(u32, u32)> {
-    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // Safety: `cred`/`len` are valid for writes of the sizes passed.
-    let rc = unsafe {
-        libc::getsockopt(
-            conn.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    (rc == 0 && cred.pid > 0).then_some((cred.pid as u32, cred.uid))
-}
-
-fn process_chain(pid: u32) -> Vec<ProcInfo> {
-    let mut out = Vec::new();
-    let mut next = pid;
-    let me = std::process::id();
-    while out.len() < MAX_CHAIN && next > 1 && next != me {
-        let Some(info) = proc_info(next) else { break };
-        next = info.ppid;
-        out.push(info);
-    }
-    out
-}
-
-fn proc_info(pid: u32) -> Option<ProcInfo> {
-    let base = PathBuf::from(format!("/proc/{pid}"));
-    let stat = fs::read_to_string(base.join("stat")).ok()?;
-    // Fields after the last ')' (the comm may itself contain ')').
-    let rest = &stat[stat.rfind(')')? + 2..];
-    let fields: Vec<&str> = rest.split(' ').collect();
-    let ppid = fields.get(1)?.parse().ok()?;
-    let start_time = fields.get(19)?.parse().ok()?;
-    let argv = fs::read(base.join("cmdline"))
-        .ok()
-        .map(|raw| raw.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| sanitize(&String::from_utf8_lossy(s))).collect())
-        .unwrap_or_default();
-    let cwd = fs::read_link(base.join("cwd")).ok().map(|p| sanitize(&p.display().to_string()));
-    let (mut reason, mut task_run) = (None, None);
-    if let Ok(environ) = fs::read(base.join("environ")) {
-        for var in environ.split(|b| *b == 0) {
-            let var = String::from_utf8_lossy(var);
-            if let Some(v) = var.strip_prefix("SSH_KEY_REASON=") {
-                reason = Some(sanitize(v));
-            } else if let Some(v) = var.strip_prefix("BEAMS_TASK_RUN=") {
-                task_run = Some(sanitize(v));
-            }
-        }
-    }
-    Some(ProcInfo { pid, ppid, start_time, argv, cwd, reason, task_run })
-}
-
-/// Drops control characters (incl. ESC, so no ANSI/OSC) and bidi overrides,
-/// and bounds the length.
-fn sanitize(s: &str) -> String {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| !c.is_control() && !matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
-        .take(MAX_TEXT)
-        .collect();
-    cleaned
-}
-
-/// Destination hosts mentioned by `ssh` invocations in the chain, spelled the
-/// way `known_hosts` would. Untrusted but harmless: a candidate only matters
-/// if the user's own known_hosts confirms it for the verified host key.
-fn host_candidates(chain: &[ProcInfo]) -> Vec<String> {
-    let mut out = Vec::new();
-    for info in chain {
-        let Some(argv0) = info.argv.first() else { continue };
-        if Path::new(argv0).file_name().and_then(|n| n.to_str()) != Some("ssh") {
-            continue;
-        }
-        if let Some((host, port)) = ssh_destination(&info.argv[1..]) {
-            let name = agent_crypto::known_hosts_name(&host, port);
-            if !out.contains(&name) {
-                out.push(name);
-            }
-        }
-    }
-    out
-}
-
-fn ssh_destination(args: &[String]) -> Option<(String, Option<u16>)> {
-    const WITH_ARG: &str = "BbcDEeFIiJLlmOoPpQRSWw";
-    let mut port = None;
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if let Some(flags) = arg.strip_prefix('-').filter(|f| !f.is_empty()) {
-            // Clustered flags; the first flag that takes an argument consumes
-            // the rest of the token or the next token.
-            for (pos, flag) in flags.char_indices() {
-                if WITH_ARG.contains(flag) {
-                    let inline = &flags[pos + flag.len_utf8()..];
-                    let value = if inline.is_empty() {
-                        i += 1;
-                        args.get(i).cloned().unwrap_or_default()
-                    } else {
-                        inline.to_string()
-                    };
-                    if flag == 'p' {
-                        port = value.parse().ok();
-                    } else if flag == 'o' {
-                        if let Some(v) = value.strip_prefix("Port=").or_else(|| value.strip_prefix("Port ")) {
-                            port = v.trim().parse().ok();
-                        }
-                    }
-                    break;
-                }
-            }
-            i += 1;
-            continue;
-        }
-        let is_url = arg.starts_with("ssh://");
-        let dest = arg.strip_prefix("ssh://").unwrap_or(arg);
-        let dest = if is_url { dest.split('/').next().unwrap_or(dest) } else { dest };
-        let dest = dest.rsplit('@').next().unwrap_or(dest);
-        let (host, url_port) = match dest.split_once(':') {
-            Some((h, p)) if is_url => (h.to_string(), p.parse().ok()),
-            _ => (dest.to_string(), None),
-        };
-        return Some((host, url_port.or(port)));
-    }
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args(s: &str) -> Vec<String> {
-        s.split_whitespace().map(String::from).collect()
-    }
-
-    #[test]
-    fn ssh_destination_parsing() {
-        assert_eq!(
-            ssh_destination(&args("-o SendEnv=GIT_PROTOCOL git@github.com git-upload-pack 'x.git'")),
-            Some(("github.com".into(), None))
-        );
-        assert_eq!(ssh_destination(&args("-p 2200 -T me@localhost true")), Some(("localhost".into(), Some(2200))));
-        assert_eq!(ssh_destination(&args("-oPort=2201 localhost")), Some(("localhost".into(), Some(2201))));
-        assert_eq!(ssh_destination(&args("ssh://git@example.com:2222/repo")), Some(("example.com".into(), Some(2222))));
-        assert_eq!(ssh_destination(&args("-tt -J jump host")), Some(("host".into(), None)));
-    }
-
-    #[test]
-    fn sanitize_strips_escapes_and_bidi() {
-        assert_eq!(sanitize("ok\x1b[31mred\u{202e}x\n"), "ok[31mredx");
-        assert_eq!(sanitize(&"a".repeat(1000)).len(), MAX_TEXT);
-    }
 }

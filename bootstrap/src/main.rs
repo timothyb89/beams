@@ -1,3 +1,4 @@
+mod agentproxy;
 mod agentspike;
 mod aptlock;
 mod clientbridge;

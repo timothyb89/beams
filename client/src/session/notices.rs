@@ -16,6 +16,9 @@ use crate::clientd::ServiceRecord;
 /// How long an ignored request's toast stays up. The request itself stays
 /// pending in the menu until the daemon expires it.
 const REQUEST_TOAST_FOR: Duration = Duration::from_secs(20);
+/// SSH key requests block whatever asked (`git`, `ssh`) until decided, so
+/// their toast stays up for as long as they can be approved.
+const AGENT_TOAST_FOR: Duration = Duration::from_secs(120);
 const DONE_TOAST_FOR: Duration = Duration::from_secs(5);
 const FAILED_TOAST_FOR: Duration = Duration::from_secs(10);
 /// Inner width the toast lines are cut to.
@@ -59,7 +62,10 @@ impl ToastPolicy {
             .filter(|request| {
                 self.first_seen
                     .get(&request.request_id)
-                    .is_some_and(|seen| now.saturating_duration_since(*seen) < REQUEST_TOAST_FOR)
+                    .is_some_and(|seen| {
+                        let shown_for = if request.agent.is_some() { AGENT_TOAST_FOR } else { REQUEST_TOAST_FOR };
+                        now.saturating_duration_since(*seen) < shown_for
+                    })
             })
             .collect();
         fresh.sort_by_key(|request| self.first_seen.get(&request.request_id).copied());
@@ -81,7 +87,7 @@ impl ToastPolicy {
                 title: if pending.len() > 1 {
                     format!("{} Beam requests", pending.len())
                 } else {
-                    "Beam request".to_string()
+                    if newest.agent.is_some() { "SSH key request".to_string() } else { "Beam request".to_string() }
                 },
                 lines: vec![
                     Line::from(Span::styled(

@@ -134,6 +134,7 @@ dependencies = [
 name = "beams-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64ct",
  "hmac",
  "serde",
  "sha1",

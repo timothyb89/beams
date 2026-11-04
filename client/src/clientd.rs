@@ -5,7 +5,7 @@
 //! per-Beam control bridges, local-only approval decisions, and supervised
 //! workstation-owned service processes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -13,7 +13,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
@@ -23,7 +23,8 @@ use anyhow::{bail, Context};
 use beams_protocol::{
     ActionRequestProjection, BeamToClient, ClientToBeam, RequestProjection, RequestStatus,
     ServiceAction, ServiceActionRequest, ServiceProjection, ServiceRequest, ServiceRequestKind,
-    ServiceStatus, TransferProgress, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
+    ServiceStatus, TransferProgress, CAPABILITY_SSH_AGENT, MAX_FRAME_BYTES, PROTOCOL,
+    PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
@@ -81,6 +82,10 @@ pub struct RequestRecord {
     /// Workstation-only approved path. Never included in Beam projections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_path: Option<String>,
+    /// Set for SSH agent sign requests (`kind` "ssh_agent"). These live only
+    /// in memory, never in the persisted state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<crate::agent::AgentPrompt>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -144,6 +149,10 @@ enum ClientMessage {
         beam_uuid: String,
         login: String,
         session_token: String,
+        /// The frontend's own `SSH_AUTH_SOCK`: the agent that signs the SSH
+        /// agent requests this frontend approves.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh_auth_sock: Option<String>,
     },
     DecideRequest {
         request_id: String,
@@ -372,6 +381,46 @@ struct Hub {
     /// Set by a termination signal or the `shutdown` control op.
     terminating: Arc<AtomicBool>,
     started_at: Instant,
+    /// `[ssh_agent]` config, re-read on use so edits apply without a restart.
+    agent_config: Box<dyn Fn() -> crate::agent::Config + Send + Sync>,
+    /// The user's known-hosts text, for naming verified host keys.
+    agent_known_hosts: Box<dyn Fn() -> String + Send + Sync>,
+    agent: Mutex<AgentRuntime>,
+    frontend_ids: AtomicU64,
+}
+
+/// SSH agent relay state (see `crate::agent`). Nothing here is persisted:
+/// a pending sign request can't outlive the Beam-side connection waiting
+/// for it anyway.
+#[derive(Default)]
+struct AgentRuntime {
+    /// Frontend connection id -> (Beam UUID, that frontend's SSH_AUTH_SOCK).
+    frontends: BTreeMap<u64, (String, Option<String>)>,
+    binds: crate::agent::BindStore,
+    /// Local request id -> waiting sign request.
+    pending: BTreeMap<String, PendingAgent>,
+    /// Beams whose bridge advertised `CAPABILITY_SSH_AGENT`.
+    capable: HashSet<String>,
+}
+
+struct PendingAgent {
+    beam_request_id: String,
+    body: Vec<u8>,
+    record: RequestRecord,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn load_agent_config() -> crate::agent::Config {
+    crate::agent::Config::load().unwrap_or_else(|err| {
+        eprintln!("ssh-agent: config ignored, proxy disabled: {err:#}");
+        crate::agent::Config::default()
+    })
 }
 
 struct BridgeRuntime {
@@ -427,13 +476,17 @@ impl Hub {
         forward_program: String,
     ) -> Self {
         let mutagen_root = std::env::temp_dir().join(format!("beams-mutagen-{}", Uuid::new_v4()));
-        Self::with_programs(
+        let mut hub = Self::with_programs(
             state,
             state_path,
             forward_program,
             "mutagen".to_string(),
             mutagen_root,
-        )
+        );
+        // Never the developer's real config or known_hosts.
+        hub.agent_config = Box::new(crate::agent::Config::default);
+        hub.agent_known_hosts = Box::new(String::new);
+        hub
     }
 
     fn with_programs(
@@ -456,6 +509,10 @@ impl Hub {
             beam_lister: Box::new(list_beam_uuids),
             terminating: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
+            agent_config: Box::new(load_agent_config),
+            agent_known_hosts: Box::new(crate::agent::read_known_hosts),
+            agent: Mutex::new(AgentRuntime::default()),
+            frontend_ids: AtomicU64::new(1),
         }
     }
 
@@ -474,11 +531,13 @@ impl Hub {
                     )
             })
             .count();
+        // SSH key requests aren't persisted, so a restart would drop them.
         let pending = state
             .requests
             .values()
             .filter(|request| request.status == RequestStatus::PendingApproval)
-            .count();
+            .count()
+            + self.agent.lock().unwrap().pending.len();
         let mut reasons = Vec::new();
         if copies > 0 {
             reasons.push(format!("{copies} file copy job(s) in progress"));
@@ -619,10 +678,12 @@ impl Hub {
 
     fn snapshot(&self) -> ServerEvent {
         let state = self.state.lock().unwrap();
+        let mut requests: Vec<RequestRecord> = state.requests.values().cloned().collect();
+        requests.extend(self.agent.lock().unwrap().pending.values().map(|p| p.record.clone()));
         ServerEvent::Snapshot {
             client_id: state.client_id.clone(),
             frontends: self.frontends.load(Ordering::SeqCst),
-            requests: state.requests.values().cloned().collect(),
+            requests,
             services: state.services.values().cloned().collect(),
             bridges: self
                 .bridges
@@ -948,6 +1009,7 @@ impl Hub {
             action: None,
             message: Some("created by local user".to_string()),
             local_path: None,
+            agent: None,
         };
         {
             let mut state = self.state.lock().unwrap();
@@ -1008,6 +1070,7 @@ impl Hub {
             action: None,
             message: Some("created by local user".to_string()),
             local_path: Some(local_path),
+            agent: None,
         };
         self.state
             .lock()
@@ -1073,6 +1136,7 @@ impl Hub {
             action: None,
             message: Some("created by local user".to_string()),
             local_path: Some(local_path),
+            agent: None,
         };
         self.state
             .lock()
@@ -1652,6 +1716,259 @@ impl Hub {
     }
 }
 
+impl Hub {
+    fn agent_frontend_attached(&self, frontend: u64, beam_uuid: &str, sock: Option<String>) {
+        self.agent
+            .lock()
+            .unwrap()
+            .frontends
+            .insert(frontend, (beam_uuid.to_string(), sock));
+        self.refresh_agent_identities(beam_uuid);
+    }
+
+    fn agent_frontend_detached(&self, frontend: u64) {
+        let beam = self.agent.lock().unwrap().frontends.remove(&frontend).map(|(beam, _)| beam);
+        if let Some(beam) = beam {
+            self.refresh_agent_identities(&beam);
+        }
+    }
+
+    fn has_agent_frontend(&self, beam_uuid: &str) -> bool {
+        self.agent
+            .lock()
+            .unwrap()
+            .frontends
+            .values()
+            .any(|(beam, _)| beam == beam_uuid)
+    }
+
+    /// The agent socket of `preferred` if it's attached to `beam_uuid` and
+    /// has one, else the most recently attached such frontend's.
+    fn agent_socket_for(&self, beam_uuid: &str, preferred: Option<u64>) -> Option<String> {
+        let agent = self.agent.lock().unwrap();
+        if let Some((beam, Some(sock))) = preferred.and_then(|id| agent.frontends.get(&id)) {
+            if beam == beam_uuid {
+                return Some(sock.clone());
+            }
+        }
+        agent
+            .frontends
+            .values()
+            .rev()
+            .find_map(|(beam, sock)| (beam == beam_uuid).then(|| sock.clone()).flatten())
+    }
+
+    /// Pushes the keys `beam_uuid` may list: the allowlisted keys of its
+    /// newest attached frontend's agent, or none.
+    fn refresh_agent_identities(&self, beam_uuid: &str) {
+        if !self.agent.lock().unwrap().capable.contains(beam_uuid) {
+            return;
+        }
+        let Some(commands) = self
+            .bridges
+            .lock()
+            .unwrap()
+            .get(beam_uuid)
+            .map(|bridge| bridge.commands.clone())
+        else {
+            return;
+        };
+        let config = (self.agent_config)();
+        let keys = match self.agent_socket_for(beam_uuid, None) {
+            Some(sock) if config.enabled() => crate::agent::allowed_keys(&config, &sock).unwrap_or_else(|err| {
+                eprintln!("ssh-agent: {beam_uuid}: listing local keys: {err:#}");
+                Vec::new()
+            }),
+            _ => Vec::new(),
+        };
+        let _ = commands.try_send(ClientToBeam::AgentIdentities { keys });
+    }
+
+    fn send_agent_response(&self, beam_uuid: &str, beam_request_id: &str, body: &[u8], note: Option<String>) {
+        let commands = self
+            .bridges
+            .lock()
+            .unwrap()
+            .get(beam_uuid)
+            .map(|bridge| bridge.commands.clone());
+        if let Some(commands) = commands {
+            let _ = commands.try_send(ClientToBeam::AgentResponse {
+                request_id: beam_request_id.to_string(),
+                message: beams_protocol::agent::b64_encode(body),
+                note,
+            });
+        }
+    }
+
+    fn deny_agent(&self, beam_uuid: &str, beam_request_id: &str, why: &str) {
+        eprintln!("ssh-agent: {beam_uuid}: denied without asking: {why}");
+        self.send_agent_response(beam_uuid, beam_request_id, &beams_protocol::agent::failure(), Some(why.to_string()));
+    }
+
+    /// A relayed sign request: refuse it outright, or queue it for the user.
+    fn handle_agent_sign(
+        self: &Arc<Self>,
+        beam_uuid: &str,
+        beam_request_id: String,
+        conn_id: &str,
+        message: &str,
+        context: &beams_protocol::AgentContext,
+    ) {
+        let config = (self.agent_config)();
+        if !config.enabled() {
+            return self.deny_agent(beam_uuid, &beam_request_id, "the SSH agent proxy is disabled on the workstation");
+        }
+        if !self.has_agent_frontend(beam_uuid) {
+            return self.deny_agent(
+                beam_uuid,
+                &beam_request_id,
+                "no interactive `beams ssh` session is attached to approve it",
+            );
+        }
+        let (binds, queued) = {
+            let agent = self.agent.lock().unwrap();
+            let queued = agent.pending.values().filter(|p| p.record.beam_uuid == beam_uuid).count();
+            (agent.binds.binds(beam_uuid, conn_id), queued)
+        };
+        if queued >= crate::agent::MAX_PENDING_PER_BEAM {
+            return self.deny_agent(beam_uuid, &beam_request_id, "too many SSH key requests are already waiting");
+        }
+        let local_keys = self
+            .agent_socket_for(beam_uuid, None)
+            .and_then(|sock| crate::agent::local_identities(&sock).ok())
+            .unwrap_or_default();
+        let timeout = config.prompt_timeout();
+        let expires_at_ms = now_ms() + timeout.as_millis() as u64;
+        let known_hosts = (self.agent_known_hosts)();
+        let (body, prompt) = match crate::agent::evaluate(
+            &config,
+            message,
+            &binds,
+            context,
+            &known_hosts,
+            &local_keys,
+            expires_at_ms,
+        ) {
+            Ok(evaluated) => evaluated,
+            Err(why) => return self.deny_agent(beam_uuid, &beam_request_id, &why),
+        };
+        let record = RequestRecord {
+            request_id: Uuid::new_v4().to_string(),
+            beam_uuid: beam_uuid.to_string(),
+            kind: "ssh_agent".to_string(),
+            status: RequestStatus::PendingApproval,
+            request: None,
+            action: None,
+            message: None,
+            local_path: None,
+            agent: Some(prompt),
+        };
+        eprintln!(
+            "ssh-agent: {beam_uuid}: asking: {} (request {})",
+            record.agent.as_ref().map(|p| p.summary()).unwrap_or_default(),
+            record.request_id
+        );
+        let request_id = record.request_id.clone();
+        self.agent.lock().unwrap().pending.insert(
+            request_id.clone(),
+            PendingAgent { beam_request_id, body, record: record.clone() },
+        );
+        self.broadcast(ServerEvent::RequestChanged { request: record });
+        let weak = Arc::downgrade(self);
+        thread::spawn(move || {
+            thread::sleep(timeout);
+            if let Some(hub) = weak.upgrade() {
+                hub.finish_agent_request(&request_id, RequestStatus::Expired, "approval timed out");
+            }
+        });
+    }
+
+    fn is_agent_request(&self, request_id: &str) -> bool {
+        self.agent.lock().unwrap().pending.contains_key(request_id)
+    }
+
+    /// Ends a still-pending request without signing.
+    fn finish_agent_request(&self, request_id: &str, status: RequestStatus, why: &str) {
+        let Some(mut pending) = self.agent.lock().unwrap().pending.remove(request_id) else {
+            return;
+        };
+        pending.record.status = status;
+        pending.record.message = Some(why.to_string());
+        eprintln!("ssh-agent: {}: {why} (request {request_id})", pending.record.beam_uuid);
+        self.send_agent_response(
+            &pending.record.beam_uuid,
+            &pending.beam_request_id,
+            &beams_protocol::agent::failure(),
+            Some(why.to_string()),
+        );
+        self.broadcast(ServerEvent::RequestChanged { request: pending.record });
+    }
+
+    fn expire_agent_requests_for(&self, beam_uuid: &str, why: &str) {
+        let ids: Vec<String> = self
+            .agent
+            .lock()
+            .unwrap()
+            .pending
+            .iter()
+            .filter(|(_, p)| p.record.beam_uuid == beam_uuid)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            self.finish_agent_request(&id, RequestStatus::Expired, why);
+        }
+    }
+
+    /// A local decision on an agent request. The first decision wins; the
+    /// signature comes from the deciding frontend's own agent.
+    fn decide_agent(self: &Arc<Self>, request_id: &str, approve: bool, frontend: u64) -> anyhow::Result<()> {
+        if !approve {
+            self.finish_agent_request(request_id, RequestStatus::Rejected, "rejected by local user");
+            return Ok(());
+        }
+        let Some(mut pending) = self.agent.lock().unwrap().pending.remove(request_id) else {
+            bail!("that SSH key request was already decided or has expired");
+        };
+        let beam_uuid = pending.record.beam_uuid.clone();
+        let Some(sock) = self.agent_socket_for(&beam_uuid, Some(frontend)) else {
+            let why = "this terminal has no SSH_AUTH_SOCK, so there is no agent to sign with";
+            pending.record.status = RequestStatus::Failed;
+            pending.record.message = Some(why.to_string());
+            self.send_agent_response(&beam_uuid, &pending.beam_request_id, &beams_protocol::agent::failure(), Some(why.to_string()));
+            self.broadcast(ServerEvent::RequestChanged { request: pending.record });
+            bail!("{why}");
+        };
+        pending.record.status = RequestStatus::Approved;
+        pending.record.message = Some("approved by local user".to_string());
+        self.broadcast(ServerEvent::RequestChanged { request: pending.record.clone() });
+        // The local agent may itself prompt (confirm, hardware touch), so
+        // sign off this frontend's connection thread.
+        let PendingAgent { beam_request_id, body, mut record } = pending;
+        let summary = record.agent.as_ref().map(|p| p.summary()).unwrap_or_default();
+        let hub = Arc::clone(self);
+        let request_id = request_id.to_string();
+        thread::spawn(move || match crate::agent::local_sign(&sock, &body) {
+            Ok(reply) => {
+                eprintln!("ssh-agent: {beam_uuid}: signed: {summary} (request {request_id})");
+                record.status = RequestStatus::Running;
+                record.message = Some("signed".to_string());
+                hub.send_agent_response(&beam_uuid, &beam_request_id, &reply, None);
+                hub.broadcast(ServerEvent::RequestChanged { request: record });
+            }
+            Err(err) => {
+                // Shown to the user through the request's message.
+                let why = format!("{err:#}");
+                eprintln!("ssh-agent: {beam_uuid}: signing failed: {why} (request {request_id})");
+                record.status = RequestStatus::Failed;
+                record.message = Some(why.clone());
+                hub.send_agent_response(&beam_uuid, &beam_request_id, &beams_protocol::agent::failure(), Some(why));
+                hub.broadcast(ServerEvent::RequestChanged { request: record });
+            }
+        });
+        Ok(())
+    }
+}
+
 fn validate_port_forward(
     remote_host: &str,
     remote_port: u16,
@@ -1995,7 +2312,17 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
         crate::bridge::Event::Connected {
             beam_uuid,
             bridge_id,
+            capabilities,
         } => {
+            {
+                let mut agent = hub.agent.lock().unwrap();
+                agent.binds.clear_beam(&beam_uuid);
+                if capabilities.iter().any(|c| c == CAPABILITY_SSH_AGENT) {
+                    agent.capable.insert(beam_uuid.clone());
+                } else {
+                    agent.capable.remove(&beam_uuid);
+                }
+            }
             let (record, commands) = {
                 let mut bridges = hub.bridges.lock().unwrap();
                 let Some(bridge) = bridges.get_mut(&beam_uuid) else {
@@ -2060,8 +2387,11 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
             let _ = commands.send(ClientToBeam::ServiceSnapshot { services });
             let _ = commands.send(ClientToBeam::Ready);
             hub.broadcast(ServerEvent::BridgeStatus { bridge: record });
+            hub.refresh_agent_identities(&beam_uuid);
         }
         crate::bridge::Event::Disconnected { beam_uuid, message } => {
+            // The Beam fails its waiting sign requests when the bridge goes.
+            hub.expire_agent_requests_for(&beam_uuid, "the Beam bridge disconnected");
             let (record, check_existence) = {
                 let mut bridges = hub.bridges.lock().unwrap();
                 let Some(bridge) = bridges.get_mut(&beam_uuid) else {
@@ -2103,6 +2433,7 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                     action: None,
                     message: None,
                     local_path: None,
+                    agent: None,
                 };
                 let inserted = {
                     let mut state = hub.state.lock().unwrap();
@@ -2153,6 +2484,7 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                     action: Some(request),
                     message: None,
                     local_path: None,
+                    agent: None,
                 };
                 let inserted = {
                     let mut state = hub.state.lock().unwrap();
@@ -2192,6 +2524,20 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                 hub.broadcast(ServerEvent::BridgeStatus { bridge: record });
             }
             BeamToClient::Pong { .. } | BeamToClient::Hello { .. } => {}
+            BeamToClient::AgentSessionBind { conn_id, message } => {
+                if let Err(err) = hub.agent.lock().unwrap().binds.add(&beam_uuid, &conn_id, &message) {
+                    eprintln!("ssh-agent: {beam_uuid} {conn_id}: session-bind ignored: {err}");
+                }
+            }
+            BeamToClient::AgentConnClosed { conn_id } => {
+                hub.agent.lock().unwrap().binds.close(&beam_uuid, &conn_id);
+            }
+            BeamToClient::AgentSignRequest {
+                request_id,
+                conn_id,
+                message,
+                context,
+            } => hub.handle_agent_sign(&beam_uuid, request_id, &conn_id, &message, &context),
         },
     }
 }
@@ -2287,6 +2633,7 @@ impl Frontend {
                 beam_uuid: target.beam_uuid.clone(),
                 login: target.login.clone(),
                 session_token: session_token.to_string(),
+                ssh_auth_sock: std::env::var("SSH_AUTH_SOCK").ok().filter(|sock| !sock.is_empty()),
             },
         )
         .context("requesting Beam bridge")
@@ -2739,6 +3086,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
         .context("clearing frontend handshake timeout")?;
 
     let client_id = hub.state.lock().unwrap().client_id.clone();
+    let frontend_id = hub.frontend_ids.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = hub.register();
     let mut write_half = stream;
     thread::spawn(move || {
@@ -2791,16 +3139,20 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                         beam_uuid,
                         login,
                         session_token,
+                        ssh_auth_sock,
                     } => {
                         let target = crate::bridge::Target {
                             beam_id,
-                            beam_uuid,
+                            beam_uuid: beam_uuid.clone(),
                             login,
                         };
-                        if let Err(err) = hub.ensure_bridge(target, session_token) {
-                            let _ = tx.try_send(ServerEvent::Error {
-                                message: format!("starting Beam bridge: {err:#}"),
-                            });
+                        match hub.ensure_bridge(target, session_token) {
+                            Ok(()) => hub.agent_frontend_attached(frontend_id, &beam_uuid, ssh_auth_sock),
+                            Err(err) => {
+                                let _ = tx.try_send(ServerEvent::Error {
+                                    message: format!("starting Beam bridge: {err:#}"),
+                                });
+                            }
                         }
                     }
                     ClientMessage::DecideRequest {
@@ -2808,7 +3160,12 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                         approve,
                         local_path,
                     } => {
-                        if let Err(err) = hub.decide_request(&request_id, approve, local_path) {
+                        let result = if hub.is_agent_request(&request_id) {
+                            hub.decide_agent(&request_id, approve, frontend_id)
+                        } else {
+                            hub.decide_request(&request_id, approve, local_path).map(|_| ())
+                        };
+                        if let Err(err) = result {
                             let _ = tx.try_send(ServerEvent::Error {
                                 message: format!("deciding request: {err:#}"),
                             });
@@ -2916,6 +3273,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
             }
         }
     }
+    hub.agent_frontend_detached(frontend_id);
     hub.unregister();
     Ok(())
 }
@@ -3163,6 +3521,7 @@ mod tests {
                 action: None,
                 message: None,
                 local_path: None,
+                agent: None,
             },
         );
         assert!(state.expire_pending_after_restart());
@@ -3442,6 +3801,7 @@ mod tests {
                 action: None,
                 message: Some("rejected by local user".to_string()),
                 local_path: None,
+                agent: None,
             },
         );
 
@@ -3450,6 +3810,7 @@ mod tests {
             crate::bridge::Event::Connected {
                 beam_uuid: "beam-uuid".to_string(),
                 bridge_id: "new-bridge-id".to_string(),
+                capabilities: Vec::new(),
             },
         );
         let request_snapshot = commands.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -3507,6 +3868,7 @@ mod tests {
                 action: None,
                 message: None,
                 local_path: None,
+                agent: None,
             },
         );
         hub.expire_request("request-3");
@@ -3813,5 +4175,210 @@ mod tests {
         });
         restarted.shutdown();
         let _ = fs::remove_file(program);
+    }
+
+    /// A stand-in for the workstation's ssh-agent: lists `key_blob`, signs
+    /// anything with a fixed signature.
+    fn fake_local_agent(key_blob: Vec<u8>) -> String {
+        use beams_protocol::agent as wire;
+        let path = temp_path("beams-fake-agent");
+        let listener = UnixListener::bind(&path).unwrap();
+        thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let key_blob = key_blob.clone();
+                thread::spawn(move || {
+                    while let Ok(Some(body)) = wire::read_message(&mut conn) {
+                        let reply = match body[0] {
+                            wire::msg::REQUEST_IDENTITIES => wire::encode_identities_answer(&[wire::Identity {
+                                key_blob: key_blob.clone(),
+                                comment: "test key".into(),
+                            }]),
+                            wire::msg::SIGN_REQUEST => {
+                                let mut reply = vec![wire::msg::SIGN_RESPONSE];
+                                reply.extend_from_slice(&3u32.to_be_bytes());
+                                reply.extend_from_slice(b"sig");
+                                reply
+                            }
+                            _ => wire::failure(),
+                        };
+                        if wire::write_message(&mut conn, &reply).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        path.display().to_string()
+    }
+
+    fn agent_hub(allowed: &str) -> (Arc<Hub>, Receiver<ClientToBeam>) {
+        let mut hub = Hub::with_state_path_and_program(PersistedState::default(), None, "tsh".to_string());
+        let allowed = allowed.to_string();
+        hub.agent_config = Box::new(move || crate::agent::Config {
+            allowed_keys: vec![allowed.clone()],
+            prompt_timeout: Some(30),
+        });
+        let hub = Arc::new(hub);
+        let (commands, command_rx) = mpsc::sync_channel(64);
+        hub.bridges.lock().unwrap().insert(
+            "beam-uuid".to_string(),
+            BridgeRuntime::new(
+                BridgeRecord {
+                    beam_id: "beam-name".to_string(),
+                    beam_uuid: "beam-uuid".to_string(),
+                    login: "beams".to_string(),
+                    status: "connecting".to_string(),
+                    session_count: 1,
+                    bridge_id: None,
+                    message: None,
+                },
+                commands,
+            ),
+        );
+        (hub, command_rx)
+    }
+
+    /// The next agent message sent to the Beam, skipping snapshots etc.
+    fn next_agent_message(commands: &Receiver<ClientToBeam>) -> ClientToBeam {
+        loop {
+            let message = commands.recv_timeout(Duration::from_secs(5)).expect("an agent message");
+            if matches!(message, ClientToBeam::AgentIdentities { .. } | ClientToBeam::AgentResponse { .. }) {
+                return message;
+            }
+        }
+    }
+
+    fn agent_sign(hub: &Arc<Hub>, beam_request_id: &str, user_key: &[u8]) {
+        use beams_protocol::agent as wire;
+        let data = wire::encode_userauth_data(&wire::UserAuthRequest {
+            session_id: vec![4; 32],
+            user: "git".into(),
+            service: "ssh-connection".into(),
+            method: wire::METHOD_PUBLICKEY.into(),
+            algorithm: "ssh-ed25519".into(),
+            key_blob: user_key.to_vec(),
+            host_key: None,
+        });
+        handle_bridge_event(
+            hub,
+            crate::bridge::Event::Message {
+                beam_uuid: "beam-uuid".to_string(),
+                message: BeamToClient::AgentSignRequest {
+                    request_id: beam_request_id.to_string(),
+                    conn_id: "agent-1".to_string(),
+                    message: wire::b64_encode(&wire::encode_sign_request(user_key, &data, 0)),
+                    context: beams_protocol::AgentContext {
+                        reason: Some("clone for review".into()),
+                        ..Default::default()
+                    },
+                },
+            },
+        );
+    }
+
+    fn pending_agent_ids(hub: &Hub) -> Vec<String> {
+        hub.agent.lock().unwrap().pending.keys().cloned().collect()
+    }
+
+    #[test]
+    fn agent_requests_need_an_attached_frontend_and_one_local_decision() {
+        use beams_protocol::agent as wire;
+        use ssh_key::{rand_core::OsRng, Algorithm, PrivateKey};
+        let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let blob = key.public_key().to_bytes().unwrap();
+        let fingerprint = beams_protocol::agent_crypto::fingerprint(&blob).unwrap();
+        let (hub, commands) = agent_hub(&fingerprint);
+        let sock = fake_local_agent(blob.clone());
+
+        handle_bridge_event(
+            &hub,
+            crate::bridge::Event::Connected {
+                beam_uuid: "beam-uuid".to_string(),
+                bridge_id: "bridge-1".to_string(),
+                capabilities: vec![CAPABILITY_SSH_AGENT.to_string()],
+            },
+        );
+        // No frontend yet: nothing to list, and signs are denied unasked.
+        assert_eq!(next_agent_message(&commands), ClientToBeam::AgentIdentities { keys: vec![] });
+        agent_sign(&hub, "beam-req-0", &blob);
+        match next_agent_message(&commands) {
+            ClientToBeam::AgentResponse { request_id, message, note } => {
+                assert_eq!(request_id, "beam-req-0");
+                assert_eq!(wire::b64_decode(&message).unwrap(), wire::failure());
+                assert!(note.unwrap().contains("no interactive"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        hub.agent_frontend_attached(7, "beam-uuid", Some(sock.clone()));
+        match next_agent_message(&commands) {
+            ClientToBeam::AgentIdentities { keys } => {
+                assert_eq!(keys.len(), 1);
+                assert_eq!(keys[0].comment, "test key");
+                assert_eq!(wire::b64_decode(&keys[0].blob).unwrap(), blob);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Queued for the user, visible in the snapshot, never persisted.
+        agent_sign(&hub, "beam-req-1", &blob);
+        let ids = pending_agent_ids(&hub);
+        assert_eq!(ids.len(), 1);
+        let ServerEvent::Snapshot { requests, .. } = hub.snapshot() else { panic!() };
+        let record = requests.iter().find(|r| r.request_id == ids[0]).unwrap();
+        assert_eq!(record.status, RequestStatus::PendingApproval);
+        let prompt = record.agent.as_ref().unwrap();
+        assert_eq!(prompt.claimed.reason.as_deref(), Some("clone for review"));
+        assert!(matches!(
+            &prompt.operation,
+            crate::agent::AgentOperation::Login { user, host: crate::agent::HostCheck::Unverified { .. } } if user == "git"
+        ));
+        assert!(hub.state.lock().unwrap().requests.is_empty());
+
+        hub.decide_agent(&ids[0], true, 7).unwrap();
+        match next_agent_message(&commands) {
+            ClientToBeam::AgentResponse { request_id, message, note } => {
+                assert_eq!(request_id, "beam-req-1");
+                assert_eq!(wire::parse_sign_response(&wire::b64_decode(&message).unwrap()).unwrap(), Some(b"sig".to_vec()));
+                assert_eq!(note, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(hub.decide_agent(&ids[0], true, 7).is_err(), "a request is decided once");
+
+        agent_sign(&hub, "beam-req-2", &blob);
+        let id = pending_agent_ids(&hub).pop().unwrap();
+        hub.decide_agent(&id, false, 7).unwrap();
+        match next_agent_message(&commands) {
+            ClientToBeam::AgentResponse { request_id, message, note } => {
+                assert_eq!(request_id, "beam-req-2");
+                assert_eq!(wire::b64_decode(&message).unwrap(), wire::failure());
+                assert!(note.unwrap().contains("rejected"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // A disallowed key is refused without asking.
+        let other = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        agent_sign(&hub, "beam-req-3", &other.public_key().to_bytes().unwrap());
+        assert!(matches!(
+            next_agent_message(&commands),
+            ClientToBeam::AgentResponse { note: Some(note), .. } if note.contains("allowed_keys")
+        ));
+        assert!(pending_agent_ids(&hub).is_empty());
+
+        // A disconnect fails anything still waiting; detaching withdraws keys.
+        agent_sign(&hub, "beam-req-4", &blob);
+        assert_eq!(pending_agent_ids(&hub).len(), 1);
+        handle_bridge_event(
+            &hub,
+            crate::bridge::Event::Disconnected { beam_uuid: "beam-uuid".to_string(), message: "gone".to_string() },
+        );
+        assert!(pending_agent_ids(&hub).is_empty());
+        assert!(matches!(next_agent_message(&commands), ClientToBeam::AgentResponse { .. }));
+        hub.agent_frontend_detached(7);
+        assert_eq!(next_agent_message(&commands), ClientToBeam::AgentIdentities { keys: vec![] });
+        let _ = fs::remove_file(sock);
     }
 }

@@ -380,6 +380,17 @@ pub fn key_type(blob: &[u8]) -> Option<String> {
     Reader::new(blob).utf8().ok()
 }
 
+/// Base64 (standard, padded) for agent bytes carried in JSON bridge messages.
+pub fn b64_encode(bytes: &[u8]) -> String {
+    use base64ct::Encoding;
+    base64ct::Base64::encode_string(bytes)
+}
+
+pub fn b64_decode(text: &str) -> Result<Vec<u8>, WireError> {
+    use base64ct::Encoding;
+    base64ct::Base64::decode_vec(text).map_err(|_| WireError("invalid base64".into()))
+}
+
 /// Lowercase hex, for logging session ids.
 pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()

@@ -35,6 +35,8 @@ pub enum Event {
     Connected {
         beam_uuid: String,
         bridge_id: String,
+        /// What the Beam side supports (its hello's `capabilities`).
+        capabilities: Vec<String>,
     },
     Disconnected {
         beam_uuid: String,
@@ -194,11 +196,13 @@ fn drive_child(
                     protocol,
                     version,
                     bridge_id,
+                    capabilities,
                 } if protocol == PROTOCOL && *version == PROTOCOL_VERSION => {
                     reader_connected.store(true, Ordering::SeqCst);
                     Event::Connected {
                         beam_uuid: beam_uuid.clone(),
                         bridge_id: bridge_id.clone(),
+                        capabilities: capabilities.clone(),
                     }
                 }
                 BeamToClient::Hello {

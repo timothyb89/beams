@@ -1,3 +1,4 @@
+mod agent;
 mod beamcmd;
 mod bridge;
 mod clientd;
@@ -175,6 +176,9 @@ enum Commands {
         #[arg(long)]
         ide: Option<String>,
     },
+    /// List the keys in this terminal's SSH agent and whether Beams may use
+    /// them (`[ssh_agent] allowed_keys` in the client config).
+    AgentKeys,
 }
 
 #[derive(Subcommand)]
@@ -272,6 +276,7 @@ fn main() -> anyhow::Result<ExitCode> {
                 approval_takeover,
             },
         )?,
+        Commands::AgentKeys => agent::print_keys()?,
         Commands::Daemon { socket, action } => match action {
             None => {
                 clientd::serve(socket)?;

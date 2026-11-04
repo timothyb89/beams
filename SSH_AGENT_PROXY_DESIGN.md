@@ -1,6 +1,7 @@
 # SSH agent proxy: workstation-held keys with per-use approval
 
-Status: design, 2026-11-04. Phase 0 spike done (see "Phase 0 findings"). Builds on the bridge, request
+Status: 2026-11-04. Phase 0 spike and phase 1 plumbing done (see "Phase 0
+findings" and "Phase 1 status"). Builds on the bridge, request
 queue, and toast/menu UI described in `CLIENT_SERVICES_DESIGN.md`.
 
 ## Problem
@@ -490,6 +491,79 @@ Not covered yet:
   peer's exit) wasn't exercised. Reading at accept time made it moot in
   every observed case.
 
+## Phase 1 status (2026-11-04)
+
+Implemented, plus the parts of phase 2 that were cheap given the phase 0
+modules: `beamsd` already parses requests authoritatively and verifies
+hosts against `known_hosts`, and the review screen keeps verified facts
+apart from the Beam's claims.
+
+- **Protocol:** capability `ssh_agent`, advertised in *both* hellos. The
+  Beam's hello gained `capabilities`, so a new workstation never sends
+  agent messages to an older Beam, whose strict bridge parser would drop
+  the connection. Beam → client: `AgentSessionBind`, `AgentSignRequest`
+  (raw bytes in base64, plus bounded `AgentContext`), `AgentConnClosed`.
+  Client → Beam: `AgentIdentities` and `AgentResponse`.
+- **Beam (`bootstrap/src/agentproxy.rs`):** listens on `ssh-agent.sock` next
+  to the daemon socket.
+  - Identity listings are answered from the keys the client pushed.
+  - Session-binds are acknowledged at once and forwarded.
+  - Sign requests wait up to 120s for the client's answer.
+  - Requests are routed by `BEAMS_SESSION_TOKEN`, or to the only connected
+    capable bridge.
+  - When a bridge goes away, its waiting requests fail immediately.
+- **Workstation (`client/src/agent.rs`, `clientd.rs`):**
+  - `[ssh_agent] allowed_keys` and `prompt_timeout` in `config.toml`, re-read
+    on every use.
+  - Each frontend reports its `SSH_AUTH_SOCK` through `EnsureBridge`. A
+    signature uses the agent of the frontend that approved it.
+  - Keys are pushed when a bridge connects and whenever a frontend attaches
+    or detaches; no frontend means no keys.
+  - Requests are denied without asking when the proxy is disabled, when no
+    frontend is attached, when the key isn't allowlisted, when the payload
+    isn't recognized, or when 8 requests are already pending.
+  - Agent requests are kept in memory only (never in `daemon-state.json`).
+    They appear as `ssh_agent` request records, so the existing toast and
+    request list show them. Signing runs off the frontend's thread, and
+    every request and decision is logged in `daemon.log`.
+  - `beams agent-keys` lists this terminal's agent keys, marks the allowed
+    ones, and shows how to allow one.
+- **UI:**
+  - The toast reads "SSH key request" and stays up for as long as the
+    request can still be approved.
+  - The review menu offers Allow once / Deny / Decide later, with **Deny
+    preselected**.
+
+Tests:
+- Unit tests: 101 bootstrap and 143 client (including a full `beamsd` agent
+  flow against a fake local agent).
+- `client/tests/ssh-agent-smoke.sh`: 18 local end-to-end checks with real
+  `ssh`/`git`/`ssh-keygen`, a real `ssh-agent` and `sshd`, the real bridge
+  binary and both daemons. The host is named through a hashed
+  `known_hosts` entry.
+- A live run of `beams ssh` (driven through tmux) against a fresh Beam with
+  a throwaway key:
+  - over the real `tsh` bridge, the toast appeared over zellij;
+  - the review screen showed the host key and the Beam's claims, with Deny
+    preselected;
+  - `y` let `ssh` log in, and a bare Enter denied ("agent refused
+    operation").
+
+Not done yet, and noticed during the live run:
+
+- **Defaults:** nothing points the Beam's default `SSH_AUTH_SOCK` at the
+  relay yet, and `bin/ssh-agent-init`, the unlock pane, key staging and
+  `wait-ssh-agent-unlock` are unchanged. Changing those defaults is phase 4
+  (or sooner, once the remaining phase 2 items land).
+- **Menu rendering:** the menu strips the leading indentation from intro
+  lines, so the "Reported by the Beam" lines aren't visibly nested. Phase 2
+  should render that section with its own style rather than relying on
+  spaces.
+- **Remaining phase 2 items:** the input guard (keys ignored for about
+  500ms), folding several identical requests into one, a countdown in the
+  toast, an expiry message pointing at the server's grace time, and a
+  separate audit log.
+
 ## Phases
 
 0. **Beam-only spike.** *Done; see "Phase 0 findings" above.* A filtered listener in front of a throwaway local
@@ -497,18 +571,16 @@ Not covered yet:
    and `SSHSIG` parsing, `/proc` context and `BEAMS_TASK_RUN` attribution,
    `git`/`ssh` behavior with a 30-60s delay before the signature, and
    `tsh` with `TELEPORT_ADD_KEYS_TO_AGENT=no`. No bridge changes.
-1. **Plumbing.** Protocol messages, frontend `SSH_AUTH_SOCK` registration,
-   allowlist, identity push, relay to the workstation agent. Every signature
-   prompts, using the existing toast and review flow with a minimal
-   screen. Deny when no frontend is attached.
+1. **Plumbing.** *Done; see "Phase 1 status" above.* Protocol messages,
+   frontend `SSH_AUTH_SOCK` registration, allowlist, identity push, relay to
+   the workstation agent. Every signature prompts, using the existing toast
+   and review flow with a minimal screen. Deny when no frontend is attached.
 2. **Context.** Authoritative parsing, host verification against
-   `known_hosts`, the two-tier review screen, sanitization, input guard,
-   folding, and the audit log.
+   `known_hosts`, the two-tier review screen, and sanitization are done.
+   Remaining: the input guard, folding, a countdown, the audit log, and
+   RSA/ECDSA session-bind fixtures.
 3. **Client-owned startup.** `config.toml`, `ClientToBeam::RunManifest`,
    startup grant, passive toasts, `wait-ssh-agent`; trim `bin/beam-shell`.
 4. **Cleanup and rules.** Remembered rules plus revoke UI, remove key staging
-   and the unlock pane, update `AGENTS.md`/`bootstrap/README.md`/`TODO.md`.
-
-Phase 0 can start now. Phase 1 touches `session.rs`/`notices.rs`
-(new request kind) and `clientd.rs` (frontend registration), so it should be
-coordinated with any concurrent UI work.
+   and the unlock pane, point the Beam's `SSH_AUTH_SOCK` at the relay, update
+   `AGENTS.md`/`bootstrap/README.md`/`TODO.md`.
