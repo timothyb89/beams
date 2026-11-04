@@ -72,10 +72,20 @@ pub struct ParamSchema {
 
 /// A template's name plus its param schema - what `list_tasks` (the
 /// daemon op) and `beam-bootstrap list-tasks` (the CLI) both enumerate.
+///
+/// `run_once` marks a template whose whole job is a one-time, no-param
+/// bit of beam setup that `bin/beam-shell` already submits at startup
+/// (toolchain installs, waiting for the ssh-agent unlock): idempotent, so
+/// running it again just skips, which makes it noise in an interactive
+/// "what can I launch?" list. The TUI hides these from its template list
+/// (their startup runs still show up in its progress list as normal).
+/// They stay fully reachable via `task run`/`run-task`/manifests - this
+/// is purely a presentation hint, not an access control.
 #[derive(Serialize)]
 pub struct TemplateInfo {
     pub template: &'static str,
     pub params: &'static [ParamSchema],
+    pub run_once: bool,
 }
 
 /// A task instance, produced by instantiating a template with concrete
@@ -170,6 +180,7 @@ pub fn templates() -> Vec<TemplateInfo> {
                 ParamSchema { name: "repo", kind: "string", required: true },
                 ParamSchema { name: "dest", kind: "path", required: true },
             ],
+            run_once: false,
         },
         TemplateInfo {
             template: CheckoutPrWorktree::NAME,
@@ -178,11 +189,15 @@ pub fn templates() -> Vec<TemplateInfo> {
                 ParamSchema { name: "pr", kind: "number", required: true },
                 ParamSchema { name: "dest", kind: "path", required: true },
             ],
+            run_once: false,
         },
-        TemplateInfo { template: InstallToolchainGo::NAME, params: &[] },
-        TemplateInfo { template: InstallToolchainRust::NAME, params: &[] },
-        TemplateInfo { template: InstallCodeServer::NAME, params: &[] },
-        TemplateInfo { template: WaitSshAgentUnlock::NAME, params: &[] },
+        TemplateInfo { template: InstallToolchainGo::NAME, params: &[], run_once: true },
+        TemplateInfo { template: InstallToolchainRust::NAME, params: &[], run_once: true },
+        // Also a one-shot install, but *not* submitted at startup (heavy,
+        // and not everyone wants it) - hiding it would leave no way to
+        // launch it from the TUI at all.
+        TemplateInfo { template: InstallCodeServer::NAME, params: &[], run_once: false },
+        TemplateInfo { template: WaitSshAgentUnlock::NAME, params: &[], run_once: true },
     ]
 }
 

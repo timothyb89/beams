@@ -52,6 +52,10 @@ pub struct TemplateInfo {
     pub template: String,
     #[serde(default)]
     pub params: Vec<ParamSchema>,
+    /// See `tasks::TemplateInfo::run_once` - hidden from the template
+    /// list, since startup already ran it.
+    #[serde(default)]
+    pub run_once: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -61,11 +65,14 @@ pub enum TaskState {
     Ok,
     Skip,
     Error,
+    /// Never started: something it depends on failed (`"blocked"`
+    /// task_status - see `executor::Event::Blocked`).
+    Blocked,
 }
 
 impl TaskState {
     fn is_terminal(self) -> bool {
-        matches!(self, TaskState::Ok | TaskState::Skip | TaskState::Error)
+        matches!(self, TaskState::Ok | TaskState::Skip | TaskState::Error | TaskState::Blocked)
     }
 
     fn glyph(self, spinner_frame: usize) -> &'static str {
@@ -76,6 +83,7 @@ impl TaskState {
             TaskState::Ok => "✔",
             TaskState::Skip => "○",
             TaskState::Error => "✘",
+            TaskState::Blocked => "⊘",
         }
     }
 
@@ -86,6 +94,7 @@ impl TaskState {
             TaskState::Ok => Color::Green,
             TaskState::Skip => Color::Blue,
             TaskState::Error => Color::Red,
+            TaskState::Blocked => Color::Magenta,
         }
     }
 }
@@ -94,7 +103,9 @@ pub struct TaskRow {
     pub task_id: String,
     pub state: TaskState,
     pub message: Option<String>,
-    pub wave: Option<u64>,
+    /// Task ids (from the same manifest) this row waits on - from the
+    /// `accepted` reply's plan. Shown on a pending row's second line.
+    pub depends_on: Vec<String>,
 }
 
 /// Which pane is focused for keyboard/scroll purposes - just the two
@@ -169,6 +180,10 @@ pub struct App {
     templates_area: Rect,
     /// Same idea as `templates_area`, for the task-progress list.
     progress_area: Rect,
+    /// First row index visible in the progress list as of the last draw
+    /// (ratatui scrolls it to keep the selection visible) - needed to map
+    /// a mouse click back to a row.
+    progress_offset: usize,
 }
 
 impl App {
@@ -202,6 +217,7 @@ impl App {
             needs_client_state: false,
             templates_area: Rect::default(),
             progress_area: Rect::default(),
+            progress_offset: 0,
         }
     }
 
@@ -246,36 +262,73 @@ impl App {
         self.rows.iter().position(|r| r.task_id == task_id)
     }
 
-    fn upsert_row(&mut self, task_id: &str, state: TaskState, message: Option<String>, wave: Option<u64>) {
+    fn upsert_row(&mut self, task_id: &str, state: TaskState, message: Option<String>) {
         match self.row_index(task_id) {
             Some(i) => {
                 self.rows[i].state = state;
                 if message.is_some() {
                     self.rows[i].message = message;
                 }
-                if wave.is_some() {
-                    self.rows[i].wave = wave;
-                }
             }
-            None => self.rows.push(TaskRow { task_id: task_id.to_string(), state, message, wave }),
+            None => self.rows.push(TaskRow { task_id: task_id.to_string(), state, message, depends_on: Vec::new() }),
         }
     }
 
-    /// Refreshes an existing row's `message`/`wave` without touching its
+    /// Resets (or creates) a row for a freshly submitted task: `Pending`,
+    /// no message left over from an earlier run of the same task id.
+    fn reset_row(&mut self, task_id: &str, depends_on: Vec<String>) {
+        match self.row_index(task_id) {
+            Some(i) => {
+                self.rows[i].state = TaskState::Pending;
+                self.rows[i].message = None;
+                self.rows[i].depends_on = depends_on;
+            }
+            None => self.rows.push(TaskRow {
+                task_id: task_id.to_string(),
+                state: TaskState::Pending,
+                message: None,
+                depends_on,
+            }),
+        }
+    }
+
+    /// Refreshes an existing row's `message` without touching its
     /// `state` - see the "progress" branch of `handle_daemon_event`'s
     /// doc comment on why this is a separate path from `upsert_row`.
-    fn update_progress_message(&mut self, task_id: &str, message: Option<String>, wave: Option<u64>) {
+    fn update_progress_message(&mut self, task_id: &str, message: Option<String>) {
         match self.row_index(task_id) {
             Some(i) => {
                 if message.is_some() {
                     self.rows[i].message = message;
                 }
-                if wave.is_some() {
-                    self.rows[i].wave = wave;
-                }
             }
-            None => self.rows.push(TaskRow { task_id: task_id.to_string(), state: TaskState::Running, message, wave }),
+            None => self.rows.push(TaskRow {
+                task_id: task_id.to_string(),
+                state: TaskState::Running,
+                message,
+                depends_on: Vec::new(),
+            }),
         }
+    }
+
+    /// What a row's second line shows: the task's latest message, or for
+    /// a still-pending row, which of its dependencies haven't finished.
+    fn row_detail(&self, row: &TaskRow) -> String {
+        if row.state == TaskState::Pending {
+            let waiting: Vec<&str> = row
+                .depends_on
+                .iter()
+                .filter(|dep| {
+                    self.row_index(dep).map_or(true, |i| !matches!(self.rows[i].state, TaskState::Ok | TaskState::Skip))
+                })
+                .map(String::as_str)
+                .collect();
+            if !waiting.is_empty() {
+                return format!("waiting on {}", waiting.join(", "));
+            }
+            return "queued".to_string();
+        }
+        row.message.clone().unwrap_or_default()
     }
 
     /// Handles one line already parsed off the daemon socket - see
@@ -284,9 +337,11 @@ impl App {
     pub fn handle_daemon_event(&mut self, value: Value) {
         match value.get("type").and_then(Value::as_str) {
             Some("tasks") => {
-                if let Some(templates) = value.get("tasks").and_then(|v| serde_json::from_value(v.clone()).ok())
+                if let Some(templates) =
+                    value.get("tasks").and_then(|v| serde_json::from_value::<Vec<TemplateInfo>>(v.clone()).ok())
                 {
-                    self.templates = templates;
+                    self.templates = templates.into_iter().filter(|t| !t.run_once).collect();
+                    self.selected_template = self.selected_template.min(self.templates.len().saturating_sub(1));
                     self.status_line = format!("{} template(s) available", self.templates.len());
                     self.needs_client_state = true;
                 }
@@ -397,15 +452,17 @@ impl App {
             }
             Some("accepted") => {
                 if let Some(task_id) = value.get("task_id").and_then(Value::as_str) {
-                    self.upsert_row(task_id, TaskState::Pending, None, None);
+                    self.reset_row(task_id, Vec::new());
                     self.status_line = format!("submitted {task_id}");
-                } else if let Some(waves) = value.get("waves").and_then(Value::as_array) {
-                    for (wave, ids) in waves.iter().enumerate() {
-                        for id in ids.as_array().into_iter().flatten() {
-                            if let Some(id) = id.as_str() {
-                                self.upsert_row(id, TaskState::Pending, None, Some(wave as u64));
-                            }
-                        }
+                } else if let Some(planned) = value.get("tasks").and_then(Value::as_array) {
+                    for entry in planned {
+                        let Some(id) = entry.get("task_id").and_then(Value::as_str) else { continue };
+                        let depends_on = entry
+                            .get("depends_on")
+                            .and_then(Value::as_array)
+                            .map(|deps| deps.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                            .unwrap_or_default();
+                        self.reset_row(id, depends_on);
                     }
                     self.status_line = "manifest submitted".to_string();
                 }
@@ -414,16 +471,15 @@ impl App {
                 let Some(task_id) = value.get("task_id").and_then(Value::as_str) else { return };
                 let status = value.get("status").and_then(Value::as_str).unwrap_or_default();
                 let message = value.get("message").and_then(Value::as_str).map(str::to_string);
-                let wave = value.get("wave").and_then(Value::as_u64);
                 // "progress" (see `executor::Event::Progress`/
                 // `daemon.rs`'s `"progress"` task_status) isn't a
                 // lifecycle state the row transitions through like the
                 // other four - it only ever arrives while a row is
-                // already `Running`, so just refresh the message/wave
+                // already `Running`, so just refresh the message
                 // without touching `state` (falling back to `Running` if
                 // somehow nothing's been seen for this task_id yet).
                 if status == "progress" {
-                    self.update_progress_message(task_id, message, wave);
+                    self.update_progress_message(task_id, message);
                     return;
                 }
                 let state = match status {
@@ -431,9 +487,10 @@ impl App {
                     "ok" => TaskState::Ok,
                     "skip" => TaskState::Skip,
                     "error" => TaskState::Error,
+                    "blocked" => TaskState::Blocked,
                     _ => return,
                 };
-                self.upsert_row(task_id, state, message, wave);
+                self.upsert_row(task_id, state, message);
             }
             Some("manifest_status") => {
                 let status = value.get("status").and_then(Value::as_str).unwrap_or_default();
@@ -608,7 +665,9 @@ impl App {
                         self.selected_template = row;
                     }
                     self.focus = Focus::Templates;
-                } else if let Some(row) = row_within(self.progress_area, mouse.column, mouse.row) {
+                } else if let Some(line) = row_within(self.progress_area, mouse.column, mouse.row) {
+                    // Each progress row is two lines tall - see `draw_progress`.
+                    let row = self.progress_offset + line / PROGRESS_ROW_HEIGHT;
                     if !self.rows.is_empty() {
                         self.log_scroll = row.min(self.rows.len() - 1);
                     }
@@ -926,31 +985,34 @@ impl App {
             .label(format!("{done}/{total} done, {running} running"));
         frame.render_widget(gauge, gauge_area);
 
+        // Two lines per row: status + task id, then the full-width
+        // progress/result message (or what a pending row waits on), so a
+        // long message isn't cut off behind a long task id.
         let spinner_frame = self.spinner_frame;
         let items: Vec<ListItem> = self
             .rows
             .iter()
             .map(|row| {
-                let wave_label = row.wave.map(|w| format!("[w{w}] ")).unwrap_or_default();
-                let message = row.message.as_deref().unwrap_or("");
-                let line = Line::from(vec![
+                let header = Line::from(vec![
                     Span::styled(row.state.glyph(spinner_frame), Style::default().fg(row.state.color())),
                     Span::raw(" "),
-                    Span::raw(wave_label),
                     Span::styled(row.task_id.clone(), Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(" "),
-                    Span::raw(message.to_string()),
                 ]);
-                ListItem::new(line)
+                let detail_style = match row.state {
+                    TaskState::Error | TaskState::Blocked => Style::default().fg(row.state.color()),
+                    _ => Style::default().fg(Color::Gray),
+                };
+                let detail = Line::from(vec![Span::raw("  "), Span::styled(self.row_detail(row), detail_style)]);
+                ListItem::new(vec![header, detail])
             })
             .collect();
         let list = List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("tasks (concurrent rows share a [wN] wave)")
+                .title("tasks")
                 .border_style(focus_style(self.focus == Focus::Log)),
         );
-        let mut list_state = ListState::default();
+        let mut list_state = ListState::default().with_offset(self.progress_offset);
         if !self.rows.is_empty() {
             let selected = self.log_scroll.min(self.rows.len() - 1);
             self.log_scroll = selected;
@@ -958,6 +1020,7 @@ impl App {
         }
         frame.render_stateful_widget(list, list_area, &mut list_state);
         self.progress_area = list_area;
+        self.progress_offset = list_state.offset();
     }
 
     /// Centered popup over everything else, replacing the old side-by-side
@@ -1005,6 +1068,9 @@ impl App {
         }
     }
 }
+
+/// Lines per row in the progress list - see `draw_progress`.
+const PROGRESS_ROW_HEIGHT: usize = 2;
 
 fn focus_style(focused: bool) -> Style {
     if focused {
@@ -1098,6 +1164,17 @@ mod tests {
     }
 
     #[test]
+    fn run_once_templates_are_hidden_from_the_template_list() {
+        let mut app = App::new();
+        app.handle_daemon_event(json!({"type": "tasks", "tasks": [
+            {"template": "clone-git-repo", "params": []},
+            {"template": "install-toolchain-go", "params": [], "run_once": true},
+        ]}));
+        let names: Vec<&str> = app.templates.iter().map(|t| t.template.as_str()).collect();
+        assert_eq!(names, vec!["clone-git-repo"]);
+    }
+
+    #[test]
     fn accepted_with_task_id_creates_a_pending_row() {
         let mut app = App::new();
         app.handle_daemon_event(json!({"type": "accepted", "task_id": "clone-git-repo:dest=/x"}));
@@ -1106,35 +1183,70 @@ mod tests {
         assert!(app.rows[0].state == TaskState::Pending);
     }
 
-    #[test]
-    fn accepted_with_waves_creates_one_row_per_task_tagged_with_its_wave() {
-        let mut app = App::new();
-        app.handle_daemon_event(json!({
-            "type": "accepted",
-            "manifest_id": "manifest-0",
-            "waves": [["a"], ["b", "c"]],
-        }));
-        assert_eq!(app.rows.len(), 3);
-        let wave_of = |id: &str| app.rows.iter().find(|r| r.task_id == id).unwrap().wave;
-        assert_eq!(wave_of("a"), Some(0));
-        assert_eq!(wave_of("b"), Some(1));
-        assert_eq!(wave_of("c"), Some(1));
+    fn plan(entries: &[(&str, &[&str])]) -> Value {
+        let tasks: Vec<Value> =
+            entries.iter().map(|(id, deps)| json!({"task_id": id, "depends_on": deps})).collect();
+        json!({"type": "accepted", "manifest_id": "manifest-0", "tasks": tasks})
     }
 
     #[test]
-    fn task_status_transitions_an_existing_row_and_keeps_its_wave() {
+    fn accepted_plan_creates_one_pending_row_per_task_with_its_dependencies() {
         let mut app = App::new();
-        app.handle_daemon_event(json!({"type": "accepted", "waves": [["a"]]}));
-        app.handle_daemon_event(json!({"type": "task_status", "task_id": "a", "status": "start", "wave": 0}));
+        app.handle_daemon_event(plan(&[("a", &[]), ("b", &["a"]), ("c", &["a"])]));
+        assert_eq!(app.rows.len(), 3);
+        assert!(app.rows.iter().all(|r| r.state == TaskState::Pending));
+        assert_eq!(app.rows[1].depends_on, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn a_pending_rows_detail_names_only_unfinished_dependencies() {
+        let mut app = App::new();
+        app.handle_daemon_event(plan(&[("a", &[]), ("b", &[]), ("c", &["a", "b"])]));
+        assert_eq!(app.row_detail(&app.rows[2]), "waiting on a, b");
+
+        app.handle_daemon_event(json!({"type": "task_status", "task_id": "a", "status": "ok", "message": "done"}));
+        assert_eq!(app.row_detail(&app.rows[2]), "waiting on b");
+        assert_eq!(app.row_detail(&app.rows[0]), "done");
+
+        app.handle_daemon_event(json!({"type": "task_status", "task_id": "b", "status": "skip"}));
+        assert_eq!(app.row_detail(&app.rows[2]), "queued");
+    }
+
+    #[test]
+    fn a_blocked_status_marks_the_row_terminal_with_its_reason() {
+        let mut app = App::new();
+        app.handle_daemon_event(plan(&[("a", &[]), ("b", &["a"])]));
+        app.handle_daemon_event(json!({"type": "task_status", "task_id": "a", "status": "error", "message": "boom"}));
+        app.handle_daemon_event(json!({
+            "type": "task_status", "task_id": "b", "status": "blocked",
+            "message": "not run: depends on a, which failed",
+        }));
+        assert!(app.rows[1].state == TaskState::Blocked);
+        assert!(app.rows[1].state.is_terminal());
+        assert_eq!(app.row_detail(&app.rows[1]), "not run: depends on a, which failed");
+    }
+
+    #[test]
+    fn task_status_transitions_an_existing_row_in_place() {
+        let mut app = App::new();
+        app.handle_daemon_event(plan(&[("a", &[])]));
+        app.handle_daemon_event(json!({"type": "task_status", "task_id": "a", "status": "start"}));
         assert!(app.rows[0].state == TaskState::Running);
 
-        app.handle_daemon_event(
-            json!({"type": "task_status", "task_id": "a", "status": "ok", "message": "done", "wave": 0}),
-        );
+        app.handle_daemon_event(json!({"type": "task_status", "task_id": "a", "status": "ok", "message": "done"}));
         assert!(app.rows[0].state == TaskState::Ok);
         assert_eq!(app.rows[0].message.as_deref(), Some("done"));
-        assert_eq!(app.rows[0].wave, Some(0));
         assert_eq!(app.rows.len(), 1, "same task_id should update in place, not duplicate");
+    }
+
+    #[test]
+    fn resubmitting_a_finished_task_resets_its_row() {
+        let mut app = App::new();
+        app.handle_daemon_event(json!({"type": "accepted", "task_id": "a"}));
+        app.handle_daemon_event(json!({"type": "task_status", "task_id": "a", "status": "ok", "message": "done"}));
+        app.handle_daemon_event(json!({"type": "accepted", "task_id": "a"}));
+        assert!(app.rows[0].state == TaskState::Pending);
+        assert_eq!(app.rows[0].message, None);
     }
 
     #[test]
@@ -1299,13 +1411,22 @@ mod tests {
     #[test]
     fn clicking_the_progress_list_moves_its_scroll_and_focuses_it() {
         let mut app = App::new();
-        app.handle_daemon_event(json!({"type": "accepted", "waves": [["a"], ["b"], ["c"]]}));
+        app.handle_daemon_event(plan(&[("a", &[]), ("b", &[]), ("c", &[])]));
         app.focus = Focus::Templates;
-        app.progress_area = Rect { x: 0, y: 10, width: 40, height: 6 };
+        app.progress_area = Rect { x: 0, y: 10, width: 40, height: 8 };
 
-        app.handle_mouse(left_click(5, 13)); // third row inside the border
-
+        // Rows are two lines tall: line 0-1 inside the border is "a",
+        // 2-3 is "b", 4-5 is "c" - y=16 is line 5, c's detail line.
+        app.handle_mouse(left_click(5, 16));
         assert_eq!(app.log_scroll, 2);
+        assert!(app.focus == Focus::Log);
+
+        app.handle_mouse(left_click(5, 13)); // line 2: "b"'s header
+        assert_eq!(app.log_scroll, 1);
+
+        app.progress_offset = 1; // list scrolled down by one row
+        app.handle_mouse(left_click(5, 11)); // line 0, now "b"
+        assert_eq!(app.log_scroll, 1);
         assert!(app.focus == Focus::Log);
     }
 

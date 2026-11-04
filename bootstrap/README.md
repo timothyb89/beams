@@ -226,7 +226,12 @@ echo '{"request_id":"1","op":"run_task","task":"clone-git-repo","params":{"repo"
 once, resolved against each other (so they can be listed in any order)
 via the same capability graph the fixed startup sequence uses - this is
 what lets `checkout-pr-worktree` and the `clone-git-repo` it depends on
-be requested together in one call:
+be requested together in one call. Each entry starts as soon as the
+entries it depends on finish (independent ones run concurrently); a
+failure only blocks its dependents, which get a `"blocked"` status.
+Neither op blocks the connection or other submissions - both reply
+`accepted` and run in the background, serialized only where tasks share
+an exclusive resource (e.g. `apt`) or are the very same task id:
 
 ```sh
 echo '{"request_id":"2","op":"run_manifest","tasks":[
@@ -347,9 +352,14 @@ The Tasks tab has a top half of
 available templates (↑/↓ to pick, enter to open a param-entry form, tab
 to move between fields, enter on the last field to submit, esc to
 cancel). Bottom half: one row per task the daemon's broadcast anywhere
-mentioned - not just tasks submitted from this TUI instance - tagged
-with its wave (`[wN]`) so concurrently-running tasks are visibly grouped,
-plus an aggregate gauge (`done/total, N running`) above them. `r`
+mentioned - not just tasks submitted from this TUI instance - each two
+lines tall: status glyph + task id, then the task's latest progress or
+result message at full width (or, while pending, which of its
+dependencies it's still waiting on), plus an aggregate gauge
+(`done/total, N running`) above them. `run_once` templates (toolchain
+installs, `wait-ssh-agent-unlock` - things `bin/beam-shell` already runs
+at startup) are left out of the template list; their runs still show up
+in the task list, and `task run` still reaches them. `r`
 refreshes the template list, `tab` (outside a form) switches focus
 between the template list and the task list for scrolling, the scroll
 wheel moves whichever of those is focused the same way the arrow keys
@@ -402,6 +412,12 @@ actual interactive key unlock whenever you get to it:
 
 Safe to run repeatedly - it's just the attach-or-create flow each time, and
 `beam-bootstrap` is idempotent.
+
+It also submits a default startup manifest to the daemon, in the
+background: `install-toolchain-go` + `install-toolchain-rust` (skip with
+`BEAM_SHELL_SKIP_DEFAULT_TOOLCHAINS=1`) and `wait-ssh-agent-unlock` + the
+usual repo clones (skip with `BEAM_SHELL_SKIP_DEFAULT_CLONES=1`). The
+toolchain installs don't wait on the ssh unlock - only the clones do.
 
 ### ssh-agent: async unlock, noninteractive-safe
 

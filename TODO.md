@@ -529,6 +529,22 @@ section above for status/details.
     in a *different*, concurrently running submission - list the full
     chain in each manifest (the redundant entry skips/serializes via the
     per-task-id lock).
+- [x] `bin/beam-shell`'s startup manifest now also includes
+  `install-toolchain-go`/`install-toolchain-rust` by default
+  (`BEAM_SHELL_SKIP_DEFAULT_TOOLCHAINS=1` opts out, alongside the
+  existing `BEAM_SHELL_SKIP_DEFAULT_CLONES=1`).
+- [x] `tasks::TemplateInfo::run_once`: marks no-param, startup-submitted
+  setup templates (both toolchains, `wait-ssh-agent-unlock`); the TUI
+  hides them from its template list. `install-code-server` is
+  deliberately *not* marked, since nothing runs it at startup and hiding
+  it would leave no TUI path to it at all.
+- [x] TUI progress rows are two lines (status + task id, then the full
+  message - or "waiting on ..." for a pending row, from the plan's
+  `depends_on`); `[wN]` wave labels are gone with the waves themselves.
+  New `Blocked` row state for the `"blocked"` status. Mouse hit-testing
+  accounts for the two-line rows and the list's scroll offset (the
+  latter was previously ignored, so clicks on a scrolled list picked the
+  wrong row).
 
 ## k8s access workaround
 
