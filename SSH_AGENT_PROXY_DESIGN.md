@@ -600,3 +600,87 @@ Not done yet, and noticed during the live run:
    "share a key?" offer in `beams ssh`, and `a` on the home screen.
    Remaining: remembered approval rules ("allow github.com for 30m"), and
    `TODO.md`.
+
+## Handoff notes (2026-11-04)
+
+Open items are tracked in `TODO.md` ("SSH agent proxy"). This section is
+what a new session needs in order to work on it.
+
+### Code map
+
+- `protocol/src/agent.rs`: agent wire format (messages, user-auth and
+  `SSHSIG` payloads, session-bind), base64 helpers. No crypto.
+- `protocol/src/agent_crypto.rs` (feature `agent-crypto`): session-bind
+  verification, fingerprints, plain and hashed `known_hosts` matching.
+- `protocol/src/lib.rs`: bridge messages (`Agent*`, `RunManifest`,
+  `Manifest*`) and capabilities (`ssh_agent`, `startup_manifest`). Both
+  hellos advertise capabilities; never send a capability's messages to a
+  peer that didn't list it, because the bridge parser is strict and the
+  bridge drops on an unknown message.
+- `bootstrap/src/agentproxy.rs`: the Beam-side relay, `/proc` context, and
+  the 16 KiB context budget that keeps a request under `MAX_FRAME_BYTES`.
+  `daemon.rs` implements `AgentBridges` for `Hub` (routing) and
+  `start_manifest`/`run_bridge_manifest`. `executor::run_tagged` and
+  `current_task_run` provide `BEAMS_TASK_RUN`. `sshagent.rs` gives tasks
+  the relay path.
+- `client/src/agent.rs`: config (`[ssh_agent]`, written with
+  `toml_edit`), local agent I/O, `BindStore`, `evaluate` (the
+  authoritative check), prompt text, fold keys, `beams agent-keys`.
+- `client/src/startup.rs`: `[startup]`, `GrantConfig`/`GrantRecord`,
+  `manifest_tasks` (adds `wait-ssh-agent`).
+- `client/src/clientd.rs`: `AgentRuntime` state. The `impl Hub` methods
+  `handle_agent_sign`, `decide_agent`, `submit_startup`,
+  `startup_accepted`, `sign_with_grant` and `end_grants_where`.
+  Frontends report `ssh_auth_sock` in `EnsureBridge`. Agent records and
+  grants live in memory only; `startup_submitted` is persisted.
+- UI: `session.rs` (`request_menu` for agent requests, `grant_menu`,
+  `agent_keys_menu`, `input_guard_until`, `offer_key_setup`),
+  `session/notices.rs` (request, key-setup and "SSH key used" toasts),
+  `session/ui.rs` (`describe_request`, the grant rows).
+
+### Tests
+
+- Unit tests: `cargo test` in `protocol` (with `--features agent-crypto`),
+  `bootstrap` and `client`.
+- `client/tests/ssh-agent-smoke.sh` (`CARGO=...` if cargo isn't on PATH):
+  the full local end-to-end check. Real Beam daemon, real bridge, beamsd,
+  a scripted frontend, `ssh-agent`, `sshd`, and a startup manifest whose
+  ssh clone runs under the grant. About 1 minute (one check waits out the
+  20s prompt timeout).
+- `client/tests/client-bridge-smoke.sh`: bridge regressions (run it
+  whenever the hellos or bridge messages change).
+- `bootstrap/tests/ssh-agent-hostkey-algos.sh <beam-bootstrap>`: host key
+  types against real OpenSSH. `bootstrap/tests/ssh-agent-proxy-spike.sh`:
+  the phase 0 spike (run on a disposable Beam).
+- Live test recipe that worked well: run `beams ssh` inside `tmux new-session -d
+  -x 200 -y 50` (stdout must be a tty, so don't pipe it), with its own
+  `XDG_CONFIG_HOME` and `XDG_RUNTIME_DIR` (a separate beamsd and purpose
+  state) and a throwaway `ssh-agent` and key. Drive it with `tmux
+  send-keys 'C-]'`, `y`, `Enter`, and read it with `tmux capture-pane -p`.
+  For a login target, start an unprivileged `sshd` on the Beam that
+  trusts the throwaway key. Stop that beamsd with `beams daemon stop
+  --force` under the same XDG variables, and `tsh beams rm` the Beam.
+
+### Gotchas found along the way
+
+- `ssh`/`ssh-keygen -Y sign` silently use a private key *file* next to the
+  `.pub` when the agent doesn't offer it. Tests must delete key files
+  after `ssh-add`, or a "denied" key appears to work.
+- `ssh-key` 0.6 can't produce RSA signatures (verifying them works), so
+  RSA coverage uses captured OpenSSH fixtures.
+- sshd keeps the *first* occurrence of a keyword, so appending
+  `LoginGraceTime` to a config does nothing; use `sed` to replace it.
+- The server's login grace time (OpenSSH default 120s; GitHub tolerated at
+  least 120s) is the real limit on how long a prompt can wait.
+  `prompt_timeout` is capped at 110s.
+- Debian hashes `known_hosts`, so names can only be *confirmed* from
+  candidates (taken from the `ssh` argv), never listed.
+- Tests that set process-wide variables (`XDG_CONFIG_HOME`,
+  `SSH_AUTH_SOCK`, `BEAM_BOOTSTRAP_SSH_*`) race other tests in the same
+  binary. Keep them to one test, or share a lock.
+- In shell harnesses, a bare `wait` also waits for background daemons and
+  hangs, so wait on specific PIDs. `pkill -f <pattern>` can match the
+  shell running it if that shell's own command line contains the pattern.
+- `tsh beams exec` runs the command through the Beam's login shell
+  (fish), so bash syntax must be wrapped in a script file. `tsh beams scp`
+  takes one source per call.

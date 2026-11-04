@@ -23,10 +23,12 @@ individual checked-off line.
   Current implementation: a fixed, run-once step list — see "Migration"
   below for how this becomes the daemon/task-graph's zero-param
   templates.
-- `beams` client: spawn-or-reuse by purpose, concurrency cap, staging +
-  scp of repo + prebuilt bootstrap binary, `tsh ssh` into `beam-shell`.
-- `bin/beam-shell`: zellij layout with main pane, bootstrap log tail, and
-  an async ssh-agent-unlock pane that never blocks a noninteractive run.
+- `beams` client: spawn-or-reuse by purpose, concurrency cap, git push of
+  the repo + scp of a prebuilt bootstrap binary (no SSH key), `tsh ssh`
+  into `beam-shell`.
+- `bin/beam-shell`: zellij layout with the main pane next to the bootstrap
+  TUI and log tail. SSH goes through the daemon's agent relay (see "SSH
+  agent proxy" below); there is no unlock pane anymore.
 - `AGENTS.md`, `DESIGN.md`: architecture/conventions + the
   daemon/task-graph design written up and agreed.
 
@@ -203,7 +205,12 @@ just consequences of this design rather than separate asks.
   change.
 - [ ] Wire manifest seeding into `client`'s `beams ssh`/`beams new` (e.g.
   `beams new --clone <pr>` builds a manifest and hands it to a freshly
-  spawned beam before its first startup pass).
+  spawned beam before its first startup pass). **Partly done:** the
+  per-user startup manifest is now client-owned (`[startup]` in the
+  client's `config.toml`, sent over the bridge as `RunManifest` once per
+  Beam; see "SSH agent proxy" below). Still open: per-invocation
+  additions (`--clone`, `--pr`) merged into that first manifest, ideally
+  covered by the same startup grant.
 
 ## New tasks enabled by the graph (deferred-by-default templates)
 
@@ -775,6 +782,63 @@ bootstrap `Task`s.
     `tsh login` recovery, network loss, Beam expiry, real Mutagen, and the
     foreground interactive PTY before implementing or enabling
     `OpenSshTransport`.
+
+## SSH agent proxy (see `SSH_AGENT_PROXY_DESIGN.md`)
+
+No private key goes to a Beam anymore: the Beam's `SSH_AUTH_SOCK` is
+`beam-bootstrapd`'s relay, and each signature is approved in the attached
+`beams ssh` (Allow once / Deny, Deny preselected), signed by that
+terminal's own agent. Startup clones can be covered by a scoped startup
+grant. Keys are opted in with `beams agent-keys --allow N`, the one-time
+offer toast, or `a` in the menu. Phases 0-3 and most of phase 4 landed on
+2026-11-04 (commits `0f3e664`..`f618adf`); the design doc's "Handoff notes"
+lists the code map, tests, and gotchas.
+
+Open:
+
+- [ ] Remembered approval rules ("allow github.com as git for 30m"),
+  scoped to Beam + key + verified host key + user, expiring no later than
+  the Beam's TTL, listed and revocable like startup grants. Never matching
+  an unverified host. (Design: "Grants and remembered rules".)
+- [ ] `BEAMS_TASK_RUN` is only set by `clone-git-repo`. `checkout-pr-worktree`
+  (its `git fetch`) and any future git-using task should set it too, so a
+  startup manifest's PR checkouts are covered by the grant. Probably better
+  centralized: one helper that prepares a task's `git` command with the
+  relay socket and the run tag.
+- [ ] Two workstations attached to one Beam: interactive shells route by
+  `BEAMS_SESSION_TOKEN`, but daemon tasks have no token and fall back to
+  "the only connected client", so with two clients attached, a startup
+  clone's key use is refused as ambiguous. Route a manifest's tasks to the
+  client that submitted it (the daemon knows it).
+- [ ] A separate local audit log of SSH key decisions. Today they're one
+  line each in `daemon.log` (`ssh-agent: <beam>: asking|signed|granted|
+  rejected|...`).
+- [ ] A GUI/OS approval surface (macOS notification or dialog) for when no
+  `beams ssh` is attached. Today such requests are denied without asking,
+  by design. The design's `ApprovalSurface` seam isn't factored out yet:
+  the terminal flow lives in `clientd.rs` (`handle_agent_sign`,
+  `decide_agent`).
+- [ ] The key-setup offer toast lasts 20s. If missed, the only hints are
+  `a ssh keys` in the menu and `beams agent-keys`. Consider a persistent
+  home-screen line while no key is shared and `[ssh_agent]` is unset.
+- [ ] The "SSH key used" toast for grant uses doesn't say which repo or
+  task; the claimed `task_run` is available on the record.
+- [ ] `daemon-state.json`'s `startup_submitted` keeps one Beam UUID per
+  Beam forever. Prune entries for Beams that no longer exist (the bridge
+  retirement path already knows).
+- [ ] Host certificates (`*-cert-v01@openssh.com` host keys,
+  `@cert-authority` lines) aren't supported: such hosts show "verified key,
+  unknown host" and can't match a grant.
+- [ ] `--approval-takeover` with SSH key requests hasn't been exercised
+  live; the input guard should cover it, but check it.
+- [ ] Beams created before the switch keep the staged key, `ssh-agent-init`
+  and the unlock pane until recycled (deliberately not migrated). The
+  CLAUDE.md merge step only appends once (marker check), so already-merged
+  Beams also lack the `SSH_KEY_REASON` guidance.
+- [ ] The hidden `beam-bootstrap agent-proxy-spike` subcommand
+  (`bootstrap/src/agentspike.rs`) is kept for
+  `bootstrap/tests/ssh-agent-proxy-spike.sh` and `ssh-agent-hostkey-algos.sh`.
+  Remove it if those scripts get rebased onto the real relay.
 
 ## Explicitly deferred — needs its own design pass later, not blocked on
 anything above
