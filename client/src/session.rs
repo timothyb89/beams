@@ -403,8 +403,11 @@ fn drive(
             redraw_palette!();
         }
 
-        // Toasts: drawn over the live screen while the menu is closed.
-        if input_router.mode == InputMode::Passthrough && !terminal_state.palette_open {
+        // Toasts: drawn over the live screen while the menu is closed. While
+        // it's open, keep watching transfers so a finish still gets its toast.
+        if input_router.mode == InputMode::Palette || terminal_state.palette_open {
+            toast_policy.observe(&daemon_view, Instant::now());
+        } else {
             let now = Instant::now();
             let current = toast_policy.current(&daemon_view, escape_key, now);
             toast_subject = current.as_ref().map(|(_, subject)| subject.clone());
@@ -524,6 +527,7 @@ fn drive(
                     palette_terminal = Some(new_palette_terminal()?);
                     // The prefix while a request's toast is up goes straight
                     // to that request.
+                    daemon_view.reviewing_from_toast = false;
                     if let Some(notices::Subject::Request(request_id)) = toast_subject.take() {
                         daemon_view.review_request(&request_id, local_daemon);
                     }
@@ -575,6 +579,8 @@ struct DaemonView {
     notice: Option<Notice>,
     /// Workstation directories offered by empty path fields.
     recents: recent::RecentPaths,
+    /// The menu was opened from a request toast (see `review_request`).
+    reviewing_from_toast: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1183,6 +1189,7 @@ impl DaemonView {
                 notice: None,
                 message: "connected".to_string(),
                 recents: Default::default(),
+                reviewing_from_toast: false,
             },
             None => Self {
                 beam_uuid,
@@ -1205,6 +1212,7 @@ impl DaemonView {
                     .clone()
                     .unwrap_or_else(|| "unavailable".to_string()),
                 recents: Default::default(),
+                reviewing_from_toast: false,
             },
         }
     }
@@ -1526,14 +1534,14 @@ impl DaemonView {
                     }
                     FormEvent::Handled | FormEvent::Ignored => {}
                 }
-                return false;
+                return self.leave_after_review();
             }
             Screen::Menu(menu) => {
                 if let Some(action) = menu.handle_key(&key) {
                     self.screen = Screen::Home;
                     self.run_menu_action(action, local_daemon);
                 }
-                return false;
+                return self.leave_after_review();
             }
             Screen::Home => {}
         }
@@ -1680,8 +1688,20 @@ impl DaemonView {
         }
     }
 
+    /// Whether a review opened from a toast just finished (the form or
+    /// menu went back to the home screen), so the menu should close and
+    /// hand the terminal straight back to the session it came from.
+    fn leave_after_review(&mut self) -> bool {
+        if self.reviewing_from_toast && matches!(self.screen, Screen::Home) {
+            self.reviewing_from_toast = false;
+            return true;
+        }
+        false
+    }
+
     /// Opens `request_id` for a decision: the path form for copies, fetches
-    /// and syncs, the approve/reject menu otherwise.
+    /// and syncs, the approve/reject menu otherwise. Finishing it (or
+    /// backing out) closes the menu again.
     fn review_request(&mut self, request_id: &str, local_daemon: &mut LocalDaemon) {
         let Some(request) = self.request_records.get(request_id) else {
             return;
@@ -1689,6 +1709,7 @@ impl DaemonView {
         if request.status != RequestStatus::PendingApproval {
             return;
         }
+        self.reviewing_from_toast = true;
         self.selected_key = Some(RowKey::Request(request_id.to_string()));
         let needs_path = matches!(
             request.request.as_ref().map(|request| &request.kind),
@@ -3542,12 +3563,29 @@ mod tests {
             &view.screen,
             Screen::Form { kind: FormKind::FetchApproval { request_id, .. }, .. } if request_id == "fetch-1"
         ));
-        view.screen = Screen::Home;
+        assert!(
+            !view.handle_key(Key::Char('x'), &mut daemon),
+            "typing stays in the form"
+        );
+        assert!(
+            view.handle_key(Key::Esc, &mut daemon),
+            "backing out of a toast's form returns to the session"
+        );
         view.review_request("forward-1", &mut daemon);
         let Screen::Menu(menu) = &view.screen else {
             panic!("a forward gets the approve/reject menu");
         };
         assert!(menu.items.iter().any(|item| item.label.contains("Approve")));
+        assert!(
+            view.handle_key(Key::Char('n'), &mut daemon),
+            "deciding returns too"
+        );
+
+        // Opened normally, the menu stays open after a decision.
+        add_request(&mut view, pending_forward("forward-2", 9090));
+        view.handle_key(Key::Enter, &mut daemon);
+        assert!(matches!(view.screen, Screen::Menu(_)));
+        assert!(!view.handle_key(Key::Char('n'), &mut daemon));
     }
 
     fn add_request(view: &mut DaemonView, request: RequestRecord) {

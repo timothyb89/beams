@@ -76,15 +76,32 @@ xterm modifyOtherKeys sequences that full-screen applications such as zellij
 can enable in modern terminals (including iTerm2). Unmatched terminal
 sequences are still forwarded byte-for-byte.
 
-When a new remote approval request for the current Beam arrives, the local
-menu opens automatically over the SSH session; the user does not need to press
-the escape key first. Each request triggers this takeover at most once, so
-closing the menu without deciding does not cause a reopening loop. A short input
-guard prevents keys already buffered for the remote shell from accidentally
-acting on the newly opened approval UI (escape/close remains immediate).
-Requests belonging to other managed Beams do not take over this session.
-`--escape-key none` retains strict passthrough and disables automatic takeover
-along with the manual menu.
+When a new remote request for the current Beam arrives, a toast appears in
+the bottom-right corner ("Fetch big.bin (60 MB) · Ctrl-] to review") without
+taking input: typing keeps going to the remote session. Pressing the menu key
+while it's up opens that request directly (its path form, or the
+approve/reject menu), and submitting, deciding, or backing out returns
+straight to the session. An ignored toast disappears after 20 seconds; the
+request stays pending in the menu until the local daemon expires it (60
+seconds). Running copies and fetches show a progress bar in the same corner,
+then a brief done or failed toast. Requests belonging to other managed Beams
+don't produce toasts. `--approval-takeover` restores the older behavior of
+opening the menu as soon as a request arrives (with a short guard so keys
+already typed for the remote can't act on it). `--escape-key none` retains
+strict passthrough and disables toasts along with the manual menu.
+
+Toasts are drawn over live remote output in both display modes, using the
+shadow terminal model the session keeps anyway. They are written only between
+escape sequences (the session tracks the remote stream's parser state,
+including OSC/DCS strings, split UTF-8, and the remote's own synchronized
+updates), inside a synchronized update of their own; afterwards the cursor and
+drawing attributes are restored from the model rather than with DECSC, whose
+single slot the remote may be using. A toast is repainted once remote output
+settles (or every 250 ms during a long burst), and the cells it covered are
+repainted from the model when it goes away or the session ends. A remote that
+enables origin mode or insert mode, or selects the DEC line-drawing
+character set, could see a toast drawn incorrectly; the model doesn't expose
+those modes.
 
 The menu shows connection/bridge state, then one selectable list: every
 pending remote request for the current Beam (oldest first), then that

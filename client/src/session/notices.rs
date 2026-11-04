@@ -94,33 +94,7 @@ impl ToastPolicy {
             return Some((toast, Subject::Request(newest.request_id.clone())));
         }
 
-        let transfers: Vec<&ServiceRecord> = view
-            .visible_services()
-            .into_iter()
-            .filter(|service| {
-                matches!(
-                    service.spec,
-                    Some(
-                        ServiceRequestKind::FileFetch { .. } | ServiceRequestKind::FileCopy { .. }
-                    )
-                )
-            })
-            .collect();
-        for service in &transfers {
-            match service.status {
-                ServiceStatus::Starting | ServiceStatus::Running | ServiceStatus::Stopping => {
-                    self.running_seen.insert(service.service_id.clone());
-                }
-                ServiceStatus::Stopped | ServiceStatus::Error
-                    if self.running_seen.contains(&service.service_id) =>
-                {
-                    self.finished_at
-                        .entry(service.service_id.clone())
-                        .or_insert(now);
-                }
-                _ => {}
-            }
-        }
+        let transfers = self.observe(view, now);
         if let Some(service) = transfers.iter().find(|service| {
             matches!(
                 service.status,
@@ -152,6 +126,45 @@ impl ToastPolicy {
                     Subject::Service(service.service_id.clone()),
                 )
             })
+    }
+
+    /// Notes request arrivals and transfer state changes without deciding on
+    /// a toast (also called while the menu is open). Returns this Beam's
+    /// transfers.
+    pub fn observe<'a>(&mut self, view: &'a DaemonView, now: Instant) -> Vec<&'a ServiceRecord> {
+        for request in view.pending_requests() {
+            self.first_seen
+                .entry(request.request_id.clone())
+                .or_insert(now);
+        }
+        let transfers: Vec<&ServiceRecord> = view
+            .visible_services()
+            .into_iter()
+            .filter(|service| {
+                matches!(
+                    service.spec,
+                    Some(
+                        ServiceRequestKind::FileFetch { .. } | ServiceRequestKind::FileCopy { .. }
+                    )
+                )
+            })
+            .collect();
+        for service in &transfers {
+            match service.status {
+                ServiceStatus::Starting | ServiceStatus::Running | ServiceStatus::Stopping => {
+                    self.running_seen.insert(service.service_id.clone());
+                }
+                ServiceStatus::Stopped | ServiceStatus::Error
+                    if self.running_seen.contains(&service.service_id) =>
+                {
+                    self.finished_at
+                        .entry(service.service_id.clone())
+                        .or_insert(now);
+                }
+                _ => {}
+            }
+        }
+        transfers
     }
 
     /// The menu was opened: requests pending now have been seen.

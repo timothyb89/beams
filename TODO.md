@@ -658,10 +658,12 @@ bootstrap `Task`s.
   interrupted copy is noticed at startup.
 - [ ] Some client unit tests remove their `/tmp/beams-*` scratch dirs only
   on success; use a drop guard so failures don't leak them.
-- [ ] Non-blocking toasts: a bottom-right notice drawn over live remote
-  output (repainted after output bursts, cells restored from the shadow
-  model) for incoming requests and copy progress, instead of an input
-  takeover; `Ctrl-]` opens straight into the request.
+- [x] Non-blocking toasts: a bottom-right notice drawn over live remote
+  output (painted only between escape sequences, repainted after output
+  bursts, cells restored from the shadow model) for incoming requests and
+  transfer progress, instead of an input takeover; `Ctrl-]` opens straight
+  into the request and returns to the session after. Verified live over
+  zellij and `less`. `--approval-takeover` keeps the old behavior.
 - [x] Phase 2: `beams daemon` is the single-instance per-user workstation
   daemon, auto-started by `beams ssh` (with `--no-client-daemon` as a
   troubleshooting escape hatch). `client/src/clientd.rs` provides a mode-0600
