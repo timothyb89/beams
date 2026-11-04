@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::num::NonZeroU16;
 
 use portable_pty::PtySize;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color as TuiColor, Modifier, Style};
 use ratatui::Frame;
@@ -151,17 +152,23 @@ impl TerminalModel {
     /// Paints the terminal model into a ratatui frame. Widgets rendered after
     /// this call naturally appear above the captured remote screen.
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect) {
+        self.render_into(frame.buffer_mut(), area);
+    }
+
+    /// Copies the model's cells into `buf` at `area`, where `area` is in
+    /// screen coordinates (so a sub-rectangle copies just that part of the
+    /// screen).
+    pub fn render_into(&self, buf: &mut Buffer, area: Rect) {
         let screen = self.screen();
         let (rows, cols) = screen.size();
-        let rows = rows.get().min(area.height);
-        let cols = cols.get().min(area.width);
-
-        for row in 0..rows {
-            for col in 0..cols {
+        let bottom = area.bottom().min(rows.get());
+        let right = area.right().min(cols.get());
+        for row in area.top()..bottom {
+            for col in area.left()..right {
                 let Some(cell) = screen.cell(row, col) else {
                     continue;
                 };
-                if let Some(tui_cell) = frame.buffer_mut().cell_mut((area.x + col, area.y + row)) {
+                if let Some(tui_cell) = buf.cell_mut((col, row)) {
                     tui_cell
                         .set_symbol(if cell.is_wide_continuation() {
                             " "

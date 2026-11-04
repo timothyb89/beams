@@ -40,8 +40,10 @@ use crate::terminal_model::TerminalModel;
 
 mod form;
 mod keys;
+mod notices;
 mod picker;
 mod recent;
+mod toast;
 mod ui;
 
 use form::{ChoiceOption, Completion, Field, Form, FormEvent};
@@ -56,6 +58,16 @@ const REDRAW_RESIZE_DELAY: Duration = Duration::from_millis(40);
 const DAEMON_RECONNECT_RETRY: Duration = Duration::from_secs(1);
 const DEFERRED_OUTPUT_LIMIT: usize = 1024 * 1024;
 type PaletteTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
+/// How the managed session draws its local UI.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DisplayOptions {
+    /// Paint the menu over the captured remote screen (`--terminal-overlay`).
+    pub overlay: bool,
+    /// Open the menu for incoming requests instead of showing a toast
+    /// (`--approval-takeover`).
+    pub approval_takeover: bool,
+}
 
 /// The local prefix byte intercepted by the managed SSH session.
 ///
@@ -208,8 +220,9 @@ pub fn run(
     info: ConnectionInfo<'_>,
     escape_key: EscapeKey,
     mut local_daemon: LocalDaemon,
-    overlay_enabled: bool,
+    display: DisplayOptions,
 ) -> anyhow::Result<u8> {
+    let overlay_enabled = display.overlay;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("interactive `beams ssh` requires a terminal on stdin and stdout");
     }
@@ -260,6 +273,7 @@ pub fn run(
         &mut local_daemon,
         &mut terminal_model,
         overlay_enabled,
+        display.approval_takeover,
     );
 
     // Restore the local terminal before waiting/printing any error. The child
@@ -297,8 +311,23 @@ fn drive(
     local_daemon: &mut LocalDaemon,
     terminal_model: &mut TerminalModel,
     overlay_enabled: bool,
+    approval_takeover: bool,
 ) -> anyhow::Result<u8> {
     let mut input_router = InputRouter::default();
+    let mut toast_policy = notices::ToastPolicy::default();
+    let mut painter = toast::ToastPainter::default();
+    // What the toast on screen is about, for the menu prefix.
+    let mut toast_subject: Option<notices::Subject> = None;
+    macro_rules! clear_toast {
+        () => {{
+            let clear = painter.clear(terminal_model);
+            if !clear.is_empty() {
+                let mut stdout = io::stdout().lock();
+                let _ = stdout.write_all(&clear);
+                let _ = stdout.flush();
+            }
+        }};
+    }
     let mut deferred = DeferredOutput::default();
     let mut output_finished = false;
     let mut daemon_view = DaemonView::new(local_daemon);
@@ -324,7 +353,11 @@ fn drive(
         let daemon_changed = daemon_view.drain(local_daemon);
         let approval_needs_attention =
             escape_key != EscapeKey::Disabled && daemon_view.take_approval_attention();
-        if approval_needs_attention && input_router.mode == InputMode::Passthrough {
+        if approval_takeover
+            && approval_needs_attention
+            && input_router.mode == InputMode::Passthrough
+        {
+            painter.forget();
             terminal_state.open_palette()?;
             input_router.mode = InputMode::Palette;
             approval_takeover_guard = Some(Instant::now() + APPROVAL_TAKEOVER_GUARD);
@@ -336,6 +369,7 @@ fn drive(
 
         if let Ok(signal) = signal_rx.try_recv() {
             let _ = child.kill();
+            clear_toast!();
             close_palette(
                 master,
                 terminal_state,
@@ -356,7 +390,11 @@ fn drive(
             &mut output_finished,
             terminal_model,
             overlay_enabled,
+            &mut terminal_state.output,
         )?;
+        if output_changed && input_router.mode == InputMode::Passthrough {
+            painter.output_written();
+        }
         // OSC and unsupported-sequence callbacks are collected for the
         // overlay/native-frontend work. The passthrough path deliberately
         // leaves their original bytes untouched for the real terminal.
@@ -365,7 +403,26 @@ fn drive(
             redraw_palette!();
         }
 
+        // Toasts: drawn over the live screen while the menu is closed.
+        if input_router.mode == InputMode::Passthrough && !terminal_state.palette_open {
+            let now = Instant::now();
+            let current = toast_policy.current(&daemon_view, escape_key, now);
+            toast_subject = current.as_ref().map(|(_, subject)| subject.clone());
+            let paint = painter.sync(
+                current.as_ref().map(|(toast, _)| toast),
+                terminal_model,
+                &mut terminal_state.output,
+                now,
+            );
+            if !paint.is_empty() {
+                let mut stdout = io::stdout().lock();
+                stdout.write_all(&paint).context("drawing toast")?;
+                stdout.flush().context("flushing toast")?;
+            }
+        }
+
         if let Some(status) = child.try_wait().context("polling tsh child")? {
+            clear_toast!();
             close_palette(
                 master,
                 terminal_state,
@@ -385,6 +442,9 @@ fn drive(
                 master.resize(size).context("resizing local PTY")?;
                 terminal_model.resize(size);
                 last_size = size;
+                // The remote repaints for the new size; don't "restore"
+                // cells at the old toast position.
+                painter.forget();
                 if input_router.mode == InputMode::Palette {
                     redraw_palette!();
                 }
@@ -434,6 +494,7 @@ fn drive(
         }
         if stdin_closed {
             let _ = child.kill();
+            clear_toast!();
             close_palette(
                 master,
                 terminal_state,
@@ -458,12 +519,20 @@ fn drive(
                 }
                 InputAction::OpenPalette => {
                     approval_takeover_guard = None;
+                    painter.forget();
                     terminal_state.open_palette()?;
                     palette_terminal = Some(new_palette_terminal()?);
+                    // The prefix while a request's toast is up goes straight
+                    // to that request.
+                    if let Some(notices::Subject::Request(request_id)) = toast_subject.take() {
+                        daemon_view.review_request(&request_id, local_daemon);
+                    }
+                    toast_policy.mark_reviewed(&daemon_view);
                     redraw_palette!();
                 }
                 InputAction::ClosePalette => {
                     approval_takeover_guard = None;
+                    painter.forget();
                     close_palette(
                         master,
                         terminal_state,
@@ -1611,6 +1680,32 @@ impl DaemonView {
         }
     }
 
+    /// Opens `request_id` for a decision: the path form for copies, fetches
+    /// and syncs, the approve/reject menu otherwise.
+    fn review_request(&mut self, request_id: &str, local_daemon: &mut LocalDaemon) {
+        let Some(request) = self.request_records.get(request_id) else {
+            return;
+        };
+        if request.status != RequestStatus::PendingApproval {
+            return;
+        }
+        self.selected_key = Some(RowKey::Request(request_id.to_string()));
+        let needs_path = matches!(
+            request.request.as_ref().map(|request| &request.kind),
+            Some(
+                ServiceRequestKind::FileCopy { .. }
+                    | ServiceRequestKind::FileFetch { .. }
+                    | ServiceRequestKind::FolderSync { .. }
+            )
+        );
+        if needs_path {
+            self.approve(request_id, local_daemon);
+        } else {
+            let menu = request_menu(request);
+            self.open_menu(menu);
+        }
+    }
+
     fn connected_bridges(&self) -> usize {
         self.bridge_statuses
             .values()
@@ -2044,10 +2139,13 @@ impl DeferredOutput {
         self.bytes.extend(bytes.iter().copied());
     }
 
-    fn flush(&mut self) -> anyhow::Result<()> {
+    fn flush(&mut self, tracker: &mut toast::OutputTracker) -> anyhow::Result<()> {
         if self.bytes.is_empty() && !self.truncated {
             return Ok(());
         }
+        let (front, back) = self.bytes.as_slices();
+        tracker.feed(front, Instant::now());
+        tracker.feed(back, Instant::now());
         let mut stdout = io::stdout().lock();
         if self.truncated {
             stdout
@@ -2157,6 +2255,7 @@ fn drain_output(
     finished: &mut bool,
     terminal_model: &mut TerminalModel,
     overlay_enabled: bool,
+    tracker: &mut toast::OutputTracker,
 ) -> anyhow::Result<bool> {
     let mut stdout = io::stdout().lock();
     let mut wrote = false;
@@ -2177,6 +2276,7 @@ fn drain_output(
                     }
                     deferred.push(&bytes);
                 } else {
+                    tracker.feed(&bytes, Instant::now());
                     stdout
                         .write_all(&bytes)
                         .context("writing remote PTY output")?;
@@ -2212,6 +2312,7 @@ fn finish_output(
             finished,
             terminal_model,
             false,
+            &mut toast::OutputTracker::default(),
         )?;
         if !*finished {
             thread::sleep(Duration::from_millis(5));
@@ -2237,7 +2338,7 @@ fn close_palette(
             deferred.clear();
             restore_terminal_model(terminal_model)?;
         } else {
-            deferred.flush()?;
+            deferred.flush(&mut terminal_state.output)?;
             force_remote_redraw(master, size)?;
         }
     }
@@ -2338,6 +2439,9 @@ fn signal_watcher() -> anyhow::Result<(Receiver<i32>, SignalHandle, thread::Join
 struct TerminalState {
     raw: bool,
     palette_open: bool,
+    /// Escape-sequence state of everything written to the real terminal,
+    /// so toasts are only drawn between sequences.
+    output: toast::OutputTracker,
 }
 
 impl TerminalState {
@@ -2346,6 +2450,7 @@ impl TerminalState {
         Ok(Self {
             raw: true,
             palette_open: false,
+            output: toast::OutputTracker::default(),
         })
     }
 
@@ -3314,6 +3419,135 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("Beam's suggestion")));
+    }
+
+    fn toast_text(toast: &toast::Toast) -> String {
+        let mut text = toast.title.clone();
+        for line in &toast.lines {
+            text.push('\n');
+            for span in &line.spans {
+                text.push_str(&span.content);
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn request_toasts_show_until_reviewed_or_ignored_for_a_while() {
+        let daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        let mut policy = notices::ToastPolicy::default();
+        let start = Instant::now();
+        assert!(policy.current(&view, EscapeKey::default(), start).is_none());
+
+        add_request(&mut view, pending_fetch("fetch-1", None));
+        let (toast, subject) = policy.current(&view, EscapeKey::default(), start).unwrap();
+        assert_eq!(subject, notices::Subject::Request("fetch-1".to_string()));
+        assert_eq!(
+            toast_text(&toast),
+            "Beam request\nFetch 2 items (1.2 MB)\nCtrl-] to review"
+        );
+        assert!(
+            policy.current(&view, EscapeKey::Disabled, start).is_none(),
+            "no toast pointing at a menu key that doesn't exist"
+        );
+
+        add_request(&mut view, pending_forward("forward-1", 8080));
+        let later = start + Duration::from_secs(5);
+        let (toast, subject) = policy.current(&view, EscapeKey::default(), later).unwrap();
+        assert_eq!(
+            subject,
+            notices::Subject::Request("forward-1".to_string()),
+            "newest first"
+        );
+        assert_eq!(
+            toast_text(&toast),
+            "2 Beam requests\nForward Beam port 8080\n+1 more · Ctrl-] to review"
+        );
+
+        // Ignored: fetch-1 times out first, then forward-1.
+        let (_, subject) = policy
+            .current(&view, EscapeKey::default(), start + Duration::from_secs(21))
+            .unwrap();
+        assert_eq!(subject, notices::Subject::Request("forward-1".to_string()));
+        assert!(policy
+            .current(&view, EscapeKey::default(), start + Duration::from_secs(26))
+            .is_none());
+
+        // Reviewed: opening the menu retires the toast at once.
+        add_request(&mut view, pending_forward("forward-2", 9090));
+        let now = start + Duration::from_secs(30);
+        assert!(policy.current(&view, EscapeKey::default(), now).is_some());
+        policy.mark_reviewed(&view);
+        assert!(policy.current(&view, EscapeKey::default(), now).is_none());
+    }
+
+    #[test]
+    fn transfer_toasts_follow_progress_then_report_the_outcome() {
+        let daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        let mut policy = notices::ToastPolicy::default();
+        let fetch_spec = pending_fetch("x", None).request.unwrap().kind;
+        let spec = serde_json::to_value(&fetch_spec).unwrap();
+        let mut old = service("old", "beam-a-uuid", spec.clone(), "stopped");
+        old.request_id = "old-request".to_string();
+        view.service_records.insert("old".to_string(), old);
+        let start = Instant::now();
+        assert!(
+            policy.current(&view, EscapeKey::default(), start).is_none(),
+            "transfers that finished before this session stay quiet"
+        );
+
+        let mut running = service("svc", "beam-a-uuid", spec, "running");
+        running.local_path = Some("/srv/drop".to_string());
+        running.progress = Some(beams_protocol::TransferProgress {
+            bytes_done: 600_000,
+            bytes_total: 1_200_300,
+            files_done: 0,
+            files_total: 2,
+        });
+        view.service_records
+            .insert("svc".to_string(), running.clone());
+        let (toast, subject) = policy.current(&view, EscapeKey::default(), start).unwrap();
+        assert_eq!(subject, notices::Subject::Service("svc".to_string()));
+        let text = toast_text(&toast);
+        assert!(text.starts_with("Fetching\n2 items\n"), "{text}");
+        assert!(text.ends_with(" 49% · 0/2"), "{text}");
+
+        running.status = beams_protocol::ServiceStatus::Stopped;
+        running.progress = Some(beams_protocol::TransferProgress {
+            bytes_done: 1_200_300,
+            bytes_total: 1_200_300,
+            files_done: 2,
+            files_total: 2,
+        });
+        view.service_records
+            .insert("svc".to_string(), running.clone());
+        let (toast, _) = policy.current(&view, EscapeKey::default(), start).unwrap();
+        assert_eq!(toast.tone, toast::Tone::Ok);
+        assert_eq!(toast_text(&toast), "Fetched\n✓ 2 items\ninto /srv/drop");
+        assert!(policy
+            .current(&view, EscapeKey::default(), start + Duration::from_secs(6))
+            .is_none());
+    }
+
+    #[test]
+    fn reviewing_from_a_toast_opens_the_request_itself() {
+        let mut daemon = managed_daemon();
+        let mut view = DaemonView::new(&daemon);
+        add_request(&mut view, pending_fetch("fetch-1", Some("~/x/")));
+        add_request(&mut view, pending_forward("forward-1", 8080));
+        view.review_request("fetch-1", &mut daemon);
+        assert!(matches!(
+            &view.screen,
+            Screen::Form { kind: FormKind::FetchApproval { request_id, .. }, .. } if request_id == "fetch-1"
+        ));
+        view.screen = Screen::Home;
+        view.review_request("forward-1", &mut daemon);
+        let Screen::Menu(menu) = &view.screen else {
+            panic!("a forward gets the approve/reject menu");
+        };
+        assert!(menu.items.iter().any(|item| item.label.contains("Approve")));
     }
 
     fn add_request(view: &mut DaemonView, request: RequestRecord) {

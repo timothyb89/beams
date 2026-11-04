@@ -116,7 +116,7 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 /// Truncates `text` to `width` columns, ending in `…` when cut.
-fn ellipsize(text: &str, width: usize) -> String {
+pub fn ellipsize(text: &str, width: usize) -> String {
     if text.width() <= width {
         return text.to_string();
     }
@@ -345,6 +345,65 @@ pub fn progress_label(progress: &beams_protocol::TransferProgress) -> String {
     } else {
         format!("{percent}%")
     }
+}
+
+fn file_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// What a fetch or copy moves, in a few words ("big.bin", "3 items").
+pub fn transfer_subject(kind: &ServiceRequestKind) -> String {
+    match kind {
+        ServiceRequestKind::FileFetch { sources, .. } => match sources.as_slice() {
+            [source] => file_name(&source.path),
+            _ => format!("{} items", sources.len()),
+        },
+        ServiceRequestKind::FileCopy { remote_path, .. } => file_name(remote_path),
+        _ => String::new(),
+    }
+}
+
+/// One line for a toast: what a pending request wants.
+pub fn request_summary(request: &RequestRecord) -> String {
+    let Some(service_request) = &request.request else {
+        return match &request.action {
+            Some(action) => format!("{} a service", capitalize(action_label(action.action))),
+            None => "Approve a request".to_string(),
+        };
+    };
+    match &service_request.kind {
+        ServiceRequestKind::FileFetch { sources, .. } => {
+            let total: u64 = sources.iter().map(|source| source.size).sum();
+            format!(
+                "Fetch {} ({})",
+                transfer_subject(&service_request.kind),
+                human_bytes(total)
+            )
+        }
+        ServiceRequestKind::FileCopy {
+            direction: FileCopyDirection::Download,
+            remote_path,
+            ..
+        } => format!("Download {}", file_name(remote_path)),
+        ServiceRequestKind::FileCopy { remote_path, .. } => format!("Upload to {remote_path}"),
+        ServiceRequestKind::LocalPortForward { remote_port, .. } => {
+            format!("Forward Beam port {remote_port}")
+        }
+        ServiceRequestKind::FolderSync { remote_path, .. } => format!("Sync {remote_path}"),
+    }
+}
+
+/// `█████░░░░░` for a fraction of `width` cells.
+pub fn progress_bar(done: u64, total: u64, width: usize) -> String {
+    let filled = if total == 0 {
+        width
+    } else {
+        ((done.min(total) as u128 * width as u128) / total as u128) as usize
+    };
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
 pub fn capitalize(text: &str) -> String {
