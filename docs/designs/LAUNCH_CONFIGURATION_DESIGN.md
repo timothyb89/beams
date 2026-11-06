@@ -20,7 +20,7 @@ template definitions, package batches, artifact selections and graph validation.
 ## Implementation status and next-session handoff
 
 Updated 2026-11-06 after the readiness/bridge slice (`e8b571c`, `6cff233`
-and the workstation-driver commit that follows them). A workstation can now
+and `59cdd45`). A workstation can now
 drive a whole launch onto an existing Beam with `beams config launch`: the
 declaration and bundles travel as chunks over the already-open bridge, the
 Beam stages each bundle itself (releasing `artifact-ready`), and an
@@ -38,7 +38,7 @@ fixed startup path; nothing sets `BEAMS_LAUNCH_ID` in a real session yet.
 | `e36c9f2` + CLI commit | Daemon acceptance by UUID/digest, waiting conditions, snapshots with a `seq` boundary, restart → interrupted, explicit retry; `launch submit/signal/status/retry`; hooks get the relay socket | `bootstrap/src/launch/daemon.rs`, `launch/mod.rs`, `daemon.rs` |
 | `e8b571c` | Shell/TUI readiness gate; Beam TUI loads launch snapshots on connect and on acceptance | `launch/daemon.rs`, `tui/app.rs`, `shell/fish/conf.d/beams-launch.fish` |
 | `6cff233` | `launch` bridge capability: chunked resumable uploads, submission by ID/digest, owner-routed status/conditions; the Beam stages each bundle itself (`launch receive`) | `protocol/src/lib.rs`, `launch/upload.rs`, `launch/daemon.rs` |
-| driver commit | Workstation driver and `beams config launch`; bridge writer stops polling | `client/src/clientd/launches.rs`, `client/src/config/mod.rs`, `client/src/bridge.rs` |
+| `59cdd45` | Workstation driver and `beams config launch`; bridge writer stops polling | `client/src/clientd/launches.rs`, `client/src/config/mod.rs`, `client/src/bridge.rs` |
 
 Available commands are `beams config validate/explain/pack/pack-post/launch`
 and `beam-bootstrap launch unpack/run-phase/submit/signal/ready/receive/status/retry/install-packages`.
@@ -95,6 +95,44 @@ The opt-in `beams ssh` launch path:
    `config init`, native parameterization, sanitized default migration,
    known_hosts/git config seeding (see `TODO.md`) and optional
    ControlMaster.
+
+### Notes for the next session
+
+- **Where things live.** Beam side: `bootstrap/src/launch/daemon.rs`
+  (acceptance, worker, conditions, readiness, bridge glue, receive),
+  `launch/upload.rs` (chunk spools), `launch/runner.rs` (phase execution),
+  `tui/app.rs` (snapshot rows, readiness report). Workstation side:
+  `client/src/clientd/launches.rs` (driver state machine, upload window),
+  `client/src/config/mod.rs` (`config launch`), `client/src/bridge.rs`
+  (writer). Shared messages and constants: `protocol/src/lib.rs`
+  (`Launch*` variants) and `protocol/src/launch.rs` (`Gate`,
+  `LaunchStatus`, `Blob`, chunk/window/declaration limits).
+- **Known gap, easy to hit next.** A Beam whose `beam-bootstrap` predates
+  `CAPABILITY_LAUNCH` never advertises it, so `start_launch` records the
+  launch and `beams config launch` waits forever on "waiting for the Beam
+  bridge". The fresh-Beam path must deliver the current runtime first; the
+  driver should also say the Beam lacks the capability once the bridge
+  connects without it.
+- **Zellij sessions.** `bin/beam-shell` runs `zellij attach beam
+  --create`; attaching to an existing session keeps that session's
+  original environment, so `BEAMS_LAUNCH_ID` (and the session token) can be
+  stale or missing in its panes. The `beams ssh --profile` path needs a
+  new session per launch, or must refuse to attach a mismatched one.
+- **Event-thread rule.** Bridge events for a Beam are handled on one
+  workstation thread, and the bridge reader drops the connection if that
+  thread's queue (256) fills. Keep slow work (packing post, hashing) off
+  it, as `start_post` does.
+- **Testing safely.** Smokes use scratch HOME/XDG/sockets and never touch
+  this session's `beam-bootstrapd` or fixed startup. A scratch workstation
+  config must set `[startup] tasks = []`, or the default startup manifest
+  installs toolchains into the scratch Beam over the network. Cleanup that
+  kills by pattern must match only the run's unique scratch path (never an
+  empty pattern). The real TUI can be driven under `script` (see
+  `launch-daemon-smoke.sh`). Staged files are sealed read-only: `chmod -R
+  u+w` before removing a kept test directory.
+- **Shell environment on this Beam.** Non-interactive shells may lack
+  `~/.cargo/bin` on `PATH`; a filtered build command can then look clean
+  while nothing compiled. Check the exit status or export the path first.
 
 ### Validation at handoff
 
