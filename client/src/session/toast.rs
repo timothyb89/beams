@@ -17,9 +17,9 @@
 //!   repainted once output settles (or periodically during a long burst).
 //! - **Going away.** The cells under a toast are repainted from the model.
 //!
-//! Known gaps: a remote that enabled origin mode or insert mode, or switched
+//! Known gaps: a remote that enabled insert mode, or switched
 //! to the DEC line-drawing character set, would see the toast drawn
-//! incorrectly; the model doesn't expose those modes.
+//! incorrectly; those states are not yet represented.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -33,139 +33,37 @@ use unicode_width::UnicodeWidthStr;
 
 use super::ui::theme;
 use crate::terminal_model::TerminalModel;
+use crate::terminal_paint;
 
 /// Output must have been quiet this long before painting, so a toast isn't
 /// drawn into the middle of a screen the remote is busy redrawing...
 const SETTLE: Duration = Duration::from_millis(30);
 /// ...unless output never stops, in which case repaint this often anyway.
 const BURST_REPAINT: Duration = Duration::from_millis(250);
-/// A string sequence (OSC/DCS) that hasn't terminated after this long of
-/// silence is assumed to have been lost rather than blocking toasts forever.
-const STALE_SEQUENCE: Duration = Duration::from_secs(1);
-
 const MIN_WIDTH: u16 = 26;
 const MAX_WIDTH: u16 = 56;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum State {
-    Ground,
-    Escape,
-    EscapeIntermediate,
-    Csi,
-    /// OSC: ends with BEL or ST.
-    Osc,
-    /// DCS, APC, PM, SOS: end with ST.
-    Str,
-    /// Saw ESC inside a string: `\` ends it, anything else starts a new
-    /// escape sequence.
-    StringEscape,
-}
-
-/// Follows the escape-sequence state of everything written to the real
-/// terminal.
-#[derive(Debug)]
+/// Tracks physical output with the same bounded framing as the shadow model.
+#[derive(Debug, Default)]
 pub struct OutputTracker {
-    state: State,
-    /// UTF-8 continuation bytes still expected.
-    utf8_pending: u8,
-    csi: Vec<u8>,
-    /// The remote opened a synchronized update and hasn't closed it.
-    sync_open: bool,
+    stream: crate::terminal_stream::TerminalStream,
     last_output: Option<Instant>,
-}
-
-impl Default for OutputTracker {
-    fn default() -> Self {
-        Self {
-            state: State::Ground,
-            utf8_pending: 0,
-            csi: Vec::new(),
-            sync_open: false,
-            last_output: None,
-        }
-    }
 }
 
 impl OutputTracker {
     pub fn feed(&mut self, bytes: &[u8], now: Instant) {
-        if bytes.is_empty() {
-            return;
-        }
-        self.last_output = Some(now);
-        for &byte in bytes {
-            self.step(byte);
+        if !bytes.is_empty() {
+            self.last_output = Some(now);
+            self.stream.observe(bytes);
         }
     }
 
-    fn step(&mut self, byte: u8) {
-        match self.state {
-            State::Ground => match byte {
-                0x1b => {
-                    self.utf8_pending = 0;
-                    self.state = State::Escape;
-                }
-                0x80..=0xbf => self.utf8_pending = self.utf8_pending.saturating_sub(1),
-                0xc0..=0xdf => self.utf8_pending = 1,
-                0xe0..=0xef => self.utf8_pending = 2,
-                0xf0..=0xf7 => self.utf8_pending = 3,
-                _ => self.utf8_pending = 0,
-            },
-            State::Escape => self.escape(byte),
-            State::EscapeIntermediate => {
-                if !(0x20..=0x2f).contains(&byte) {
-                    self.state = State::Ground;
-                }
-            }
-            State::Csi => match byte {
-                0x1b => self.state = State::Escape,
-                0x40..=0x7e => {
-                    if self.csi == b"?2026" {
-                        match byte {
-                            b'h' => self.sync_open = true,
-                            b'l' => self.sync_open = false,
-                            _ => {}
-                        }
-                    }
-                    self.state = State::Ground;
-                }
-                _ => {
-                    if self.csi.len() < 32 {
-                        self.csi.push(byte);
-                    }
-                }
-            },
-            State::Osc => match byte {
-                0x07 => self.state = State::Ground,
-                0x1b => self.state = State::StringEscape,
-                _ => {}
-            },
-            State::Str => {
-                if byte == 0x1b {
-                    self.state = State::StringEscape;
-                }
-            }
-            State::StringEscape => {
-                if byte == b'\\' {
-                    self.state = State::Ground;
-                } else {
-                    self.escape(byte);
-                }
-            }
-        }
+    pub fn pending(&self) -> &[u8] {
+        self.stream.pending()
     }
 
-    fn escape(&mut self, byte: u8) {
-        self.state = match byte {
-            b'[' => {
-                self.csi.clear();
-                State::Csi
-            }
-            b']' => State::Osc,
-            b'P' | b'_' | b'^' | b'X' => State::Str,
-            0x1b => State::Escape,
-            0x20..=0x2f => State::EscapeIntermediate,
-            _ => State::Ground,
-        };
+    pub fn synchronized_update(&self) -> bool {
+        self.stream.synchronized_update()
     }
 
     pub fn quiet_for(&self, now: Instant) -> Duration {
@@ -174,20 +72,9 @@ impl OutputTracker {
             .unwrap_or(Duration::MAX)
     }
 
-    /// Whether the remote stream is between sequences, so the terminal will
-    /// interpret whatever is written next on its own.
-    pub fn at_boundary(&mut self, now: Instant) -> bool {
-        let clean = self.state == State::Ground && self.utf8_pending == 0 && !self.sync_open;
-        if !clean && self.quiet_for(now) >= STALE_SEQUENCE {
-            // Something was lost (e.g. truncated deferred output); don't
-            // let it block toasts forever.
-            *self = Self {
-                last_output: self.last_output,
-                ..Self::default()
-            };
-            return true;
-        }
-        clean
+    /// Silence is not a sequence terminator. Wait for an actual boundary.
+    pub fn at_boundary(&mut self, _now: Instant) -> bool {
+        self.stream.at_boundary()
     }
 }
 
@@ -284,6 +171,10 @@ impl ToastPainter {
     /// Takes the toast down now, whatever the remote stream is doing; for
     /// when the session is ending and there won't be a better moment.
     pub fn clear(&mut self, model: &TerminalModel) -> Vec<u8> {
+        if !model.can_paint() {
+            self.forget();
+            return Vec::new();
+        }
         let Some((rect, _)) = self.shown.take() else {
             return Vec::new();
         };
@@ -291,12 +182,13 @@ impl ToastPainter {
         if rect.right() > cols.get() || rect.bottom() > rows.get() {
             return Vec::new();
         }
-        let mut out = Vec::new();
+        let rect = restoration_area(rect, cols.get());
+        let mut out = terminal_paint::BEGIN.to_vec();
         let mut buf = Buffer::empty(rect);
         model.render_into(&mut buf, rect);
         encode_area(&buf, rect, &mut out);
-        out.extend_from_slice(model.screen().cursor_state_formatted().as_bytes());
-        out.extend_from_slice(model.screen().attributes_formatted().as_bytes());
+        terminal_paint::restore(model.screen(), false, &mut out);
+        out.extend_from_slice(terminal_paint::END);
         out
     }
 
@@ -309,6 +201,10 @@ impl ToastPainter {
         tracker: &mut OutputTracker,
         now: Instant,
     ) -> Vec<u8> {
+        if !model.can_paint() {
+            self.forget();
+            return Vec::new();
+        }
         let (rows, cols) = model.screen().size();
         let target = desired
             .and_then(|toast| placement(toast, rows.get(), cols.get()).map(|rect| (rect, toast)));
@@ -333,14 +229,14 @@ impl ToastPainter {
             return Vec::new();
         }
 
-        let mut out = Vec::new();
-        out.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
+        let mut out = terminal_paint::BEGIN.to_vec();
         if let Some((old, _)) = &self.shown {
             if target.as_ref().is_none_or(|(rect, _)| rect != old) {
                 // Put back what the old toast covered.
-                let mut buf = Buffer::empty(*old);
-                model.render_into(&mut buf, *old);
-                encode_area(&buf, *old, &mut out);
+                let area = restoration_area(*old, cols.get());
+                let mut buf = Buffer::empty(area);
+                model.render_into(&mut buf, area);
+                encode_area(&buf, area, &mut out);
             }
         }
         match target {
@@ -352,9 +248,8 @@ impl ToastPainter {
             }
             None => self.shown = None,
         }
-        out.extend_from_slice(model.screen().cursor_state_formatted().as_bytes());
-        out.extend_from_slice(model.screen().attributes_formatted().as_bytes());
-        out.extend_from_slice(b"\x1b[?2026l");
+        terminal_paint::restore(model.screen(), false, &mut out);
+        out.extend_from_slice(terminal_paint::END);
         self.dirty = false;
         self.last_paint = Some(now);
         out
@@ -367,6 +262,15 @@ impl ToastPainter {
         self.last_paint = None;
         self.sync(desired, model, &mut tracker, Instant::now())
     }
+}
+
+fn restoration_area(area: Rect, cols: u16) -> Rect {
+    // A toast edge can bisect a double-width character. Repaint one column
+    // on either side so both halves are restored, including a leading cell
+    // just outside the toast.
+    let left = area.x.saturating_sub(1);
+    let right = area.right().saturating_add(1).min(cols);
+    Rect::new(left, area.y, right.saturating_sub(left), area.height)
 }
 
 /// Writes the cells of `area` from `buf` as positioned, styled text.
@@ -534,12 +438,14 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_string_terminator_eventually_stops_blocking() {
+    fn silence_does_not_end_an_unfinished_string() {
         let start = Instant::now();
         let mut tracker = OutputTracker::default();
         tracker.feed(b"\x1b]0;never ends", start);
         assert!(!tracker.at_boundary(start + Duration::from_millis(500)));
-        assert!(tracker.at_boundary(start + STALE_SEQUENCE));
+        assert!(!tracker.at_boundary(start + Duration::from_secs(20)));
+        tracker.feed(b"\x1b\\", start + Duration::from_secs(21));
+        assert!(tracker.at_boundary(start + Duration::from_secs(21)));
     }
 
     #[test]
@@ -573,6 +479,34 @@ mod tests {
         );
         assert!(screen.contents().contains("Ctrl-] to review"));
         assert!(screen.contents().contains("╭"));
+    }
+
+    #[test]
+    fn painting_outside_remote_margins_preserves_origin_and_the_saved_slot() {
+        let mut model = model(10, 60);
+        let remote = b"\x1b[2;4r\x1b[?6h\x1b[2;3H\x1b[31m\x1b7\x1b[1;1H\x1b[32m";
+        model.process(remote);
+        let mut painter = ToastPainter::default();
+        let paint = painter.sync_now(Some(&toast("outside the scroll region")), &model);
+        let mut physical = screen_after(10, 60, &[remote, &paint]);
+        assert!(physical
+            .screen()
+            .rows(0, 60)
+            .nth(7)
+            .unwrap()
+            .contains("outside the scroll region"));
+        assert_eq!(physical.screen().drawing_state(), model.drawing_state());
+        let clear = painter.clear(&model);
+        physical.process(&clear);
+        let after = b"\x1b8X\r\nnext\r\nscroll";
+        model.process(after);
+        physical.process(after);
+        assert_eq!(
+            visible(physical.screen()).trim_end(),
+            visible(model.screen()).trim_end(),
+        );
+        assert_eq!(physical.screen().drawing_state(), model.drawing_state());
+        assert_eq!(physical.screen().fgcolor(), vt100::Color::Idx(1));
     }
 
     #[test]
@@ -675,5 +609,50 @@ mod tests {
         encode_area(&buf, area, &mut out);
         let parser = screen_after(1, 6, &[&out]);
         assert_eq!(visible(parser.screen()), "界ab");
+    }
+
+    #[test]
+    fn hiding_a_toast_restores_wide_glyphs_bisected_by_its_edges() {
+        let mut model = model(10, 60);
+        let notice = toast("hello");
+        let rect = placement(&notice, 10, 60).unwrap();
+        let remote = format!(
+            "\x1b[{};{}H界\x1b[{};{}H界",
+            rect.y + 1,
+            rect.x,
+            rect.y + 2,
+            rect.right(),
+        );
+        model.process(remote.as_bytes());
+        let mut painter = ToastPainter::default();
+        let paint = painter.sync_now(Some(&notice), &model);
+        let clear = painter.clear(&model);
+        let physical = screen_after(10, 60, &[remote.as_bytes(), &paint, &clear]);
+        assert_eq!(
+            visible(physical.screen()).trim_end(),
+            visible(model.screen()).trim_end()
+        );
+    }
+
+    #[test]
+    fn unfinished_remote_prefix_can_be_replayed_after_local_painting() {
+        let now = Instant::now();
+        for (before, after) in [
+            (b"\x1b[38;2;".as_slice(), b"1;2;3mred".as_slice()),
+            (b"\x1b]2;ti".as_slice(), b"tle\x07".as_slice()),
+            (&"界".as_bytes()[..2], &"界".as_bytes()[2..]),
+        ] {
+            let mut tracker = OutputTracker::default();
+            tracker.feed(before, now);
+            assert_eq!(tracker.pending(), before);
+            let mut physical = screen_after(10, 60, &[before, b"\x18\x1b\\LOCAL"]);
+            physical.process(b"\x1b[2J\x1b[H");
+            physical.process(tracker.pending());
+            physical.process(after);
+            let expected = screen_after(10, 60, &[before, after]);
+            assert_eq!(visible(physical.screen()), visible(expected.screen()));
+            tracker.feed(after, now);
+            assert!(tracker.pending().is_empty());
+        }
     }
 }

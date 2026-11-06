@@ -252,16 +252,25 @@ offending field and the form stays open with its input intact; `Enter`
 submits and `Esc` cancels. Menu keys are decoded from plain bytes, `ESC [`
 and application-cursor `ESC O` sequences, Kitty CSI-u, and modifyOtherKeys,
 so they work whichever keyboard mode the remote application left the outer
-terminal in.
+terminal in. Kitty key-release events do not act as menu keys, and holding
+the prefix cannot repeatedly toggle the menu. The menu enables bracketed
+paste and restores the remote setting on close. A menu prefix inside
+bracketed paste remains pasted text.
+Legacy X10, UTF-8, SGR, and urxvt mouse reports are consumed as whole reports
+while the menu is open; their coordinates cannot act as menu keys. Terminal
+query replies (including OSC clipboard and DCS replies) still reach the
+remote application while the menu owns keyboard input.
 
 The client does not nest another terminal alternate screen over remote zellij
-(alternate-screen state is not stackable). It drains up to 1 MiB of remote
+(alternate-screen state is not stackable). In the default takeover mode it
+drains up to 1 MiB of remote
 output while the menu is visible, restores that output on close, and briefly
 resizes/restores the child PTY with distinct notifications to make the remote
 application redraw. Every menu frame clears stale cells before painting, and
 the dialog is drawn on a cleared panel, so local resizes and shorter updates
 do not retain content from an older frame. Terminal raw mode and cursor
-visibility are restored on normal exit, errors, and handled termination
+visibility and ordinary mouse/paste input modes are restored on normal exit,
+errors, and handled termination
 signals. Daemon request, bridge, and service events repaint an open menu
 immediately; closing and reopening it is not required to refresh status.
 
@@ -274,19 +283,51 @@ the same dialog the takeover mode draws (both modes share one renderer in
 while it is hidden from the physical terminal. A persistent ratatui renderer
 updates only changed cells, avoiding the full-screen clear/redraw flicker of
 the first prototype. Closing an overlay restores the model without sending a
-synthetic one-column resize pulse to the remote PTY. OSC title/clipboard
-requests, mouse mode, bracketed paste, alternate-screen state, resize, colors,
-and wide characters are tracked by the model, but clipboard actions and
-unsupported terminal features are not interpreted by the model yet. Complete
-OSC sequences are still passed through to the physical terminal, preserving
-the existing title/clipboard behavior. The existing takeover path remains the
-fallback and default.
+synthetic one-column resize pulse to the remote PTY. It restores the active
+display buffer, cursor, modeled attributes and input modes; unfinished
+remote sequences resume across menu boundaries. Menus and toasts establish
+absolute positioning with origin mode off and full vertical margins, then
+restore the represented remote state. Menu close also restores per-buffer
+saved cursor/attributes changed while hidden. Toasts preserve the application's
+save slot; takeover resumes deferred bytes from its captured entry state.
+While open, complete OSC
+title/clipboard effects are relayed from parser callbacks (normalized to an
+ST terminator), ordinary cursor/status queries are answered from the remote
+model (including origin-relative cursor reports), and device/window queries
+reach the physical terminal. The output queue is bounded and yields to
+input/resize handling during long bursts.
+
+The model and physical-output tracker share a bounded stream framer. It holds
+at most 64 KiB of an unfinished control sequence and feeds complete sequences
+to the allocating emulator only when they fit that budget. If hidden output
+exceeds it, the menu closes and the retained prefix and remaining original
+bytes resume in passthrough without truncation. Overlay menus and toasts are
+then suppressed until the remote sends a full terminal reset (`ESC c`);
+ordinary typing still reaches the remote, and pressing the prefix twice still
+sends it remotely. This is a conservative recovery for budget exhaustion,
+not yet the general unknown-screen compatibility policy. Silence does not
+end an unfinished string or synchronized update.
+
+The client uses a focused, vendored `vt100` 0.18.1 extension in
+`vendor/vt100` for read-only current/saved cursor and attribute snapshots,
+per-buffer origin/margins, streaming DCS callbacks and reset notifications.
+Bursts of complete query/effect sequences are drained at each parsed frame,
+avoiding event-queue pressure. DCS query answers and support for further
+drawing/input state remain pending.
+
+The [readiness audit](../docs/development/terminal-overlay.md) records the
+expanded coverage and remaining default blockers: DCS queries, unknown
+initial/inactive screens, differing saved-state semantics across emulators,
+and unsupported drawing/input protocols. The existing
+takeover path remains the fallback and default.
 
 The controlling-terminal smoke test exercises both paths:
 
 ```sh
 ./client/tests/managed-session-smoke.sh
 BEAMS_TEST_OVERLAY=1 ./client/tests/managed-session-smoke.sh
+cargo build --manifest-path client/Cargo.toml
+python3 client/tests/terminal-overlay-smoke.py
 ```
 
 ## Local service daemon
@@ -392,8 +433,11 @@ inside it, if that's a directory); several items, or a directory, land inside
 the destination directory, which is created if needed. Each item is copied
 with `tsh scp` (`-r` for directories) into a hidden sibling temp name and
 renamed into place; existing targets fail the fetch unless `--overwrite` was
-given. The command prints byte progress until the copy finishes and exits
-non-zero on rejection, expiry, failure, or cancellation. Ctrl-C withdraws the
+given. On acceptance, the command prints a lasting stderr acknowledgement
+with a reminder to review and approve in the workstation's Beams menu, even
+when a toast also appears. The command prints byte progress until the copy
+finishes and exits non-zero on rejection, expiry, failure, or cancellation.
+Ctrl-C withdraws the
 request: the Beam daemon notices the command's connection closing and tells
 the workstation, which drops it if still pending or cancels it if running.
 

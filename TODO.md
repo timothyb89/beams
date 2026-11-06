@@ -751,6 +751,10 @@ section above for status/details.
 - [ ] No CI configured (`.github/workflows` doesn't exist). At minimum a
   `cargo check`/`cargo test` workflow for both `bootstrap/` and `client/`
   would catch breakage before it's discovered on a live beam.
+- [ ] Investigate intermittent missing stderr in
+  `forward::tests::startup_failure_includes_captured_diagnostics`. During
+  overlay validation it once reported only exit status 23; the isolated test
+  and full-suite rerun passed.
 
 ## Client-owned services and remote requests
 
@@ -792,6 +796,80 @@ bootstrap `Task`s.
   for OSC title and clipboard requests, bracketed paste, mouse encodings,
   alternate-screen transitions, wide/combining characters, resize, and
   input/query response behavior before considering this path for default use.
+  [2026-11-06 readiness audit](docs/development/terminal-overlay.md):
+  expanded model/byte-router fixtures and a hermetic controlling-PTY harness
+  cover the recommendations. Fixed pasted-prefix interception, mouse payload
+  decoding, Kitty release/repeat toggles, title/clipboard and ordinary query
+  handling, partial-sequence boundaries, active-screen/mouse restoration,
+  inverse default colors, bisected wide toast glyphs, output starvation and
+  ordinary mode cleanup on termination. Private CPR and common input-mode
+  reports also use remote state. Saved-cursor and origin/margins acceptance
+  gates now pass in the ordinary suite; the DCS query gate remains ignored
+  and failing. Keep opt-in.
+  Also resolve unknown initial/inactive screen state,
+  unsupported drawing/input protocols, and independent
+  workstation font/reflow/lifecycle validation before changing the default.
+  The [2026-11-06 handoff](docs/designs/TERMINAL_OVERLAY_DESIGN.md#implementation-status-and-next-session-handoff)
+  records completed commits, validation and implementation entry points.
+  Next: DECRQSS replies from remote state, then child-input backpressure;
+  the saved-cursor and origin/margins fixes do not complete compatibility work.
+  Follow the [resolution plan](docs/designs/TERMINAL_OVERLAY_DESIGN.md) in
+  separately reviewable milestones:
+
+  - [x] First small slice: `beams fetch` logs accepted requests as a lasting
+    stderr acknowledgement, including when a toast appears, using the existing
+    return path. Generic guidance directs the user to the workstation's Beams
+    menu; session-specific prefix/availability hints remain optional future
+    work rather than assuming the default key or adding a notice protocol.
+  - [x] Model/backend foundation: a focused vendored `vt100` 0.18.1 extension
+    exposes current/saved cursors and attributes, both buffers' origin/margins,
+    and streaming DCS callbacks. The shared `terminal_stream` framer bounds
+    control sequences at 64 KiB before allocating parser input; overflow closes
+    an overlay and resumes original output without truncation. Painting stays
+    suppressed until observed `ESC c`. Event count/bytes are bounded; the live
+    relay drains each frame, including 512-query bursts. Silence never implies
+    a sequence terminator. Fixtures and the controlling-PTY harness cover this.
+  - [ ] Complete snapshot/eligibility coverage for further drawing/input state
+    and content provenance. The foundation's loss flag handles byte-budget
+    exhaustion, not unknown initial cells or every unsupported protocol.
+  - [x] Shared painting for represented saved/current cursors, SGR attributes,
+    origin mode and vertical margins. Menus and toasts draw under full margins
+    with origin off; close restores per-buffer saved slots, including hidden
+    updates. Toasts never borrow a save slot. DEC and xterm-style ANSI aliases
+    are covered; saved-cursor and origin/margins gates are unignored.
+    Takeover replays deferred bytes from its captured entry state.
+  - [ ] Extend painting to insert mode, DEC character sets, OSC 8 hyperlinks
+    and every touched inactive buffer, with content provenance and resize
+    invalidation. A limited xterm.js 5.5 replay validates nine restoration
+    traces and the actual menu renderer, but saved-wrap/origin semantics differ
+    from the model. Establish the supported terminal behavior or defer painting
+    on those variants before changing the default.
+  - [ ] Ordered remote/physical query dispatch, starting with DECRQSS and
+    origin-relative CPR. Unignore the DCS acceptance gate; test exactly-once
+    replies and bounded query pressure. Origin-relative CPR is implemented;
+    audit child-input backpressure (reply writes are still synchronous).
+  - [ ] Content provenance and unsupported-feature policy; settle compatibility
+    UX before integrating it. Proposed default: defer unsafe painting, retain
+    explicit best-effort takeover. Cover unknown inherited screens, common
+    drawing protocols, resize/reflow invalidation and mid-dialog fallback.
+  - [ ] Guarded alternate-buffer menu fallback for unknown primary screens:
+    preserve primary content and cursor/mode state, establish inactive-buffer
+    ownership, close/replay before output overflow or a remote buffer switch,
+    and deliver queries/effects exactly once. Never nest over a remote-owned
+    alternate buffer or switch screens for ordinary toasts.
+  - [ ] Optional richer inline approval guidance for uncertain terminal states,
+    skippable if high effort. Correlate the request's originating session with
+    frontend prefix/UI availability; add capability-negotiated advisory notices
+    and render them in `beams fetch`/other waiting CLIs without changing approval
+    status. Test custom/disabled prefixes, multiple frontends and old peers.
+    This enhancement does not block the overlay fixes/default-readiness work.
+  - [ ] Session-entry/exit state ownership and advanced keyboard/mode cleanup,
+    including non-default outer-terminal state and partial-string termination.
+  - [ ] Independent emulator comparison and recorded workstation matrix with
+    Zellij, plain shell, pager/editor, fonts/reflow and lifecycle checks.
+  - [ ] Separate default switch after all gates pass, retaining an explicit
+    takeover option and strict `--escape-key none` behavior.
+
 - [x] Local menu overhaul: one renderer (`client/src/session/ui.rs`) for both
   takeover and overlay modes (the overlay previously had a cut-down copy that
   hid most copy/sync form fields and printed services with `{:?}`); a

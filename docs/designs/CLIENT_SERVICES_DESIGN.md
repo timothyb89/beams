@@ -355,6 +355,16 @@ into a local ratatui widget would require a VT parser, mouse-mode translation,
 clipboard/OSC policy, and substantially more compatibility work without
 improving the service model.
 
+The implemented experimental `--terminal-overlay` now observes passthrough
+output with a shadow model and restores captured content without the takeover
+resize pulse. The [readiness audit](../development/terminal-overlay.md) records
+its current limits. The follow-up
+[default-readiness plan](TERMINAL_OVERLAY_DESIGN.md) extends the shared terminal
+state used by menus and toasts, defines safe query/restoration behavior, and
+gates painting when content is unobserved or unsupported. That proposal
+supersedes the assumption above that a modal takeover/redraw is sufficient
+recovery for every application; the ordinary output path remains passthrough.
+
 ## Service types
 
 ### Local port forward

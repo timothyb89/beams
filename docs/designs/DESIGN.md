@@ -11,6 +11,13 @@ remote-to-client approval bridge are a separate control plane; see
 `docs/designs/CLIENT_SERVICES_DESIGN.md`. They may be requested and observed through this
 daemon/TUI, but they are deliberately not bootstrap tasks.
 
+The client terminal overlay's default-readiness work is planned in
+[TERMINAL_OVERLAY_DESIGN.md](TERMINAL_OVERLAY_DESIGN.md): bounded parsing,
+remote-state restoration, query routing, compatibility policy and independent
+terminal validation. The overlay remains opt-in until those gates pass.
+See the [overlay handoff](TERMINAL_OVERLAY_DESIGN.md#implementation-status-and-next-session-handoff)
+for completed commits, validation and the next query-dispatch work.
+
 Configurable environment launches and the split between pre-interface
 prerequisites and initialization shown in the TUI are proposed in
 `docs/designs/LAUNCH_CONFIGURATION_DESIGN.md`. That proposal builds on this executor,

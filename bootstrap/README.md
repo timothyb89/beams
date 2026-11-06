@@ -404,6 +404,12 @@ stays attached, printing progress, until the copy finishes; closing its
 connection (Ctrl-C) withdraws the request. See `client/README.md` for the
 workstation side.
 
+After acceptance it always prints a lasting acknowledgement on stderr with
+the requested items and a reminder to review and approve in the workstation's
+Beams menu, whether or not a local toast appears. Progress updates do not
+overwrite that acknowledgement. It does not assume the default menu key;
+session-specific key and terminal-availability hints remain future work.
+
 Upload/download requests create one-shot workstation-owned `tsh scp` jobs.
 `--local-path-hint` is display-only (normally a basename): the local user must
 enter or confirm the real workstation path before approval, and that path is

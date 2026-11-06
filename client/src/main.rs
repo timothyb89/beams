@@ -12,6 +12,8 @@ mod stage;
 mod state;
 mod sync;
 mod terminal_model;
+mod terminal_paint;
+mod terminal_stream;
 mod tsh;
 
 use std::path::{Path, PathBuf};
