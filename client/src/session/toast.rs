@@ -72,6 +72,10 @@ pub struct OutputTracker {
     /// The remote opened a synchronized update and hasn't closed it.
     sync_open: bool,
     last_output: Option<Instant>,
+    /// The raw prefix of an unfinished sequence/UTF-8 character. Overlay
+    /// painting cancels it physically; close replays it before passthrough
+    /// resumes, so the next remote chunk is interpreted in the right state.
+    pending: Vec<u8>,
 }
 
 impl Default for OutputTracker {
@@ -82,6 +86,7 @@ impl Default for OutputTracker {
             csi: Vec::new(),
             sync_open: false,
             last_output: None,
+            pending: Vec::new(),
         }
     }
 }
@@ -93,8 +98,25 @@ impl OutputTracker {
         }
         self.last_output = Some(now);
         for &byte in bytes {
+            if self.state != State::Ground || self.utf8_pending != 0 || byte >= 0x80 || byte == 0x1b
+            {
+                if self.pending.len() < super::DEFERRED_OUTPUT_LIMIT {
+                    self.pending.push(byte);
+                }
+            }
             self.step(byte);
+            if self.state == State::Ground && self.utf8_pending == 0 {
+                self.pending.clear();
+            }
         }
+    }
+
+    pub fn pending(&self) -> &[u8] {
+        &self.pending
+    }
+
+    pub fn synchronized_update(&self) -> bool {
+        self.sync_open
     }
 
     fn step(&mut self, byte: u8) {
@@ -291,6 +313,7 @@ impl ToastPainter {
         if rect.right() > cols.get() || rect.bottom() > rows.get() {
             return Vec::new();
         }
+        let rect = restoration_area(rect, cols.get());
         let mut out = Vec::new();
         let mut buf = Buffer::empty(rect);
         model.render_into(&mut buf, rect);
@@ -338,9 +361,10 @@ impl ToastPainter {
         if let Some((old, _)) = &self.shown {
             if target.as_ref().is_none_or(|(rect, _)| rect != old) {
                 // Put back what the old toast covered.
-                let mut buf = Buffer::empty(*old);
-                model.render_into(&mut buf, *old);
-                encode_area(&buf, *old, &mut out);
+                let area = restoration_area(*old, cols.get());
+                let mut buf = Buffer::empty(area);
+                model.render_into(&mut buf, area);
+                encode_area(&buf, area, &mut out);
             }
         }
         match target {
@@ -367,6 +391,15 @@ impl ToastPainter {
         self.last_paint = None;
         self.sync(desired, model, &mut tracker, Instant::now())
     }
+}
+
+fn restoration_area(area: Rect, cols: u16) -> Rect {
+    // A toast edge can bisect a double-width character. Repaint one column
+    // on either side so both halves are restored, including a leading cell
+    // just outside the toast.
+    let left = area.x.saturating_sub(1);
+    let right = area.right().saturating_add(1).min(cols);
+    Rect::new(left, area.y, right.saturating_sub(left), area.height)
 }
 
 /// Writes the cells of `area` from `buf` as positioned, styled text.
@@ -675,5 +708,50 @@ mod tests {
         encode_area(&buf, area, &mut out);
         let parser = screen_after(1, 6, &[&out]);
         assert_eq!(visible(parser.screen()), "界ab");
+    }
+
+    #[test]
+    fn hiding_a_toast_restores_wide_glyphs_bisected_by_its_edges() {
+        let mut model = model(10, 60);
+        let notice = toast("hello");
+        let rect = placement(&notice, 10, 60).unwrap();
+        let remote = format!(
+            "\x1b[{};{}H界\x1b[{};{}H界",
+            rect.y + 1,
+            rect.x,
+            rect.y + 2,
+            rect.right(),
+        );
+        model.process(remote.as_bytes());
+        let mut painter = ToastPainter::default();
+        let paint = painter.sync_now(Some(&notice), &model);
+        let clear = painter.clear(&model);
+        let physical = screen_after(10, 60, &[remote.as_bytes(), &paint, &clear]);
+        assert_eq!(
+            visible(physical.screen()).trim_end(),
+            visible(model.screen()).trim_end()
+        );
+    }
+
+    #[test]
+    fn unfinished_remote_prefix_can_be_replayed_after_local_painting() {
+        let now = Instant::now();
+        for (before, after) in [
+            (b"\x1b[38;2;".as_slice(), b"1;2;3mred".as_slice()),
+            (b"\x1b]2;ti".as_slice(), b"tle\x07".as_slice()),
+            (&"界".as_bytes()[..2], &"界".as_bytes()[2..]),
+        ] {
+            let mut tracker = OutputTracker::default();
+            tracker.feed(before, now);
+            assert_eq!(tracker.pending(), before);
+            let mut physical = screen_after(10, 60, &[before, b"\x18\x1b\\LOCAL"]);
+            physical.process(b"\x1b[2J\x1b[H");
+            physical.process(tracker.pending());
+            physical.process(after);
+            let expected = screen_after(10, 60, &[before, after]);
+            assert_eq!(visible(physical.screen()), visible(expected.screen()));
+            tracker.feed(after, now);
+            assert!(tracker.pending().is_empty());
+        }
     }
 }

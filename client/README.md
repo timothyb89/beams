@@ -224,13 +224,15 @@ query replies (including OSC clipboard and DCS replies) still reach the
 remote application while the menu owns keyboard input.
 
 The client does not nest another terminal alternate screen over remote zellij
-(alternate-screen state is not stackable). It drains up to 1 MiB of remote
+(alternate-screen state is not stackable). In the default takeover mode it
+drains up to 1 MiB of remote
 output while the menu is visible, restores that output on close, and briefly
 resizes/restores the child PTY with distinct notifications to make the remote
 application redraw. Every menu frame clears stale cells before painting, and
 the dialog is drawn on a cleared panel, so local resizes and shorter updates
 do not retain content from an older frame. Terminal raw mode and cursor
-visibility are restored on normal exit, errors, and handled termination
+visibility and ordinary mouse/paste input modes are restored on normal exit,
+errors, and handled termination
 signals. Daemon request, bridge, and service events repaint an open menu
 immediately; closing and reopening it is not required to refresh status.
 
@@ -243,19 +245,27 @@ the same dialog the takeover mode draws (both modes share one renderer in
 while it is hidden from the physical terminal. A persistent ratatui renderer
 updates only changed cells, avoiding the full-screen clear/redraw flicker of
 the first prototype. Closing an overlay restores the model without sending a
-synthetic one-column resize pulse to the remote PTY. OSC title/clipboard
-requests, mouse mode, bracketed paste, alternate-screen state, resize, colors,
-and wide characters are tracked by the model, but clipboard actions and
-unsupported terminal features are not interpreted by the model yet. Complete
-OSC sequences are still passed through to the physical terminal, preserving
-the existing title/clipboard behavior. The existing takeover path remains the
-fallback and default.
+synthetic one-column resize pulse to the remote PTY. It restores the active
+display buffer, cursor, modeled attributes and input modes; unfinished
+remote sequences resume across menu boundaries. While open, complete OSC
+title/clipboard effects are relayed from parser callbacks (normalized to an
+ST terminator), ordinary cursor/status queries are answered from the remote
+model, and device/window queries reach the physical terminal. The output
+queue is bounded and yields to input/resize handling during long bursts.
+
+The [readiness audit](../docs/development/terminal-overlay.md) records the
+expanded coverage and remaining default blockers: saved cursors,
+origin/scroll-margin state, DCS queries, unknown
+initial screens and unsupported drawing/input protocols. The existing
+takeover path remains the fallback and default.
 
 The controlling-terminal smoke test exercises both paths:
 
 ```sh
 ./client/tests/managed-session-smoke.sh
 BEAMS_TEST_OVERLAY=1 ./client/tests/managed-session-smoke.sh
+cargo build --manifest-path client/Cargo.toml
+python3 client/tests/terminal-overlay-smoke.py
 ```
 
 ## Local service daemon

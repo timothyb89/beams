@@ -36,7 +36,7 @@ use beams_protocol::{
 };
 
 use crate::clientd::{BridgeRecord, Frontend, RequestRecord, ServerEvent, ServiceRecord};
-use crate::terminal_model::TerminalModel;
+use crate::terminal_model::{TerminalEvent, TerminalModel};
 
 mod form;
 mod keys;
@@ -61,6 +61,8 @@ const REDRAW_RESIZE_DELAY: Duration = Duration::from_millis(40);
 const AGENT_INPUT_GUARD: Duration = Duration::from_millis(500);
 const DAEMON_RECONNECT_RETRY: Duration = Duration::from_secs(1);
 const DEFERRED_OUTPUT_LIMIT: usize = 1024 * 1024;
+const OUTPUT_QUEUE_CHUNKS: usize = 32;
+const OUTPUT_CHUNKS_PER_TICK: usize = 16;
 type PaletteTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
 /// How the managed session draws its local UI.
@@ -245,7 +247,7 @@ pub fn run(
         .context("cloning local PTY reader")?;
     let mut writer = master.take_writer().context("opening local PTY writer")?;
 
-    let (output_tx, output_rx) = mpsc::channel();
+    let (output_tx, output_rx) = mpsc::sync_channel(OUTPUT_QUEUE_CHUNKS);
     let output_thread = thread::spawn(move || read_pty_output(&mut reader, output_tx));
 
     let (signal_rx, signal_handle, signal_thread) = signal_watcher()?;
@@ -391,14 +393,11 @@ fn drive(
             terminal_model,
             overlay_enabled,
             &mut terminal_state.output,
+            writer,
         )?;
         if output_changed && input_router.mode == InputMode::Passthrough {
             painter.output_written();
         }
-        // OSC and unsupported-sequence callbacks are collected for the
-        // overlay/native-frontend work. The passthrough path deliberately
-        // leaves their original bytes untouched for the real terminal.
-        let _terminal_events = terminal_model.take_events();
         if output_changed && overlay_enabled && input_router.mode == InputMode::Palette {
             redraw_palette!();
         }
@@ -515,7 +514,7 @@ fn drive(
                 }
                 InputAction::OpenPalette => {
                     painter.forget();
-                    terminal_state.open_palette()?;
+                    terminal_state.open_palette(terminal_model.screen().alternate_screen())?;
                     palette_terminal = Some(new_palette_terminal()?);
                     // The prefix while a request's toast is up goes straight
                     // to that request.
@@ -2148,7 +2147,11 @@ impl InputRouter {
         now: Instant,
         on_key: &mut dyn FnMut(Key) -> bool,
     ) -> Vec<InputAction> {
-        if is_string_sequence(&self.pending) || self.pending.starts_with(b"\x1b[M") {
+        if is_string_sequence(&self.pending)
+            || self.pending.starts_with(b"\x1b[M")
+            || ((self.paste.is_some() || self.remote_paste)
+                && b"\x1b[201~".starts_with(&self.pending))
+        {
             // Clipboard/terminal replies can arrive slowly. Waiting for ST
             // keeps their payload from ever becoming menu keys.
             return Vec::new();
@@ -2164,8 +2167,7 @@ impl InputRouter {
         self.pending_since = None;
         let mut actions = Vec::new();
         let mut remote = Vec::new();
-        // A partial report must not become menu keystrokes on timeout.
-        // In particular an OSC clipboard reply may contain "q", "y", etc.
+        // A partial CSI report must not become menu keystrokes on timeout.
         if pending.len() > 1 && pending.starts_with(b"\x1b") {
             if self.mode == InputMode::Passthrough {
                 remote.extend_from_slice(&pending);
@@ -2188,7 +2190,11 @@ impl InputRouter {
     }
 
     fn poll_timeout(&self, now: Instant) -> Duration {
-        if is_string_sequence(&self.pending) || self.pending.starts_with(b"\x1b[M") {
+        if is_string_sequence(&self.pending)
+            || self.pending.starts_with(b"\x1b[M")
+            || ((self.paste.is_some() || self.remote_paste)
+                && b"\x1b[201~".starts_with(&self.pending))
+        {
             return LOOP_TICK;
         }
         self.pending_since
@@ -2503,7 +2509,6 @@ fn route_input(mode: &mut InputMode, escape_key: EscapeKey, input: &[u8]) -> Vec
 struct DeferredOutput {
     bytes: VecDeque<u8>,
     truncated: bool,
-    pending_osc: Vec<u8>,
 }
 
 impl DeferredOutput {
@@ -2559,48 +2564,6 @@ impl DeferredOutput {
     fn clear(&mut self) {
         self.bytes.clear();
         self.truncated = false;
-        self.pending_osc.clear();
-    }
-
-    fn extract_osc(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
-        let mut completed = Vec::new();
-        let mut index = 0;
-        while index < bytes.len() {
-            if self.pending_osc.is_empty() {
-                if bytes[index] == b'\x1b' && bytes.get(index + 1) == Some(&b']') {
-                    self.pending_osc.extend_from_slice(&bytes[index..index + 2]);
-                    index += 2;
-                } else if bytes[index] == b'\x1b' && index + 1 == bytes.len() {
-                    self.pending_osc.push(bytes[index]);
-                    index += 1;
-                } else {
-                    index += 1;
-                }
-                continue;
-            }
-
-            if self.pending_osc == [b'\x1b'] {
-                if bytes[index] == b']' {
-                    self.pending_osc.push(bytes[index]);
-                    index += 1;
-                    continue;
-                }
-                self.pending_osc.clear();
-                continue;
-            }
-
-            let byte = bytes[index];
-            self.pending_osc.push(byte);
-            index += 1;
-            if byte == b'\x07'
-                || (byte == b'\\'
-                    && self.pending_osc.len() >= 2
-                    && self.pending_osc[self.pending_osc.len() - 2] == b'\x1b')
-            {
-                completed.push(std::mem::take(&mut self.pending_osc));
-            }
-        }
-        completed
     }
 }
 
@@ -2610,7 +2573,7 @@ enum OutputEvent {
     Error(io::Error),
 }
 
-fn read_pty_output(reader: &mut dyn Read, tx: mpsc::Sender<OutputEvent>) {
+fn read_pty_output(reader: &mut dyn Read, tx: mpsc::SyncSender<OutputEvent>) {
     let mut bytes = [0u8; 8192];
     loop {
         match reader.read(&mut bytes) {
@@ -2637,6 +2600,7 @@ fn read_pty_output(reader: &mut dyn Read, tx: mpsc::Sender<OutputEvent>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_output(
     rx: &Receiver<OutputEvent>,
     mode: InputMode,
@@ -2645,27 +2609,41 @@ fn drain_output(
     terminal_model: &mut TerminalModel,
     overlay_enabled: bool,
     tracker: &mut toast::OutputTracker,
+    remote_writer: &mut dyn Write,
 ) -> anyhow::Result<bool> {
     let mut stdout = io::stdout().lock();
     let mut wrote = false;
     let mut changed = false;
-    loop {
+    // A continuous stream (large builds, `yes`, log tails) must yield to
+    // keyboard input, signals, resize and daemon events.
+    for _ in 0..OUTPUT_CHUNKS_PER_TICK {
         match rx.try_recv() {
             Ok(OutputEvent::Data(bytes)) => {
+                if overlay_enabled || mode == InputMode::Passthrough {
+                    tracker.feed(&bytes, Instant::now());
+                }
                 terminal_model.process(&bytes);
+                let events = terminal_model.take_events();
                 changed = true;
                 if mode == InputMode::Palette {
                     if overlay_enabled {
-                        for osc in deferred.extract_osc(&bytes) {
-                            stdout
-                                .write_all(&osc)
-                                .context("writing out-of-band OSC during overlay")?;
-                            wrote = true;
+                        for event in events {
+                            if let TerminalEvent::Reply(reply) = event {
+                                remote_writer
+                                    .write_all(&reply)
+                                    .context("answering remote terminal query")?;
+                                remote_writer.flush().context("flushing terminal reply")?;
+                            } else if let Some(bytes) = event.terminal_bytes() {
+                                stdout
+                                    .write_all(&bytes)
+                                    .context("relaying terminal effect")?;
+                                wrote = true;
+                            }
                         }
+                    } else {
+                        deferred.push(&bytes);
                     }
-                    deferred.push(&bytes);
                 } else {
-                    tracker.feed(&bytes, Instant::now());
                     stdout
                         .write_all(&bytes)
                         .context("writing remote PTY output")?;
@@ -2702,6 +2680,7 @@ fn finish_output(
             terminal_model,
             false,
             &mut toast::OutputTracker::default(),
+            &mut io::sink(),
         )?;
         if !*finished {
             thread::sleep(Duration::from_millis(5));
@@ -2725,23 +2704,51 @@ fn close_palette(
         terminal_state.close_palette(overlay_enabled)?;
         if overlay_enabled {
             deferred.clear();
-            restore_terminal_model(terminal_model)?;
+            restore_terminal_model(terminal_model, terminal_state.covered_alternate)?;
+            let mut stdout = io::stdout().lock();
+            if terminal_state.output.synchronized_update() {
+                stdout
+                    .write_all(b"\x1b[?2026h")
+                    .context("restoring synchronized output")?;
+            }
+            stdout
+                .write_all(terminal_state.output.pending())
+                .context("restoring unfinished remote sequence")?;
+            stdout
+                .flush()
+                .context("flushing unfinished remote sequence")?;
         } else {
+            let mut stdout = io::stdout().lock();
+            stdout
+                .write_all(&terminal_state.menu_prefix)
+                .context("restoring interrupted remote sequence")?;
+            stdout
+                .flush()
+                .context("flushing interrupted remote sequence")?;
+            drop(stdout);
             deferred.flush(&mut terminal_state.output)?;
+            let paste_mode = if terminal_model.screen().bracketed_paste() {
+                b"\x1b[?2004h"
+            } else {
+                b"\x1b[?2004l"
+            };
+            let mut stdout = io::stdout().lock();
+            stdout
+                .write_all(paste_mode)
+                .context("restoring bracketed paste mode")?;
+            stdout.flush().context("flushing paste mode")?;
             force_remote_redraw(master, size)?;
         }
+        terminal_state.menu_prefix.clear();
     }
     *mode = InputMode::Passthrough;
     Ok(())
 }
 
-fn restore_terminal_model(model: &TerminalModel) -> anyhow::Result<()> {
+fn restore_terminal_model(model: &TerminalModel, covered_alternate: bool) -> anyhow::Result<()> {
     let mut stdout = io::stdout().lock();
     stdout
-        .write_all(b"\x1b[2J\x1b[H")
-        .context("clearing terminal before restoring overlay model")?;
-    stdout
-        .write_all(model.screen().state_formatted().as_bytes())
+        .write_all(&model.restore_bytes(covered_alternate))
         .context("restoring terminal model")?;
     stdout.flush().context("flushing restored terminal model")?;
     Ok(())
@@ -2828,9 +2835,11 @@ fn signal_watcher() -> anyhow::Result<(Receiver<i32>, SignalHandle, thread::Join
 struct TerminalState {
     raw: bool,
     palette_open: bool,
-    /// Escape-sequence state of everything written to the real terminal,
-    /// so toasts are only drawn between sequences.
+    /// Remote sequence state (including hidden overlay output), so toasts
+    /// paint between sequences and menu close can resume an unfinished one.
     output: toast::OutputTracker,
+    menu_prefix: Vec<u8>,
+    covered_alternate: bool,
 }
 
 impl TerminalState {
@@ -2840,15 +2849,23 @@ impl TerminalState {
             raw: true,
             palette_open: false,
             output: toast::OutputTracker::default(),
+            menu_prefix: Vec::new(),
+            covered_alternate: false,
         })
     }
 
-    fn open_palette(&mut self) -> io::Result<()> {
+    fn open_palette(&mut self, alternate: bool) -> io::Result<()> {
         // Do not enter the terminal's alternate screen here. The remote zellij
         // application normally already owns it, and alternate-screen state is
-        // not safely nestable. Clear the current screen and rely on the
-        // SIGWINCH redraw in `close_palette` instead.
+        // not safely nestable. The overlay restores its model; takeover
+        // relies on the SIGWINCH redraw in `close_palette`.
         let mut stdout = io::stdout();
+        self.menu_prefix = self.output.pending().to_vec();
+        self.covered_alternate = alternate;
+        // A menu can open between chunks of a CSI, OSC/DCS or UTF-8
+        // character. Cancel only the physical parser; the model and tracker
+        // retain the remote prefix, which close replays before passthrough.
+        stdout.write_all(b"\x18\x1b\\\x1b[?2026l\x1b[?2004h")?;
         execute!(stdout, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
         self.palette_open = true;
         Ok(())
@@ -2866,6 +2883,20 @@ impl TerminalState {
     }
 
     fn restore(&mut self) {
+        if !self.raw && !self.palette_open {
+            return;
+        }
+        // A killed SSH child cannot be relied on to send its application's
+        // terminal cleanup. End any partial string/update before restoring
+        // ordinary shell input modes and leaving the remote alternate screen.
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(
+            b"\x18\x1b\\\x1b[?2026l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\
+              \x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?2004l\x1b[?1l\x1b>\
+              \x1b[?1049l\x1b[?47l\x1b[0m\x1b[?25h",
+        );
+        let _ = stdout.flush();
+        drop(stdout);
         if self.palette_open {
             let _ = self.close_palette(false);
         } else {
@@ -3037,6 +3068,41 @@ mod tests {
             vec![InputAction::OpenPalette],
             "prefix works again after paste ends"
         );
+    }
+
+    #[test]
+    fn a_slow_split_paste_end_does_not_leave_the_router_in_paste_mode() {
+        for mode in [InputMode::Passthrough, InputMode::Palette] {
+            let mut router = InputRouter {
+                mode,
+                ..InputRouter::default()
+            };
+            let now = Instant::now();
+            router.route(
+                EscapeKey::default(),
+                b"\x1b[200~text\x1b[20",
+                now,
+                &mut |_| false,
+            );
+            assert!(router
+                .flush_expired(
+                    EscapeKey::default(),
+                    now + Duration::from_secs(1),
+                    &mut |_| { panic!("a paste delimiter became a key") }
+                )
+                .is_empty());
+            router.route(
+                EscapeKey::default(),
+                b"1~",
+                now + Duration::from_secs(1),
+                &mut |key| {
+                    assert_eq!(key, Key::Paste("text".to_string()));
+                    false
+                },
+            );
+            assert!(!router.remote_paste && router.paste.is_none());
+            assert_eq!(router.poll_timeout(now), LOOP_TICK);
+        }
     }
 
     #[test]
@@ -3364,26 +3430,44 @@ mod tests {
     }
 
     #[test]
-    fn overlay_extracts_complete_osc_sequences_across_output_chunks() {
-        let mut output = DeferredOutput::default();
-        assert!(output.extract_osc(b"prefix\x1b]2;title").is_empty());
+    fn overlay_relays_complete_osc_sequences_across_output_chunks() {
+        let mut model = TerminalModel::new(PtySize::default());
+        model.process(b"prefix\x1b]2;title");
+        assert!(model.take_events().is_empty());
+        model.process(b" continued\x07suffix");
         assert_eq!(
-            output.extract_osc(b" continued\x07suffix"),
-            vec![b"\x1b]2;title continued\x07".to_vec()]
+            model
+                .take_events()
+                .iter()
+                .filter_map(TerminalEvent::terminal_bytes)
+                .collect::<Vec<_>>(),
+            vec![b"\x1b]2;title continued\x1b\\".to_vec()]
         );
 
-        assert!(output.extract_osc(b"\x1b]52;c;SGV").is_empty());
+        model.process(b"\x1b]52;c;SGV");
+        assert!(model.take_events().is_empty());
+        model.process(b"sbG8=\x1b\\");
         assert_eq!(
-            output.extract_osc(b"sbG8=\x1b\\"),
+            model
+                .take_events()
+                .iter()
+                .filter_map(TerminalEvent::terminal_bytes)
+                .collect::<Vec<_>>(),
             vec![b"\x1b]52;c;SGVsbG8=\x1b\\".to_vec()]
         );
 
-        let mut output = DeferredOutput::default();
-        assert!(output.extract_osc(b"\x1b").is_empty());
-        assert!(output.extract_osc(b"]2;split").is_empty());
+        model.process(b"\x1b");
+        assert!(model.take_events().is_empty());
+        model.process(b"]2;split");
+        assert!(model.take_events().is_empty());
+        model.process(b"\x07");
         assert_eq!(
-            output.extract_osc(b"\x07"),
-            vec![b"\x1b]2;split\x07".to_vec()]
+            model
+                .take_events()
+                .iter()
+                .filter_map(TerminalEvent::terminal_bytes)
+                .collect::<Vec<_>>(),
+            vec![b"\x1b]2;split\x1b\\".to_vec()]
         );
     }
 
