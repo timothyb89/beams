@@ -24,11 +24,10 @@ order below is just this doc's presentation order (and still a valid
 never run concurrently with *each other*, even though nothing else stops
 them from doing so.
 
-1. **link-files** — symlinks `bin` and `.ssh` from the repo checkout into
-   `$HOME`. `.ssh` is force-replaced: a fresh beam ships its own default
-   `~/.ssh` (a delegated signing agent, not a plain key), which this moves
-   aside to `~/.ssh.orig` the first time, so the repo's stable key always
-   wins. (`.claude` is *not* symlinked — `~/.claude` already holds real
+1. **link-files** — symlinks `bin` from the repo checkout into `$HOME`.
+   The repo needs no `.ssh` directory; Beam-managed `~/.ssh` is preserved.
+   SSH key use goes through the daemon's relay.
+   (`.claude` is *not* symlinked — `~/.claude` already holds real
    beam state like session history and credentials, so it can't be
    replaced wholesale the same way.)
 2. **claude-md-merge** — appends the repo's `.claude/CLAUDE.md` into
@@ -139,7 +138,7 @@ at the fallback path).
 
   `status` is one of `start`, `ok`, `skip`, `error`.
 - `--only <step-id>` — run just that one step (e.g. `link-files`) instead
-  of the full sequence. `bin/beam-shell` uses this to get `~/.ssh`/`~/bin`
+  of the full sequence. `bin/beam-shell` uses this to get `~/bin`
   in place synchronously before anything that needs them, ahead of
   backgrounding the full run.
 

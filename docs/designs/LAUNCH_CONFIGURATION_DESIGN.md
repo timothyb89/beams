@@ -109,8 +109,10 @@ Make removal of this legacy forced directory link an immediate prerequisite,
 preserving the Beam's own `~/.ssh`. Validate the link step with a fixture
 representing a clean committed checkout, no repo `.ssh`, and existing
 Beam-managed SSH state. Individual known-host file customization remains
-an explicit profile choice. This review records the regression; it does
-not change the running bootstrap or implement the fix.
+an explicit profile choice. The independent repair is now implemented:
+`link-files` only links `bin`, with isolated fixtures covering clean
+checkout/repeat behavior and preservation of real or symlinked SSH state.
+The running session's startup sequence and daemon were not restarted.
 
 The current full-history Git push also transfers historical blobs of
 files removed by the cleanup. Removal from the current tree is not removal

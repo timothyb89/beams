@@ -30,14 +30,15 @@ Script paths select local files relative to their declaring profile;
 entrypoints are automatically uploaded. An optional `script_root` selects
 a helper directory to preserve on the Beam, with phase-aware packaging.
 
-- [ ] Immediate prerequisite from review of `06060b5`/`651fc1c`: remove
+- [x] Immediate prerequisite from review of `06060b5`/`651fc1c`: remove
   the stale forced repo `.ssh` link in `bootstrap/src/steps/link.rs`.
   The current tracked tree no longer contains `.ssh`, but the synchronous
   `link-files` pre-step still requires it and fails before Zellij on fresh
   Beams. Preserve Beam-managed `~/.ssh`, update link-step docs/comments,
   and validate using a clean-checkout fixture without local leftovers.
-  The workstation-file cleanup itself is already done; runtime dependency
-  removal is not.
+  Completed: only `bin` is linked. Isolated filesystem fixtures cover a
+  clean checkout, repeat/skip behavior, and preservation of both real and
+  symlinked Beam SSH directories, including old repo `.ssh` leftovers.
 - [ ] Phase 1: record cold/warm launch milestones and transport counts;
   implement profile resolution/inheritance, validation, versioned plan,
   and `beams config init/validate/explain`. Bundled core/development

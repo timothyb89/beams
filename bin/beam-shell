@@ -34,9 +34,8 @@ BOOTSTRAP_BIN="$REPO/bootstrap/target/x86_64-unknown-linux-musl/release/beam-boo
 # expanding $HOME in shell commands rather than relying on one).
 export BEAM_BOOTSTRAP_BIN="$BOOTSTRAP_BIN"
 
-# 1. make sure ~/.ssh and ~/bin are in place before anything below needs
-#    them (link-files force-replaces beams' own default ~/.ssh with the
-#    repo's, which carries known_hosts) - and that zellij and fish are
+# 1. make sure ~/bin is in place before anything below needs it
+#    (Beam-managed ~/.ssh stays intact) - and that zellij and fish are
 #    both installed, since step 4 below
 #    execs zellij immediately rather than waiting on the backgrounded full
 #    run (and zellij needs fish to already exist to use it for new panes -

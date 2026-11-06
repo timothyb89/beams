@@ -16,9 +16,9 @@ use anyhow::{bail, Context};
 /// rather than clobbering something unexpected - the right call for e.g.
 /// `~/.claude`, which already holds real beam-managed state. If `force` is
 /// `true`, the existing entry is moved aside to `<target>.orig` (once;
-/// fails rather than overwriting a prior `.orig`) before linking - needed
-/// for `~/.ssh`, which beams provision with their own default (and we
-/// deliberately want to replace with the repo's stable key).
+/// fails rather than overwriting a prior `.orig`) before linking. Only
+/// use this for explicitly managed targets, such as the bootstrap binary
+/// link under `~/.local/bin`; preserve Beam-managed SSH state.
 pub fn ensure_symlink(source: &Path, target: &Path, force: bool) -> anyhow::Result<bool> {
     if !source.exists() {
         bail!("expected {} in repo checkout, not found", source.display());
