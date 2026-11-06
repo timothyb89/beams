@@ -11,6 +11,13 @@ remote-to-client approval bridge are a separate control plane; see
 `docs/designs/CLIENT_SERVICES_DESIGN.md`. They may be requested and observed through this
 daemon/TUI, but they are deliberately not bootstrap tasks.
 
+Configurable environment launches and the split between pre-interface
+prerequisites and initialization shown in the TUI are proposed in
+`LAUNCH_CONFIGURATION_DESIGN.md`. That proposal builds on this executor,
+replaces hard-coded startup selection with client-resolved profiles, and
+adds launch readiness conditions and task snapshots. It is not implemented
+yet; the current Git delivery and fixed-step startup paths remain in use.
+
 ## Why
 
 The original design (see `project.md`) only covered unattended startup

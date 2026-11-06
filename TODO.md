@@ -15,6 +15,42 @@ so far" context blurbs for small completed items can just be trimmed or
 dropped; archiving is for a section's worth of finished work, not every
 individual checked-off line.
 
+## Configurable environment launches
+
+Proposed 2026-11-06 in `LAUNCH_CONFIGURATION_DESIGN.md`: client-owned TOML
+profiles compile into a versioned launch graph, with small pre-interface
+and background post-interface bundles/package batches. Reuse the existing
+executor and client transport. The design records current launch behavior,
+inheritance rules, hook semantics, recovery, migration, and acceptance
+criteria; syntax remains provisional until implementation.
+
+- [ ] Phase 1: record cold/warm launch milestones and transport counts;
+  implement profile resolution/inheritance, validation, versioned plan,
+  and `beams config init/validate/explain`. Bundled core/development
+  profiles plus gitignored local configuration; keep new launch opt-in.
+- [ ] Phase 2: generic package transactions, file-install and script
+  tasks/custom templates; parameterize specialized installs. Split
+  Rust's apt prerequisite from rustup. Add task snapshots/bounded logs
+  and durable, deduplicated launch acceptance.
+- [ ] Phase 3: ship a small runtime/pre archive independently of a Git
+  checkout; run pre tasks through the daemon, prepare the shell before
+  spawning it, and gate post tasks on shell startup + first TUI frame.
+  Remove the new path's competing background fixed bootstrap.
+- [ ] Phase 4: batched background uploads with projected TUI progress,
+  artifact-ready conditions, bounded task concurrency, retry/recovery,
+  and submitting-client routing for startup SSH grants.
+- [ ] Phase 5: migrate the maintainer's setup onto a local profile,
+  distribute a sanitized development default, adapt legacy `[startup]`,
+  document customization, and validate on disposable Beams before
+  switching defaults.
+- [ ] Phase 6: optional daemon-owned OpenSSH ControlMaster for preparation
+  and uploads after the workstation compatibility matrix passes. Share
+  the Phase 7 client-services transport work below, not a second backend.
+- [ ] Acceptance: no optional post work gates the first interface;
+  normal setup uses at most two apt install transactions and two archive
+  uploads; apt/downloads overlap; reconnect restores task state; packaged
+  launches need no source checkout or maintainer-specific configuration.
+
 ## Done so far (for context, not actionable)
 
 - `beam-bootstrap`: dotfile linking, apt packages, fish/starship,

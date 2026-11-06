@@ -33,9 +33,8 @@ beams ssh [--repo ~/beams] [--purpose default] [--region REGION] [--login beams]
    up with no `origin` configured at all, since neither `git init` nor
    a push over a bare URL creates one. Skipped entirely if `--repo`
    itself has no `origin` configured.
-4. Separately `scp`s the two things deliberately *not* tracked in git
-   but still required - the ssh private key, and a prebuilt
-   `beam-bootstrap` binary (**build this first**: beams run Linux, so if
+4. Separately `scp`s the required extra deliberately *not* tracked in git:
+   a prebuilt `beam-bootstrap` binary (**build this first**: beams run Linux, so if
    you're on macOS (or just want a statically linked build) run
    `../bootstrap/build-cross.sh`; on Linux, `cd ../bootstrap && cargo
    build --release` also works. No Rust toolchain on a fresh beam, so the
@@ -50,9 +49,9 @@ beams ssh [--repo ~/beams] [--purpose default] [--region REGION] [--login beams]
    `exec` handoff, `beams` now supervises `tsh` under a local PTY: terminal
    bytes, resize events, exit status, and signals still pass through, while
    `Ctrl-]` can temporarily open a local menu over the remote session.
-   `beam-shell` unlocks the ssh-agent key, kicks off `beam-bootstrap` in the
-   background, and drops you into zellij with a log pane - see
-   `../bootstrap/README.md`.
+   `beam-shell` starts the daemon's SSH agent relay, kicks off
+   `beam-bootstrap` in the background, and drops you into zellij with a
+   TUI and log pane - see `../bootstrap/README.md`.
 
 On reuse, steps 3-4 are skipped entirely - a reused beam is assumed to
 already be bootstrapped from a prior run.
@@ -423,6 +422,10 @@ doesn't leave the others half-done. `tsh beams add` isn't wrapped:
 it also tracks the purpose and bootstraps the beam.
 
 ## Configuration: SSH keys and startup tasks
+
+Client-side environment profiles, batched uploads/packages, and pre/post
+hooks are proposed in `../LAUNCH_CONFIGURATION_DESIGN.md`; they are not
+implemented yet. The configuration below is what works today.
 
 `~/.config/beams-client/config.toml` (re-read on use; a missing file means
 the defaults below):
