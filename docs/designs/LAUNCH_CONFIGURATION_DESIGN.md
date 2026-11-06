@@ -6,6 +6,9 @@ configuration syntax. It builds on [DESIGN.md](DESIGN.md)'s task graph and
 transport. [TODO.md](../../TODO.md)
 tracks the implementation sequence.
 
+The graph direction and explicit readiness conditions were endorsed on
+2026-11-06. The profile syntax and implementation details remain proposed.
+
 ## Goals and recommendation
 
 Make the client resolve an environment profile into a versioned launch
@@ -369,6 +372,51 @@ Batch explicit file/directory selections into a pre archive and a post
 archive with a manifest mapping artifact IDs to destination paths,
 permissions, hashes, copy/link mode, and overwrite policy. Do not create
 one SSH/scp process per destination.
+
+Use standard tar as the container, with compression selected separately.
+The initial implementation should support uncompressed tar and gzip;
+recommend gzip level 1 as the initial default to test for runtime bundles,
+with uncompressed tar available when compression adds more cost than it
+saves. Compare both against the actual launch baseline before making the
+default permanent. Zstd can be a later codec without changing the bundle
+manifest or task graph; installing it must not become a prerequisite to
+opening the interface.
+
+A bundle's logical layout is deliberately small:
+
+```text
+bundle.json
+payload/fish/config.fish
+payload/project-data/...
+```
+
+`bundle.json` identifies the version, launch/bundle IDs, and declared
+artifact entries; destination paths and copy/link policies come from the
+accepted plan. Archive paths are staging-relative, not workstation paths
+or final installation targets. Preserve ordinary file modes, directories,
+and validated internal symlinks. Support standard long-path extensions
+where needed, but exclude host-specific ownership, ACLs, xattrs and macOS
+metadata from the bundle contract.
+
+Tar can be streamed to an SSH exec channel; a persistent `.tar` file is
+not required by the transport. V1 may spool a completed bundle locally
+to freeze inputs, know its digest/byte count, and replay the same bytes
+after a failed transfer. Post spooling occurs after interface readiness.
+Compression happens before the SSH channel. Stock tar/gzip can install
+the first runtime bundle before the receiver binary exists; subsequent
+receives can use Rust `tar` and `flate2` with a Rust compression backend.
+Keep the self-bootstrap path separate from assuming the native receiver
+is already installed.
+
+Release `artifact-ready:<bundle>` only after the complete stream has
+arrived, its digest has been checked, extraction has passed validation,
+and staging has been published. V1 retries interrupted archives from the
+start; task recovery still skips completed work. Byte-offset resumption
+of a compressed tar stream is not part of this proposal.
+
+Primary library references, reviewed 2026-11-06:
+`https://docs.rs/tar/latest/tar/` and
+`https://docs.rs/flate2/latest/flate2/`.
 
 The initial transfer contains the bootstrap runtime, launcher/layout,
 resolved plan, pre scripts, and pre files. Zellij can be a cached,

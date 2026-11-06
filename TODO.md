@@ -22,7 +22,10 @@ profiles compile into a versioned launch graph, with small pre-interface
 and background post-interface bundles/package batches. Reuse the existing
 executor and client transport. The design records current launch behavior,
 inheritance rules, hook semantics, recovery, migration, and acceptance
-criteria; syntax remains provisional until implementation.
+criteria. The graph/readiness-condition direction is endorsed; syntax
+remains provisional until implementation. The archive recommendation is
+standard tar with independent none/gzip compression, initially testing
+gzip level 1; complete verification/extraction releases artifact readiness.
 
 - [ ] Immediate prerequisite from review of `06060b5`/`651fc1c`: remove
   the stale forced repo `.ssh` link in `bootstrap/src/steps/link.rs`.
