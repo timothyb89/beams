@@ -22,7 +22,7 @@ profiles compile into a versioned launch graph, with small pre-interface
 and background post-interface bundles/package batches. Reuse the existing
 executor and client transport. The design records current launch behavior,
 inheritance rules, hook semantics, recovery, migration, and acceptance
-criteria. The graph/readiness-condition direction is endorsed; syntax
+criteria. The overall plan and graph/readiness-condition direction are endorsed; syntax
 remains provisional until implementation. The archive recommendation is
 standard tar with independent none/gzip compression, initially testing
 gzip level 1; complete verification/extraction releases artifact readiness.
@@ -42,6 +42,17 @@ a helper directory to preserve on the Beam, with phase-aware packaging.
   implement profile resolution/inheritance, validation, versioned plan,
   and `beams config init/validate/explain`. Bundled core/development
   profiles plus gitignored local configuration; keep new launch opt-in.
+  First compiler slice: typed profile/plan structures, inherited source
+  provenance, offline validate/explain, and fixtures proving package,
+  script/file artifact and phase/dependency ordering.
+- [ ] Developer documentation is required alongside implementation:
+  evolve `docs/development/launches.md` with the compiler/schema, an
+  execution-order graph, explicit scripts-vs-packages/file dependencies,
+  ready conditions, resource locks, task extension instructions, and
+  retry/reconnect diagnosis. Deliver an annotated profile with matching
+  explain output and fixture coverage; update binary READMEs in the same
+  changes. The initial draft is present; supported behavior/examples must
+  be completed as each phase lands.
 - [ ] Phase 2: generic package transactions, file-install and script
   tasks/custom templates, including automatic entrypoint upload, explicit
   helper roots, remote working directories and shared-root promotion;

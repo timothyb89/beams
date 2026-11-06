@@ -61,6 +61,8 @@ daemon, etc).
 - [Configurable launches](docs/designs/LAUNCH_CONFIGURATION_DESIGN.md) —
   proposed client-side profiles, batched uploads/packages, and pre/post
   initialization tasks; not implemented yet.
+- [Launch developer guide](docs/development/launches.md) — draft execution
+  ordering and task extension guidance for the planned configuration system.
 
 ## Status
 

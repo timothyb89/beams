@@ -6,8 +6,9 @@ configuration syntax. It builds on [DESIGN.md](DESIGN.md)'s task graph and
 transport. [TODO.md](../../TODO.md)
 tracks the implementation sequence.
 
-The graph direction and explicit readiness conditions were endorsed on
-2026-11-06. The profile syntax and implementation details remain proposed.
+The overall plan, graph direction, explicit readiness conditions, and
+developer documentation requirement were endorsed on 2026-11-06. The
+profile syntax and implementation details remain proposed.
 
 ## Goals and recommendation
 
@@ -689,6 +690,36 @@ Reference: OpenSSH `ssh_config(5)`, sections ControlMaster, ControlPath,
 ControlPersist, retrieved 2026-11-06:
 `https://man.openbsd.org/ssh_config`.
 
+## Developer documentation is part of delivery
+
+Maintain [the developer launch guide](../development/launches.md) as a
+required deliverable in each phase, starting with the compiler. Its draft
+already records the ordering contract and a graph illustration. Explain
+the difference between current behavior, implemented profile behavior,
+and pending work so examples do not imply unsupported commands.
+
+The guide must cover:
+
+- Workstation profile resolution, inheritance, script roots, archive
+  creation, and the boundaries of remote execution.
+- Pre work, the interface gate, and post work, with an annotated graph
+  and a clear distinction between readiness conditions, successful task
+  dependencies, and resource serialization.
+- Scripts versus package/file installs: there is no implicit global
+  packages-before-scripts barrier. Package requirements create edges;
+  explicit `after = ["packages:post", "files:data"]` waits for those
+  results. Independent work overlaps, and all post tasks await the interface.
+- How to add a built-in/custom task, declare package needs and resources,
+  emit progress, preserve idempotency, register CLI/TUI metadata, and test it.
+- Failures, blocked tasks, retries, snapshots, and diagnosing a task waiting
+  on packages, uploads, resources, or an incorrectly phased prerequisite.
+- One complete annotated profile and its `config explain` output, with
+  fixture coverage of the expected ordering.
+
+Update the guide and applicable binary README alongside changes to these
+contracts. Documentation belongs with the compiler/execution work rather
+than only at final rollout.
+
 ## Implementation sequence and acceptance
 
 0. **Fresh-checkout startup repair.** Remove the stale mandatory `.ssh`
@@ -698,12 +729,14 @@ ControlPersist, retrieved 2026-11-06:
 1. **Baseline and compiler.** Instrument launch milestones and transport
    counts; extract profile assets and implement resolution, validation,
    `config init/validate/explain`, and a versioned plan. Keep legacy launch
-   behavior available while the new path is opt-in.
+   behavior available while the new path is opt-in. Deliver profile/schema
+   examples and the developer guide's ordering overview in this phase.
 2. **Generic execution primitives.** Package transactions, file
    installation, scripts/custom templates, parameterized existing
    installs, task state/log snapshots, and durable launch acceptance.
    Split Rust's apt prerequisite. Preserve existing task CLI coverage
-   and meaningful template/schema tests.
+   and meaningful template/schema tests. Document package/script ordering,
+   resource ownership, probes, and the contributor extension recipe.
 3. **Small pre bundle and interface gate.** Install the runtime without
    a repo checkout, execute pre work through the daemon, prepare shell
    env/config first, open Zellij/TUI, and release post work from readiness.
@@ -756,6 +789,9 @@ Acceptance examples:
   their documented paths; two workstations do not share task key grants.
 - The packaged client launches without this project's source checkout,
   personal files, private-key transfer, or the maintainer's cluster bot.
+- The developer guide explains the supported execution ordering using
+  a complete profile and `config explain` output; fixtures verify the
+  illustrated graph and docs distinguish implemented features from plans.
 
 The main prototype questions are the readiness signal implementation,
 the fastest practical core bundle/Zellij delivery, and whether one post
@@ -767,3 +803,12 @@ configuration implementation should be the offline profile compiler and
 a sanitized extraction of the existing config, including an example local
 override and `config explain` output. That establishes the user-facing
 contract before changing live startup or its transport.
+
+For that compiler milestone, first implement typed profile/plan structures,
+local inheritance with source provenance, and offline `config validate` /
+`config explain`. Include package batching, script/file artifact assignment,
+phase/dependency validation, and two fixture profiles with an inherited
+override. Completion means the fixtures resolve to the expected graph,
+invalid configurations fail clearly without creating a Beam, and the
+developer guide can explain that same graph. Add `config init` and runtime
+wiring once this foundation is reviewable.
