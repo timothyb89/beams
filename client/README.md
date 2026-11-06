@@ -250,8 +250,27 @@ display buffer, cursor, modeled attributes and input modes; unfinished
 remote sequences resume across menu boundaries. While open, complete OSC
 title/clipboard effects are relayed from parser callbacks (normalized to an
 ST terminator), ordinary cursor/status queries are answered from the remote
-model, and device/window queries reach the physical terminal. The output
-queue is bounded and yields to input/resize handling during long bursts.
+model (including origin-relative cursor reports), and device/window queries
+reach the physical terminal. The output queue is bounded and yields to
+input/resize handling during long bursts.
+
+The model and physical-output tracker share a bounded stream framer. It holds
+at most 64 KiB of an unfinished control sequence and feeds complete sequences
+to the allocating emulator only when they fit that budget. If hidden output
+exceeds it, the menu closes and the retained prefix and remaining original
+bytes resume in passthrough without truncation. Overlay menus and toasts are
+then suppressed until the remote sends a full terminal reset (`ESC c`);
+ordinary typing still reaches the remote, and pressing the prefix twice still
+sends it remotely. This is a conservative recovery for budget exhaustion,
+not yet the general unknown-screen compatibility policy. Silence does not
+end an unfinished string or synchronized update.
+
+The client uses a focused, vendored `vt100` 0.18.1 extension in
+`vendor/vt100` for read-only current/saved cursor and attribute snapshots,
+per-buffer origin/margins, streaming DCS callbacks and reset notifications.
+Bursts of complete query/effect sequences are drained at each parsed frame,
+avoiding event-queue pressure. DCS query answers and restoration of the newly
+exposed state still need implementing.
 
 The [readiness audit](../docs/development/terminal-overlay.md) records the
 expanded coverage and remaining default blockers: saved cursors,
@@ -373,8 +392,9 @@ with `tsh scp` (`-r` for directories) into a hidden sibling temp name and
 renamed into place; existing targets fail the fetch unless `--overwrite` was
 given. On acceptance, the command prints a lasting stderr acknowledgement
 with a reminder to review and approve in the workstation's Beams menu, even
-when a toast also appears. The command prints byte progress until the copy finishes and exits
-non-zero on rejection, expiry, failure, or cancellation. Ctrl-C withdraws the
+when a toast also appears. The command prints byte progress until the copy
+finishes and exits non-zero on rejection, expiry, failure, or cancellation.
+Ctrl-C withdraws the
 request: the Beam daemon notices the command's connection closing and tells
 the workstation, which drops it if still pending or cancels it if running.
 

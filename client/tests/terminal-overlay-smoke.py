@@ -200,6 +200,10 @@ def run_checks(root, binary):
         session.send(device_reply)
         session.wait(lambda: session.remote_input() == baseline + replies + device_reply,
                      "physical device reply routing")
+        storm_baseline = session.remote_input()
+        session.emit(b"\x1b[5n" * 512)
+        session.wait(lambda: session.remote_input() == storm_baseline + b"\x1b[0n" * 512,
+                     "query burst answered without queue loss")
 
         # Emit an OSC split across commands, including its ST terminator.
         session.emit(b"\x1b]2;OVERLAY TITLE")
@@ -226,6 +230,27 @@ def run_checks(root, binary):
         session.wait(lambda: session.remote_input().endswith(b"REMOTE INPUT"), "input after menu close")
         assert "24 99\n" not in (root / "sizes").read_text(), "overlay injected a resize pulse"
         assert session.output.count(b"\x1b]52;c;SGVsbG8=\x1b\\") == 1, "clipboard effect duplicated"
+
+        # Exceed the model's string budget while hidden. Recovery must close
+        # the menu and resume the exact original bytes, including the prefix
+        # retained across earlier reads, without partially publishing the OSC.
+        session.open()
+        offset = len(session.output)
+        oversized = b"\x1b]52;c;" + b"A" * (64 * 1024 + 19)
+        session.emit(oversized)
+        session.wait(lambda: oversized in session.output[offset:], "oversized OSC prefix recovery")
+        blocked_offset = len(session.output)
+        session.send(b"\x1dyAFTER LIMIT")
+        session.wait(lambda: session.remote_input().endswith(b"yAFTER LIMIT"),
+                     "unsafe model cannot interpret unseen approval keys")
+        ending = b"\x1b\\AFTER OVERSIZED"
+        session.emit(ending)
+        session.wait(lambda: oversized + ending in session.output[offset:],
+                     "oversized OSC resumed byte-for-byte")
+        assert session.output.count(oversized + ending) == 1, "oversized OSC duplicated"
+        assert b"Beams local menu" not in session.output[blocked_offset:], "unsafe menu reopened"
+        session.emit(b"\x1bc\x1b[?1049hRECOVERED MODEL")
+        session.wait(lambda: b"RECOVERED MODEL" in session.output, "full model reset")
 
         # Sustained output must yield to local input. The fixture writes a
         # burst larger than both client queues while the menu is open.

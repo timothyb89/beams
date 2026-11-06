@@ -8,7 +8,8 @@ not sufficient to enable this path by default.
 The proposed [resolution plan](../designs/TERMINAL_OVERLAY_DESIGN.md) sequences
 bounded parsing and state snapshots, reversible painting, query dispatch,
 compatibility/lifecycle behavior, independent validation and the final default
-switch. Implementation of those milestones is still pending.
+switch. The first model/backend foundation is now implemented; the three
+restoration/query acceptance gates and later milestones remain pending.
 
 ## Recommended test coverage
 
@@ -20,7 +21,7 @@ switch. Implementation of those milestones is still pending.
 | Alternate screens | Emulator fixtures cover entering, leaving and round trips while the menu is open, selecting the final buffer and removing the menu from the buffer it covered. An ordinary alternate-screen overlay preserves the workstation main screen that the shadow model never observed. Updates to inactive buffers across more complex transitions remain a gap. |
 | Wide/combining text | Fixtures cover double-width cells, combining accents, Nerd Font private-use glyphs, RGB, inverse video with default colors, and pending right-margin wrap. Toast removal restores wide glyphs bisected by either edge. Actual font/emoji width differences still require visual testing. |
 | Resize | The controlling-PTY harness resizes an open dialog through ordinary and small sizes, checks the child sees each size and verifies overlay close does not inject the takeover mode's one-column pulse. |
-| Input/query replies | Fixtures and the PTY harness cover ordinary/private CPR, DSR, device queries, OSC clipboard replies and opaque DCS input replies. CPR is answered from the remote model at the query's position, even if later bytes move its cursor. Application-cursor, cursor-visibility and bracketed-paste DECRQM reports use remote state. Kitty prefix repeats/releases cannot toggle the menu. Origin-relative CPR, additional mode queries and DCS queries remain gaps. |
+| Input/query replies | Fixtures and the PTY harness cover ordinary/private CPR, DSR, device queries, OSC clipboard replies and opaque DCS input replies. CPR is answered from the remote model at the query's position, even if later bytes move its cursor; origin-relative CPR now uses exposed remote margins. Application-cursor, cursor-visibility and bracketed-paste DECRQM reports use remote state. Kitty prefix repeats/releases cannot toggle the menu. The PTY harness verifies 512 replies to 512 status queries without queue loss. Additional mode queries and DCS query answers remain gaps. |
 | Sustained output/lifecycle | A bounded 32-chunk output channel and a 16-chunk drain budget give input, resize, signals and daemon events turns during output bursts. The PTY harness checks a 4 MiB burst, child exit status, SIGTERM, terminal termios restoration, and cleanup sequences for mouse/paste/alternate-screen modes. |
 | Chunk boundaries | The remote prefix is tracked across reads. Opening a menu cancels an unfinished sequence only in the physical terminal; closing replays the latest unfinished prefix before passthrough resumes. Fixtures cover CSI, OSC and split UTF-8. |
 
@@ -46,12 +47,15 @@ fail; their ignore reasons link each failure to this remaining work:
    A remote application can leave a scroll region and origin mode enabled.
    Local absolute-position painting then addresses the wrong rows, and
    restoring formatted model content does not suspend/restore those modes.
-   Ordinary CPR also needs to account for origin-relative coordinates.
+   Origin-relative CPR is now covered, but painting/restoration still needs
+   to suspend and restore this state.
 3. **DCS queries:** `overlay_acceptance_dcs_query`. The model drops DECRQSS
    (`DCS $ q ... ST`) requests. A remote application that probes terminal
-   settings while hidden can wait indefinitely or time out. Attribute/mode
-   queries must use remote state where the dialog has temporarily changed
-   physical state; forwarding alone is insufficient.
+   settings while hidden can wait indefinitely or time out. A focused backend
+   extension now exposes bounded DCS callbacks, but they are not yet
+   dispatched as queries. Attribute/mode queries must use remote state where
+   the dialog has temporarily changed physical state; forwarding alone is
+   insufficient.
 
 Run the gates separately so their failures are visible:
 
@@ -73,10 +77,12 @@ fallback before changing the default:
   changes are incompletely modeled. OSC hyperlink state can also attach a
   remote link to local UI text. Suspend/restore those states or choose a
   compatibility path when the model cannot represent them.
-- `vt100`'s underlying allocating OSC parser can retain an arbitrarily long
-  unterminated OSC. The relay/input queues are bounded, but that does not
-  bound the model parser. Add a parser byte budget and an explicit recovery
-  policy for malformed/oversized strings.
+- Parser-string retention is now bounded before the allocating parser by the
+  shared 64 KiB framer. Hidden overflow closes the menu and resumes the exact
+  original sequence rather than truncating it; further painting is suppressed
+  until an observed full reset. Unit/PTY fixtures check opaque tails, reset
+  recovery and that keys cannot approve through an unseen menu. This loss
+  flag does not yet establish full content provenance or compatibility UX.
 - Real terminal resize/reflow and emoji/grapheme widths can differ from the
   reference model. The current harness verifies PTY size propagation, not
   agreement with every emulator's reflow behavior.
@@ -107,6 +113,14 @@ differences described above. They remain ignored in the ordinary suite.
 No independent graphical terminal or workstation font/reflow pass was
 available here. Repository-wide formatting checks also report pre-existing
 formatting differences; formatting changes were restricted to edited code.
+
+After the model/backend foundation: 201 client unit tests and 3 integration
+tests pass, along with both managed-session display modes and the expanded
+protocol/PTY harness. The forward diagnostic test once missed its captured
+stderr; its isolated and full-suite reruns passed, and TODO tracks the flake.
+The three gates were rerun explicitly and still fail. The backend can expose
+their needed state, but restoring it and answering DCS queries remain the next
+work.
 
 For the final workstation pass, use the actual supported outer terminals with
 Zellij, a plain shell, `less`, and an editor. Open/close the menu during a

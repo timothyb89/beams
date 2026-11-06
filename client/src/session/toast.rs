@@ -39,155 +39,30 @@ use crate::terminal_model::TerminalModel;
 const SETTLE: Duration = Duration::from_millis(30);
 /// ...unless output never stops, in which case repaint this often anyway.
 const BURST_REPAINT: Duration = Duration::from_millis(250);
-/// A string sequence (OSC/DCS) that hasn't terminated after this long of
-/// silence is assumed to have been lost rather than blocking toasts forever.
-const STALE_SEQUENCE: Duration = Duration::from_secs(1);
-
 const MIN_WIDTH: u16 = 26;
 const MAX_WIDTH: u16 = 56;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum State {
-    Ground,
-    Escape,
-    EscapeIntermediate,
-    Csi,
-    /// OSC: ends with BEL or ST.
-    Osc,
-    /// DCS, APC, PM, SOS: end with ST.
-    Str,
-    /// Saw ESC inside a string: `\` ends it, anything else starts a new
-    /// escape sequence.
-    StringEscape,
-}
-
-/// Follows the escape-sequence state of everything written to the real
-/// terminal.
-#[derive(Debug)]
+/// Tracks physical output with the same bounded framing as the shadow model.
+#[derive(Debug, Default)]
 pub struct OutputTracker {
-    state: State,
-    /// UTF-8 continuation bytes still expected.
-    utf8_pending: u8,
-    csi: Vec<u8>,
-    /// The remote opened a synchronized update and hasn't closed it.
-    sync_open: bool,
+    stream: crate::terminal_stream::TerminalStream,
     last_output: Option<Instant>,
-    /// The raw prefix of an unfinished sequence/UTF-8 character. Overlay
-    /// painting cancels it physically; close replays it before passthrough
-    /// resumes, so the next remote chunk is interpreted in the right state.
-    pending: Vec<u8>,
-}
-
-impl Default for OutputTracker {
-    fn default() -> Self {
-        Self {
-            state: State::Ground,
-            utf8_pending: 0,
-            csi: Vec::new(),
-            sync_open: false,
-            last_output: None,
-            pending: Vec::new(),
-        }
-    }
 }
 
 impl OutputTracker {
     pub fn feed(&mut self, bytes: &[u8], now: Instant) {
-        if bytes.is_empty() {
-            return;
-        }
-        self.last_output = Some(now);
-        for &byte in bytes {
-            if self.state != State::Ground || self.utf8_pending != 0 || byte >= 0x80 || byte == 0x1b
-            {
-                if self.pending.len() < super::DEFERRED_OUTPUT_LIMIT {
-                    self.pending.push(byte);
-                }
-            }
-            self.step(byte);
-            if self.state == State::Ground && self.utf8_pending == 0 {
-                self.pending.clear();
-            }
+        if !bytes.is_empty() {
+            self.last_output = Some(now);
+            self.stream.observe(bytes);
         }
     }
 
     pub fn pending(&self) -> &[u8] {
-        &self.pending
+        self.stream.pending()
     }
 
     pub fn synchronized_update(&self) -> bool {
-        self.sync_open
-    }
-
-    fn step(&mut self, byte: u8) {
-        match self.state {
-            State::Ground => match byte {
-                0x1b => {
-                    self.utf8_pending = 0;
-                    self.state = State::Escape;
-                }
-                0x80..=0xbf => self.utf8_pending = self.utf8_pending.saturating_sub(1),
-                0xc0..=0xdf => self.utf8_pending = 1,
-                0xe0..=0xef => self.utf8_pending = 2,
-                0xf0..=0xf7 => self.utf8_pending = 3,
-                _ => self.utf8_pending = 0,
-            },
-            State::Escape => self.escape(byte),
-            State::EscapeIntermediate => {
-                if !(0x20..=0x2f).contains(&byte) {
-                    self.state = State::Ground;
-                }
-            }
-            State::Csi => match byte {
-                0x1b => self.state = State::Escape,
-                0x40..=0x7e => {
-                    if self.csi == b"?2026" {
-                        match byte {
-                            b'h' => self.sync_open = true,
-                            b'l' => self.sync_open = false,
-                            _ => {}
-                        }
-                    }
-                    self.state = State::Ground;
-                }
-                _ => {
-                    if self.csi.len() < 32 {
-                        self.csi.push(byte);
-                    }
-                }
-            },
-            State::Osc => match byte {
-                0x07 => self.state = State::Ground,
-                0x1b => self.state = State::StringEscape,
-                _ => {}
-            },
-            State::Str => {
-                if byte == 0x1b {
-                    self.state = State::StringEscape;
-                }
-            }
-            State::StringEscape => {
-                if byte == b'\\' {
-                    self.state = State::Ground;
-                } else {
-                    self.escape(byte);
-                }
-            }
-        }
-    }
-
-    fn escape(&mut self, byte: u8) {
-        self.state = match byte {
-            b'[' => {
-                self.csi.clear();
-                State::Csi
-            }
-            b']' => State::Osc,
-            b'P' | b'_' | b'^' | b'X' => State::Str,
-            0x1b => State::Escape,
-            0x20..=0x2f => State::EscapeIntermediate,
-            _ => State::Ground,
-        };
+        self.stream.synchronized_update()
     }
 
     pub fn quiet_for(&self, now: Instant) -> Duration {
@@ -196,20 +71,9 @@ impl OutputTracker {
             .unwrap_or(Duration::MAX)
     }
 
-    /// Whether the remote stream is between sequences, so the terminal will
-    /// interpret whatever is written next on its own.
-    pub fn at_boundary(&mut self, now: Instant) -> bool {
-        let clean = self.state == State::Ground && self.utf8_pending == 0 && !self.sync_open;
-        if !clean && self.quiet_for(now) >= STALE_SEQUENCE {
-            // Something was lost (e.g. truncated deferred output); don't
-            // let it block toasts forever.
-            *self = Self {
-                last_output: self.last_output,
-                ..Self::default()
-            };
-            return true;
-        }
-        clean
+    /// Silence is not a sequence terminator. Wait for an actual boundary.
+    pub fn at_boundary(&mut self, _now: Instant) -> bool {
+        self.stream.at_boundary()
     }
 }
 
@@ -306,6 +170,10 @@ impl ToastPainter {
     /// Takes the toast down now, whatever the remote stream is doing; for
     /// when the session is ending and there won't be a better moment.
     pub fn clear(&mut self, model: &TerminalModel) -> Vec<u8> {
+        if !model.can_paint() {
+            self.forget();
+            return Vec::new();
+        }
         let Some((rect, _)) = self.shown.take() else {
             return Vec::new();
         };
@@ -332,6 +200,10 @@ impl ToastPainter {
         tracker: &mut OutputTracker,
         now: Instant,
     ) -> Vec<u8> {
+        if !model.can_paint() {
+            self.forget();
+            return Vec::new();
+        }
         let (rows, cols) = model.screen().size();
         let target = desired
             .and_then(|toast| placement(toast, rows.get(), cols.get()).map(|rect| (rect, toast)));
@@ -567,12 +439,14 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_string_terminator_eventually_stops_blocking() {
+    fn silence_does_not_end_an_unfinished_string() {
         let start = Instant::now();
         let mut tracker = OutputTracker::default();
         tracker.feed(b"\x1b]0;never ends", start);
         assert!(!tracker.at_boundary(start + Duration::from_millis(500)));
-        assert!(tracker.at_boundary(start + STALE_SEQUENCE));
+        assert!(!tracker.at_boundary(start + Duration::from_secs(20)));
+        tracker.feed(b"\x1b\\", start + Duration::from_secs(21));
+        assert!(tracker.at_boundary(start + Duration::from_secs(21)));
     }
 
     #[test]

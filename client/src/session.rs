@@ -385,7 +385,7 @@ fn drive(
             return Ok((128 + signal).clamp(1, 255) as u8);
         }
 
-        let output_changed = drain_output(
+        let output = drain_output(
             output_rx,
             input_router.mode,
             &mut deferred,
@@ -395,6 +395,33 @@ fn drive(
             &mut terminal_state.output,
             writer,
         )?;
+        let output_changed = output.changed;
+        if let Some(resume) = output.resume {
+            // The tracker holds the exact bounded prefix. close_palette
+            // restores the last model state and replays that prefix before
+            // the remaining bytes resume raw passthrough.
+            painter.forget();
+            close_palette(
+                master,
+                terminal_state,
+                &mut palette_terminal,
+                &mut input_router.mode,
+                &mut deferred,
+                last_size,
+                terminal_model,
+                overlay_enabled,
+            )?;
+            terminal_model.process(&resume);
+            terminal_model.take_events();
+            terminal_state.output.feed(&resume, Instant::now());
+            let mut stdout = io::stdout().lock();
+            stdout
+                .write_all(&resume)
+                .context("resuming oversized terminal sequence")?;
+            stdout
+                .flush()
+                .context("flushing resumed terminal sequence")?;
+        }
         if output_changed && input_router.mode == InputMode::Passthrough {
             painter.output_written();
         }
@@ -454,6 +481,7 @@ fn drive(
         }
 
         let now = Instant::now();
+        input_router.palette_available = !overlay_enabled || terminal_model.can_paint();
         if input_router.mode == InputMode::Passthrough {
             input_router.mouse_utf8 = terminal_model.screen().mouse_protocol_encoding()
                 == vt100::MouseProtocolEncoding::Utf8;
@@ -2035,6 +2063,9 @@ struct InputRouter {
     /// An oversized OSC/DCS reply is streamed without retaining its payload.
     /// Keep consuming it opaquely through its terminator.
     string_tail: Option<(bool, bool)>,
+    /// An unsafe shadow state must never decode unseen palette shortcuts.
+    palette_available: bool,
+    unavailable_prefix: bool,
 }
 
 impl Default for InputRouter {
@@ -2047,6 +2078,8 @@ impl Default for InputRouter {
             remote_paste: false,
             mouse_utf8: false,
             string_tail: None,
+            palette_available: true,
+            unavailable_prefix: false,
         }
     }
 }
@@ -2222,10 +2255,19 @@ impl InputRouter {
                 _ => {}
             }
             if !self.remote_paste && logical.is_some() && escape_key.byte() == logical {
+                if !self.palette_available {
+                    if self.unavailable_prefix {
+                        remote.extend_from_slice(encoded);
+                    }
+                    self.unavailable_prefix = !self.unavailable_prefix;
+                    return;
+                }
+                self.unavailable_prefix = false;
                 flush_remote(actions, remote);
                 self.mode = InputMode::Palette;
                 actions.push(InputAction::OpenPalette);
             } else {
+                self.unavailable_prefix = false;
                 remote.extend_from_slice(encoded);
             }
             return;
@@ -2600,6 +2642,13 @@ fn read_pty_output(reader: &mut dyn Read, tx: mpsc::SyncSender<OutputEvent>) {
     }
 }
 
+struct OutputUpdate {
+    changed: bool,
+    /// The chunk tail to forward after closing an unsafe overlay. The bounded
+    /// unfinished prefix is held by the physical output tracker.
+    resume: Option<Vec<u8>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_output(
     rx: &Receiver<OutputEvent>,
@@ -2610,37 +2659,52 @@ fn drain_output(
     overlay_enabled: bool,
     tracker: &mut toast::OutputTracker,
     remote_writer: &mut dyn Write,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<OutputUpdate> {
     let mut stdout = io::stdout().lock();
     let mut wrote = false;
     let mut changed = false;
-    // A continuous stream (large builds, `yes`, log tails) must yield to
-    // keyboard input, signals, resize and daemon events.
     for _ in 0..OUTPUT_CHUNKS_PER_TICK {
         match rx.try_recv() {
             Ok(OutputEvent::Data(bytes)) => {
-                if overlay_enabled || mode == InputMode::Passthrough {
-                    tracker.feed(&bytes, Instant::now());
-                }
-                terminal_model.process(&bytes);
-                let events = terminal_model.take_events();
                 changed = true;
-                if mode == InputMode::Palette {
-                    if overlay_enabled {
-                        for event in events {
-                            if let TerminalEvent::Reply(reply) = event {
-                                remote_writer
-                                    .write_all(&reply)
-                                    .context("answering remote terminal query")?;
-                                remote_writer.flush().context("flushing terminal reply")?;
-                            } else if let Some(bytes) = event.terminal_bytes() {
-                                stdout
-                                    .write_all(&bytes)
-                                    .context("relaying terminal effect")?;
-                                wrote = true;
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    let consumed =
+                        terminal_model.process_with_events(&bytes[offset..], |event| {
+                            if mode == InputMode::Palette && overlay_enabled {
+                                if let TerminalEvent::Reply(reply) = event {
+                                    remote_writer
+                                        .write_all(&reply)
+                                        .context("answering remote terminal query")?;
+                                    remote_writer.flush().context("flushing terminal reply")?;
+                                } else if let Some(bytes) = event.terminal_bytes() {
+                                    stdout
+                                        .write_all(&bytes)
+                                        .context("relaying terminal effect")?;
+                                    wrote = true;
+                                }
                             }
+                            Ok::<(), anyhow::Error>(())
+                        })?;
+                    if overlay_enabled || mode == InputMode::Passthrough {
+                        tracker.feed(&bytes[offset..offset + consumed], Instant::now());
+                    }
+                    offset += consumed;
+                    if offset < bytes.len() {
+                        terminal_model.discard_oversized_sequence();
+                        if mode == InputMode::Palette && overlay_enabled {
+                            stdout
+                                .flush()
+                                .context("flushing effects before overlay recovery")?;
+                            return Ok(OutputUpdate {
+                                changed,
+                                resume: Some(bytes[offset..].to_vec()),
+                            });
                         }
-                    } else {
+                    }
+                }
+                if mode == InputMode::Palette {
+                    if !overlay_enabled {
                         deferred.push(&bytes);
                     }
                 } else {
@@ -2661,7 +2725,10 @@ fn drain_output(
     if wrote {
         stdout.flush().context("flushing remote PTY output")?;
     }
-    Ok(changed)
+    Ok(OutputUpdate {
+        changed,
+        resume: None,
+    })
 }
 
 fn finish_output(
@@ -2943,6 +3010,25 @@ fn new_palette_terminal() -> anyhow::Result<PaletteTerminal> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unavailable_palette_cannot_consume_keys_as_unseen_approvals() {
+        let mut router = super::InputRouter {
+            palette_available: false,
+            ..Default::default()
+        };
+        let key = super::EscapeKey::default();
+        let mut on_key = |_| panic!("unseen palette received a key");
+        assert_eq!(
+            router.route(key, b"\x1dy", std::time::Instant::now(), &mut on_key),
+            vec![super::InputAction::Remote(b"y".to_vec())],
+        );
+        assert_eq!(
+            router.route(key, b"\x1d\x1d", std::time::Instant::now(), &mut on_key),
+            vec![super::InputAction::Remote(b"\x1d".to_vec())],
+        );
+        assert_eq!(router.mode, super::InputMode::Passthrough);
+    }
+
     use super::*;
     use std::io::{BufRead, BufReader};
 

@@ -687,6 +687,10 @@ section above for status/details.
 - [ ] No CI configured (`.github/workflows` doesn't exist). At minimum a
   `cargo check`/`cargo test` workflow for both `bootstrap/` and `client/`
   would catch breakage before it's discovered on a live beam.
+- [ ] Investigate intermittent missing stderr in
+  `forward::tests::startup_failure_includes_captured_diagnostics`. During
+  overlay validation it once reported only exit status 23; the isolated test
+  and full-suite rerun passed.
 
 ## Client-owned services and remote requests
 
@@ -738,7 +742,7 @@ bootstrap `Task`s.
   reports also use remote state. Keep opt-in: three executable ignored
   acceptance gates still fail (saved cursor, origin/margins, DCS queries).
   Also resolve unknown initial/inactive screen state,
-  unsupported drawing/input protocols, parser string bounds, and independent
+  unsupported drawing/input protocols, and independent
   workstation font/reflow/lifecycle validation before changing the default.
   Follow the [resolution plan](docs/designs/TERMINAL_OVERLAY_DESIGN.md) in
   separately reviewable milestones:
@@ -748,16 +752,24 @@ bootstrap `Task`s.
     return path. Generic guidance directs the user to the workstation's Beams
     menu; session-specific prefix/availability hints remain optional future
     work rather than assuming the default key or adding a notice protocol.
-  - [ ] Bounded shared stream controller and complete remote-state snapshots;
-    first spike the model/backend extension needed for saved state and DCS.
-    Bound parser strings and event bytes before allocation; preserve opaque
-    passthrough on overflow and never infer sequence completion from silence.
+  - [x] Model/backend foundation: a focused vendored `vt100` 0.18.1 extension
+    exposes current/saved cursors and attributes, both buffers' origin/margins,
+    and streaming DCS callbacks. The shared `terminal_stream` framer bounds
+    control sequences at 64 KiB before allocating parser input; overflow closes
+    an overlay and resumes original output without truncation. Painting stays
+    suppressed until observed `ESC c`. Event count/bytes are bounded; the live
+    relay drains each frame, including 512-query bursts. Silence never implies
+    a sequence terminator. Fixtures and the controlling-PTY harness cover this.
+  - [ ] Complete snapshot/eligibility coverage for further drawing/input state
+    and content provenance. The foundation's loss flag handles byte-budget
+    exhaustion, not unknown initial cells or every unsupported protocol.
   - [ ] Reversible painting shared by menus and toasts: saved/current cursors,
     origin/margins, drawing state and observed active/inactive buffers.
     Unignore saved-cursor and origin/margins acceptance gates.
   - [ ] Ordered remote/physical query dispatch, starting with DECRQSS and
     origin-relative CPR. Unignore the DCS acceptance gate; test exactly-once
-    replies and bounded query pressure.
+    replies and bounded query pressure. Origin-relative CPR is implemented;
+    audit child-input backpressure (reply writes are still synchronous).
   - [ ] Content provenance and unsupported-feature policy; settle compatibility
     UX before integrating it. Proposed default: defer unsafe painting, retain
     explicit best-effort takeover. Cover unknown inherited screens, common

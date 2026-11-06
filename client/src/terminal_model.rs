@@ -16,7 +16,10 @@ use ratatui::style::{Color as TuiColor, Modifier, Style};
 use ratatui::Frame;
 use vt100::{Callbacks, Color as VtColor, Parser, Screen};
 
+use crate::terminal_stream::{TerminalStream, CONTROL_SEQUENCE_LIMIT};
+
 const MAX_EVENTS: usize = 128;
+const MAX_EVENT_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalEvent {
@@ -38,6 +41,10 @@ pub enum TerminalEvent {
     Reply(Vec<u8>),
     /// Device/color/window queries still belong to the physical terminal.
     Query(Vec<u8>),
+    /// Bounded DCS callback exposure; semantic query dispatch is still pending.
+    UnhandledDcs(Vec<u8>),
+    /// Explicit diagnostic for a consumer that did not drain its event queue.
+    EventOverflow,
     UnhandledCsi(char),
     UnhandledEscape,
     UnhandledControl(u8),
@@ -47,22 +54,87 @@ pub enum TerminalEvent {
 #[derive(Default)]
 struct EventCallbacks {
     events: VecDeque<TerminalEvent>,
+    event_bytes: usize,
+    dcs: Option<Vec<u8>>,
+    reset_observed: bool,
 }
 
 impl EventCallbacks {
     fn push(&mut self, event: TerminalEvent) {
-        if self.events.len() >= MAX_EVENTS {
-            self.events.pop_front();
+        let bytes = match &event {
+            TerminalEvent::WindowTitle(bytes)
+            | TerminalEvent::WindowIconName(bytes)
+            | TerminalEvent::UnhandledOsc(bytes)
+            | TerminalEvent::Reply(bytes)
+            | TerminalEvent::Query(bytes)
+            | TerminalEvent::UnhandledDcs(bytes) => bytes.len(),
+            TerminalEvent::CopyToClipboard { target, data } => target.len() + data.len(),
+            TerminalEvent::PasteFromClipboard { target } => target.len(),
+            _ => 0,
+        };
+        if self.events.len() >= MAX_EVENTS || self.event_bytes + bytes > MAX_EVENT_BYTES {
+            // Live query/effect frames are drained immediately. An offline
+            // consumer or a malformed-text diagnostic flood gets a loss marker.
+            self.events.clear();
+            self.event_bytes = 0;
+            self.events.push_back(TerminalEvent::EventOverflow);
         }
+        self.event_bytes += bytes;
         self.events.push_back(event);
     }
 
     fn take(&mut self) -> Vec<TerminalEvent> {
+        self.event_bytes = 0;
         self.events.drain(..).collect()
     }
 }
 
 impl Callbacks for EventCallbacks {
+    fn terminal_reset(&mut self, _: &mut Screen) {
+        self.reset_observed = true;
+        self.dcs = None;
+    }
+
+    fn dcs_hook(
+        &mut self,
+        _: &mut Screen,
+        params: &[&[u16]],
+        intermediates: &[u8],
+        ignore: bool,
+        action: char,
+    ) {
+        if ignore {
+            self.dcs = None;
+            return;
+        }
+        let mut header = csi(
+            intermediates.first().copied(),
+            intermediates.get(1).copied(),
+            if params == [&[0][..]] { &[] } else { params },
+            action,
+        );
+        header[1] = b'P';
+        self.dcs = Some(header);
+    }
+
+    fn dcs_put(&mut self, _: &mut Screen, byte: u8) {
+        if let Some(dcs) = &mut self.dcs {
+            if dcs.len() < CONTROL_SEQUENCE_LIMIT {
+                dcs.push(byte);
+            } else {
+                self.dcs = None;
+                self.push(TerminalEvent::EventOverflow);
+            }
+        }
+    }
+
+    fn dcs_unhook(&mut self, _: &mut Screen) {
+        if let Some(mut dcs) = self.dcs.take() {
+            dcs.extend_from_slice(b"\x1b\\");
+            self.push(TerminalEvent::UnhandledDcs(dcs));
+        }
+    }
+
     fn audible_bell(&mut self, _: &mut Screen) {
         self.push(TerminalEvent::AudibleBell);
     }
@@ -118,6 +190,17 @@ impl Callbacks for EventCallbacks {
             }
             if matches!(i1, None | Some(b'?')) && params == [&[6][..]] {
                 let (row, col) = screen.cursor_position();
+                let state = screen.drawing_state();
+                let buffer = if state.alternate_screen {
+                    state.alternate
+                } else {
+                    state.primary
+                };
+                let row = if buffer.cursor.origin_mode {
+                    row.saturating_sub(buffer.scroll_region.0)
+                } else {
+                    row
+                };
                 let cols = screen.size().1.get();
                 let private = i1 == Some(b'?');
                 self.push(TerminalEvent::Reply(
@@ -233,6 +316,8 @@ impl TerminalEvent {
 
 pub struct TerminalModel {
     parser: Parser<EventCallbacks>,
+    stream: TerminalStream,
+    integrity_lost: bool,
 }
 
 impl TerminalModel {
@@ -244,11 +329,62 @@ impl TerminalModel {
                 usize::from(size.rows).saturating_mul(4),
                 EventCallbacks::default(),
             ),
+            stream: TerminalStream::default(),
+            integrity_lost: false,
         }
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            let consumed = self
+                .stream
+                .advance(remaining, |frame| {
+                    self.parser.process(frame);
+                    if std::mem::take(&mut self.parser.callbacks_mut().reset_observed) {
+                        self.integrity_lost = false;
+                    }
+                    Ok::<(), std::convert::Infallible>(())
+                })
+                .unwrap();
+            remaining = &remaining[consumed..];
+            if !remaining.is_empty() {
+                self.discard_oversized_sequence();
+            }
+        }
+    }
+
+    /// Drain events at each frame so query/effect floods cannot overflow the
+    /// live relay's bounded event queue. Stop before exceeding the byte budget.
+    pub fn process_with_events<E>(
+        &mut self,
+        bytes: &[u8],
+        mut event: impl FnMut(TerminalEvent) -> Result<(), E>,
+    ) -> Result<usize, E> {
+        self.stream.advance(bytes, |frame| {
+            self.parser.process(frame);
+            if std::mem::take(&mut self.parser.callbacks_mut().reset_observed) {
+                self.integrity_lost = false;
+            }
+            for item in self.parser.callbacks_mut().take() {
+                event(item)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn discard_oversized_sequence(&mut self) {
+        self.integrity_lost = true;
+        self.stream.discard_sequence();
+    }
+
+    /// Budget exhaustion makes repainting unsafe until an observed full reset.
+    pub fn can_paint(&self) -> bool {
+        !self.integrity_lost
+    }
+
+    pub fn drawing_state(&self) -> vt100::DrawingState {
+        self.screen().drawing_state()
     }
 
     pub fn resize(&mut self, size: PtySize) {
@@ -271,7 +407,7 @@ impl TerminalModel {
         let (rows, cols) = screen.size();
         let mut copy = Parser::new(rows, cols, 0);
         *copy.screen_mut() = screen.clone();
-        let active = screen.alternate_screen();
+        let active = self.drawing_state().alternate_screen;
         let mut bytes = b"\x18\x1b\\\x1b[?2026h".to_vec();
         let buffers = if covered_alternate == active {
             vec![active]
@@ -678,6 +814,103 @@ mod tests {
                 TerminalEvent::Reply(b"\x1b[?2004;1$y".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn snapshots_include_hidden_saved_attributes_and_both_buffers() {
+        let mut model = TerminalModel::new(size());
+        model.process(b"\x1b[2;4r\x1b[?6h\x1b[2;3H\x1b[31m\x1b7\x1b[0m");
+        let before = model.drawing_state();
+        assert_eq!(before.primary.cursor.row, 2);
+        assert_eq!(before.primary.saved_cursor.col, 2);
+        assert!(before.primary.saved_cursor.origin_mode);
+        assert_eq!(before.primary.scroll_region, (1, 3));
+        assert_eq!(before.saved_attributes, "\x1b[m\x1b[31m");
+        model.process(b"\x1b[?47h\x1b[1;3r\x1b[3;7H\x1b[32m\x1b7\x1b[H");
+        let hidden = model.drawing_state();
+        assert!(hidden.alternate_screen);
+        assert_eq!(hidden.primary, before.primary);
+        assert_eq!(hidden.alternate.saved_cursor.row, 2);
+        assert_eq!(hidden.alternate.saved_cursor.col, 6);
+        assert_eq!(hidden.alternate.scroll_region, (0, 2));
+        assert_eq!(hidden.saved_attributes, "\x1b[m\x1b[32m");
+    }
+
+    #[test]
+    fn origin_relative_cursor_reports_use_the_remote_scroll_region() {
+        let mut model = TerminalModel::new(size());
+        model.process(b"\x1b[2;4r\x1b[?6h\x1b[2;3H\x1b[6n\x1b[?6n");
+        assert_eq!(
+            model.take_events(),
+            vec![
+                TerminalEvent::Reply(b"\x1b[2;3R".to_vec()),
+                TerminalEvent::Reply(b"\x1b[?2;3;1R".to_vec()),
+            ],
+        );
+    }
+
+    #[test]
+    fn dcs_callbacks_preserve_split_headers_and_bodies() {
+        let query = b"\x1bP$qm\x1b\\";
+        for split in 0..=query.len() {
+            let mut model = TerminalModel::new(size());
+            model.process(&query[..split]);
+            model.process(&query[split..]);
+            assert_eq!(
+                model.take_events(),
+                vec![TerminalEvent::UnhandledDcs(query.to_vec())],
+                "split at {split}",
+            );
+        }
+    }
+
+    #[test]
+    fn live_query_dispatch_does_not_drop_events_under_queue_pressure() {
+        let mut model = TerminalModel::new(size());
+        let queries = b"\x1b[5n".repeat(MAX_EVENTS * 4);
+        let mut replies = Vec::new();
+        let consumed = model
+            .process_with_events(&queries, |event| {
+                replies.push(event);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+        assert_eq!(consumed, queries.len());
+        assert_eq!(
+            replies,
+            vec![TerminalEvent::Reply(b"\x1b[0n".to_vec()); MAX_EVENTS * 4],
+        );
+        assert!(model.take_events().is_empty());
+    }
+
+    #[test]
+    fn oversized_osc_is_not_partially_applied_and_a_full_reset_recovers() {
+        let mut model = TerminalModel::new(size());
+        let mut bytes = b"\x1b]52;c;".to_vec();
+        bytes.extend(std::iter::repeat_n(b'A', CONTROL_SEQUENCE_LIMIT * 4));
+        bytes.extend_from_slice(b"\x1b\\visible");
+        model.process(&bytes);
+        assert!(!model.can_paint());
+        assert!(model.take_events().is_empty());
+        assert_eq!(model.screen().contents(), "visible");
+        model.process(b"\x1bc");
+        assert!(model.can_paint());
+        assert_eq!(model.screen().contents(), "");
+    }
+
+    #[test]
+    fn full_reset_recovers_when_it_aborts_an_oversized_sequence() {
+        for start in [b"\x1b]2;".as_slice(), b"\x1bP$q", b"\x1b["] {
+            let mut model = TerminalModel::new(size());
+            let mut bytes = start.to_vec();
+            bytes.extend(std::iter::repeat_n(b'0', CONTROL_SEQUENCE_LIMIT));
+            model.process(&bytes);
+            assert!(!model.can_paint());
+            model.process(b"\x1b");
+            model.process(b"c");
+            assert!(model.can_paint(), "reset after {start:?}");
+            assert_eq!(model.screen().contents(), "");
+        }
     }
 
     #[test]

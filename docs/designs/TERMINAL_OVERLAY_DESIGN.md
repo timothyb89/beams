@@ -364,16 +364,45 @@ The small durable `beams fetch` request acknowledgement is implemented using
 the existing return path, with generic workstation-menu guidance. Progress
 does not overwrite it. Session-specific hints remain optional future work.
 
-The first substantive overlay change is milestone 1's model/backend spike and
-bounded framing contract. Use `overlay_acceptance_saved_cursor` and
-`overlay_acceptance_origin_and_margins` to define the required current/saved
-cursor and attribute snapshots, origin/margin state and buffer semantics;
-verify that the backend can also expose DCS queries. Record whether a focused
-model extension/fork suffices before changing the UI renderer. Prove storage
-is bounded for unfinished control strings.
+The first model/backend slice is implemented with a focused, vendored `vt100`
+0.18.1 extension (`client/vendor/vt100/BEAMS.md` records provenance and changes).
+It exposes read-only current/saved cursor and attribute state, both buffers'
+origin modes and margins, streaming DCS callbacks and reset notifications.
+This demonstrates that the first two restoration gates can use the emulator's
+state rather than another cursor/mode ledger. DCS semantics and unimplemented
+drawing features still need work; vendoring does not confer support for them.
 
-Then land milestone 2's shared painting transaction before broadening feature
-support. Milestone 3 shares the same snapshots and can follow it without a
-second parser. Milestones 4 and 5 determine the supported envelope; milestone
-6 validates it before milestone 7 changes the default. Optional richer request
-notices can follow once availability information actually exists.
+`client/src/terminal_stream.rs` is shared by the model and physical-output
+tracker. It retains at most 64 KiB per unfinished control sequence and supplies
+bounded frames to the allocating parser. On hidden-output
+overflow, the driver closes the palette, restores the captured frame and
+replays the retained original prefix before forwarding the chunk tail.
+Remaining sequence bytes stay opaque; no clipboard payload is truncated or
+partially published by the model. This recovery still inherits the existing
+saved-cursor/origin restoration limitations until milestone 2 lands.
+
+Budget exhaustion suppresses further overlay menus/toasts until an observed
+full reset (`ESC c`). The input router keeps ordinary keys remote and supports
+a doubled literal/enhanced prefix without interpreting unseen approval
+shortcuts. This is the first conservative eligibility condition, not complete
+content provenance or availability UX. The borrowed-buffer fallback is pending.
+
+Event storage has count/byte budgets. The live relay drains events at each frame
+so supported query/effect bursts do not hit those budgets; offline consumers
+get an explicit overflow diagnostic. Origin-relative CPR now uses the exposed
+remote margins. Query-phase work must also audit synchronous reply-write
+backpressure; the current 512-query PTY check does not prove a peer that stops
+reading its input cannot stall the driver.
+
+Validation: the client suite passes (201 unit tests and 3 integration tests),
+as do both managed-session display modes and the expanded controlling-PTY
+checks for exact oversized-OSC recovery, unseen approval-key isolation,
+full-reset recovery and 512 query replies.
+All three explicit acceptance gates still fail and remain ignored in the
+ordinary suite.
+
+Next: milestone 2's shared painting transaction, starting with the saved-cursor
+and origin/margins gates. Milestone 3 shares those snapshots. Milestones 4 and
+5 complete the supported envelope, and independent/workstation validation
+still precedes the default switch. Optional richer request notices can follow
+once availability information actually exists.
