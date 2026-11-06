@@ -743,6 +743,10 @@ bootstrap `Task`s.
   Follow the [resolution plan](docs/designs/TERMINAL_OVERLAY_DESIGN.md) in
   separately reviewable milestones:
 
+  - [ ] First small slice: always log accepted requests as a lasting stderr
+    acknowledgement, including when a toast appears, using the existing
+    return path. Add a prefix hint only when reliably known; keep generic
+    guidance for unknown metadata. Do not block on a new notice protocol.
   - [ ] Bounded shared stream controller and complete remote-state snapshots;
     first spike the model/backend extension needed for saved state and DCS.
     Bound parser strings and event bytes before allocation; preserve opaque
@@ -762,11 +766,12 @@ bootstrap `Task`s.
     ownership, close/replay before output overflow or a remote buffer switch,
     and deliver queries/effects exactly once. Never nest over a remote-owned
     alternate buffer or switch screens for ordinary toasts.
-  - [ ] Inline approval guidance over the control pipe, including when toasts
-    are suppressed. Correlate the request's originating session with frontend
-    prefix/UI availability; add capability-negotiated advisory notices and
-    render them in `beams fetch`/other waiting CLIs without changing approval
+  - [ ] Optional richer inline approval guidance for uncertain terminal states,
+    skippable if high effort. Correlate the request's originating session with
+    frontend prefix/UI availability; add capability-negotiated advisory notices
+    and render them in `beams fetch`/other waiting CLIs without changing approval
     status. Test custom/disabled prefixes, multiple frontends and old peers.
+    This enhancement does not block the overlay fixes/default-readiness work.
   - [ ] Session-entry/exit state ownership and advanced keyboard/mode cleanup,
     including non-default outer-terminal state and partial-string termination.
   - [ ] Independent emulator comparison and recorded workstation matrix with

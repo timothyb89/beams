@@ -32,9 +32,10 @@ Prefer preserving the remote session when its screen cannot be restored:
   hold, borrow the alternate buffer for a manual menu without repainting the
   unknown primary content. Otherwise defer local painting.
 - Keep requests pending under their existing expiry policy; suppressing a
-  notification must never imply approval or rejection. Send approval guidance
-  back to the requesting command, using the actual session's prefix and UI
-  availability.
+  notification must never imply approval or rejection. Always log acceptance
+  in the requesting command. Include the session's prefix when reliably known;
+  additional terminal-state guidance is useful but optional if its transport
+  requires substantial work.
 - A menu request can wait for a recoverable state; a second prefix press still
   sends the original encoding remotely. Define cancellation and availability
   feedback before shipping so the prefix does not appear broken.
@@ -104,35 +105,50 @@ screen just to display a notification.
 
 ### Inline approval guidance over the existing control pipe
 
-Use a separate advisory notice, not a failed or decided request:
+Scope agreed in the follow-up discussion: always log the accepted request,
+even when a toast succeeds. Extra information about an uncertain terminal state
+is optional if expensive; it must not become a prerequisite for fixing overlay
+restoration.
+
+The first small change can use the existing `service_request_accepted` reply
+and `fetch.rs` waiting message. Make acceptance a lasting stderr line rather
+than a transient line overwritten by progress. Describe the request and where
+to approve it; a generic workstation-menu instruction works without new
+protocol messages. Include a key hint only when the configured key is reliably
+known, handling custom and disabled prefixes. Do not hard-code the default or
+assume environment inherited by a long-lived Zellij pane describes its current
+attached SSH frontend.
+
+For additional live availability information, use a separate advisory notice,
+not a failed or decided request:
 
 ```text
 SSH frontend -> workstation daemon -> client bridge
              -> Beam daemon -> requesting command's socket -> stderr
 ```
 
-The frontend reports its session token, configured prefix, menu availability
+The frontend can report its session token, configured prefix, menu availability
 (overlay, borrowed buffer, deferred, or disabled), notification availability,
 and a bounded reason code. Correlate the requesting shell's session token with
 the correct live frontend, including when several frontends share one Beam.
 The bridge currently carries a request without that origin token, so extend
 its advisory metadata as well as the frontend registration.
 
-Have the requesting command show approval guidance whenever the request is
-accepted, even when a toast is available. For example, with the default prefix
-and a usable overlay or borrowed buffer:
+When that metadata is available, refine the acknowledgement. For example,
+with the default prefix and a usable overlay or borrowed buffer:
 
 ```text
 beams: request sent; press Ctrl-] in your Beams SSH session to review and approve (Ctrl-C to withdraw)
 ```
 
-When neither display path is usable, say that approval UI is unavailable and
-direct the user to a supported session or the explicit takeover option.
-Do not instruct them to press a disabled or ineffective prefix. Print through
-the requesting process's normal stderr so the shell or Zellij renders it in
-place; Beams does not paint over unknown cells to deliver this message.
+If reported availability says neither display path is usable, explain that
+approval UI is unavailable and direct the user to a supported session or the
+explicit takeover option. Do not instruct them to press a disabled or
+ineffective prefix. Print through the requesting process's normal stderr so
+the shell or Zellij renders it in place; Beams does not paint over unknown
+cells to deliver this message.
 
-The transport exists, but current code needs changes: `RequestStatus`
+Dynamic notices need additional work: `RequestStatus`
 transitions reject `PendingApproval -> PendingApproval`, and `fetch.rs` ignores
 pending-status messages. Add a capability-negotiated request-notice message
 and structured availability data rather than weakening the approval state
@@ -267,10 +283,11 @@ support them or apply the declared compatibility policy. An ignored escape
 sequence must not automatically mean "safe to composite."
 
 Integrate the chosen UX policy, including the guarded borrowed-buffer path,
-pending menu cancellation, preservation of forms and inline request notices.
-Availability feedback must itself avoid painting an unknown screen. Keep
-compatibility reasons available in diagnostics without writing debug text into
-remote output.
+pending menu cancellation and preservation of forms. The request acknowledgement
+is mandatory; richer inline availability notices are an optional separate
+change. Availability feedback must itself avoid painting an unknown screen.
+Keep compatibility reasons available in diagnostics without writing debug
+text into remote output.
 
 Completion checks:
 
@@ -284,9 +301,12 @@ Completion checks:
   policy. No fallback relies on an unconditional clear or guessed redraw.
 - A pending approval remains pending/expirable when UI is unavailable; prefix
   forwarding and cancellation remain usable.
-- A fetch without a local toast receives an accurate inline hint, including
-  custom/disabled prefixes, multiple frontends, disconnect/reconnect, recovery,
-  expiry and older peers. Sending a notice does not change approval status.
+- A fetch logs request acceptance even without a toast; any key hint handles
+  custom/disabled/unknown prefixes correctly.
+- If dynamic notices are implemented, test multiple frontends,
+  disconnect/reconnect, recovery, expiry and older peers. Sending a notice
+  does not change approval status. These optional notices do not block the
+  restoration work or default switch.
 
 ### 5. Restore only state owned by the client
 
@@ -340,9 +360,19 @@ Only after milestones 1–6 pass:
 
 ## First implementation slice
 
-Start with milestone 1's model/backend spike and bounded framing contract,
-using the saved-cursor and origin/margins failures as state round-trip examples.
-Then land milestone 2 before broadening feature support. Milestone 3 shares
-the same snapshots and can follow it without a second parser. Milestones 4
-and 5 determine the supported envelope; milestone 6 validates it before
-milestone 7 changes the default.
+Land the small durable request-acknowledgement change independently, using the
+existing return path. Do not start with a new availability-notice protocol.
+
+The first substantive overlay change is milestone 1's model/backend spike and
+bounded framing contract. Use `overlay_acceptance_saved_cursor` and
+`overlay_acceptance_origin_and_margins` to define the required current/saved
+cursor and attribute snapshots, origin/margin state and buffer semantics;
+verify that the backend can also expose DCS queries. Record whether a focused
+model extension/fork suffices before changing the UI renderer. Prove storage
+is bounded for unfinished control strings.
+
+Then land milestone 2's shared painting transaction before broadening feature
+support. Milestone 3 shares the same snapshots and can follow it without a
+second parser. Milestones 4 and 5 determine the supported envelope; milestone
+6 validates it before milestone 7 changes the default. Optional richer request
+notices can follow once availability information actually exists.
