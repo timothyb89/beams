@@ -1,5 +1,7 @@
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
+use crate::term::BufWrite as _;
+
 // chosen to make the size of the cell struct 32 bytes
 const CONTENT_BYTES: usize = 22;
 
@@ -193,5 +195,17 @@ impl Cell {
     #[must_use]
     pub fn inverse(&self) -> bool {
         self.attrs.inverse()
+    }
+
+    /// SGR commands establishing this cell's attributes from any attributes.
+    #[must_use]
+    pub fn attributes_formatted(&self) -> alloc::string::String {
+        let mut out = alloc::string::String::new();
+        crate::term::ClearAttrs.write_buf(&mut out);
+        self.attrs.write_escape_code_diff(
+            &mut out,
+            &crate::attrs::Attrs::default(),
+        );
+        out
     }
 }

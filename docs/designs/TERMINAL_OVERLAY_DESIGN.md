@@ -398,11 +398,41 @@ Validation: the client suite passes (201 unit tests and 3 integration tests),
 as do both managed-session display modes and the expanded controlling-PTY
 checks for exact oversized-OSC recovery, unseen approval-key isolation,
 full-reset recovery and 512 query replies.
-All three explicit acceptance gates still fail and remain ignored in the
-ordinary suite.
+At the foundation commit, all three explicit acceptance gates still failed
+and remained ignored in the ordinary suite.
 
-Next: milestone 2's shared painting transaction, starting with the saved-cursor
-and origin/margins gates. Milestone 3 shares those snapshots. Milestones 4 and
-5 complete the supported envelope, and independent/workstation validation
-still precedes the default switch. Optional richer request notices can follow
-once availability information actually exists.
+This foundation supplies the snapshots used by the following painting slice.
+
+## Saved cursor and margin painting slice
+
+`client/src/terminal_paint.rs` now owns the shared physical drawing setup and
+represented-state restoration. Menus, model restoration and toast paint/removal
+use full vertical margins with origin mode off. Close restores each covered
+buffer's saved cursor and attributes before its current margins, origin,
+cursor, attributes and visibility. Pending wrap is recreated by reprinting the
+existing final glyph, including wide glyphs. A toast restores only current
+state, leaving the application's save slot untouched.
+
+Saved attributes are now per-buffer in the vendored emulator; xterm-style ANSI
+save/restore aliases are modeled explicitly. Saved origin-relative rows clamp
+to the current margins on restore, following xterm's `CursorRestoreFlags`.
+Takeover captures entry state so deferred original bytes replay from that
+state rather than the model after it has consumed them.
+
+The saved-cursor and origin/margins gates are unignored and pass. Additional
+fixtures exercise subsequent printing/scrolling, saved attributes, narrow/wide
+saved wrap, distinct buffer slots and toast placement outside remote margins.
+An opt-in `@xterm/headless` 5.5 comparison verifies nine restoration traces and
+actual controlling-PTY renderer output against an unpainted baseline.
+
+That comparison does not establish complete model fidelity. The independent
+emulator restores saved wrap/origin differently from the VT/xterm model; hidden
+output that relies on those differences still needs terminal-specific support
+or conservative invalidation. Insert mode, character sets, OSC 8 links, more
+complex inactive-buffer mutations and resize/reflow provenance also remain.
+These complete milestone 2 alongside the compatibility work; the overlay stays
+opt-in. The independent graphical/workstation matrix remains pending.
+
+Next: milestone 3's DECRQSS dispatch and remote-state replies using these
+snapshots, plus query-write backpressure. Retain the remaining painting and
+compatibility items above as explicit gates before the default switch.

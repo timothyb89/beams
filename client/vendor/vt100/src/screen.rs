@@ -84,7 +84,7 @@ pub struct Screen {
     alternate_grid: crate::grid::Grid,
 
     attrs: crate::attrs::Attrs,
-    saved_attrs: crate::attrs::Attrs,
+    saved_attrs: [crate::attrs::Attrs; 2],
 
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
@@ -114,7 +114,7 @@ impl Screen {
             ),
 
             attrs: crate::attrs::Attrs::default(),
-            saved_attrs: crate::attrs::Attrs::default(),
+            saved_attrs: [crate::attrs::Attrs::default(); 2],
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -630,18 +630,22 @@ impl Screen {
     /// origin modes, scroll regions and current/saved attributes.
     #[must_use]
     pub fn drawing_state(&self) -> crate::DrawingState {
-        let mut saved_attributes = String::new();
-        crate::term::ClearAttrs.write_buf(&mut saved_attributes);
-        self.saved_attrs.write_escape_code_diff(
-            &mut saved_attributes,
-            &crate::attrs::Attrs::default(),
-        );
+        let saved_attributes = self.saved_attrs.map(|attrs| {
+            let mut out = String::new();
+            crate::term::ClearAttrs.write_buf(&mut out);
+            attrs.write_escape_code_diff(
+                &mut out,
+                &crate::attrs::Attrs::default(),
+            );
+            out
+        });
         crate::DrawingState {
-            primary: self.grid.drawing_state(),
-            alternate: self.alternate_grid.drawing_state(),
+            primary: self.grid.drawing_state(saved_attributes[0].clone()),
+            alternate: self
+                .alternate_grid
+                .drawing_state(saved_attributes[1].clone()),
             alternate_screen: self.alternate_screen(),
             attributes: self.attributes_formatted(),
-            saved_attributes,
         }
     }
 
@@ -820,12 +824,12 @@ impl Screen {
 
     fn save_cursor(&mut self) {
         self.grid_mut().save_cursor();
-        self.saved_attrs = self.attrs;
+        self.saved_attrs[usize::from(self.alternate_screen())] = self.attrs;
     }
 
     fn restore_cursor(&mut self) {
         self.grid_mut().restore_cursor();
-        self.attrs = self.saved_attrs;
+        self.attrs = self.saved_attrs[usize::from(self.alternate_screen())];
     }
 
     fn set_mode(&mut self, mode: u8) {

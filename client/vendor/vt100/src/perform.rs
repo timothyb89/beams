@@ -132,6 +132,9 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                     params,
                     self.screen.grid().size(),
                 )),
+                // Xterm's ANSI aliases share the DEC save/restore slot.
+                's' if params.iter().all(|p| p == [0]) => self.decsc(),
+                'u' if params.iter().all(|p| p == [0]) => self.decrc(),
                 't' => {
                     let mut params_iter = params.iter();
                     let op =

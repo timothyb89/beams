@@ -14,7 +14,7 @@ pub struct CursorState {
 }
 
 /// Drawing state owned by one screen buffer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BufferState {
     /// Current cursor.
     pub cursor: CursorState,
@@ -22,6 +22,8 @@ pub struct BufferState {
     pub saved_cursor: CursorState,
     /// Inclusive zero-based top and bottom scroll margins.
     pub scroll_region: (u16, u16),
+    /// SGR commands that establish this buffer's DECSC saved attributes.
+    pub saved_attributes: String,
 }
 
 /// The represented drawing state of both buffers and the shared attributes.
@@ -35,6 +37,4 @@ pub struct DrawingState {
     pub alternate_screen: bool,
     /// SGR commands that establish the current attributes from any attributes.
     pub attributes: String,
-    /// SGR commands that establish the DECSC saved attributes.
-    pub saved_attributes: String,
 }

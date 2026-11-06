@@ -247,7 +247,12 @@ updates only changed cells, avoiding the full-screen clear/redraw flicker of
 the first prototype. Closing an overlay restores the model without sending a
 synthetic one-column resize pulse to the remote PTY. It restores the active
 display buffer, cursor, modeled attributes and input modes; unfinished
-remote sequences resume across menu boundaries. While open, complete OSC
+remote sequences resume across menu boundaries. Menus and toasts establish
+absolute positioning with origin mode off and full vertical margins, then
+restore the represented remote state. Menu close also restores per-buffer
+saved cursor/attributes changed while hidden. Toasts preserve the application's
+save slot; takeover resumes deferred bytes from its captured entry state.
+While open, complete OSC
 title/clipboard effects are relayed from parser callbacks (normalized to an
 ST terminator), ordinary cursor/status queries are answered from the remote
 model (including origin-relative cursor reports), and device/window queries
@@ -269,13 +274,13 @@ The client uses a focused, vendored `vt100` 0.18.1 extension in
 `vendor/vt100` for read-only current/saved cursor and attribute snapshots,
 per-buffer origin/margins, streaming DCS callbacks and reset notifications.
 Bursts of complete query/effect sequences are drained at each parsed frame,
-avoiding event-queue pressure. DCS query answers and restoration of the newly
-exposed state still need implementing.
+avoiding event-queue pressure. DCS query answers and support for further
+drawing/input state remain pending.
 
 The [readiness audit](../docs/development/terminal-overlay.md) records the
-expanded coverage and remaining default blockers: saved cursors,
-origin/scroll-margin state, DCS queries, unknown
-initial screens and unsupported drawing/input protocols. The existing
+expanded coverage and remaining default blockers: DCS queries, unknown
+initial/inactive screens, differing saved-state semantics across emulators,
+and unsupported drawing/input protocols. The existing
 takeover path remains the fallback and default.
 
 The controlling-terminal smoke test exercises both paths:

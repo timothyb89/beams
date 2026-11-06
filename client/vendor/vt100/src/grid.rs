@@ -174,7 +174,10 @@ impl Grid {
         self.pos
     }
 
-    pub fn drawing_state(&self) -> crate::BufferState {
+    pub fn drawing_state(
+        &self,
+        saved_attributes: alloc::string::String,
+    ) -> crate::BufferState {
         crate::BufferState {
             cursor: crate::CursorState {
                 row: self.pos.row,
@@ -187,6 +190,7 @@ impl Grid {
                 origin_mode: self.saved_origin_mode,
             },
             scroll_region: (self.scroll_top, self.scroll_bottom),
+            saved_attributes,
         }
     }
 
@@ -208,6 +212,8 @@ impl Grid {
     pub fn restore_cursor(&mut self) {
         self.pos = self.saved_pos;
         self.origin_mode = self.saved_origin_mode;
+        self.row_clamp_top(self.origin_mode);
+        self.row_clamp_bottom(self.origin_mode);
     }
 
     pub fn visible_rows(&self) -> impl Iterator<Item = &crate::row::Row> {

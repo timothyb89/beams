@@ -220,6 +220,14 @@ impl Callbacks for EventCallbacks {
             let mode = params[0].first().copied().unwrap_or(0);
             let enabled = match mode {
                 1 => Some(screen.application_cursor()),
+                6 => {
+                    let state = screen.drawing_state();
+                    Some(if state.alternate_screen {
+                        state.alternate.cursor.origin_mode
+                    } else {
+                        state.primary.cursor.origin_mode
+                    })
+                }
                 25 => Some(!screen.hide_cursor()),
                 2004 => Some(screen.bracketed_paste()),
                 _ => None,
@@ -408,7 +416,7 @@ impl TerminalModel {
         let mut copy = Parser::new(rows, cols, 0);
         *copy.screen_mut() = screen.clone();
         let active = self.drawing_state().alternate_screen;
-        let mut bytes = b"\x18\x1b\\\x1b[?2026h".to_vec();
+        let mut bytes = crate::terminal_paint::BEGIN.to_vec();
         let buffers = if covered_alternate == active {
             vec![active]
         } else {
@@ -424,11 +432,13 @@ impl TerminalModel {
             };
             copy.process(select);
             bytes.extend_from_slice(select);
+            bytes.extend_from_slice(crate::terminal_paint::BEGIN);
             bytes.extend_from_slice(copy.screen().contents_formatted().as_bytes());
+            crate::terminal_paint::restore(copy.screen(), true, &mut bytes);
         }
         bytes.extend_from_slice(b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l");
         bytes.extend_from_slice(screen.input_mode_formatted().as_bytes());
-        bytes.extend_from_slice(b"\x1b[?2026l");
+        bytes.extend_from_slice(crate::terminal_paint::END);
         bytes
     }
 
@@ -768,10 +778,9 @@ mod tests {
         );
     }
 
-    // Executable default-readiness gates. Keep these visibly ignored until
-    // their tracked restoration/protocol gaps are fixed; see the audit doc.
+    // Executable default-readiness gates. Resolved gates run in the ordinary
+    // suite; the remaining DCS gap stays explicitly ignored (see the audit).
     #[test]
-    #[ignore = "default gate: serialize saved cursor/attributes changed while the overlay is open"]
     fn overlay_acceptance_saved_cursor() {
         let mut model = TerminalModel::new(size());
         let mut physical = Parser::new(nonzero(4), nonzero(12), 0);
@@ -787,7 +796,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "default gate: suspend and restore origin mode and per-buffer scroll margins"]
     fn overlay_acceptance_origin_and_margins() {
         let mut model = TerminalModel::new(size());
         let mut physical = Parser::new(nonzero(4), nonzero(12), 0);
@@ -800,6 +808,136 @@ mod tests {
         model.process(b"\r\nnext");
         physical.process(b"\r\nnext");
         assert_eq!(visible(physical.screen()), visible(model.screen()));
+    }
+
+    #[test]
+    fn menu_restoration_survives_saved_attributes_wrap_and_buffer_switches() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let cases = [
+            (
+                "saved DEC attributes and origin",
+                "\x1b[2;4r\x1b[?6h\x1b[2;3H\x1b[31mold\x1b7",
+                "\x1b[3;7H\x1b[32m\x1b7\x1b[?6l\x1b[H\x1b[34m",
+                "\x1b8X\r\nnext",
+            ),
+            (
+                "ANSI save DEC restore",
+                "\x1b[2;3H\x1b[31m\x1b[s",
+                "\x1b[3;7H\x1b[32m\x1b[s\x1b[H",
+                "\x1b8X",
+            ),
+            (
+                "DEC save ANSI restore",
+                "\x1b[2;3H\x1b7",
+                "\x1b[3;7H\x1b[32m\x1b7\x1b[H",
+                "\x1b[uX",
+            ),
+            (
+                "per-buffer saved attributes",
+                "\x1b[2;3H\x1b[31m\x1b7primary",
+                "\x1b[3;7H\x1b[32m\x1b7\x1b[?1049halternate\x1b[2;5H\x1b[33m\x1b7\x1b[H",
+                "\x1b8A\x1b[?47l\x1b8P",
+            ),
+            (
+                "saved narrow wrap",
+                "",
+                "\x1b[31mabcdefghijkl\x1b7\x1b[H\x1b[32m",
+                "\x1b8Z",
+            ),
+            (
+                "saved wide wrap",
+                "",
+                "\x1b[31mabcdefghij界\x1b7\x1b[H\x1b[32m",
+                "\x1b8Z",
+            ),
+            (
+                "current wrap at scroll bottom",
+                "\x1b[2;4r\x1b[?6h",
+                "\x1b[3;1H\x1b[31mabcdefghijkl",
+                "Z\r\nnext",
+            ),
+            (
+                "saved origin with new margins",
+                "\x1b[3;4r\x1b[?6h\x1b[2;4H\x1b7",
+                "\x1b[1;2r\x1b[?6l\x1b[H",
+                "\x1b8X",
+            ),
+            (
+                "hidden margins change",
+                "\x1b[2;4r\x1b[?6h\x1b[2;3Hbefore",
+                "\x1b[1;3r\x1b[?6h\x1b[3;1Hafter",
+                "\r\nnext",
+            ),
+        ];
+        let mut traces = Vec::new();
+        for (name, before, hidden, after) in cases {
+            let mut model = TerminalModel::new(size());
+            let mut physical = Parser::new(nonzero(4), nonzero(12), 0);
+            model.process(before.as_bytes());
+            physical.process(before.as_bytes());
+            let covered = model.screen().alternate_screen();
+            let mut paint = crate::terminal_paint::BEGIN.to_vec();
+            paint.extend_from_slice(b"\x1b[2J\x1b[HLOCAL MENU");
+            paint.extend_from_slice(crate::terminal_paint::END);
+            physical.process(&paint);
+            model.process(hidden.as_bytes());
+            let restore = model.restore_bytes(covered);
+            physical.process(&restore);
+            model.process(after.as_bytes());
+            physical.process(after.as_bytes());
+            assert_eq!(
+                visible(physical.screen()),
+                visible(model.screen()),
+                "{name}"
+            );
+            assert_eq!(
+                physical.screen().cursor_position(),
+                model.screen().cursor_position(),
+                "{name}"
+            );
+            assert_eq!(
+                physical.screen().drawing_state(),
+                model.drawing_state(),
+                "{name}"
+            );
+            for row in 0..4 {
+                for col in 0..12 {
+                    let actual = physical.screen().cell(row, col).unwrap();
+                    let expected = model.screen().cell(row, col).unwrap();
+                    if expected.has_contents() {
+                        assert_eq!(actual, expected, "{name}: ({row}, {col})");
+                    }
+                }
+            }
+            traces.push(serde_json::json!({
+                "name": name, "rows": 4, "cols": 12,
+                "before": before.as_bytes(), "hidden": hidden.as_bytes(), "after": after.as_bytes(),
+                "paint": paint, "restore": restore,
+            }));
+        }
+        if let Some(module) = std::env::var_os("BEAMS_TEST_XTERM_MODULE") {
+            let mut reference = Command::new("node")
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/terminal-paint-reference.cjs"
+                ))
+                .arg(module)
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("starting independent xterm.js reference");
+            reference
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&serde_json::to_vec(&traces).unwrap())
+                .unwrap();
+            assert!(
+                reference.wait().unwrap().success(),
+                "independent reference disagreed"
+            );
+        }
     }
 
     #[test]
@@ -825,7 +963,7 @@ mod tests {
         assert_eq!(before.primary.saved_cursor.col, 2);
         assert!(before.primary.saved_cursor.origin_mode);
         assert_eq!(before.primary.scroll_region, (1, 3));
-        assert_eq!(before.saved_attributes, "\x1b[m\x1b[31m");
+        assert_eq!(before.primary.saved_attributes, "\x1b[m\x1b[31m");
         model.process(b"\x1b[?47h\x1b[1;3r\x1b[3;7H\x1b[32m\x1b7\x1b[H");
         let hidden = model.drawing_state();
         assert!(hidden.alternate_screen);
@@ -833,18 +971,20 @@ mod tests {
         assert_eq!(hidden.alternate.saved_cursor.row, 2);
         assert_eq!(hidden.alternate.saved_cursor.col, 6);
         assert_eq!(hidden.alternate.scroll_region, (0, 2));
-        assert_eq!(hidden.saved_attributes, "\x1b[m\x1b[32m");
+        assert_eq!(hidden.alternate.saved_attributes, "\x1b[m\x1b[32m");
     }
 
     #[test]
     fn origin_relative_cursor_reports_use_the_remote_scroll_region() {
         let mut model = TerminalModel::new(size());
-        model.process(b"\x1b[2;4r\x1b[?6h\x1b[2;3H\x1b[6n\x1b[?6n");
+        model.process(b"\x1b[2;4r\x1b[?6h\x1b[2;3H\x1b[6n\x1b[?6n\x1b[?6$p\x1b[?6l\x1b[?6$p");
         assert_eq!(
             model.take_events(),
             vec![
                 TerminalEvent::Reply(b"\x1b[2;3R".to_vec()),
                 TerminalEvent::Reply(b"\x1b[?2;3;1R".to_vec()),
+                TerminalEvent::Reply(b"\x1b[?6;1$y".to_vec()),
+                TerminalEvent::Reply(b"\x1b[?6;2$y".to_vec()),
             ],
         );
     }

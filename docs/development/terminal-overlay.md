@@ -1,15 +1,16 @@
 # Terminal overlay readiness audit
 
 Audit date: 2026-11-06. **Keep `--terminal-overlay` opt-in.** The recommended
-tests exposed interactive bugs, now covered by regressions, and three
-reproducible default-readiness failures. Passing the ordinary test suite is
+tests exposed interactive bugs, now covered by regressions, and three original
+release gates. Two gates are resolved. Passing the ordinary test suite is
 not sufficient to enable this path by default.
 
 The proposed [resolution plan](../designs/TERMINAL_OVERLAY_DESIGN.md) sequences
 bounded parsing and state snapshots, reversible painting, query dispatch,
 compatibility/lifecycle behavior, independent validation and the final default
-switch. The first model/backend foundation is now implemented; the three
-restoration/query acceptance gates and later milestones remain pending.
+switch. The model/backend foundation and represented cursor/margin painting
+are implemented. The saved-cursor and origin/margins gates pass; DCS queries
+and later compatibility/lifecycle milestones remain pending.
 
 ## Recommended test coverage
 
@@ -25,30 +26,36 @@ restoration/query acceptance gates and later milestones remain pending.
 | Sustained output/lifecycle | A bounded 32-chunk output channel and a 16-chunk drain budget give input, resize, signals and daemon events turns during output bursts. The PTY harness checks a 4 MiB burst, child exit status, SIGTERM, terminal termios restoration, and cleanup sequences for mouse/paste/alternate-screen modes. |
 | Chunk boundaries | The remote prefix is tracked across reads. Opening a menu cancels an unfinished sequence only in the physical terminal; closing replays the latest unfinished prefix before passthrough resumes. Fixtures cover CSI, OSC and split UTF-8. |
 
-The emulator fixtures use `vt100` as the physical-terminal reference. They
-exercise composition and restoration, but cannot establish fidelity for
+The ordinary emulator fixtures use `vt100` as the physical-terminal reference.
+They exercise composition and restoration, but cannot establish fidelity for
 features that `vt100` itself does not implement. The PTY harness exercises
 the compiled client and real controlling-terminal behavior without a live
-Beam, workstation daemon, SSH agent or package installation.
+Beam, workstation daemon, SSH agent or package installation. An optional pinned
+xterm.js reference also replays restoration fixtures and actual menu output
+against an unpainted baseline.
 
 ## Reproducible blockers
 
-Three ignored acceptance tests in `client/src/terminal_model.rs` are executable
-release gates. They deliberately assert the required behavior and currently
-fail; their ignore reasons link each failure to this remaining work:
+Three acceptance tests in `client/src/terminal_model.rs` are executable release
+gates. The first two now pass unignored; the remaining DCS gate is still ignored
+and failing:
 
 1. **Saved cursor/attributes:** `overlay_acceptance_saved_cursor`. An
    application can issue DECSC (`ESC 7`) while hidden, then DECRC (`ESC 8`)
    after the menu closes. The physical saved slot is stale because restoration
    only serializes the current cursor. The next character appears at a
    different location from the model. This affects later output, not just the
-   overlay's appearance.
+   overlay's appearance. **Resolved:** menu close restores per-buffer saved
+   cursors and attributes; DEC and parameterless xterm-style ANSI aliases have
+   follow-up printing and color fixtures.
 2. **Origin and scroll margins:** `overlay_acceptance_origin_and_margins`.
    A remote application can leave a scroll region and origin mode enabled.
    Local absolute-position painting then addresses the wrong rows, and
    restoring formatted model content does not suspend/restore those modes.
-   Origin-relative CPR is now covered, but painting/restoration still needs
-   to suspend and restore this state.
+   **Resolved:** the shared drawing transaction suspends and restores this
+   state for menus and toasts, including toast removal outside the scroll
+   region. CPR and the origin-mode report use remote state while local drawing
+   uses absolute positioning.
 3. **DCS queries:** `overlay_acceptance_dcs_query`. The model drops DECRQSS
    (`DCS $ q ... ST`) requests. A remote application that probes terminal
    settings while hidden can wait indefinitely or time out. A focused backend
@@ -57,9 +64,10 @@ fail; their ignore reasons link each failure to this remaining work:
    the dialog has temporarily changed physical state; forwarding alone is
    insufficient.
 
-Run the gates separately so their failures are visible:
+Run the passing gates and the remaining failing gate separately:
 
 ```sh
+cargo test --manifest-path client/Cargo.toml overlay_acceptance
 cargo test --manifest-path client/Cargo.toml overlay_acceptance -- --ignored
 ```
 
@@ -86,6 +94,12 @@ fallback before changing the default:
 - Real terminal resize/reflow and emoji/grapheme widths can differ from the
   reference model. The current harness verifies PTY size propagation, not
   agreement with every emulator's reflow behavior.
+- Saved-cursor semantics also vary. The xterm.js 5.5 reference drops pending
+  wrap on restore and does not save origin mode, unlike the VT/xterm model.
+  The optional replay checks transaction transparency on that emulator; it
+  does not prove complete shadow-model agreement for hidden output using those
+  features. Support the target terminal behavior or invalidate painting when
+  that uncertainty matters.
 - Cleanup covers ordinary terminal input modes. Kitty keyboard stacks,
   modifyOtherKeys, character-set and other application state still need
   independent lifecycle checks and restoration policy.
@@ -100,6 +114,24 @@ BEAMS_TEST_OVERLAY=1 ./client/tests/managed-session-smoke.sh
 python3 client/tests/terminal-overlay-smoke.py
 ```
 
+Optional independent replay (Node and the separately installed module required):
+
+```sh
+npm install --prefix /tmp/beams-terminal-reference --ignore-scripts --no-audit --no-fund @xterm/headless@5.5.0
+export BEAMS_TEST_XTERM_MODULE=/tmp/beams-terminal-reference/node_modules/@xterm/headless
+cargo test --manifest-path client/Cargo.toml menu_restoration_survives -- --nocapture
+python3 client/tests/terminal-overlay-smoke.py
+```
+
+`terminal-paint-reference.cjs` compares nine model-restoration traces and the
+PTY harness's actual rendered menu output with the same remote output without
+painting. It checks final cells/colors, cursor and origin mode after saved
+cursor restore, printing and scrolling. It does not add a Node dependency to
+the ordinary Rust suite. The cursor semantics above follow xterm's
+`cursor.c::CursorRestoreFlags`; the ANSI aliases follow `charproc.c::CASE_ANSI_SC`
+and `CASE_ANSI_RC`. The independent implementation is pinned because those
+semantics are part of the test evidence.
+
 The Python harness uses only the standard library and isolated fixture
 directories; it kills fixture children and removes files on completion.
 The existing smoke test also checks daemon-connected forms and path completion
@@ -109,7 +141,7 @@ Recorded results in this Linux Beam environment: 188 client unit tests and
 3 integration tests passed; the takeover smoke, overlay smoke and new overlay
 protocol/PTY harness passed. The three acceptance gates were also run
 explicitly and all failed with the cursor, row-offset and dropped-query
-differences described above. They remain ignored in the ordinary suite.
+differences described above. They were ignored at that stage.
 No independent graphical terminal or workstation font/reflow pass was
 available here. Repository-wide formatting checks also report pre-existing
 formatting differences; formatting changes were restricted to edited code.
@@ -121,6 +153,14 @@ stderr; its isolated and full-suite reruns passed, and TODO tracks the flake.
 The three gates were rerun explicitly and still fail. The backend can expose
 their needed state, but restoring it and answering DCS queries remain the next
 work.
+
+After shared cursor/margin painting: 206 client unit tests and 3 integration
+tests pass, with one ignored DCS release gate. Both managed-session display
+modes and the expanded protocol/PTY harness pass. Independent xterm.js replay
+passes the nine restoration traces and actual origin/margin menu renderer
+trace. Toast and takeover fixtures also preserve current/saved drawing state
+through subsequent output. Insert mode, character sets, hyperlinks, complex
+inactive-buffer updates and the semantics/provenance gaps above remain.
 
 For the final workstation pass, use the actual supported outer terminals with
 Zellij, a plain shell, `less`, and an editor. Open/close the menu during a

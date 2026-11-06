@@ -17,9 +17,9 @@
 //!   repainted once output settles (or periodically during a long burst).
 //! - **Going away.** The cells under a toast are repainted from the model.
 //!
-//! Known gaps: a remote that enabled origin mode or insert mode, or switched
+//! Known gaps: a remote that enabled insert mode, or switched
 //! to the DEC line-drawing character set, would see the toast drawn
-//! incorrectly; the model doesn't expose those modes.
+//! incorrectly; those states are not yet represented.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -33,6 +33,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::ui::theme;
 use crate::terminal_model::TerminalModel;
+use crate::terminal_paint;
 
 /// Output must have been quiet this long before painting, so a toast isn't
 /// drawn into the middle of a screen the remote is busy redrawing...
@@ -182,12 +183,12 @@ impl ToastPainter {
             return Vec::new();
         }
         let rect = restoration_area(rect, cols.get());
-        let mut out = Vec::new();
+        let mut out = terminal_paint::BEGIN.to_vec();
         let mut buf = Buffer::empty(rect);
         model.render_into(&mut buf, rect);
         encode_area(&buf, rect, &mut out);
-        out.extend_from_slice(model.screen().cursor_state_formatted().as_bytes());
-        out.extend_from_slice(model.screen().attributes_formatted().as_bytes());
+        terminal_paint::restore(model.screen(), false, &mut out);
+        out.extend_from_slice(terminal_paint::END);
         out
     }
 
@@ -228,8 +229,7 @@ impl ToastPainter {
             return Vec::new();
         }
 
-        let mut out = Vec::new();
-        out.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
+        let mut out = terminal_paint::BEGIN.to_vec();
         if let Some((old, _)) = &self.shown {
             if target.as_ref().is_none_or(|(rect, _)| rect != old) {
                 // Put back what the old toast covered.
@@ -248,9 +248,8 @@ impl ToastPainter {
             }
             None => self.shown = None,
         }
-        out.extend_from_slice(model.screen().cursor_state_formatted().as_bytes());
-        out.extend_from_slice(model.screen().attributes_formatted().as_bytes());
-        out.extend_from_slice(b"\x1b[?2026l");
+        terminal_paint::restore(model.screen(), false, &mut out);
+        out.extend_from_slice(terminal_paint::END);
         self.dirty = false;
         self.last_paint = Some(now);
         out
@@ -480,6 +479,34 @@ mod tests {
         );
         assert!(screen.contents().contains("Ctrl-] to review"));
         assert!(screen.contents().contains("╭"));
+    }
+
+    #[test]
+    fn painting_outside_remote_margins_preserves_origin_and_the_saved_slot() {
+        let mut model = model(10, 60);
+        let remote = b"\x1b[2;4r\x1b[?6h\x1b[2;3H\x1b[31m\x1b7\x1b[1;1H\x1b[32m";
+        model.process(remote);
+        let mut painter = ToastPainter::default();
+        let paint = painter.sync_now(Some(&toast("outside the scroll region")), &model);
+        let mut physical = screen_after(10, 60, &[remote, &paint]);
+        assert!(physical
+            .screen()
+            .rows(0, 60)
+            .nth(7)
+            .unwrap()
+            .contains("outside the scroll region"));
+        assert_eq!(physical.screen().drawing_state(), model.drawing_state());
+        let clear = painter.clear(&model);
+        physical.process(&clear);
+        let after = b"\x1b8X\r\nnext\r\nscroll";
+        model.process(after);
+        physical.process(after);
+        assert_eq!(
+            visible(physical.screen()).trim_end(),
+            visible(model.screen()).trim_end(),
+        );
+        assert_eq!(physical.screen().drawing_state(), model.drawing_state());
+        assert_eq!(physical.screen().fgcolor(), vt100::Color::Idx(1));
     }
 
     #[test]

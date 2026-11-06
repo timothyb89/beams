@@ -542,7 +542,7 @@ fn drive(
                 }
                 InputAction::OpenPalette => {
                     painter.forget();
-                    terminal_state.open_palette(terminal_model.screen().alternate_screen())?;
+                    terminal_state.open_palette(terminal_model.screen())?;
                     palette_terminal = Some(new_palette_terminal()?);
                     // The prefix while a request's toast is up goes straight
                     // to that request.
@@ -2786,6 +2786,16 @@ fn close_palette(
                 .context("flushing unfinished remote sequence")?;
         } else {
             let mut stdout = io::stdout().lock();
+            let mut restore = Vec::new();
+            if let Some(snapshot) = &terminal_state.menu_snapshot {
+                // Deferred bytes start from the entry state, not the model
+                // after consuming them. Local drawing never used its save slot.
+                crate::terminal_paint::restore(snapshot, false, &mut restore);
+            }
+            restore.extend_from_slice(crate::terminal_paint::END);
+            stdout
+                .write_all(&restore)
+                .context("restoring takeover drawing state")?;
             stdout
                 .write_all(&terminal_state.menu_prefix)
                 .context("restoring interrupted remote sequence")?;
@@ -2807,6 +2817,7 @@ fn close_palette(
             force_remote_redraw(master, size)?;
         }
         terminal_state.menu_prefix.clear();
+        terminal_state.menu_snapshot = None;
     }
     *mode = InputMode::Passthrough;
     Ok(())
@@ -2906,6 +2917,7 @@ struct TerminalState {
     /// paint between sequences and menu close can resume an unfinished one.
     output: toast::OutputTracker,
     menu_prefix: Vec<u8>,
+    menu_snapshot: Option<vt100::Screen>,
     covered_alternate: bool,
 }
 
@@ -2917,22 +2929,25 @@ impl TerminalState {
             palette_open: false,
             output: toast::OutputTracker::default(),
             menu_prefix: Vec::new(),
+            menu_snapshot: None,
             covered_alternate: false,
         })
     }
 
-    fn open_palette(&mut self, alternate: bool) -> io::Result<()> {
+    fn open_palette(&mut self, screen: &vt100::Screen) -> io::Result<()> {
         // Do not enter the terminal's alternate screen here. The remote zellij
         // application normally already owns it, and alternate-screen state is
         // not safely nestable. The overlay restores its model; takeover
         // relies on the SIGWINCH redraw in `close_palette`.
         let mut stdout = io::stdout();
         self.menu_prefix = self.output.pending().to_vec();
-        self.covered_alternate = alternate;
+        self.covered_alternate = screen.alternate_screen();
+        self.menu_snapshot = Some(screen.clone());
         // A menu can open between chunks of a CSI, OSC/DCS or UTF-8
         // character. Cancel only the physical parser; the model and tracker
         // retain the remote prefix, which close replays before passthrough.
-        stdout.write_all(b"\x18\x1b\\\x1b[?2026l\x1b[?2004h")?;
+        stdout.write_all(crate::terminal_paint::BEGIN)?;
+        stdout.write_all(b"\x1b[?2004h")?;
         execute!(stdout, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
         self.palette_open = true;
         Ok(())
@@ -2990,6 +3005,9 @@ fn draw_palette(
     terminal_model: &TerminalModel,
     overlay_enabled: bool,
 ) -> anyhow::Result<()> {
+    io::stdout()
+        .write_all(crate::terminal_paint::BEGIN)
+        .context("establishing menu drawing state")?;
     terminal
         .draw(|frame| {
             ui::draw(
@@ -3001,6 +3019,10 @@ fn draw_palette(
             )
         })
         .context("drawing local menu")?;
+    io::stdout()
+        .write_all(crate::terminal_paint::END)
+        .context("ending menu drawing transaction")?;
+    io::stdout().flush().context("flushing menu transaction")?;
     Ok(())
 }
 

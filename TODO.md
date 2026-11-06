@@ -739,8 +739,9 @@ bootstrap `Task`s.
   handling, partial-sequence boundaries, active-screen/mouse restoration,
   inverse default colors, bisected wide toast glyphs, output starvation and
   ordinary mode cleanup on termination. Private CPR and common input-mode
-  reports also use remote state. Keep opt-in: three executable ignored
-  acceptance gates still fail (saved cursor, origin/margins, DCS queries).
+  reports also use remote state. Saved-cursor and origin/margins acceptance
+  gates now pass in the ordinary suite; the DCS query gate remains ignored
+  and failing. Keep opt-in.
   Also resolve unknown initial/inactive screen state,
   unsupported drawing/input protocols, and independent
   workstation font/reflow/lifecycle validation before changing the default.
@@ -763,9 +764,18 @@ bootstrap `Task`s.
   - [ ] Complete snapshot/eligibility coverage for further drawing/input state
     and content provenance. The foundation's loss flag handles byte-budget
     exhaustion, not unknown initial cells or every unsupported protocol.
-  - [ ] Reversible painting shared by menus and toasts: saved/current cursors,
-    origin/margins, drawing state and observed active/inactive buffers.
-    Unignore saved-cursor and origin/margins acceptance gates.
+  - [x] Shared painting for represented saved/current cursors, SGR attributes,
+    origin mode and vertical margins. Menus and toasts draw under full margins
+    with origin off; close restores per-buffer saved slots, including hidden
+    updates. Toasts never borrow a save slot. DEC and xterm-style ANSI aliases
+    are covered; saved-cursor and origin/margins gates are unignored.
+    Takeover replays deferred bytes from its captured entry state.
+  - [ ] Extend painting to insert mode, DEC character sets, OSC 8 hyperlinks
+    and every touched inactive buffer, with content provenance and resize
+    invalidation. A limited xterm.js 5.5 replay validates nine restoration
+    traces and the actual menu renderer, but saved-wrap/origin semantics differ
+    from the model. Establish the supported terminal behavior or defer painting
+    on those variants before changing the default.
   - [ ] Ordered remote/physical query dispatch, starting with DECRQSS and
     origin-relative CPR. Unignore the DCS acceptance gate; test exactly-once
     replies and bounded query pressure. Origin-relative CPR is implemented;

@@ -17,6 +17,7 @@ import select
 import shlex
 import signal
 import struct
+import subprocess
 import sys
 import tempfile
 import termios
@@ -230,6 +231,35 @@ def run_checks(root, binary):
         session.wait(lambda: session.remote_input().endswith(b"REMOTE INPUT"), "input after menu close")
         assert "24 99\n" not in (root / "sizes").read_text(), "overlay injected a resize pulse"
         assert session.output.count(b"\x1b]52;c;SGVsbG8=\x1b\\") == 1, "clipboard effect duplicated"
+
+        # Exercise the live menu under origin mode and restricted margins.
+        # Saved attributes change while hidden, then SC/RC and scrolling
+        # must work after close. Optionally replay the actual renderer bytes
+        # against the same remote trace in an independent xterm.js emulator.
+        offset = len(session.output)
+        before = (b"\x1bc\x1b[?1049h\x1b[2;23r\x1b[?6h\x1b[2;3H"
+                  b"\x1b[31mORIGIN BEFORE\x1b7\x1b[?25l")
+        session.emit(before)
+        session.wait(lambda: b"ORIGIN BEFORE" in session.output[offset:], "origin fixture startup")
+        session.open()
+        hidden = b"\x1b[4;9H\x1b[32m\x1b7\x1b[1;1HORIGIN HIDDEN\x1b[6n\x1b[?6$p"
+        query_baseline = session.remote_input()
+        session.emit(hidden)
+        session.wait(lambda: session.remote_input() == query_baseline + b"\x1b[1;14R\x1b[?6;1$y",
+                     "origin-relative query while menu owns the physical cursor")
+        session.send(b"qORIGIN INPUT")
+        session.wait(lambda: session.remote_input().endswith(b"ORIGIN INPUT"), "origin menu close")
+        after = b"\x1b8Z\r\nAFTER ORIGIN"
+        session.emit(after)
+        session.wait(lambda: b"AFTER ORIGIN" in session.output[offset:], "scrolling after origin menu")
+        if module := os.environ.get("BEAMS_TEST_XTERM_MODULE"):
+            trace = dict(name="live origin menu", rows=24, cols=100,
+                         before=list(before), hidden=list(hidden), after=list(after),
+                         physical=list(session.output[offset:]))
+            subprocess.run(["node", str(Path(__file__).with_name("terminal-paint-reference.cjs")), module],
+                           input=json.dumps([trace]), text=True, check=True)
+        session.emit(b"\x1bc\x1b[?1049hORIGIN CHECK FINISHED")
+        session.wait(lambda: b"ORIGIN CHECK FINISHED" in session.output, "origin fixture cleanup")
 
         # Exceed the model's string budget while hidden. Recovery must close
         # the menu and resume the exact original bytes, including the prefix
