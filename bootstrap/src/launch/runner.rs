@@ -6,23 +6,132 @@ use beams_protocol::{launch::*, ManifestParam};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// A phase's verified staging: (canonical staging dir, artifact) pairs.
+pub type Verified = Arc<Vec<(PathBuf, PackedArtifact)>>;
+
+/// How a launch's external conditions (`interface-ready`,
+/// `artifact-ready:<phase>`) are released: checked once by the foreground
+/// CLI (`ForegroundConditions`), waited for by the daemon
+/// (`launch::daemon`).
+pub trait Conditions: Send + Sync {
+    /// Runs before any effect of `phase`; may refuse the run.
+    fn prepare(&self, declaration: &Declaration, phase: Phase) -> anyhow::Result<()>;
+    /// Returns once `condition` is released, or fails if it can't be.
+    fn wait(&self, condition: &str, progress: &dyn Fn(&str)) -> anyhow::Result<()>;
+    /// The verified artifacts of `phase`, once released.
+    fn verified(&self, phase: Phase) -> Option<Verified>;
+}
+
+/// The foreground `run-phase` policy: staging that is present is verified
+/// up front (before effects); a missing bundle fails its condition, and
+/// `interface-ready` releases only with explicit `--headless`.
+pub struct ForegroundConditions {
+    staging: PathBuf,
+    headless: bool,
+    verified: Mutex<BTreeMap<Phase, Verified>>,
+}
+impl ForegroundConditions {
+    pub fn new(staging: PathBuf, headless: bool) -> Self {
+        Self { staging, headless, verified: Mutex::default() }
+    }
+}
+impl Conditions for ForegroundConditions {
+    fn prepare(&self, declaration: &Declaration, phase: Phase) -> anyhow::Result<()> {
+        if phase == Phase::Post && !self.headless {
+            bail!("post requires --headless; Zellij/TUI signals are not wired yet");
+        }
+        let mut verified = self.verified.lock().unwrap();
+        for candidate in [Phase::Pre, Phase::Post] {
+            if candidate > phase {
+                continue;
+            }
+            if let Some(artifacts) = verify_phase(declaration, &self.staging, candidate)? {
+                verified.insert(candidate, Arc::new(artifacts));
+            }
+        }
+        Ok(())
+    }
+    fn wait(&self, condition: &str, progress: &dyn Fn(&str)) -> anyhow::Result<()> {
+        if condition == "interface-ready" {
+            if !self.headless {
+                bail!("interface-ready has not been signaled");
+            }
+            progress("Explicit headless gate released");
+            return Ok(());
+        }
+        let phase = condition_phase(condition)?;
+        if !self.verified.lock().unwrap().contains_key(&phase) {
+            bail!("missing verified {} staging; unpack then retry", phase.name());
+        }
+        Ok(())
+    }
+    fn verified(&self, phase: Phase) -> Option<Verified> {
+        self.verified.lock().unwrap().get(&phase).cloned()
+    }
+}
+
+/// The phase an `artifact-ready:<phase>` condition is about.
+pub fn condition_phase(condition: &str) -> anyhow::Result<Phase> {
+    match condition {
+        "artifact-ready:pre" => Ok(Phase::Pre),
+        "artifact-ready:post" => Ok(Phase::Post),
+        other => bail!("unknown external condition {other:?}"),
+    }
+}
+
+/// Verifies `<staging>/<phase>` against `declaration`: its receipt binds
+/// this launch and digest, its content matches, and it holds exactly the
+/// declared artifacts of that phase. `None` when nothing is staged yet.
+pub fn verify_phase(
+    declaration: &Declaration,
+    staging: &Path,
+    phase: Phase,
+) -> anyhow::Result<Option<Vec<(PathBuf, PackedArtifact)>>> {
+    let path = staging.join(phase.name());
+    if fs::symlink_metadata(&path).is_err() {
+        return Ok(None);
+    }
+    let descriptor: BundleDescriptor = beams_artifacts::read_json(&path.join("receipt.json"))?;
+    if descriptor.launch_id != declaration.launch_id
+        || descriptor.plan_digest != declaration.plan_digest
+        || descriptor.phase != phase
+    {
+        bail!("staging belongs to another launch");
+    }
+    let manifest = beams_artifacts::verify_staging(&path, &descriptor)?;
+    let expected: BTreeMap<_, _> = declaration
+        .plan
+        .artifacts
+        .iter()
+        .filter(|a| a.phase == phase)
+        .map(|a| (a.id.as_str(), a.directory))
+        .collect();
+    let actual: BTreeMap<_, _> = manifest
+        .artifacts
+        .iter()
+        .map(|a| (a.id.as_str(), a.directory))
+        .collect();
+    if expected != actual {
+        bail!("staging must contain exactly the declared {phase:?} artifacts");
+    }
+    let path = path.canonicalize()?;
+    Ok(Some(manifest.artifacts.into_iter().map(|a| (path.clone(), a)).collect()))
+}
 
 pub struct Options {
     pub home: PathBuf,
-    pub staging: PathBuf,
     pub state: PathBuf,
     pub phase: Phase,
-    pub headless: bool,
     pub retry_interrupted: bool,
 }
 struct Context {
     declaration: Declaration,
     options: Options,
-    artifacts: BTreeMap<String, (PathBuf, PackedArtifact)>,
-    ready: BTreeSet<Phase>,
+    conditions: Arc<dyn Conditions>,
 }
 #[derive(Serialize, Deserialize)]
 struct PhaseReceipt {
@@ -36,18 +145,19 @@ struct ScriptRecord {
     status: String,
 }
 
+/// Validates `declaration` and runs its `options.phase` nodes through the
+/// executor with `resources` (the daemon's shared ones, or a fresh set for
+/// the foreground CLI). External conditions are released by `conditions`.
 pub fn run(
     declaration: Declaration,
     options: Options,
+    resources: &executor::Resources,
+    conditions: Arc<dyn Conditions>,
     on_event: &(dyn Fn(executor::Event) + Sync),
 ) -> anyhow::Result<bool> {
-    beams_artifacts::validate_declaration(&declaration)?;
-    validate_plan(&declaration.plan)?;
+    validate(&declaration)?;
     if !options.home.is_absolute() {
         bail!("Beam HOME must be absolute");
-    }
-    if options.phase == Phase::Post && !options.headless {
-        bail!("post requires --headless; Zellij/TUI signals are not wired yet");
     }
     let state = options.state.join(&declaration.launch_id);
     fs::create_dir_all(&state)?;
@@ -63,51 +173,12 @@ pub fn run(
             bail!("pre receipt belongs to another launch");
         }
     }
-    let mut artifacts = BTreeMap::new();
-    let mut ready = BTreeSet::new();
-    for phase in [Phase::Pre, Phase::Post] {
-        if phase == Phase::Post && options.phase == Phase::Pre {
-            continue;
-        }
-        let path = options.staging.join(phase.name());
-        if fs::symlink_metadata(&path).is_err() {
-            continue;
-        }
-        let descriptor: BundleDescriptor = beams_artifacts::read_json(&path.join("receipt.json"))?;
-        if descriptor.launch_id != declaration.launch_id
-            || descriptor.plan_digest != declaration.plan_digest
-            || descriptor.phase != phase
-        {
-            bail!("staging belongs to another launch");
-        }
-        let manifest = beams_artifacts::verify_staging(&path, &descriptor)?;
-        let expected: BTreeMap<_, _> = declaration
-            .plan
-            .artifacts
-            .iter()
-            .filter(|a| a.phase == phase)
-            .map(|a| (a.id.as_str(), a.directory))
-            .collect();
-        let actual: BTreeMap<_, _> = manifest
-            .artifacts
-            .iter()
-            .map(|a| (a.id.as_str(), a.directory))
-            .collect();
-        if expected != actual {
-            bail!("staging must contain exactly the declared {phase:?} artifacts");
-        }
-        let path = path.canonicalize()?;
-        for artifact in manifest.artifacts {
-            artifacts.insert(artifact.id.clone(), (path.clone(), artifact));
-        }
-        ready.insert(phase);
-    }
+    conditions.prepare(&declaration, options.phase)?;
     let selected = options.phase;
     let context = Arc::new(Context {
         declaration,
         options,
-        artifacts,
-        ready,
+        conditions,
     });
     let mut tasks: Vec<Box<dyn Task>> = Vec::new();
     for node in context
@@ -152,7 +223,7 @@ pub fn run(
     }
     let ok = executor::run_tagged(
         tasks,
-        &executor::Resources::default(),
+        resources,
         Some(&context.declaration.launch_id),
         on_event,
     )?;
@@ -167,6 +238,13 @@ pub fn run(
         )?;
     }
     Ok(ok)
+}
+
+/// The checks `run` makes before any effect: declaration identity and the
+/// plan's structure (including native template instantiation).
+pub fn validate(declaration: &Declaration) -> anyhow::Result<()> {
+    beams_artifacts::validate_declaration(declaration)?;
+    validate_plan(&declaration.plan)
 }
 
 fn validate_plan(plan: &LaunchPlan) -> anyhow::Result<()> {
@@ -354,9 +432,18 @@ impl Context {
         }
         Ok(path)
     }
-    fn artifact(&self, id: &str) -> anyhow::Result<&(PathBuf, PackedArtifact)> {
-        self.artifacts
-            .get(id)
+    fn artifact(&self, id: &str) -> anyhow::Result<(PathBuf, PackedArtifact)> {
+        let phase = self
+            .declaration
+            .plan
+            .artifacts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.phase)
+            .with_context(|| format!("artifact {id} is not declared"))?;
+        self.conditions
+            .verified(phase)
+            .and_then(|verified| verified.iter().find(|(_, a)| a.id == id).cloned())
             .with_context(|| format!("artifact {id} has not been verified"))
     }
     fn environment(&self) -> BTreeMap<String, String> {
@@ -442,24 +529,7 @@ impl Task for LaunchTask {
     fn run_with_progress(&self, progress: &dyn Fn(&str)) -> anyhow::Result<Option<String>> {
         match &self.node.action {
             Action::Condition => {
-                if self.node.id == "interface-ready" {
-                    if !self.context.options.headless {
-                        bail!("interface-ready has not been signaled");
-                    }
-                    progress("Explicit headless gate released");
-                } else {
-                    let phase = if self.node.id == "artifact-ready:pre" {
-                        Phase::Pre
-                    } else {
-                        Phase::Post
-                    };
-                    if !self.context.ready.contains(&phase) {
-                        bail!(
-                            "missing verified {} staging; unpack then retry",
-                            phase.name()
-                        );
-                    }
-                }
+                self.context.conditions.wait(&self.node.id, progress)?;
                 Ok(None)
             }
             Action::Runtime => {
@@ -487,6 +557,7 @@ impl Task for LaunchTask {
                 overwrite,
             } => {
                 let (staging, artifact) = self.context.artifact(artifact)?;
+                let (staging, artifact) = (&staging, &artifact);
                 let target = self.context.path(target)?;
                 if target == self.context.options.home || target.parent().is_none() {
                     bail!("file target must not replace a root");
@@ -527,6 +598,7 @@ impl LaunchTask {
             unreachable!()
         };
         let (staging, artifact) = self.context.artifact(artifact)?;
+        let (staging, artifact) = (&staging, &artifact);
         let root = staging.join(&artifact.root);
         let script = if artifact.directory {
             root.join(entrypoint)

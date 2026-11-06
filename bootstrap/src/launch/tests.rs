@@ -77,12 +77,12 @@ impl Fixture {
             launch.clone(),
             runner::Options {
                 home: self.home.clone(),
-                staging: staging.to_owned(),
                 state: self.state.clone(),
                 phase,
-                headless,
                 retry_interrupted: retry,
             },
+            &crate::executor::Resources::default(),
+            std::sync::Arc::new(runner::ForegroundConditions::new(staging.to_owned(), headless)),
             &|event| {
                 let (id, status) = match event {
                     Event::Start { task_id } => (task_id, "start"),

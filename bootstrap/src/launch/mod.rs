@@ -67,15 +67,18 @@ pub fn run(command: Command) -> anyhow::Result<()> {
             let id = declaration.launch_id.clone();
             let options = runner::Options {
                 home,
-                staging,
                 state,
                 phase,
-                headless,
                 retry_interrupted,
             };
-            let ok = runner::run(declaration, options, &|event| {
-                println!("{}", crate::daemon::task_event_line(event, Some(&id)))
-            })?;
+            let conditions = std::sync::Arc::new(runner::ForegroundConditions::new(staging, headless));
+            let ok = runner::run(
+                declaration,
+                options,
+                &crate::executor::Resources::default(),
+                conditions,
+                &|event| println!("{}", crate::daemon::task_event_line(event, Some(&id))),
+            )?;
             if !ok {
                 anyhow::bail!("launch phase failed; inspect failed/blocked task events");
             }
