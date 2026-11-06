@@ -740,6 +740,30 @@ bootstrap `Task`s.
   Also resolve unknown initial/inactive screen state,
   unsupported drawing/input protocols, parser string bounds, and independent
   workstation font/reflow/lifecycle validation before changing the default.
+  Follow the [resolution plan](docs/designs/TERMINAL_OVERLAY_DESIGN.md) in
+  separately reviewable milestones:
+
+  - [ ] Bounded shared stream controller and complete remote-state snapshots;
+    first spike the model/backend extension needed for saved state and DCS.
+    Bound parser strings and event bytes before allocation; preserve opaque
+    passthrough on overflow and never infer sequence completion from silence.
+  - [ ] Reversible painting shared by menus and toasts: saved/current cursors,
+    origin/margins, drawing state and observed active/inactive buffers.
+    Unignore saved-cursor and origin/margins acceptance gates.
+  - [ ] Ordered remote/physical query dispatch, starting with DECRQSS and
+    origin-relative CPR. Unignore the DCS acceptance gate; test exactly-once
+    replies and bounded query pressure.
+  - [ ] Content provenance and unsupported-feature policy; settle compatibility
+    UX before integrating it. Proposed default: defer unsafe painting, retain
+    explicit best-effort takeover. Cover unknown inherited screens, common
+    drawing protocols, resize/reflow invalidation and mid-dialog fallback.
+  - [ ] Session-entry/exit state ownership and advanced keyboard/mode cleanup,
+    including non-default outer-terminal state and partial-string termination.
+  - [ ] Independent emulator comparison and recorded workstation matrix with
+    Zellij, plain shell, pager/editor, fonts/reflow and lifecycle checks.
+  - [ ] Separate default switch after all gates pass, retaining an explicit
+    takeover option and strict `--escape-key none` behavior.
+
 - [x] Local menu overhaul: one renderer (`client/src/session/ui.rs`) for both
   takeover and overlay modes (the overlay previously had a cut-down copy that
   hid most copy/sync form fields and printed services with `{:?}`); a

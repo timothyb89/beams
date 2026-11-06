@@ -5,6 +5,11 @@ tests exposed interactive bugs, now covered by regressions, and three
 reproducible default-readiness failures. Passing the ordinary test suite is
 not sufficient to enable this path by default.
 
+The proposed [resolution plan](../designs/TERMINAL_OVERLAY_DESIGN.md) sequences
+bounded parsing and state snapshots, reversible painting, query dispatch,
+compatibility/lifecycle behavior, independent validation and the final default
+switch. Implementation of those milestones is still pending.
+
 ## Recommended test coverage
 
 | TODO recommendation | Coverage and result |
