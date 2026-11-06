@@ -1,10 +1,10 @@
 # Developing configurable launches
 
-Status: offline compiler implemented, 2026-11-06. `beams config validate`
+Status: offline compiler and verified archive tooling implemented, 2026-11-06. `beams config validate`
 and `beams config explain` resolve and validate profiles without contacting
 Teleport, reading client state, installing packages, or invoking hooks.
 `beams ssh` still uses the existing startup path. Execution, archive
-packing/upload, readiness signals, and profile selection during SSH are
+upload, readiness signals, and profile selection during SSH are
 the next milestones. The full
 [launch design](../designs/LAUNCH_CONFIGURATION_DESIGN.md) records the
 proposal and migration.
@@ -75,8 +75,8 @@ must be supplied by configured packages/files/hooks.
 
 `source`, `script`, and `script_root` are local, relative to the declaring
 file (including inherited definitions). Existing files/directories are
-checked with metadata only. No recursive enumeration, content hashing,
-symlink-tree validation or source snapshot occurs yet; those belong to
+checked with metadata only by validate/explain. Recursive enumeration,
+hashing, symlink-tree validation and source snapshots occur during phase
 packing. `exclude` currently accepts root-relative path prefixes, without
 globs or `..`. A script's entrypoint cannot be excluded. Without a
 `script_root`, only that file is selected, not its sibling helpers.
@@ -125,10 +125,64 @@ belong to the template definition.
 `explain --json` contains a `plan` plus workstation-only `profiles`,
 `origins`, `sources`, and explanatory `notes`. The plan has no authoritative
 local source paths. Its node/artifact IDs and schema describe compiler
-output, not an accepted daemon request: content digests, immutable source
-snapshots, launch identities and negotiated runtime versions are still
+output, not an accepted daemon request. Packing wraps that plan in a
+declaration with a launch UUID and plan digest, and freezes each phase's
+payload separately. Negotiated runtime versions and daemon acceptance are
 pending. Human output shows values/origins, package selections, artifact
 roots, pre promotion, graph dependencies and resource declarations.
+
+## Snapshot, pack and verify
+
+These commands work today without contacting Teleport:
+
+```sh
+client/target/debug/beams config pack \
+  --profile environments/examples/team/environment.toml --output /tmp/team-launch
+bootstrap/target/debug/beam-bootstrap launch unpack \
+  --archive /tmp/team-launch/pre/bundle.tar.gz \
+  --descriptor /tmp/team-launch/pre/descriptor.json --output /tmp/team-stage/pre
+
+# Deferred operation: run only once the interface is ready in the future launcher.
+client/target/debug/beams config pack-post --launch-dir /tmp/team-launch
+bootstrap/target/debug/beam-bootstrap launch unpack \
+  --archive /tmp/team-launch/post/bundle.tar.gz \
+  --descriptor /tmp/team-launch/post/descriptor.json --output /tmp/team-stage/post
+```
+
+Pack publishes a new private directory containing the frozen declaration,
+workstation-only `local-inputs.json`, and the pre archive/descriptor. It
+does not enumerate post roots. Pack-post snapshots those sources at the
+later call; retries reuse its completed spool instead of rereading sources.
+Select `--compression none` for plain tar; gzip defaults to level 1.
+Bundle bytes are deterministic for a fixed declaration/content/mode set.
+
+Only declaration and phase archive/descriptor are remote inputs. Source
+paths in `local-inputs.json` stay local. The profile payload bundle does
+not yet include the bootstrap runtime or Zellij; the unpack binary must
+already be installed. The future SSH transport will transfer one bundle
+per phase, rather than invoking scp for each file.
+
+`bundle.json` binds the archive to a launch ID, plan digest and phase.
+Every artifact has a staging-relative root and a hashed list of entry paths,
+types, sizes, modes and content hashes. Ownership, timestamps, ACLs, xattrs
+and host metadata are not copied. Ordinary mode bits and empty directories
+are preserved in the manifest. Internal symlinks must resolve to selected
+entries within their own artifact; dangling, excluded or external targets
+and special files fail. Directory symlink targets are preserved without
+recursively traversing them during snapshotting.
+
+The receiver hashes a private copy of the entire stream before decoding,
+checks every payload against the manifest, creates links after regular
+entries, seals staged payloads read-only and atomically publishes the
+generation. Receipt checks include the launch/plan/phase binding. Repeat
+receives verify existing contents; different bundles cannot replace them.
+Interrupted/invalid extraction leaves no published generation. Whole
+archive retries are supported; byte-offset resume is not.
+
+Packing/receiving alone never installs files or executes hooks. Only
+successful receive can release `artifact-ready:<phase>`; a subsequent
+file-install task will release `files:<ID>`. Installation and automated
+readiness signaling remain the next runtime milestone.
 
 ## Ownership and execution
 
@@ -308,7 +362,7 @@ tasks:configure [post] Configure project data (script: artifact-4/configure.sh)
 ```
 
 The artifact root for the hooks is promoted into pre, while the data root
-stays post. Exact archive bytes are not produced yet. The key dependencies
+stays post. Packing now produces those phase archives. The key dependencies
 are:
 
 | Node | Dependencies relevant to this example |

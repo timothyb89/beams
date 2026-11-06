@@ -7,3 +7,5 @@
 /protocol/Cargo.lock
 /.claude/worktrees/
 /environments/local/
+/artifacts/target/
+/artifacts/Cargo.lock

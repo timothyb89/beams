@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod task_catalog;
+pub mod launch;
 #[cfg(feature = "agent-crypto")]
 pub mod agent_crypto;
 

@@ -7,6 +7,7 @@ mod events;
 mod executor;
 mod fetch;
 mod graph;
+mod launch;
 mod pathutil;
 mod releaseutil;
 mod sshagent;
@@ -48,6 +49,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Explicit verified-artifact and launch operations (no fixed startup).
+    Launch {
+        #[command(subcommand)]
+        command: launch::Command,
+    },
     /// List available templated tasks and their param schema (see
     /// `tasks::TemplateInfo`).
     ListTasks,
@@ -308,6 +314,10 @@ fn main() {
     }
     let args = Args::parse();
     let exit_code = match args.command {
+        Some(Command::Launch { command }) => match launch::run(command) {
+            Ok(()) => 0,
+            Err(err) => { eprintln!("error: {err:#}"); 1 }
+        },
         Some(Command::ListTasks) => {
             list_tasks();
             0

@@ -202,6 +202,23 @@ custom script templates are not daemon inputs yet. See
 [the launch developer guide](../docs/development/launches.md) for the
 compiler contract and next execution milestones.
 
+### Verified launch archives
+
+`beam-bootstrap launch unpack --archive PATH --descriptor PATH --output DIR`
+verifies a client-packed tar or gzip tar and publishes private staging
+atomically. The descriptor binds bytes/SHA-256 to a launch UUID, plan digest
+and phase; the archive's `bundle.json` describes selected payload entries.
+It never installs over live targets, starts a daemon, or runs startup.
+The receiver must already be present; first-runtime delivery is pending.
+
+Entries must match the declared paths, kinds, sizes, modes and hashes.
+Traversal, external/dangling symlinks, hardlinks and special files are
+rejected. Files/directories in published payloads are read-only. A retry
+against existing staging verifies its receipt and contents rather than
+replacing it. A failed receive leaves no published staging.
+See the [developer guide](../docs/development/launches.md) for pack/unpack
+examples and the distinction between artifact readiness and installation.
+
 ### Daemon
 
 `beam-bootstrap daemon` listens on a UDS socket (`--socket`, defaults to

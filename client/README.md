@@ -31,13 +31,36 @@ Beam, or a source checkout; built-in profiles/assets are embedded.
 `--json` includes workstation source metadata alongside a remote-facing
 `plan`; it is inspection output, not a daemon launch request yet. These
 commands do not install, upload, or execute anything. `beams ssh` still uses
-its existing startup path. Profile selection during SSH, archive packing,
+its existing startup path. Profile selection during SSH, archive upload,
 `config init` and runtime execution are pending.
 
 See the [developer guide](../docs/development/launches.md) for the supported
 schema, ordering rules, custom templates and a checked team example in
 `environments/examples/team/`. Copy the example to `environments/local/`
 (gitignored) to customize it.
+
+## `beams config pack` / `pack-post`
+
+```sh
+beams config pack --profile /path/to/environment.toml --output /tmp/launch
+beams config pack-post --launch-dir /tmp/launch
+```
+
+Pack creates a new private launch directory with `launch.json` (UUID and
+plan digest), workstation-only `local-inputs.json`, and `pre/descriptor.json`
+plus `pre/bundle.tar.gz`. It freezes only pre sources. `pack-post` uses the
+saved declarations to snapshot post sources later; repeating it reuses
+the frozen spool, even if the original sources have changed.
+`--compression none` produces plain `bundle.tar`; gzip uses level 1.
+Existing launch output is refused rather than overwritten.
+
+Tar entries contain `bundle.json` and staging-relative payload paths, with
+content hashes, ordinary modes, directories and validated internal symlinks.
+Traversal, escaping/dangling links and special files fail. The remote
+`beam-bootstrap launch unpack` receiver verifies and publishes staging
+without installing targets. Upload only `launch.json` and the phase
+archive/descriptor, keeping `local-inputs.json` on the workstation.
+These are profile payload bundles; runtime/Zellij delivery is still pending.
 
 ## `beams ssh`
 

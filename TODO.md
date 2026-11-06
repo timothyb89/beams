@@ -46,7 +46,7 @@ a helper directory to preserve on the Beam, with phase-aware packaging.
   and `beams config init/validate/explain`. Bundled core/development
   profiles plus gitignored local configuration; keep new launch opt-in.
   Remaining here: timing/transport baseline, `config init`, workstation
-  profile selection, content snapshots/digests and launch identities.
+  profile selection; snapshot/digest/launch identity tooling is now present.
 - [x] First compiler slice: typed strict schema/plan, inherited source
   provenance, offline `config validate/explain`, embedded core/development
   starters, gitignored local off-ramp, and team override/helper fixtures.
@@ -57,6 +57,14 @@ a helper directory to preserve on the Beam, with phase-aware packaging.
 - [x] Compiler developer documentation: supported schema, command examples,
   annotated team fixture/explain output and checked script/file/package
   ordering in `docs/development/launches.md`; binary READMEs updated.
+- [x] Profile payload snapshot/receive foundation: shared typed launch and
+  bundle declarations, UUID/plan digest, phase-local deterministic tar and
+  gzip-level-1 spools, deferred `config pack-post`, frozen replay, ordinary
+  modes/empty directories/internal symlinks, hashed manifest entries and
+  verified atomic read-only staging via `beam-bootstrap launch unpack`.
+  Tests cover codecs, deferral, source edits, metadata, bad hashes/bindings,
+  truncation, modified staging, unsupported files and malformed entries.
+  Runtime/Zellij assets and SSH upload/readiness wiring remain pending.
 - [ ] Developer documentation is required alongside implementation:
   evolve `docs/development/launches.md` with the compiler/schema, an
   execution-order graph, explicit scripts-vs-packages/file dependencies,

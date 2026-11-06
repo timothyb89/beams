@@ -824,6 +824,9 @@ The offline compiler milestone is now implemented in `client/src/config/`
 with embedded core/development starters and a team override/helper fixture.
 The fixture verifies shared-root pre promotion, post data gating, package
 batch dependencies and disabling inherited tasks. Validation checks source
-metadata only; source snapshots, tar packing/digests, executable remote plan
-acceptance and launch IDs belong to subsequent milestones. Live startup
-continues to use the existing path.
+metadata only. `config pack/pack-post` now snapshot the selected phase into
+deterministic tar/gzip spools with launch IDs, plan/entry digests and a shared
+bundle manifest. `beam-bootstrap launch unpack` verifies bytes, validates
+extraction and atomically publishes read-only staging. Runtime/Zellij
+delivery, executable daemon acceptance and transport wiring remain pending;
+live startup continues to use the existing path.

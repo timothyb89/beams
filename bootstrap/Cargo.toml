@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+beams-artifacts = { path = "../artifacts" }
 beams-protocol = { path = "../protocol", features = ["agent-crypto"] }
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }

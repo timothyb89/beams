@@ -1,16 +1,33 @@
 //! Offline launch configuration tools. Live `ssh` retains the existing startup
 //! path until the execution/transport milestones are implemented.
 
+mod pack;
 mod plan;
 mod profile;
 #[cfg(test)]
 mod tests;
 
-use clap::Subcommand;
+use beams_protocol::launch::Compression;
+use clap::{Subcommand, ValueEnum};
 use plan::{Action, Compilation};
+use std::path::PathBuf;
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Freeze a declaration and pre archive without contacting a Beam.
+    Pack {
+        #[arg(long, default_value = "builtin:development")]
+        profile: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, value_enum, default_value = "gzip")]
+        compression: Codec,
+    },
+    /// Snapshot post sources of a prepared launch; reuse a completed spool.
+    PackPost {
+        #[arg(long)]
+        launch_dir: PathBuf,
+    },
     /// Validate a launch profile without connecting to or modifying a Beam.
     Validate {
         #[arg(long, default_value = "builtin:development")]
@@ -26,8 +43,37 @@ pub enum Command {
     },
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+pub enum Codec {
+    None,
+    Gzip,
+}
+
 pub fn run(command: Command) -> anyhow::Result<u8> {
     match command {
+        Command::Pack {
+            profile,
+            output,
+            compression,
+        } => {
+            let compression = match compression {
+                Codec::None => Compression::None,
+                Codec::Gzip => Compression::Gzip,
+            };
+            let declaration = pack::prepare(&profile, &output, compression)?;
+            println!(
+                "Prepared {} at {} (pre only; post sources deferred)",
+                declaration.launch_id,
+                output.display()
+            );
+        }
+        Command::PackPost { launch_dir } => {
+            let descriptor = pack::prepare_post(&launch_dir)?;
+            println!(
+                "Post bundle: {} bytes, sha256 {}",
+                descriptor.bytes, descriptor.sha256
+            );
+        }
         Command::Validate { profile } => {
             let compilation = plan::compile(&profile)?;
             println!(

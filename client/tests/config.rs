@@ -75,3 +75,26 @@ fn invalid_explicit_profile_returns_failure_without_fallback_or_side_effects() {
     assert!(result.stdout.is_empty());
     client.assert_offline();
 }
+
+#[test]
+fn packing_is_offline_and_post_is_an_explicit_later_operation() {
+    let client = OfflineClient::new();
+    let packed = client.run(&["config", "pack", "--output", "launch"]);
+    assert!(
+        packed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packed.stderr)
+    );
+    assert!(client.0.join("launch/pre/bundle.tar.gz").is_file());
+    assert!(!client.0.join("launch/post").exists());
+    let post = client.run(&["config", "pack-post", "--launch-dir", "launch"]);
+    assert!(
+        post.status.success(),
+        "{}",
+        String::from_utf8_lossy(&post.stderr)
+    );
+    assert!(client.0.join("launch/post/bundle.tar.gz").is_file());
+    let retry = client.run(&["config", "pack-post", "--launch-dir", "launch"]);
+    assert!(retry.status.success());
+    client.assert_offline();
+}

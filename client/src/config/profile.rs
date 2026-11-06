@@ -5,33 +5,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
+pub use beams_protocol::launch::{FileMode, Overwrite, Phase, Rerun, Shell};
 use beams_protocol::ManifestParam;
 use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "lowercase")]
-pub enum Phase {
-    Pre,
-    #[default]
-    Post,
-}
-
-impl Phase {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Pre => "pre",
-            Self::Post => "post",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Shell {
-    pub program: Option<String>,
-    pub path: Option<Vec<String>>,
-    pub change_login_shell: Option<bool>,
-}
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,23 +25,6 @@ struct PackageEdits {
     add: Vec<String>,
     #[serde(default)]
     remove: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FileMode {
-    #[default]
-    Copy,
-    Link,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Overwrite {
-    #[default]
-    Deny,
-    Backup,
-    Replace,
 }
 
 fn enabled() -> bool {
@@ -89,14 +48,6 @@ pub struct File {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub after: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Rerun {
-    #[default]
-    Manual,
-    OnChange,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -203,7 +154,7 @@ impl Origin {
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", content = "path", rename_all = "lowercase")]
 pub enum Source {
     Local(PathBuf),

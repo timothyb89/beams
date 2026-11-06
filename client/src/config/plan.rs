@@ -8,68 +8,8 @@ use anyhow::{bail, Context};
 use beams_protocol::{task_catalog, ManifestParam};
 use serde::Serialize;
 
-use super::profile::{
-    self, Declared, FileMode, Origin, Overwrite, Phase, Rerun, Resolved, Source, Task,
-};
-
-#[derive(Debug, Serialize)]
-pub struct LaunchPlan {
-    pub schema_version: u32,
-    pub shell: profile::Shell,
-    pub env: BTreeMap<String, String>,
-    pub artifacts: Vec<Artifact>,
-    /// Stable topological order, not mandatory execution waves.
-    pub nodes: Vec<Node>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Artifact {
-    pub id: String,
-    pub phase: Phase,
-    pub directory: bool,
-    pub exclude: Vec<String>,
-    pub used_by: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Node {
-    pub id: String,
-    pub label: String,
-    pub phase: Phase,
-    pub after: Vec<String>,
-    pub resources: Vec<String>,
-    pub action: Action,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
-pub enum Action {
-    Condition,
-    Runtime,
-    Packages {
-        packages: Vec<String>,
-    },
-    File {
-        artifact: String,
-        target: String,
-        mode: FileMode,
-        overwrite: Overwrite,
-    },
-    Script {
-        artifact: String,
-        entrypoint: String,
-        interpreter: Vec<String>,
-        args: Vec<String>,
-        working_dir: Option<String>,
-        env: BTreeMap<String, String>,
-        check: Option<Vec<String>>,
-        rerun: Rerun,
-    },
-    Builtin {
-        template: String,
-        params: BTreeMap<String, ManifestParam>,
-    },
-}
+use super::profile::{self, Declared, Origin, Phase, Resolved, Source, Task};
+pub use beams_protocol::launch::{Action, Artifact, LaunchPlan, Node};
 
 /// Workstation-only explanation/snapshot inputs. Authoritative source paths
 /// never belong to the remote plan.
