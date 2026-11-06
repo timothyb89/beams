@@ -46,6 +46,29 @@ and external readiness conditions, before changing live SSH startup.
   Completed: only `bin` is linked. Isolated filesystem fixtures cover a
   clean checkout, repeat/skip behavior, and preservation of both real and
   symlinked Beam SSH directories, including old repo `.ssh` leftovers.
+- [ ] Pre-seed `~/.ssh/known_hosts` and git config on new Beams. Found
+  2026-11-06: this Beam had no `~/.ssh` (only a dangling pre-`38109e3`
+  link to the repo's), so `git push` failed host key verification. Git
+  also had no `user.name`/`user.email`. Since the repo's `.ssh`
+  (which carried known_hosts) was dropped in `06060b5`/`651fc1c`, nothing
+  seeds them. Likely consequence, not yet checked on a fresh Beam: a
+  startup manifest's `git@github.com:` clones fail ("Host key verification
+  failed", no TTY to ask) before the agent relay is ever asked to sign.
+  - known_hosts: a launch-profile-driven, idempotent line merge (a native
+    task, not a leaf file copy: a Beam-provided `known_hosts` would
+    conflict with the file adapter's deny/backup/replace). Sources: pinned
+    GitHub keys in the core profile (from `https://api.github.com/meta`,
+    with fingerprints recorded), and/or entries for named hosts taken from
+    the workstation's own `known_hosts`, which is already the relay's
+    trust root. Never `ssh-keyscan`/`accept-new` alone. Hashed workstation
+    entries can only be matched for named hosts, not listed (see the SSH
+    agent design's gotchas).
+  - git config: `user.name`/`user.email` defaulted from the workstation's
+    `git config` at compile time, overridable per profile, applied with
+    `git config --global` (idempotent; leaves other Beam settings alone).
+    Optional: SSH commit signing through the relay (`gpg.format = ssh`,
+    `user.signingkey = "key::<allowed key>"`); each signature then prompts
+    like any SSHSIG request.
 - [ ] Phase 1: record cold/warm launch milestones and transport counts;
   implement profile resolution/inheritance, validation, versioned plan,
   and `beams config init/validate/explain`. Bundled core/development
