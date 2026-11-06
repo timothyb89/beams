@@ -26,6 +26,9 @@ criteria. The graph/readiness-condition direction is endorsed; syntax
 remains provisional until implementation. The archive recommendation is
 standard tar with independent none/gzip compression, initially testing
 gzip level 1; complete verification/extraction releases artifact readiness.
+Script paths select local files relative to their declaring profile;
+entrypoints are automatically uploaded. An optional `script_root` selects
+a helper directory to preserve on the Beam, with phase-aware packaging.
 
 - [ ] Immediate prerequisite from review of `06060b5`/`651fc1c`: remove
   the stale forced repo `.ssh` link in `bootstrap/src/steps/link.rs`.
@@ -40,7 +43,9 @@ gzip level 1; complete verification/extraction releases artifact readiness.
   and `beams config init/validate/explain`. Bundled core/development
   profiles plus gitignored local configuration; keep new launch opt-in.
 - [ ] Phase 2: generic package transactions, file-install and script
-  tasks/custom templates; parameterize specialized installs. Split
+  tasks/custom templates, including automatic entrypoint upload, explicit
+  helper roots, remote working directories and shared-root promotion;
+  parameterize specialized installs. Split
   Rust's apt prerequisite from rustup. Add task snapshots/bounded logs
   and durable, deduplicated launch acceptance.
 - [ ] Phase 3: ship a small runtime/pre archive independently of a Git

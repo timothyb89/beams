@@ -257,11 +257,11 @@ client needs TOML, inheritance, or authoritative workstation source paths.
 The Beam receives artifact IDs and destination paths.
 
 Use a launch ID stable across transport retries, plus a digest covering
-effective config, scripts and pre file contents. Post data declarations
-are covered by that digest, while their contents are snapshotted and
-bound to separate artifact digests after readiness. This deliberately
-selects post data at transfer time rather than delaying the interface to
-freeze every large directory. Neither snapshot may change midway through
+effective config, pre script bundles and pre file contents. Post script
+and data declarations are covered by that digest, while their contents
+are snapshotted and bound to separate artifact digests after readiness.
+This deliberately selects post content at transfer time rather than
+delaying the interface to freeze every large directory. Neither snapshot may change midway through
 its transfer. The generation record retains both plan and artifact digests.
 The client daemon must receive this exact plan from `beams ssh`; it must
 not independently reread a global startup config for that launch.
@@ -428,8 +428,9 @@ compression saves more network time than it costs.
 Build the post archive after the interface opens; enumerating or hashing
 a multi-gigabyte post directory must not delay the pre bundle. Freeze
 its source snapshot then and attach a verified artifact digest to the
-already accepted file declaration. Post scripts needed to describe or
-register tasks can travel in the small initial bundle.
+already accepted declaration. Post script/template metadata travels in
+the initial plan; its script payload belongs in the post bundle unless
+a shared script root is already required by pre work.
 
 Stream one archive per phase over an SSH exec channel, or transfer one
 archive with scp then unpack it. Keep both behind a transport method so
@@ -480,6 +481,70 @@ and a retry policy. Run it as the Beam user with an explicit working
 directory and prepared environment. Stream stdout/stderr into bounded
 task logs and show a useful latest progress line. No background shell
 spawn that escapes task status.
+
+Script sources are workstation paths. A relative `script` path is rooted
+at the profile that declared it, including when that profile is inherited;
+an absolute path or local `~` still selects a workstation file. It does
+not refer to a file already on the Beam. Automatically package each
+entrypoint in the archive required by its task's phase, and make the task
+depend on that archive's `artifact-ready` condition.
+
+Support an optional local `script_root` to package a whole directory of
+helper scripts and supporting files. Both `script` and `script_root`
+resolve against the declaring profile; the entrypoint must be inside the
+root. Without `script_root`, upload only the entrypoint. Do not parse
+shell/Python/etc. source to guess dependencies or implicitly upload its
+siblings or the entire configuration checkout.
+
+For example, next to `environment.toml`:
+
+```text
+hooks/
+  setup.sh
+  lib/common.sh
+  tools/configure.sh
+```
+
+```toml
+[tasks.setup]
+phase = "post"
+script = "./hooks/setup.sh"
+script_root = "./hooks"
+interpreter = ["bash"]
+```
+
+Upload that directory as one script artifact and preserve its internal
+layout. `setup.sh` executes from the extracted immutable copy on the Beam;
+it can source `lib/common.sh` or invoke `tools/configure.sh`. Default the
+working directory to the entrypoint's extracted parent, and supply remote
+`BEAMS_SCRIPT_DIR` and `BEAMS_SCRIPT_ROOT` environment variables so helpers
+remain addressable when a task chooses another working directory:
+
+```sh
+. "$BEAMS_SCRIPT_DIR/lib/common.sh"
+bash "$BEAMS_SCRIPT_DIR/tools/configure.sh"
+```
+
+An explicit `working_dir` selects a Beam directory; relative values resolve
+against the extracted entrypoint directory, and remote `~`/`${beam.home}`
+refer to the Beam user. Interpreter argv, check argv, and the script's own
+commands also execute on the Beam. Invoking an already-installed remote
+script is an ordinary command inside the hook, with dependencies declared
+for any files/tools that must first be installed.
+
+Deduplicate shared script roots by resolved source selection and preserve
+their origin through inheritance. If pre and post tasks share one root,
+ship it in pre and show that promotion in `config explain`. A large
+post-only root stays deferred. Supporting files needed outside a root
+are explicit file artifacts with dependency edges. Apply the same
+exclusion, symlink, staging and validation rules as other uploaded trees;
+include helper contents in artifact digests and `on-change` retry keys.
+The same packaging rules apply to reusable custom script templates.
+
+Helper scripts run within the invoking task, sharing its progress/log
+capture and resource ownership. Work needing its own TUI row, retries,
+dependencies or parallel execution should be a separate named task with
+an explicit graph edge rather than an opaque helper invocation.
 
 Hooks run once for initialization of a launch generation, not on every
 SSH attachment. Separate per-attachment hooks can be added later; attaching
