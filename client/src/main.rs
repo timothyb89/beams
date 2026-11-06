@@ -81,11 +81,6 @@ enum Commands {
         /// menu over the captured remote screen instead of a blank takeover.
         #[arg(long)]
         terminal_overlay: bool,
-        /// Open the local menu as soon as a Beam request arrives (taking
-        /// over the terminal) instead of showing a toast you can review
-        /// with the menu key.
-        #[arg(long)]
-        approval_takeover: bool,
     },
     /// Run the workstation-side service daemon in the foreground. Normal
     /// `beams ssh` invocations start it automatically as needed.
@@ -279,7 +274,6 @@ fn main() -> anyhow::Result<ExitCode> {
             escape_key,
             no_client_daemon,
             terminal_overlay,
-            approval_takeover,
         } => ssh(
             &expand_tilde(&repo),
             &purpose,
@@ -289,7 +283,6 @@ fn main() -> anyhow::Result<ExitCode> {
             no_client_daemon,
             session::DisplayOptions {
                 overlay: terminal_overlay,
-                approval_takeover,
             },
         )?,
         Commands::AgentKeys { allow, deny } => agent::agent_keys_command(allow.as_deref(), deny.as_deref())?,

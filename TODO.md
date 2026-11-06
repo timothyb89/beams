@@ -785,7 +785,8 @@ bootstrap `Task`s.
   bursts, cells restored from the shadow model) for incoming requests and
   transfer progress, instead of an input takeover; `Ctrl-]` opens straight
   into the request and returns to the session after. Verified live over
-  zellij and `less`. `--approval-takeover` keeps the old behavior.
+  zellij and `less`. (`--approval-takeover`, the old open-on-arrival
+  behavior, was removed 2026-11-06: toasts work in both display modes.)
 - [x] Phase 2: `beams daemon` is the single-instance per-user workstation
   daemon, auto-started by `beams ssh` (with `--no-client-daemon` as a
   troubleshooting escape hatch). `client/src/clientd.rs` provides a mode-0600
@@ -911,7 +912,9 @@ lists the code map, tests, and gotchas. 2026-11-06 closed the small
 follow-ups: run tags on every git task, routing a manifest's key use to
 its submitting client, the `ssh-agent-audit.jsonl` audit log, task names
 in grant-use toasts, pruning retired Beams from `startup_submitted`, a
-home-screen key-setup hint, and typing-proof input guards. Pre-switch
+home-screen key-setup hint, a typing-proof review input guard, and
+removing `--approval-takeover` (it let stray typing open and approve an
+SSH key review; requests only ever toast now). Pre-switch
 Beams (staged key, old CLAUDE.md merge) have all aged out (24h TTL).
 
 Open:
@@ -928,12 +931,6 @@ Open:
 - [ ] Host certificates (`*-cert-v01@openssh.com` host keys,
   `@cert-authority` lines) aren't supported: such hosts show "verified key,
   unknown host" and can't match a grant.
-- [ ] `--approval-takeover` with SSH key requests (checked 2026-11-06):
-  the guards now restart on every key, so continuous typing can't
-  approve. Still possible: pause, `Enter` (opens the review), pause, `y`
-  or `Up`+`Enter`. If that's too loose, don't take over for SSH key
-  requests (show the toast instead) or drop the review's `y` hotkey when
-  takeover opened it. Not exercised live yet.
 - [ ] The hidden `beam-bootstrap agent-proxy-spike` subcommand
   (`bootstrap/src/agentspike.rs`) is kept for
   `bootstrap/tests/ssh-agent-proxy-spike.sh` and `ssh-agent-hostkey-algos.sh`.

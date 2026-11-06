@@ -277,11 +277,12 @@ For now: interactive `beams ssh` frontends only.
     line.
   - Input is ignored for about 500ms after the review screen opens, and the
     default focus is `Deny`, so keys typed into the shell can't approve by
-    accident. Each ignored key restarts the 500ms (as does the 300ms
-    `--approval-takeover` guard), so the guard ends only after a pause in
-    typing. A fixed window wasn't enough with takeover: typing that kept
-    going could open the review (`Enter`) and then approve (`y`, or `Up`
-    then `Enter`) once both windows had passed.
+    accident. Each ignored key restarts the 500ms, so the guard ends only
+    after a pause in typing. The review only opens from the menu key
+    (straight from the toast, or the home screen); the old
+    `--approval-takeover` mode, which opened the menu on arrival, was
+    removed because typing that kept going could open the review (`Enter`)
+    and then approve it (`y`, or `Up` then `Enter`).
   - "Allow for this process" is limited to the reported root process
     (pid + start time) and the verified host/user. Because it relies on the
     advisory pid, it is offered only for verified-host requests and expires

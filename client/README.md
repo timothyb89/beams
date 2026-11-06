@@ -147,9 +147,7 @@ straight to the session. An ignored toast disappears after 20 seconds; the
 request stays pending in the menu until the local daemon expires it (60
 seconds). Running copies and fetches show a progress bar in the same corner,
 then a brief done or failed toast. Requests belonging to other managed Beams
-don't produce toasts. `--approval-takeover` restores the older behavior of
-opening the menu as soon as a request arrives (with a short guard so keys
-already typed for the remote can't act on it). `--escape-key none` retains
+don't produce toasts; the menu never opens by itself. `--escape-key none` retains
 strict passthrough and disables toasts along with the manual menu.
 
 Toasts are drawn over live remote output in both display modes, using the

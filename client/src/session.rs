@@ -51,15 +51,13 @@ use keys::{Decoded, Key};
 
 const LOOP_TICK: Duration = Duration::from_millis(25);
 const INPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
-/// Keys are ignored this long after `--approval-takeover` opens the menu,
-/// restarted by each ignored key (like `AGENT_INPUT_GUARD`).
-const APPROVAL_TAKEOVER_GUARD: Duration = Duration::from_millis(300);
 const MAX_INPUT_SEQUENCE_LEN: usize = 64;
 const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
 const REDRAW_RESIZE_DELAY: Duration = Duration::from_millis(40);
 /// How long keys are ignored after an SSH key request's menu opens. Each
-/// ignored key restarts it, so it ends only after a pause in typing: a
-/// steady stream of keys meant for the shell can't outlast it.
+/// ignored key restarts it, so it ends only after a pause in typing: keys
+/// still being typed for the shell when the menu key opened the review
+/// can't act on it.
 const AGENT_INPUT_GUARD: Duration = Duration::from_millis(500);
 const DAEMON_RECONNECT_RETRY: Duration = Duration::from_secs(1);
 const DEFERRED_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -70,9 +68,6 @@ type PaletteTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 pub struct DisplayOptions {
     /// Paint the menu over the captured remote screen (`--terminal-overlay`).
     pub overlay: bool,
-    /// Open the menu for incoming requests instead of showing a toast
-    /// (`--approval-takeover`).
-    pub approval_takeover: bool,
 }
 
 /// The local prefix byte intercepted by the managed SSH session.
@@ -279,7 +274,6 @@ pub fn run(
         &mut local_daemon,
         &mut terminal_model,
         overlay_enabled,
-        display.approval_takeover,
     );
 
     // Restore the local terminal before waiting/printing any error. The child
@@ -317,7 +311,6 @@ fn drive(
     local_daemon: &mut LocalDaemon,
     terminal_model: &mut TerminalModel,
     overlay_enabled: bool,
-    approval_takeover: bool,
 ) -> anyhow::Result<u8> {
     let mut input_router = InputRouter::default();
     let mut toast_policy = notices::ToastPolicy::default();
@@ -347,7 +340,6 @@ fn drive(
             .and_then(|sock| crate::agent::local_identities(&sock).ok())
             .is_some_and(|keys| !keys.is_empty());
     daemon_view.key_setup_hint = daemon_view.offer_key_setup;
-    let mut approval_takeover_guard = None;
     let mut palette_terminal = None;
     macro_rules! redraw_palette {
         () => {
@@ -366,19 +358,12 @@ fn drive(
 
     loop {
         let daemon_changed = daemon_view.drain(local_daemon);
-        let approval_needs_attention =
-            escape_key != EscapeKey::Disabled && daemon_view.take_approval_attention();
-        if approval_takeover
-            && approval_needs_attention
-            && input_router.mode == InputMode::Passthrough
-        {
-            painter.forget();
-            terminal_state.open_palette()?;
-            input_router.mode = InputMode::Palette;
-            approval_takeover_guard = Some(Instant::now() + APPROVAL_TAKEOVER_GUARD);
-            palette_terminal = Some(new_palette_terminal()?);
-            redraw_palette!();
-        } else if daemon_changed && input_router.mode == InputMode::Palette {
+        // New requests get a toast; this only selects the newest on the
+        // home screen, for when the menu is opened.
+        if escape_key != EscapeKey::Disabled {
+            daemon_view.take_approval_attention();
+        }
+        if daemon_changed && input_router.mode == InputMode::Palette {
             redraw_palette!();
         }
 
@@ -479,14 +464,6 @@ fn drive(
             // to the remote session instead.
             let mut on_key = |key: Key| -> bool {
                 keys_handled = true;
-                // A request can arrive while the user is typing into the
-                // remote shell. Don't let already-buffered keys, or keys
-                // still being typed, approve or manipulate the newly opened
-                // menu: each one restarts the guard. The prefix key still
-                // closes it immediately (handled by the router).
-                if takeover_guard_drops(&mut approval_takeover_guard, Instant::now()) {
-                    return false;
-                }
                 daemon_view.handle_key(key, local_daemon)
             };
             actions.extend(input_router.flush_expired(escape_key, now, &mut on_key));
@@ -526,10 +503,6 @@ fn drive(
             )?;
             return Ok(0);
         }
-        if approval_takeover_guard.is_some_and(|until| Instant::now() >= until) {
-            approval_takeover_guard = None;
-        }
-
         for action in actions {
             match action {
                 InputAction::Remote(bytes) => {
@@ -537,7 +510,6 @@ fn drive(
                     writer.flush().context("flushing local PTY")?;
                 }
                 InputAction::OpenPalette => {
-                    approval_takeover_guard = None;
                     painter.forget();
                     terminal_state.open_palette()?;
                     palette_terminal = Some(new_palette_terminal()?);
@@ -558,7 +530,6 @@ fn drive(
                     redraw_palette!();
                 }
                 InputAction::ClosePalette => {
-                    approval_takeover_guard = None;
                     painter.forget();
                     close_palette(
                         master,
@@ -576,18 +547,6 @@ fn drive(
         if keys_handled && input_router.mode == InputMode::Palette && palette_terminal.is_some() {
             redraw_palette!();
         }
-    }
-}
-
-/// Whether the `--approval-takeover` guard drops a key arriving at `now`;
-/// a dropped key restarts it.
-fn takeover_guard_drops(guard: &mut Option<Instant>, now: Instant) -> bool {
-    match guard {
-        Some(until) if now < *until => {
-            *until = now + APPROVAL_TAKEOVER_GUARD;
-            true
-        }
-        _ => false,
     }
 }
 
@@ -1569,9 +1528,8 @@ impl DaemonView {
     }
 
     /// Marks newly pending approvals for this session's Beam as presented,
-    /// selecting the oldest new one. The caller uses the true return value
-    /// to preempt normal SSH output once; closing the menu without deciding
-    /// must not make it repeatedly reopen.
+    /// selecting the oldest new one so the menu opens on it. True when
+    /// there was one (once per request).
     fn take_approval_attention(&mut self) -> bool {
         let new_requests = self
             .pending_requests()
@@ -2988,7 +2946,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_takeover_is_once_per_request_and_scoped_to_this_beam() {
+    fn approval_attention_is_once_per_request_and_scoped_to_this_beam() {
         let local_daemon = LocalDaemon {
             frontend: None,
             unavailable: None,
@@ -4042,19 +4000,6 @@ mod tests {
     }
 
     #[test]
-    fn approval_takeover_guard_lasts_until_typing_pauses() {
-        let start = Instant::now();
-        let mut guard = Some(start + APPROVAL_TAKEOVER_GUARD);
-        // Keys 200ms apart keep it closed well past the first 300ms.
-        for step in 1..=5 {
-            assert!(takeover_guard_drops(&mut guard, start + Duration::from_millis(200 * step)));
-        }
-        let last = start + Duration::from_millis(1000);
-        assert!(!takeover_guard_drops(&mut guard, last + APPROVAL_TAKEOVER_GUARD), "a pause ends it");
-        assert!(!takeover_guard_drops(&mut None, start));
-    }
-
-    #[test]
     fn ssh_key_review_keeps_the_beam_claims_indented_and_shows_a_countdown() {
         let mut daemon = managed_daemon();
         let mut view = DaemonView::new(&daemon);
@@ -4074,7 +4019,7 @@ mod tests {
     }
 
     #[test]
-    fn every_pending_request_is_listed_oldest_first_and_takeover_selects_the_new_one() {
+    fn every_pending_request_is_listed_oldest_first_and_the_new_one_is_selected() {
         let mut daemon = managed_daemon();
         let mut view = DaemonView::new(&daemon);
         // Ids sort the other way round from arrival.
