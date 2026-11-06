@@ -743,10 +743,11 @@ bootstrap `Task`s.
   Follow the [resolution plan](docs/designs/TERMINAL_OVERLAY_DESIGN.md) in
   separately reviewable milestones:
 
-  - [ ] First small slice: always log accepted requests as a lasting stderr
-    acknowledgement, including when a toast appears, using the existing
-    return path. Add a prefix hint only when reliably known; keep generic
-    guidance for unknown metadata. Do not block on a new notice protocol.
+  - [x] First small slice: `beams fetch` logs accepted requests as a lasting
+    stderr acknowledgement, including when a toast appears, using the existing
+    return path. Generic guidance directs the user to the workstation's Beams
+    menu; session-specific prefix/availability hints remain optional future
+    work rather than assuming the default key or adding a notice protocol.
   - [ ] Bounded shared stream controller and complete remote-state snapshots;
     first spike the model/backend extension needed for saved state and DCS.
     Bound parser strings and event bytes before allocation; preserve opaque

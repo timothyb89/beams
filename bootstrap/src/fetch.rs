@@ -252,8 +252,8 @@ pub fn run_fetch(args: FetchArgs) -> i32 {
         return 1;
     }
 
-    // On a terminal, transient lines (waiting, progress) overwrite each
-    // other in place; otherwise only lasting ones are printed.
+    // On a terminal, transient progress lines overwrite each other in
+    // place. Acceptance stays visible even when a local toast also appears.
     let interactive = std::io::stderr().is_terminal();
     let show = |line: &str, transient: bool| {
         let mut stderr = std::io::stderr().lock();
@@ -295,8 +295,8 @@ pub fn run_fetch(args: FetchArgs) -> i32 {
             }
             Some("service_request_accepted") => {
                 show(
-                    &format!("beams: fetch {summary}: waiting for approval on your workstation (Ctrl-C to withdraw)"),
-                    interactive,
+                    &format!("beams: fetch {summary}: request sent; review and approve in your workstation's Beams menu (Ctrl-C to withdraw)"),
+                    false,
                 );
             }
             Some("service_request_status") => {

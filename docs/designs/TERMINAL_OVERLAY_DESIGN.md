@@ -360,8 +360,9 @@ Only after milestones 1–6 pass:
 
 ## First implementation slice
 
-Land the small durable request-acknowledgement change independently, using the
-existing return path. Do not start with a new availability-notice protocol.
+The small durable `beams fetch` request acknowledgement is implemented using
+the existing return path, with generic workstation-menu guidance. Progress
+does not overwrite it. Session-specific hints remain optional future work.
 
 The first substantive overlay change is milestone 1's model/backend spike and
 bounded framing contract. Use `overlay_acceptance_saved_cursor` and

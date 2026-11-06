@@ -371,7 +371,9 @@ inside it, if that's a directory); several items, or a directory, land inside
 the destination directory, which is created if needed. Each item is copied
 with `tsh scp` (`-r` for directories) into a hidden sibling temp name and
 renamed into place; existing targets fail the fetch unless `--overwrite` was
-given. The command prints byte progress until the copy finishes and exits
+given. On acceptance, the command prints a lasting stderr acknowledgement
+with a reminder to review and approve in the workstation's Beams menu, even
+when a toast also appears. The command prints byte progress until the copy finishes and exits
 non-zero on rejection, expiry, failure, or cancellation. Ctrl-C withdraws the
 request: the Beam daemon notices the command's connection closing and tells
 the workstation, which drops it if still pending or cancels it if running.
