@@ -114,9 +114,7 @@ fn run_loop(terminal: &mut DefaultTerminal, client: &mut DaemonClient) -> anyhow
             }
         }
 
-        if app.pending_request.is_none() && app.needs_client_state && !app.disconnected {
-            app.request_client_state();
-        }
+        app.queue_deferred();
 
         if app.disconnected && Instant::now() >= next_reconnect_attempt {
             match client.reconnect() {
@@ -126,6 +124,7 @@ fn run_loop(terminal: &mut DefaultTerminal, client: &mut DaemonClient) -> anyhow
         }
 
         terminal.draw(|frame| app.draw(frame))?;
+        app.frame_drawn();
 
         if event::poll(TICK)? {
             match event::read()? {

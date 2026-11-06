@@ -5,8 +5,10 @@ foundation implemented, 2026-11-06. `beams config validate`
 and `beams config explain` resolve and validate profiles without contacting
 Teleport, reading client state, installing packages, or invoking hooks.
 `beams ssh` still uses the existing startup path. The opt-in headless runner
-executes package/file/script graphs; daemon acceptance, archive upload,
-shell/TUI readiness signals and profile selection during SSH are pending. The full
+executes package/file/script graphs, and the daemon accepts launches, waits
+for their conditions and releases the interface from shell/TUI readiness;
+archive upload from the workstation and profile selection during SSH are
+pending. The full
 [launch design](../designs/LAUNCH_CONFIGURATION_DESIGN.md) records the
 proposal and migration.
 
@@ -183,7 +185,8 @@ archive retries are supported; byte-offset resume is not.
 Packing/receiving alone never installs files or executes hooks. Only
 successful receive can release `artifact-ready:<phase>`; a subsequent
 file-install task releases `files:<ID>`. Foreground installation is now
-implemented; automated shell/TUI readiness signaling remains pending.
+implemented, and the daemon path releases `interface-ready` from shell/TUI
+readiness reports (below).
 
 ## Execute a verified graph today
 
@@ -242,7 +245,8 @@ beam-bootstrap launch submit --launch /tmp/team-launch/launch.json --staging /tm
 # elsewhere, as inputs arrive:
 beam-bootstrap launch unpack ... --output /tmp/team-stage/pre
 beam-bootstrap launch signal --launch-id ID --condition artifact-ready:pre
-beam-bootstrap launch signal --launch-id ID --condition interface-ready
+beam-bootstrap launch ready --launch-id ID --component shell   # the initial shell does this
+beam-bootstrap launch ready --launch-id ID --component tui     # the TUI does this
 beam-bootstrap launch unpack ... --output /tmp/team-stage/post
 beam-bootstrap launch signal --launch-id ID --condition artifact-ready:post
 beam-bootstrap launch status [--launch-id ID] [--json]
@@ -264,12 +268,24 @@ worker probes both phases when it starts.
   staging itself, when the worker starts or on `launch signal`. Signalling
   with nothing staged leaves it waiting (the CLI exits 1); staging that
   fails verification fails the condition and blocks its consumers.
-- **`interface-ready`** waits for `launch signal --condition
-  interface-ready` with the default interactive gate. The initial shell and
-  TUI will send it once the launcher is wired; until then the CLI does.
-  `--headless` releases it as soon as pre succeeds. There is no timer.
-  Post nodes that need only pre artifacts proceed once the interface is
-  ready, while post-bundle consumers still wait for their bundle.
+- **`interface-ready`**, with the default interactive gate, waits until
+  both the initial shell and the TUI report `launch ready` (its waiting
+  message names whichever is missing). `launch signal --condition
+  interface-ready` is the manual override; `--headless` releases it as soon
+  as pre succeeds. There is no timer: a missing report is a visible wait.
+  Reports are recorded once (other panes repeating them change nothing),
+  may arrive before the launch is accepted, are kept in the snapshot's
+  `ready`, and survive a retry, since the interface is still up. Post nodes
+  that need only pre artifacts proceed once the interface is ready, while
+  post-bundle consumers still wait for their bundle.
+- **Who reports.** Both read `BEAMS_LAUNCH_ID`; without it neither does
+  anything, so the fixed startup is unaffected. The shell's report comes
+  from `shell/fish/conf.d/beams-launch.fish` at the first interactive
+  prompt (in the background, via `$BEAM_BOOTSTRAP_BIN` or `beam-bootstrap`
+  on `PATH`). The TUI reports after the first frame drawn with its launch's
+  snapshot applied, unless that snapshot already has `tui` or a released
+  interface. Getting `BEAMS_LAUNCH_ID` into the Zellij session is the
+  launcher's job (the next slice); until then, export it yourself.
 - **Failure and retry.** A failed pre blocks every post node and fails the
   launch. `launch retry` reruns a failed or interrupted launch with its
   accepted plan (completed hooks skip as usual; `--retry-interrupted` as for
@@ -284,34 +300,46 @@ worker probes both phases when it starts.
 
 ### Daemon ops, events and snapshots
 
-The CLI is a thin client of four ops on the daemon socket:
+The CLI is a thin client of five ops on the daemon socket:
 
 ```json
 {"request_id": "1", "op": "launch_submit", "launch": "/abs/launch.json", "staging": "/abs/stage", "gate": "interactive"}
 {"request_id": "2", "op": "launch_signal", "launch_id": "...", "condition": "artifact-ready:post"}
 {"request_id": "3", "op": "launch_snapshot", "launch_id": "..."}
 {"request_id": "4", "op": "launch_retry", "launch_id": "...", "retry_interrupted": false}
+{"request_id": "5", "op": "launch_ready", "launch_id": "...", "component": "shell"}
 ```
 
 Replies are `launch_accepted` (`existing`, `seq`, `launch`),
 `launch_signaled` (`released`, `message`), `launch_snapshot` (`seq`,
-`launches`), `launch_retrying` (`seq`, `launch`) or `error`. A launch
+`launches`), `launch_retrying` (`seq`, `launch`), `launch_ready`
+(`accepted`: false when recorded ahead of acceptance) or `error`. A launch
 snapshot has the launch's `status` (`accepted`, `running`, `ok`, `failed`,
-`interrupted`), its gate, and every node with `status` (`pending`,
+`interrupted`), its gate, `ready` (interface components that reported),
+`released` (conditions released, in order), and every node with `status` (`pending`,
 `waiting`, `running`, `ok`, `skip`, `error`, `blocked`, `interrupted`),
 its last message and its last 10 progress lines. Snapshots are persisted
 on lifecycle transitions as `snapshot.json`.
 
-Broadcasts are `launch_status` and `task_status` events. `task_status` has
-the shape the Beam TUI already renders, with `manifest_id` set to the
-launch ID, plus `launch_id`, `node`, and `waiting: true` while a condition
-waits. Every launch event carries a daemon-wide `seq`. Replies that carry
+Broadcasts are `launch_status`, `task_status`, `launch_condition`
+(`condition`, `released`, `message`: each release once, each verification
+failure as it happens), `launch_ready` (`component`, `ready`) and
+`launch_nodes_blocked` (`phase`, `nodes`, `message`, when a failed pre
+blocks post). `task_status` has the shape the Beam TUI already renders,
+with `manifest_id` set to the launch ID, plus `launch_id`, `node`, and
+`waiting: true` while a condition waits. Every launch event carries a daemon-wide `seq`. Replies that carry
 launch state are queued while holding the lock under which events are
 numbered, so they are exact boundaries: a client that connects (every
 connection receives broadcasts), requests a snapshot, applies it, and
 ignores events with `seq` at or below the snapshot's neither misses nor
-duplicates a transition. `bootstrap/tests/launch-daemon-smoke.sh` drives
-all of this with the real binaries in a scratch directory.
+duplicates a transition. The Beam TUI does exactly that: it requests
+`launch_snapshot` when it connects, after reconnecting, and whenever a
+launch is (re)accepted, replaces that launch's rows with the snapshot's
+nodes (so pending post work is listed before it runs, labelled
+`phase · label`), and drops launch events at or below the snapshot's `seq`.
+`bootstrap/tests/launch-daemon-smoke.sh` drives all of this with the real
+binaries in a scratch directory, including the real TUI on a pseudo-terminal
+reporting its readiness.
 
 ### Package transactions and parallel work
 

@@ -17,6 +17,8 @@ fail() { echo "FAIL $*"; fails=$((fails + 1)); }
 check() { local name=$1; shift; if "$@"; then pass "$name"; else fail "$name"; fi; }
 cleanup() {
     for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null; done
+    # The TUI and its `script` (matched by this run's unique socket path).
+    pkill -9 -f "$SOCK" 2>/dev/null
     if [ "${KEEP_TEST_DIR:-0}" = 1 ] || [ "$fails" -gt 0 ]; then echo "kept $S"; else chmod -R u+w "$S"; rm -rf "$S"; fi
 }
 trap cleanup EXIT
@@ -82,7 +84,21 @@ check "post work is still pending" status_has 'pending +post +Configure'
 
 "$C" config pack-post --launch-dir "$S/launch" >/dev/null
 unpack post
-check "interface-ready is released by signal" signal interface-ready
+check "launch ready is a no-op outside a launch" "$B" launch ready --socket "$SOCK" --component shell
+check "the shell reports ready" env BEAMS_LAUNCH_ID="$ID" "$B" launch ready --socket "$SOCK" --component shell
+check "the interface then waits only for the TUI" eventually status_has 'waiting +post +Shell and first TUI frame ready - waiting for the TUI to start'
+if command -v script >/dev/null; then
+    # The real TUI, on a pseudo-terminal, reports once its launch's
+    # snapshot is on screen.
+    BEAMS_LAUNCH_ID="$ID" TERM=xterm script -qc "'$B' tui --socket '$SOCK'" /dev/null \
+        < <(sleep 60) >/dev/null 2>&1 &
+    pids+=($!)
+    disown "$!"
+    check "the TUI reports ready" eventually status_has 'ready: \[shell, tui\]'
+else
+    check "the TUI reports ready" "$B" launch ready --socket "$SOCK" --component tui --launch-id "$ID"
+fi
+check "interface-ready is released by both" eventually status_has 'released: \[.*interface-ready'
 check "the post bundle is released by signal" signal artifact-ready:post
 wait "$follower"
 check "the follower exits 0 when the launch succeeds" test $? -eq 0

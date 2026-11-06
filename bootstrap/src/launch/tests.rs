@@ -1077,4 +1077,95 @@ mod daemon_launches {
         assert_eq!(done.status, LaunchStatus::Ok, "{done:#?}");
         assert_eq!(fs::read_to_string(f.home.join("events")).unwrap(), "pre\n", "the completed hook isn't rerun");
     }
+
+    fn ready(host: &Arc<FakeHost>, id: &str, component: &str) -> Value {
+        call(host, "launch_ready", json!({"launch_id": id, "component": component}))
+    }
+
+    fn node_message(snapshot: &LaunchSnapshot, id: &str) -> String {
+        snapshot.nodes.iter().find(|n| n.id == id).unwrap().message.clone().unwrap_or_default()
+    }
+
+    fn count(host: &Arc<FakeHost>, kind: &str) -> usize {
+        host.received.lock().unwrap().iter().filter(|m| m["type"] == kind && m.get("seq").is_some()).count()
+    }
+
+    #[test]
+    fn interactive_interface_is_released_once_both_the_shell_and_tui_report_ready() {
+        let f = Fixture::new();
+        let launch = pre_post_launch(&f);
+        let id = launch.launch_id.clone();
+        f.stage(&launch, Phase::Pre, &hooks(&f));
+        f.stage(&launch, Phase::Post, &hooks(&f));
+        let host = host(&f);
+        submit(&f, &host, &launch, "interactive");
+        let state = wait_until(&host, &id, "the interface wait", |s| {
+            node_status(s, "interface-ready") == NodeStatus::Waiting
+        });
+        assert!(node_message(&state, "interface-ready").contains("the shell and TUI"), "{state:#?}");
+        assert!(state.released.contains(&"artifact-ready:pre".to_string()), "{:?}", state.released);
+
+        assert_eq!(ready(&host, &id, "shell")["accepted"], true);
+        let state = snapshot(&host, &id);
+        assert_eq!(state.ready, ["shell"]);
+        assert_eq!(node_message(&state, "interface-ready"), "waiting for the TUI to start");
+        assert_eq!(node_status(&state, "tasks:post"), NodeStatus::Pending);
+        // Another pane's shell reporting again changes nothing.
+        let before = count(&host, "launch_ready");
+        ready(&host, &id, "shell");
+        assert_eq!(count(&host, "launch_ready"), before, "a repeat isn't an event");
+
+        let bogus = call(&host, "launch_ready", json!({"launch_id": id, "component": "editor"}));
+        assert_eq!(bogus["type"], "error");
+
+        ready(&host, &id, "tui");
+        let state = wait_until(&host, &id, "completion", finished);
+        assert_eq!(state.status, LaunchStatus::Ok, "{state:#?}");
+        assert_eq!(state.ready, ["shell", "tui"]);
+        assert!(state.released.contains(&"interface-ready".to_string()), "{:?}", state.released);
+        let conditions: Vec<Value> = host
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m["type"] == "launch_condition")
+            .cloned()
+            .collect();
+        let released: Vec<&str> = conditions.iter().map(|m| m["condition"].as_str().unwrap()).collect();
+        assert_eq!(released.iter().filter(|c| **c == "interface-ready").count(), 1, "{conditions:?}");
+        assert!(released.contains(&"artifact-ready:post"), "{conditions:?}");
+    }
+
+    #[test]
+    fn readiness_reported_before_acceptance_counts_and_survives_a_retry() {
+        let f = Fixture::new();
+        f.write("hooks/pre.sh", "printf 'pre\\n' >> \"$HOME/events\"");
+        f.write("hooks/post.sh", "[ -e \"$HOME/fixed\" ] || exit 3; printf 'post\\n' >> \"$HOME/events\"");
+        let launch = declaration(
+            vec![artifact("hooks", Phase::Pre, true)],
+            vec![
+                script("tasks:pre", Phase::Pre, "pre.sh", &["artifact-ready:pre"], Rerun::Manual),
+                script("tasks:post", Phase::Post, "post.sh", &["artifact-ready:pre", "tasks:pre"], Rerun::Manual),
+            ],
+        );
+        let id = launch.launch_id.clone();
+        f.stage(&launch, Phase::Pre, &hooks(&f));
+        f.stage(&launch, Phase::Post, &hooks(&f));
+        let host = host(&f);
+        // The shell came up before the submission landed.
+        assert_eq!(ready(&host, &id, "shell")["accepted"], false);
+        submit(&f, &host, &launch, "interactive");
+        ready(&host, &id, "tui");
+        let failed = wait_until(&host, &id, "the post failure", finished);
+        assert_eq!(failed.status, LaunchStatus::Failed, "{failed:#?}");
+        assert_eq!(failed.ready, ["shell", "tui"]);
+
+        // The interface is still up: a retry doesn't wait for it again.
+        fs::write(f.home.join("fixed"), "").unwrap();
+        let retrying = call(&host, "launch_retry", json!({"launch_id": id}));
+        assert_eq!(retrying["launch"]["ready"], json!(["shell", "tui"]), "{retrying}");
+        let done = wait_until(&host, &id, "the retried run", finished);
+        assert_eq!(done.status, LaunchStatus::Ok, "{done:#?}");
+        assert_eq!(fs::read_to_string(f.home.join("events")).unwrap(), "pre\npost\n");
+    }
 }

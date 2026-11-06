@@ -8,6 +8,7 @@ use crate::graph::Capability;
 const LINKS: &[(&str, &str)] = &[
     ("shell/fish/config.fish", "fish/config.fish"),
     ("shell/fish/conf.d/beams-path.fish", "fish/conf.d/beams-path.fish"),
+    ("shell/fish/conf.d/beams-launch.fish", "fish/conf.d/beams-launch.fish"),
     ("shell/starship.toml", "starship.toml"),
 ];
 

@@ -10,7 +10,12 @@
 //! {"op": "launch_signal", "launch_id": "...", "condition": "interface-ready"}
 //! {"op": "launch_snapshot", "launch_id": "..."}
 //! {"op": "launch_retry", "launch_id": "...", "retry_interrupted": false}
+//! {"op": "launch_ready", "launch_id": "...", "component": "shell"}
 //! ```
+//!
+//! An interactive launch's `interface-ready` is released once both the
+//! initial shell and the TUI have reported `launch_ready` (or by an explicit
+//! `launch_signal`); a headless one releases it when pre succeeds.
 //!
 //! Every launch event carries a daemon-wide `seq`. A reply carrying launch
 //! state (`launch_snapshot`, `launch_accepted`, `launch_retrying`) is
@@ -103,7 +108,22 @@ pub struct LaunchSnapshot {
     pub status: LaunchStatus,
     pub message: Option<String>,
     pub nodes: Vec<NodeState>,
+    /// Interface components that reported `launch_ready` (`shell`, `tui`).
+    #[serde(default)]
+    pub ready: Vec<String>,
+    /// External conditions released so far, in release order.
+    #[serde(default)]
+    pub released: Vec<String>,
 }
+
+/// The interface components an interactive launch waits for.
+pub const READY_COMPONENTS: [&str; 2] = ["shell", "tui"];
+
+const INTERFACE_READY: &str = "interface-ready";
+
+/// Readiness reports for launches not accepted yet (the shell can start
+/// before a slow submission lands); applied at acceptance. Bounded.
+const EARLY_READY_LIMIT: usize = 32;
 
 /// Persisted before any effect, as `<root>/<launch id>/accepted.json`.
 #[derive(Clone, Deserialize, Serialize)]
@@ -125,6 +145,7 @@ struct Entry {
 struct Table {
     seq: u64,
     entries: BTreeMap<String, Entry>,
+    early_ready: BTreeMap<String, Vec<String>>,
 }
 
 /// The daemon's launches. State lives under `root` (shared with the
@@ -193,6 +214,7 @@ pub fn handle<H: Host>(host: &Arc<H>, op: &str, request: &Value, send: &dyn Fn(V
         "launch_signal" => signal(host, request).map(|reply| send(reply)),
         "launch_snapshot" => snapshot(host, request, send),
         "launch_retry" => retry(host, request, send),
+        "launch_ready" => ready(host, request).map(|reply| send(reply)),
         _ => Err(anyhow::anyhow!("unknown launch op {op:?}")),
     };
     if let Err(err) = result {
@@ -247,7 +269,8 @@ fn submit<H: Host>(host: &Arc<H>, request: &Value, send: &dyn Fn(Value)) -> anyh
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         beams_artifacts::set_mode(&dir, 0o700)?;
         beams_artifacts::write_json(&dir.join("accepted.json"), &accepted)?;
-        let snapshot = initial_snapshot(&accepted);
+        let mut snapshot = initial_snapshot(&accepted);
+        snapshot.ready = table.early_ready.remove(&id).unwrap_or_default();
         beams_artifacts::write_json(&dir.join("snapshot.json"), &snapshot)?;
         let conditions = DaemonConditions::new(&accepted);
         table.entries.insert(id.clone(), Entry { accepted, snapshot: snapshot.clone(), conditions, worker: true });
@@ -268,12 +291,12 @@ fn signal<H: Host>(host: &Arc<H>, request: &Value) -> anyhow::Result<Value> {
         let table = host.launches().table.lock().unwrap();
         Arc::clone(&table.entries.get(id).with_context(|| format!("no launch {id}"))?.conditions)
     };
-    let (released, message) = if condition == "interface-ready" {
-        conditions.release_interface();
+    let (released, message) = if condition == INTERFACE_READY {
+        release_interface(&**host, id, &conditions, "released by launch_signal");
         (true, "interface-ready released".to_string())
     } else {
         let phase = runner::condition_phase(condition)?;
-        match conditions.probe(phase) {
+        match probe(&**host, id, &conditions, phase) {
             Ok(true) => (true, format!("verified the {} staging", phase.name())),
             Ok(false) => (false, format!("nothing is staged for {} yet", phase.name())),
             Err(why) => bail!("{} staging failed verification: {why}", phase.name()),
@@ -307,13 +330,19 @@ fn retry<H: Host>(host: &Arc<H>, request: &Value, send: &dyn Fn(Value)) -> anyho
     {
         let launches = host.launches();
         let mut table = launches.table.lock().unwrap();
-        let Table { seq, entries } = &mut *table;
+        let Table { seq, entries, .. } = &mut *table;
         let entry = entries.get_mut(&id).with_context(|| format!("no launch {id}"))?;
         if entry.worker || !matches!(entry.snapshot.status, LaunchStatus::Failed | LaunchStatus::Interrupted) {
             bail!("launch {id} is {:?}; only failed or interrupted launches can be retried", entry.snapshot.status);
         }
-        entry.snapshot = initial_snapshot(&entry.accepted);
+        // The interface outlives the attempt: keep what it reported.
+        let previous = std::mem::replace(&mut entry.snapshot, initial_snapshot(&entry.accepted));
+        entry.snapshot.ready = previous.ready;
         entry.conditions = DaemonConditions::new(&entry.accepted);
+        if previous.released.iter().any(|c| c == INTERFACE_READY) || interface_reported(&entry.snapshot) {
+            entry.snapshot.released.push(INTERFACE_READY.to_string());
+            entry.conditions.release_interface();
+        }
         entry.worker = true;
         *seq += 1;
         let _ = beams_artifacts::write_json(&launches.dir(&id).join("snapshot.json"), &entry.snapshot);
@@ -322,6 +351,114 @@ fn retry<H: Host>(host: &Arc<H>, request: &Value, send: &dyn Fn(Value)) -> anyho
     }
     spawn_worker(host, id, retry_interrupted);
     Ok(())
+}
+
+/// Records that an interface component is up; once both are (interactive
+/// gate), releases `interface-ready`. Repeats are no-ops.
+fn ready<H: Host>(host: &Arc<H>, request: &Value) -> anyhow::Result<Value> {
+    let id = str_field(request, "launch_id")?;
+    let component = str_field(request, "component")?;
+    if !READY_COMPONENTS.contains(&component) {
+        bail!("component must be one of {}", READY_COMPONENTS.join(", "));
+    }
+    let release = {
+        let launches = host.launches();
+        let mut table = launches.table.lock().unwrap();
+        let Table { seq, entries, early_ready } = &mut *table;
+        let Some(entry) = entries.get_mut(id) else {
+            if early_ready.len() >= EARLY_READY_LIMIT && !early_ready.contains_key(id) {
+                bail!("no launch {id}");
+            }
+            let seen = early_ready.entry(id.to_string()).or_default();
+            if !seen.iter().any(|c| c == component) {
+                seen.push(component.to_string());
+            }
+            return Ok(json!({"type": "launch_ready", "launch_id": id, "component": component, "accepted": false}));
+        };
+        let snapshot = &mut entry.snapshot;
+        if !snapshot.ready.iter().any(|c| c == component) {
+            snapshot.ready.push(component.to_string());
+            let waiting = interface_waiting(snapshot);
+            if let Some(node) = snapshot.nodes.iter_mut().find(|n| n.id == INTERFACE_READY && n.status == NodeStatus::Waiting) {
+                node.message = Some(waiting);
+            }
+            *seq += 1;
+            if let Err(err) = beams_artifacts::write_json(&launches.dir(id).join("snapshot.json"), &*snapshot) {
+                eprintln!("daemon: saving launch {id} snapshot: {err:#}");
+            }
+            host.broadcast(
+                &json!({"type": "launch_ready", "launch_id": id, "component": component, "ready": snapshot.ready, "seq": *seq})
+                    .to_string(),
+            );
+        }
+        let release = entry.accepted.gate == Gate::Interactive
+            && interface_reported(&entry.snapshot)
+            && !entry.snapshot.released.iter().any(|c| c == INTERFACE_READY);
+        release.then(|| Arc::clone(&entry.conditions))
+    };
+    if let Some(conditions) = release {
+        release_interface(&**host, id, &conditions, "the shell and TUI are up");
+    }
+    Ok(json!({"type": "launch_ready", "launch_id": id, "component": component, "accepted": true}))
+}
+
+fn interface_reported(snapshot: &LaunchSnapshot) -> bool {
+    READY_COMPONENTS.iter().all(|c| snapshot.ready.iter().any(|r| r == c))
+}
+
+/// What a waiting `interface-ready` node says it is waiting for.
+fn interface_waiting(snapshot: &LaunchSnapshot) -> String {
+    let missing: Vec<&str> = READY_COMPONENTS
+        .iter()
+        .copied()
+        .filter(|c| !snapshot.ready.iter().any(|r| r == c))
+        .map(|c| if c == "tui" { "the TUI" } else { "the shell" })
+        .collect();
+    match missing.as_slice() {
+        [] => "the shell and TUI are up".to_string(),
+        [one] => format!("waiting for {one} to start"),
+        _ => "waiting for the shell and TUI to start (or `beam-bootstrap launch signal --condition interface-ready`)"
+            .to_string(),
+    }
+}
+
+/// Releases `interface-ready` for launch `id` and records it.
+fn release_interface<H: Host>(host: &H, id: &str, conditions: &DaemonConditions, why: &str) {
+    conditions.release_interface();
+    condition_changed(host, id, INTERFACE_READY, true, Some(why.to_string()));
+}
+
+/// Probes `phase`'s staging for launch `id`, recording a release or a
+/// verification failure.
+fn probe<H: Host>(host: &H, id: &str, conditions: &DaemonConditions, phase: Phase) -> Result<bool, String> {
+    let result = conditions.probe(phase);
+    let condition = format!("artifact-ready:{}", phase.name());
+    match &result {
+        Ok(true) => condition_changed(host, id, &condition, true, None),
+        Err(why) => condition_changed(host, id, &condition, false, Some(why.clone())),
+        Ok(false) => {}
+    }
+    result
+}
+
+/// Numbers and broadcasts a condition transition (`launch_condition`). A
+/// release is recorded once; a failure is reported each time it happens.
+fn condition_changed<H: Host>(host: &H, id: &str, condition: &str, released: bool, message: Option<String>) {
+    update(host, id, true, |snapshot| {
+        if released {
+            if snapshot.released.iter().any(|c| c == condition) {
+                return None;
+            }
+            snapshot.released.push(condition.to_string());
+        }
+        Some(json!({
+            "type": "launch_condition",
+            "launch_id": id,
+            "condition": condition,
+            "released": released,
+            "message": message,
+        }))
+    });
 }
 
 fn initial_snapshot(accepted: &Accepted) -> LaunchSnapshot {
@@ -345,6 +482,8 @@ fn initial_snapshot(accepted: &Accepted) -> LaunchSnapshot {
                 log: VecDeque::new(),
             })
             .collect(),
+        ready: Vec::new(),
+        released: Vec::new(),
     }
 }
 
@@ -358,7 +497,7 @@ fn update<H: Host>(
 ) {
     let launches = host.launches();
     let mut table = launches.table.lock().unwrap();
-    let Table { seq, entries } = &mut *table;
+    let Table { seq, entries, .. } = &mut *table;
     let Some(entry) = entries.get_mut(id) else { return };
     let Some(mut event) = change(&mut entry.snapshot) else { return };
     *seq += 1;
@@ -430,9 +569,11 @@ fn record_event<H: Host>(host: &H, id: &str, event: executor::Event) {
 
 fn mark_waiting<H: Host>(host: &H, id: &str, node_id: &str, message: &str) {
     update(host, id, true, |snapshot| {
+        let message =
+            if node_id == INTERFACE_READY { interface_waiting(snapshot) } else { message.to_string() };
         let node = snapshot.nodes.iter_mut().find(|n| n.id == node_id)?;
         node.status = NodeStatus::Waiting;
-        node.message = Some(message.to_string());
+        node.message = Some(message.clone());
         Some(json!({
             "type": "task_status",
             "task_id": format!("launch:{id}:{node_id}"),
@@ -449,13 +590,15 @@ fn mark_waiting<H: Host>(host: &H, id: &str, node_id: &str, message: &str) {
 /// Marks every still-pending node of `phase` blocked (its phase never ran).
 fn block_phase<H: Host>(host: &H, id: &str, phase: Phase, why: &str) {
     update(host, id, true, |snapshot| {
-        let mut any = false;
+        let mut nodes = Vec::new();
         for node in snapshot.nodes.iter_mut().filter(|n| n.phase == phase && n.status == NodeStatus::Pending) {
             node.status = NodeStatus::Blocked;
             node.message = Some(why.to_string());
-            any = true;
+            nodes.push(node.id.clone());
         }
-        any.then(|| json!({"type": "launch_nodes_blocked", "launch_id": id, "phase": phase, "message": why}))
+        (!nodes.is_empty()).then(|| {
+            json!({"type": "launch_nodes_blocked", "launch_id": id, "phase": phase, "nodes": nodes, "message": why})
+        })
     });
 }
 
@@ -470,7 +613,7 @@ fn spawn_worker<H: Host>(host: &Arc<H>, id: String, retry_interrupted: bool) {
         conditions.attach(Arc::clone(&host), id.clone());
         // Staging unpacked before submission releases right away.
         for phase in [Phase::Pre, Phase::Post] {
-            let _ = conditions.probe(phase);
+            let _ = probe(&*host, &id, &conditions, phase);
         }
         set_status(&*host, &id, LaunchStatus::Running, None);
         let outcome = run_phases(&*host, &id, &accepted, &conditions, retry_interrupted);
@@ -498,7 +641,7 @@ fn run_phases<H: Host>(
     let launches = host.launches();
     for phase in [Phase::Pre, Phase::Post] {
         if phase == Phase::Post && accepted.gate == Gate::Headless {
-            conditions.release_interface();
+            release_interface(host, id, conditions, "headless: pre succeeded");
         }
         let options = runner::Options {
             home: launches.home.clone(),
@@ -617,7 +760,7 @@ impl Conditions for DaemonConditions {
             if !announced {
                 announced = true;
                 let message = match phase {
-                    None => "waiting for interface-ready (the shell and TUI, or `beam-bootstrap launch signal`)".to_string(),
+                    None => "waiting for the shell and TUI to start".to_string(),
                     Some(phase) => format!(
                         "waiting for the {0} bundle: unpack it, then `beam-bootstrap launch signal --condition artifact-ready:{0}`",
                         phase.name()

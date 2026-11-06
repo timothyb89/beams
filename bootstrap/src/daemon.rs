@@ -483,7 +483,7 @@ fn handle_line(hub: &Arc<Hub>, line: &str, reply: &Sender<String>, context: &mut
             let tasks_value = request.get("tasks").cloned().unwrap_or(Value::Null);
             run_manifest(hub, request_id, tasks_value, reply);
         }
-        "launch_submit" | "launch_signal" | "launch_snapshot" | "launch_retry" => {
+        "launch_submit" | "launch_signal" | "launch_snapshot" | "launch_retry" | "launch_ready" => {
             crate::launch::daemon::handle(hub, op, &request, &|mut message| {
                 message["request_id"] = json!(request_id);
                 let _ = reply.send(message.to_string());

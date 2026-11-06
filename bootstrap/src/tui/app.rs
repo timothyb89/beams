@@ -58,7 +58,7 @@ pub struct TemplateInfo {
     pub run_once: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TaskState {
     Pending,
     Running,
@@ -68,11 +68,18 @@ pub enum TaskState {
     /// Never started: something it depends on failed (`"blocked"`
     /// task_status - see `executor::Event::Blocked`).
     Blocked,
+    /// A launch condition waiting to be released (a bundle, the interface).
+    Waiting,
+    /// The daemon stopped while it ran (a launch snapshot after a restart).
+    Interrupted,
 }
 
 impl TaskState {
     fn is_terminal(self) -> bool {
-        matches!(self, TaskState::Ok | TaskState::Skip | TaskState::Error | TaskState::Blocked)
+        matches!(
+            self,
+            TaskState::Ok | TaskState::Skip | TaskState::Error | TaskState::Blocked | TaskState::Interrupted
+        )
     }
 
     fn glyph(self, spinner_frame: usize) -> &'static str {
@@ -84,6 +91,8 @@ impl TaskState {
             TaskState::Skip => "○",
             TaskState::Error => "✘",
             TaskState::Blocked => "⊘",
+            TaskState::Waiting => "◷",
+            TaskState::Interrupted => "↯",
         }
     }
 
@@ -95,8 +104,36 @@ impl TaskState {
             TaskState::Skip => Color::Blue,
             TaskState::Error => Color::Red,
             TaskState::Blocked => Color::Magenta,
+            TaskState::Waiting => Color::Cyan,
+            TaskState::Interrupted => Color::Magenta,
         }
     }
+
+    /// A launch snapshot node's status (`launch::daemon::NodeStatus`).
+    fn from_node_status(status: &str) -> Option<Self> {
+        Some(match status {
+            "pending" => TaskState::Pending,
+            "waiting" => TaskState::Waiting,
+            "running" => TaskState::Running,
+            "ok" => TaskState::Ok,
+            "skip" => TaskState::Skip,
+            "error" => TaskState::Error,
+            "blocked" => TaskState::Blocked,
+            "interrupted" => TaskState::Interrupted,
+            _ => return None,
+        })
+    }
+}
+
+/// Whether this TUI still owes its launch (`BEAMS_LAUNCH_ID`) a
+/// `launch_ready` report: one is due after the first frame drawn with that
+/// launch's snapshot applied, while its interface is not yet released.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadyReport {
+    Idle,
+    AwaitingFrame,
+    Due,
+    Sent,
 }
 
 pub struct TaskRow {
@@ -106,6 +143,8 @@ pub struct TaskRow {
     /// Task ids (from the same manifest) this row waits on - from the
     /// `accepted` reply's plan. Shown on a pending row's second line.
     pub depends_on: Vec<String>,
+    /// Shown instead of `task_id` (a launch node's phase and label).
+    pub label: Option<String>,
 }
 
 /// Which pane is focused for keyboard/scroll purposes - just the two
@@ -170,6 +209,15 @@ pub struct App {
     /// `&mut DaemonClient`.
     pub pending_request: Option<Value>,
     pub needs_client_state: bool,
+    /// Ask for `launch_snapshot`: at start, after a reconnect, and when a
+    /// launch is (re)accepted, so its pending rows appear before they run.
+    pub needs_launch_snapshot: bool,
+    /// The last applied snapshot's `seq`: launch events at or below it are
+    /// already reflected in it.
+    launch_seq: u64,
+    /// `BEAMS_LAUNCH_ID`: the launch this TUI is part of the interface of.
+    launch_id: Option<String>,
+    pub ready_report: ReadyReport,
 
     /// The on-screen area the template list's rows were last drawn into
     /// (including its border) - set at the end of `draw_templates` each
@@ -215,6 +263,10 @@ impl App {
             should_quit: false,
             pending_request: None,
             needs_client_state: false,
+            needs_launch_snapshot: true,
+            launch_seq: 0,
+            launch_id: std::env::var("BEAMS_LAUNCH_ID").ok().filter(|value| !value.is_empty()),
+            ready_report: ReadyReport::Idle,
             templates_area: Rect::default(),
             progress_area: Rect::default(),
             progress_offset: 0,
@@ -238,6 +290,80 @@ impl App {
         self.needs_client_state = false;
     }
 
+    /// Queues the next deferred request once the single request slot is
+    /// free: client state, then a launch snapshot, then a due readiness
+    /// report.
+    pub fn queue_deferred(&mut self) {
+        if self.pending_request.is_some() || self.disconnected {
+            return;
+        }
+        if self.needs_client_state {
+            self.request_client_state();
+        } else if self.needs_launch_snapshot {
+            self.needs_launch_snapshot = false;
+            let id = self.next_id();
+            self.pending_request = Some(json!({"request_id": id, "op": "launch_snapshot"}));
+        } else if self.ready_report == ReadyReport::Due {
+            if let Some(launch_id) = self.launch_id.clone() {
+                let id = self.next_id();
+                self.pending_request =
+                    Some(json!({"request_id": id, "op": "launch_ready", "launch_id": launch_id, "component": "tui"}));
+            }
+            self.ready_report = ReadyReport::Sent;
+        }
+    }
+
+    /// Called after each drawn frame: a readiness report waiting on one is
+    /// now due.
+    pub fn frame_drawn(&mut self) {
+        if self.ready_report == ReadyReport::AwaitingFrame {
+            self.ready_report = ReadyReport::Due;
+        }
+    }
+
+    /// Replaces every launch's rows with the snapshot's nodes (in plan
+    /// order) and records its `seq` boundary.
+    fn apply_launch_snapshot(&mut self, value: &Value) {
+        let Some(launches) = value.get("launches").and_then(Value::as_array) else { return };
+        for launch in launches {
+            let Some(launch_id) = launch.get("launch_id").and_then(Value::as_str) else { continue };
+            let prefix = format!("launch:{launch_id}:");
+            self.rows.retain(|row| !row.task_id.starts_with(&prefix));
+            for node in launch.get("nodes").and_then(Value::as_array).into_iter().flatten() {
+                let Some(node_id) = node.get("id").and_then(Value::as_str) else { continue };
+                let state = node
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .and_then(TaskState::from_node_status)
+                    .unwrap_or(TaskState::Pending);
+                let label = node.get("label").and_then(Value::as_str).unwrap_or(node_id);
+                let phase = node.get("phase").and_then(Value::as_str).unwrap_or_default();
+                self.rows.push(TaskRow {
+                    task_id: format!("{prefix}{node_id}"),
+                    state,
+                    message: node.get("message").and_then(Value::as_str).map(str::to_string),
+                    depends_on: Vec::new(),
+                    label: Some(if phase.is_empty() { label.to_string() } else { format!("{phase} · {label}") }),
+                });
+            }
+            if self.launch_id.as_deref() == Some(launch_id) {
+                let listed = |field: &str, item: &str| {
+                    launch
+                        .get(field)
+                        .and_then(Value::as_array)
+                        .is_some_and(|items| items.iter().any(|v| v.as_str() == Some(item)))
+                };
+                let owed = !listed("released", "interface-ready") && !listed("ready", "tui");
+                if owed && matches!(self.ready_report, ReadyReport::Idle | ReadyReport::Sent) {
+                    self.ready_report = ReadyReport::AwaitingFrame;
+                }
+            }
+        }
+        if let Some(seq) = value.get("seq").and_then(Value::as_u64) {
+            self.launch_seq = seq;
+        }
+    }
+
     /// The daemon connection just dropped - `run_loop` calls this the
     /// moment the event channel reports `Disconnected`, before it starts
     /// retrying `DaemonClient::reconnect`.
@@ -255,6 +381,9 @@ impl App {
     pub fn mark_reconnected(&mut self) {
         self.disconnected = false;
         self.status_line = "reconnected".to_string();
+        // A restarted daemon numbers events from scratch.
+        self.launch_seq = 0;
+        self.needs_launch_snapshot = true;
         self.request_task_list();
     }
 
@@ -270,7 +399,13 @@ impl App {
                     self.rows[i].message = message;
                 }
             }
-            None => self.rows.push(TaskRow { task_id: task_id.to_string(), state, message, depends_on: Vec::new() }),
+            None => self.rows.push(TaskRow {
+                task_id: task_id.to_string(),
+                state,
+                message,
+                depends_on: Vec::new(),
+                label: None,
+            }),
         }
     }
 
@@ -288,6 +423,7 @@ impl App {
                 state: TaskState::Pending,
                 message: None,
                 depends_on,
+                label: None,
             }),
         }
     }
@@ -307,6 +443,7 @@ impl App {
                 state: TaskState::Running,
                 message,
                 depends_on: Vec::new(),
+                label: None,
             }),
         }
     }
@@ -335,7 +472,42 @@ impl App {
     /// `daemon.rs`'s module doc comment for the shapes being matched
     /// here.
     pub fn handle_daemon_event(&mut self, value: Value) {
+        // Already part of the last launch snapshot.
+        if value.get("launch_id").is_some()
+            && value.get("seq").and_then(Value::as_u64).is_some_and(|seq| seq <= self.launch_seq)
+        {
+            return;
+        }
         match value.get("type").and_then(Value::as_str) {
+            Some("launch_snapshot") => self.apply_launch_snapshot(&value),
+            Some("launch_status") => {
+                let launch_id = value.get("launch_id").and_then(Value::as_str).unwrap_or_default();
+                let status = value.get("status").and_then(Value::as_str).unwrap_or_default();
+                // A new or retried launch: fetch its plan so pending rows show.
+                if status == "accepted" {
+                    self.needs_launch_snapshot = true;
+                }
+                let message = value.get("message").and_then(Value::as_str).map(|m| format!(": {m}")).unwrap_or_default();
+                self.status_line = format!("launch {} {status}{message}", short_id(launch_id));
+            }
+            Some("launch_condition") => {
+                let condition = value.get("condition").and_then(Value::as_str).unwrap_or_default();
+                if value.get("released").and_then(Value::as_bool) == Some(true) {
+                    self.status_line = format!("released {condition}");
+                } else {
+                    let why = value.get("message").and_then(Value::as_str).unwrap_or("failed");
+                    self.status_line = format!("{condition}: {why}");
+                }
+            }
+            Some("launch_nodes_blocked") => {
+                let launch_id = value.get("launch_id").and_then(Value::as_str).unwrap_or_default();
+                let message = value.get("message").and_then(Value::as_str).map(str::to_string);
+                for node in value.get("nodes").and_then(Value::as_array).into_iter().flatten() {
+                    if let Some(node) = node.as_str() {
+                        self.upsert_row(&format!("launch:{launch_id}:{node}"), TaskState::Blocked, message.clone());
+                    }
+                }
+            }
             Some("tasks") => {
                 if let Some(templates) =
                     value.get("tasks").and_then(|v| serde_json::from_value::<Vec<TemplateInfo>>(v.clone()).ok())
@@ -479,7 +651,11 @@ impl App {
                 // without touching `state` (falling back to `Running` if
                 // somehow nothing's been seen for this task_id yet).
                 if status == "progress" {
-                    self.update_progress_message(task_id, message);
+                    if value.get("waiting").and_then(Value::as_bool) == Some(true) {
+                        self.upsert_row(task_id, TaskState::Waiting, message);
+                    } else {
+                        self.update_progress_message(task_id, message);
+                    }
                     return;
                 }
                 let state = match status {
@@ -1008,7 +1184,10 @@ impl App {
                 let header = Line::from(vec![
                     Span::styled(row.state.glyph(spinner_frame), Style::default().fg(row.state.color())),
                     Span::raw(" "),
-                    Span::styled(abbreviate_home(&row.task_id), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        row.label.clone().unwrap_or_else(|| abbreviate_home(&row.task_id)),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                 ]);
                 let detail_style = match row.state {
                     TaskState::Error | TaskState::Blocked => Style::default().fg(row.state.color()),
@@ -1593,5 +1772,133 @@ mod tests {
         assert_eq!(request["session_token"], "managed-token");
         assert_eq!(request["request"]["service_id"], "service-a");
         assert_eq!(request["request"]["action"], "stop");
+    }
+
+    fn launch_snapshot(seq: u64, ready: &[&str], released: &[&str]) -> Value {
+        json!({"type": "launch_snapshot", "request_id": "9", "seq": seq, "launches": [{
+            "launch_id": "L1", "plan_digest": "d", "gate": "interactive", "status": "running",
+            "ready": ready, "released": released,
+            "nodes": [
+                {"id": "artifact-ready:pre", "label": "Pre bundle", "phase": "pre", "status": "ok", "message": null, "log": []},
+                {"id": "interface-ready", "label": "Shell and first TUI frame ready", "phase": "post", "status": "waiting",
+                 "message": "waiting for the TUI to start", "log": []},
+                {"id": "tasks:configure", "label": "Configure", "phase": "post", "status": "pending", "message": null, "log": []},
+            ],
+        }]})
+    }
+
+    fn row<'a>(app: &'a App, task_id: &str) -> &'a TaskRow {
+        &app.rows[app.row_index(task_id).unwrap_or_else(|| panic!("no row {task_id}"))]
+    }
+
+    #[test]
+    fn a_launch_snapshot_shows_every_node_including_pending_post_work() {
+        let mut app = App::new();
+        // A live event that arrived before the snapshot is replaced by it.
+        app.handle_daemon_event(json!({"type": "task_status", "task_id": "launch:L1:artifact-ready:pre",
+            "status": "start", "launch_id": "L1", "seq": 3}));
+        app.handle_daemon_event(launch_snapshot(5, &["shell"], &["artifact-ready:pre"]));
+        assert_eq!(app.rows.len(), 3);
+        assert!(row(&app, "launch:L1:artifact-ready:pre").state == TaskState::Ok);
+        let interface = row(&app, "launch:L1:interface-ready");
+        assert!(interface.state == TaskState::Waiting);
+        assert_eq!(interface.message.as_deref(), Some("waiting for the TUI to start"));
+        let configure = row(&app, "launch:L1:tasks:configure");
+        assert!(configure.state == TaskState::Pending);
+        assert_eq!(configure.label.as_deref(), Some("post · Configure"));
+
+        // Events the snapshot already covers are ignored; later ones apply.
+        app.handle_daemon_event(json!({"type": "task_status", "task_id": "launch:L1:tasks:configure",
+            "status": "start", "launch_id": "L1", "seq": 5}));
+        assert!(row(&app, "launch:L1:tasks:configure").state == TaskState::Pending);
+        app.handle_daemon_event(json!({"type": "task_status", "task_id": "launch:L1:tasks:configure",
+            "status": "start", "launch_id": "L1", "seq": 6}));
+        assert!(row(&app, "launch:L1:tasks:configure").state == TaskState::Running);
+
+        // A fresh snapshot replaces the launch's rows rather than adding more.
+        app.handle_daemon_event(launch_snapshot(9, &["shell", "tui"], &["artifact-ready:pre", "interface-ready"]));
+        assert_eq!(app.rows.len(), 3);
+    }
+
+    #[test]
+    fn waiting_blocked_and_interrupted_launch_nodes_map_to_their_own_states() {
+        let mut app = App::new();
+        app.handle_daemon_event(json!({"type": "task_status", "task_id": "launch:L1:artifact-ready:post",
+            "status": "progress", "waiting": true, "message": "waiting for the post bundle", "launch_id": "L1", "seq": 1}));
+        assert!(row(&app, "launch:L1:artifact-ready:post").state == TaskState::Waiting);
+        app.handle_daemon_event(json!({"type": "launch_nodes_blocked", "launch_id": "L1", "phase": "post",
+            "nodes": ["tasks:a", "tasks:b"], "message": "not run: pre did not complete", "seq": 2}));
+        assert!(row(&app, "launch:L1:tasks:b").state == TaskState::Blocked);
+        assert_eq!(row(&app, "launch:L1:tasks:a").message.as_deref(), Some("not run: pre did not complete"));
+        assert_eq!(TaskState::from_node_status("interrupted"), Some(TaskState::Interrupted));
+        assert!(TaskState::Interrupted.is_terminal() && !TaskState::Waiting.is_terminal());
+    }
+
+    #[test]
+    fn requests_a_snapshot_at_start_after_reconnecting_and_when_a_launch_is_accepted() {
+        let mut app = App::new();
+        app.pending_request = None;
+        app.queue_deferred();
+        assert_eq!(app.pending_request.take().unwrap()["op"], "launch_snapshot");
+        app.queue_deferred();
+        assert!(app.pending_request.is_none(), "only once");
+
+        app.handle_daemon_event(json!({"type": "launch_status", "launch_id": "L2", "status": "accepted", "seq": 1}));
+        app.queue_deferred();
+        assert_eq!(app.pending_request.take().unwrap()["op"], "launch_snapshot");
+
+        app.handle_daemon_event(launch_snapshot(20, &[], &[]));
+        app.mark_disconnected();
+        app.mark_reconnected();
+        app.pending_request = None; // the task list request
+        app.queue_deferred();
+        assert_eq!(app.pending_request.take().unwrap()["op"], "launch_snapshot");
+        // The restarted daemon's numbering starts over.
+        app.handle_daemon_event(json!({"type": "task_status", "task_id": "launch:L1:tasks:configure",
+            "status": "start", "launch_id": "L1", "seq": 1}));
+        assert!(row(&app, "launch:L1:tasks:configure").state == TaskState::Running);
+    }
+
+    #[test]
+    fn reports_tui_readiness_for_its_own_launch_once_after_a_frame() {
+        let mut app = App::new();
+        app.pending_request = None;
+        app.needs_launch_snapshot = false;
+        app.launch_id = Some("L1".into());
+        app.handle_daemon_event(launch_snapshot(5, &["shell"], &["artifact-ready:pre"]));
+        app.queue_deferred();
+        assert!(app.pending_request.is_none(), "not before a frame is drawn");
+        app.frame_drawn();
+        app.queue_deferred();
+        let request = app.pending_request.take().unwrap();
+        assert_eq!(request["op"], "launch_ready");
+        assert_eq!(request["launch_id"], "L1");
+        assert_eq!(request["component"], "tui");
+        app.frame_drawn();
+        app.queue_deferred();
+        assert!(app.pending_request.is_none(), "only once");
+
+        // A later snapshot that already has it doesn't ask again...
+        app.handle_daemon_event(launch_snapshot(6, &["shell", "tui"], &["interface-ready"]));
+        app.frame_drawn();
+        app.queue_deferred();
+        assert!(app.pending_request.is_none());
+        // ...but one from a daemon that lost it (after a restart) does.
+        app.handle_daemon_event(launch_snapshot(7, &["shell"], &[]));
+        app.frame_drawn();
+        app.queue_deferred();
+        assert_eq!(app.pending_request.take().unwrap()["op"], "launch_ready");
+    }
+
+    #[test]
+    fn a_tui_outside_a_launch_reports_nothing() {
+        let mut app = App::new();
+        app.pending_request = None;
+        app.needs_launch_snapshot = false;
+        app.launch_id = None;
+        app.handle_daemon_event(launch_snapshot(5, &[], &[]));
+        app.frame_drawn();
+        app.queue_deferred();
+        assert!(app.pending_request.is_none());
     }
 }

@@ -155,6 +155,9 @@ toolchains' `bin/` dirs, reachable by bare name instead of a full path:
   installed) `~/.local/toolchains/go/bin` and
   `~/.local/toolchains/code-server/bin` ahead of their own install
   tasks ever running.
+- `shell-config` also links `shell/fish/conf.d/beams-launch.fish`, which
+  only acts inside a launch (`BEAMS_LAUNCH_ID`): see "Daemon launch
+  execution" below.
 - `shell-config` links `shell/fish/conf.d/beams-path.fish`, which adds
   all of those (plus `~/bin` and `~/.local/bin` itself) to fish's
   PATH via `fish_add_path` - every example below works by bare name
@@ -281,7 +284,11 @@ artifact-ready:pre|artifact-ready:post|interface-ready` releases one (the
 daemon verifies staging itself first). `launch status [--launch-id ID]
 [--json]` prints the retained snapshot; `launch retry --launch-id ID
 [--retry-interrupted]` reruns a failed launch, or one a daemon restart left
-interrupted. State is `launch-state/` next to the daemon socket. The ops,
+interrupted. `launch ready --component shell|tui [--launch-id ID]` reports
+an interface component (default launch `$BEAMS_LAUNCH_ID`; without one it
+does nothing): an interactive launch releases `interface-ready` once both
+have, which `shell/fish/conf.d/beams-launch.fish` and the TUI do on their
+own. State is `launch-state/` next to the daemon socket. The ops,
 events and snapshot `seq` boundary are documented in
 `docs/development/launches.md` ("Run a launch through the daemon"); the
 end-to-end check is `tests/launch-daemon-smoke.sh`.
@@ -497,11 +504,20 @@ to the owning client and do not act until the workstation user approves it.
 The Requests tab shows create and action requests with their current local
 decision/status; `r` refreshes the full client projection.
 
+Daemon launches (`launch submit`) appear as rows too: the TUI requests a
+`launch_snapshot` on connect and whenever a launch is accepted, so every
+node is listed (as `phase · label`) before it runs, including post work
+waiting on the interface; waiting conditions show `◷`, nodes a daemon
+restart interrupted `↯`. Run with `BEAMS_LAUNCH_ID` set, it reports
+`launch ready --component tui` for that launch after its first frame with
+the launch on screen.
+
 If the daemon connection drops (e.g. `beamctl restart beam-bootstrapd`
 mid-session), the status line says so and the TUI retries every second
-until it's back - rows from before the drop are left as-is (whatever
+until it's back - task rows from before the drop are left as-is (whatever
 happened to those tasks while disconnected is simply unknown), but the
-template list is re-fetched the moment reconnection succeeds.
+template list and launch snapshot are re-fetched the moment reconnection
+succeeds.
 
 Only submits one task at a time today (`run_task`), even though the
 daemon's `run_manifest` can resolve and run several together - there's

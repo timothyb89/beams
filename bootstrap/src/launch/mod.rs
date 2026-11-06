@@ -73,6 +73,19 @@ pub enum Command {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// Report that an interface component is up. An interactive launch
+    /// releases interface-ready once both `shell` and `tui` have. Does
+    /// nothing (exit 0) without a launch ID, so the initial shell can call
+    /// it unconditionally.
+    Ready {
+        #[arg(long, value_parser = ["shell", "tui"])]
+        component: String,
+        /// Default: `$BEAMS_LAUNCH_ID`.
+        #[arg(long)]
+        launch_id: Option<String>,
+        #[arg(long)]
+        socket: Option<String>,
+    },
     /// Restart a failed or interrupted daemon launch with its accepted plan.
     Retry {
         #[arg(long)]
@@ -143,6 +156,18 @@ pub fn run(command: Command) -> anyhow::Result<()> {
                     print_snapshot(launch);
                 }
             }
+        }
+        Command::Ready { component, launch_id, socket } => {
+            let Some(launch_id) = launch_id
+                .or_else(|| std::env::var("BEAMS_LAUNCH_ID").ok())
+                .filter(|id| !id.is_empty())
+            else {
+                return Ok(());
+            };
+            request(
+                &mut connect(socket)?,
+                json!({"op": "launch_ready", "launch_id": launch_id, "component": component}),
+            )?;
         }
         Command::Retry { launch_id, retry_interrupted, no_follow, socket } => {
             let mut conn = connect(socket)?;
@@ -242,6 +267,9 @@ fn print_snapshot(launch: &daemon::LaunchSnapshot) {
         launch.gate,
         launch.message.as_deref().map(|m| format!(": {m}")).unwrap_or_default()
     );
+    if !launch.ready.is_empty() || !launch.released.is_empty() {
+        println!("  ready: [{}]; released: [{}]", launch.ready.join(", "), launch.released.join(", "));
+    }
     for node in &launch.nodes {
         println!(
             "  {:<11} {:<4} {}{}",
@@ -286,6 +314,12 @@ fn follow(conn: &mut crate::taskcli::Connection, reply: &Value, no_follow: bool)
                 "  {:<11} {}{}",
                 if event["waiting"] == true { "waiting" } else { event["status"].as_str().unwrap_or("?") },
                 event["node"].as_str().unwrap_or("?"),
+                event["message"].as_str().map(|m| format!(" - {m}")).unwrap_or_default()
+            ),
+            Some("launch_condition") => println!(
+                "  {} {}{}",
+                if event["released"] == true { "released" } else { "failed" },
+                event["condition"].as_str().unwrap_or("?"),
                 event["message"].as_str().map(|m| format!(" - {m}")).unwrap_or_default()
             ),
             Some("launch_status") => {
