@@ -217,6 +217,15 @@ start=$(date +%s)
 ssh $SSHOPTS "$ME@127.0.0.1" true 2>/dev/null
 check "login with no frontend fails without waiting" test $? -ne 0 -a $(( $(date +%s) - start )) -lt 5
 
+AUDIT="$W/config/beams-client/ssh-agent-audit.jsonl"
+audit_has() { grep -q "\"event\":\"$1\"" "$AUDIT"; }
+check "audit log is private" test "$(stat -c %a "$AUDIT" 2>/dev/null)" = 600
+check "audit log records the grant's use and its task" \
+    bash -c "grep '\"event\":\"granted\"' '$AUDIT' | grep -q '\"task_run\":\"manifest-'"
+for event in asked signed rejected expired; do
+    check "audit log records $event" audit_has "$event"
+done
+
 echo
 grep -h 'ssh-agent' "$W/local.log" | sed 's/^/LOG /' | head -12
 echo "$fails failure(s)"

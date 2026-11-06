@@ -6,6 +6,10 @@
 # process, with a fake `tsh` standing in for the remote endpoint.
 
 set -eu
+# An inherited agent with keys (e.g. a Beam's relay) would put up the
+# one-time "share an SSH key?" toast, and Ctrl-] would open that instead of
+# the menu this test expects.
+unset SSH_AUTH_SOCK
 
 CLIENT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 TEST_DIR=$(mktemp -d "${TMPDIR:-/tmp}/beams-managed-session.XXXXXX")
