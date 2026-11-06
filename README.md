@@ -58,6 +58,9 @@ daemon, etc).
 - `docs/designs/` — design docs and exploratory spikes for specific
   subsystems (the daemon/task-graph architecture, client-owned services,
   the SSH agent proxy, folder sync, OpenSSH multiplexing).
+- [Configurable launches](docs/designs/LAUNCH_CONFIGURATION_DESIGN.md) —
+  proposed client-side profiles, batched uploads/packages, and pre/post
+  initialization tasks; not implemented yet.
 
 ## Status
 

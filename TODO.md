@@ -17,13 +17,21 @@ individual checked-off line.
 
 ## Configurable environment launches
 
-Proposed 2026-11-06 in `LAUNCH_CONFIGURATION_DESIGN.md`: client-owned TOML
+Proposed 2026-11-06 in `docs/designs/LAUNCH_CONFIGURATION_DESIGN.md`: client-owned TOML
 profiles compile into a versioned launch graph, with small pre-interface
 and background post-interface bundles/package batches. Reuse the existing
 executor and client transport. The design records current launch behavior,
 inheritance rules, hook semantics, recovery, migration, and acceptance
 criteria; syntax remains provisional until implementation.
 
+- [ ] Immediate prerequisite from review of `06060b5`/`651fc1c`: remove
+  the stale forced repo `.ssh` link in `bootstrap/src/steps/link.rs`.
+  The current tracked tree no longer contains `.ssh`, but the synchronous
+  `link-files` pre-step still requires it and fails before Zellij on fresh
+  Beams. Preserve Beam-managed `~/.ssh`, update link-step docs/comments,
+  and validate using a clean-checkout fixture without local leftovers.
+  The workstation-file cleanup itself is already done; runtime dependency
+  removal is not.
 - [ ] Phase 1: record cold/warm launch milestones and transport counts;
   implement profile resolution/inheritance, validation, versioned plan,
   and `beams config init/validate/explain`. Bundled core/development

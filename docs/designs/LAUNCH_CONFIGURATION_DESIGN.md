@@ -1,8 +1,9 @@
 # Configurable Beam launches
 
 Status: proposed design, 2026-11-06. This is a plan, not implemented
-configuration syntax. It builds on `DESIGN.md`'s task graph and
-`CLIENT_SERVICES_DESIGN.md`'s workstation-owned transport. `TODO.md`
+configuration syntax. It builds on [DESIGN.md](DESIGN.md)'s task graph and
+[CLIENT_SERVICES_DESIGN.md](CLIENT_SERVICES_DESIGN.md)'s workstation-owned
+transport. [TODO.md](../../TODO.md)
 tracks the implementation sequence.
 
 ## Goals and recommendation
@@ -74,6 +75,45 @@ Gaps that shape the design:
   the existing shell's startup file.
 - The Zellij layout, wrappers, links, bot/cluster names, and several
   filesystem paths assume this repository's layout and personal setup.
+
+## Review of the public-preparation changes
+
+Reviewed against `origin/main` at `651fc1c` on 2026-11-06, incorporating
+`06060b5` (workstation-detail cleanup) and `651fc1c` (documentation
+organization). The task scheduler, package installers, client startup
+config, launch sequence, and transport implementations have no executable
+changes in those commits. The architecture recommended here still applies.
+
+The cleanup already removes the tracked workstation public key and host
+inventory, ignores all `.ssh/*`, and moves the TPM onboarding token example
+into `bot-onboarding/` with a placeholder for the workstation identifier.
+Treat that content cleanup as completed. Bot onboarding remains cluster
+setup, not a default per-Beam customization. Keep the new design alongside
+the existing designs in `docs/designs/`, and use the new root README to
+point users to the configuration proposal.
+
+There is one immediate startup regression to fix before broader migration:
+`bootstrap/src/steps/link.rs` still includes `(".ssh", true)` in `LINKS`.
+The latest committed tree has no `.ssh` directory, the client only stages
+the bootstrap binary, and `ensure_symlink` errors when its source does not
+exist. `bin/beam-shell` calls `--only link-files` synchronously under
+`set -e`, so fresh Git-delivered environments stop before Zellij. Removing
+tracked data did not remove this runtime dependency. Existing checkouts
+with leftover local `.ssh` files can hide the issue.
+
+Make removal of this legacy forced directory link an immediate prerequisite,
+preserving the Beam's own `~/.ssh`. Validate the link step with a fixture
+representing a clean committed checkout, no repo `.ssh`, and existing
+Beam-managed SSH state. Individual known-host file customization remains
+an explicit profile choice. This review records the regression; it does
+not change the running bootstrap or implement the fix.
+
+The current full-history Git push also transfers historical blobs of
+files removed by the cleanup. Removal from the current tree is not removal
+from Git history. This reinforces using an explicit runtime/profile
+artifact bundle for ordinary launches and making Git history delivery a
+development option. The launch design does not rewrite repository history;
+any separate public-history cleanup needs its own deliberate decision.
 
 ## Configuration ownership, profiles, and inheritance
 
@@ -485,8 +525,9 @@ unavailable rather than silently omit it.
 | Kubectl | Optional Kubernetes profile task/source configuration |
 | k3s bot, cluster names, tbot outputs and kubeconfig | Opt-in Teleport Kubernetes profile with required parameters and cluster prerequisites |
 | Personal clone URLs/destinations | Gitignored local profile; published starter uses a neutral example |
-| Repo `.ssh` symlink | Remove from generic startup; opt-in individual known-host files, preserve Beam-managed state |
-| Public user key and personal host inventory | Exclude from distributed default profile/runtime |
+| Repo `.ssh` symlink | Immediate prerequisite: remove the stale forced link before configurable startup; opt-in individual known-host files later |
+| Public user key and personal host inventory | Already removed from the tracked current tree; keep ordinary runtime artifacts independent of historical blobs |
+| TPM onboarding token example | Already relocated/redacted; remains optional cluster onboarding, outside default launch artifacts |
 | `.claude/CLAUDE.md` merge and Claude update | Optional guidance/update tasks; only generic relay guidance in a sanitized example |
 | Teleport organization-specific AI policy | Opt-in organization profile, not generic default guidance |
 | Git push of this project with its history | Explicit source-development option, normally post-interface |
@@ -537,6 +578,10 @@ ControlPersist, retrieved 2026-11-06:
 
 ## Implementation sequence and acceptance
 
+0. **Fresh-checkout startup repair.** Remove the stale mandatory `.ssh`
+   link left behind by the workstation-detail cleanup, preserve existing
+   Beam SSH state, update the link-step docs/comments, and validate a clean
+   checkout fixture. This repair is independent of the profile compiler.
 1. **Baseline and compiler.** Instrument launch milestones and transport
    counts; extract profile assets and implement resolution, validation,
    `config init/validate/explain`, and a versioned plan. Keep legacy launch
@@ -561,7 +606,8 @@ ControlPersist, retrieved 2026-11-06:
    parallel with the preceding implementation work; integrate only after
    passing. Launch configuration remains usable with `tsh`.
 
-Compiler/fixture tests should cover inheritance provenance, disabling
+Compiler/fixture tests should cover clean-checkout startup without repo
+`.ssh`, inheritance provenance, disabling
 entries, package union/promotion/version conflicts, destination conflicts,
 missing inputs, graph cycles, phase inversions, parameter validation,
 artifact traversal/symlinks, and old configuration compatibility.
@@ -581,6 +627,8 @@ choosing a numeric latency target.
 Acceptance examples:
 
 - Core opens Zellij + TUI without installing development tools.
+- A checkout built entirely from current tracked files needs no local
+  `.ssh` leftovers and preserves Beam-managed SSH configuration.
 - A slow post hook, large post directory, or toolchain install does not
   sit on the path to the first interface. Changing a post hook from 1s
   to 60s does not add that duration to interface startup.
@@ -601,7 +649,8 @@ the fastest practical core bundle/Zellij delivery, and whether one post
 bundle is sufficient for typical profiles. None requires changing the
 profile ownership or adding another execution engine.
 
-The first reviewable implementation should be the offline profile
-compiler and a sanitized extraction of the existing config, including
-an example local override and `config explain` output. That establishes
-the user-facing contract before changing live startup or its transport.
+After the independent fresh-checkout repair, the first reviewable
+configuration implementation should be the offline profile compiler and
+a sanitized extraction of the existing config, including an example local
+override and `config explain` output. That establishes the user-facing
+contract before changing live startup or its transport.

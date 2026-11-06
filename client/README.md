@@ -424,7 +424,7 @@ it also tracks the purpose and bootstraps the beam.
 ## Configuration: SSH keys and startup tasks
 
 Client-side environment profiles, batched uploads/packages, and pre/post
-hooks are proposed in `../LAUNCH_CONFIGURATION_DESIGN.md`; they are not
+hooks are proposed in `../docs/designs/LAUNCH_CONFIGURATION_DESIGN.md`; they are not
 implemented yet. The configuration below is what works today.
 
 `~/.config/beams-client/config.toml` (re-read on use; a missing file means
