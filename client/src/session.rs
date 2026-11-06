@@ -1381,6 +1381,7 @@ impl DaemonView {
                     services,
                     bridges,
                     grants,
+                    ..
                 }) => {
                     self.grants = grants
                         .into_iter()
@@ -1449,7 +1450,10 @@ impl DaemonView {
                     | ServerEvent::Pong
                     | ServerEvent::DaemonInfo { .. }
                     | ServerEvent::ShuttingDown
-                    | ServerEvent::ShutdownRefused { .. },
+                    | ServerEvent::ShutdownRefused { .. }
+                    // Shown by `beams config launch`; the session overlay
+                    // doesn't list launches yet.
+                    | ServerEvent::LaunchChanged { .. },
                 ) => {}
                 Err(TryRecvError::Empty) => return changed,
                 Err(TryRecvError::Disconnected) => {

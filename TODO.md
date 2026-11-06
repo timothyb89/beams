@@ -34,10 +34,11 @@ a helper directory to preserve on the Beam, with phase-aware packaging.
 
 The [2026-11-06 handoff](docs/designs/LAUNCH_CONFIGURATION_DESIGN.md#implementation-status-and-next-session-handoff)
 records completed commits, execution limits and validation. Daemon
-acceptance, waiting conditions and snapshots are done (2026-11-06). Next:
-TUI snapshot-on-connect, shell/TUI readiness signals, the bridge launch
-capability and transport-driven artifact release, before changing live
-SSH startup.
+acceptance, waiting conditions and snapshots, the shell/TUI readiness gate,
+TUI snapshots, bridge uploads/submission with receive-driven release and
+`beams config launch` are done (2026-11-06). Next: the opt-in `beams ssh`
+path (runtime delivery, shell preparation, Zellij/TUI with
+`BEAMS_LAUNCH_ID`), before changing live SSH startup.
 
 - [x] Immediate prerequisite from review of `06060b5`/`651fc1c`: remove
   the stale forced repo `.ssh` link in `bootstrap/src/steps/link.rs`.
@@ -127,10 +128,30 @@ SSH startup.
   replies exact event-stream boundaries, restart -> interrupted, explicit
   retry. Hooks get the relay `SSH_AUTH_SOCK`. Fixture tests plus
   `bootstrap/tests/launch-daemon-smoke.sh`.
+- [x] Readiness and bridge launches (2026-11-06): `launch_ready` (shell via
+  `shell/fish/conf.d/beams-launch.fish` at the first prompt, the TUI after
+  its first frame with the launch's snapshot) releases interactive
+  `interface-ready`; the Beam TUI loads `launch_snapshot` on connect and on
+  acceptance; `launch` bridge capability with chunked resumable uploads
+  (32 KiB, window 8), submission by ID/digest, owner-routed
+  `LaunchStatus`/`LaunchCondition`; the Beam stages each complete bundle
+  itself (also `launch receive`); workstation `beams config launch`
+  re-drives unfinished launches on every bridge connection. The bridge
+  writer no longer polls (it capped all bridge messages at 20/s).
+  `client/tests/launch-bridge-smoke.sh` runs it end to end.
 - [ ] Launch daemon follow-ups: reconcile owned subprocesses after a
   daemon restart before allowing retry to overlap an old installer; a
-  cancel op (a condition otherwise waits until signalled); the Beam TUI
-  requesting `launch_snapshot` on connect.
+  cancel op (a condition otherwise waits until signalled); retry over the
+  bridge (an interrupted launch is only retried on the Beam today);
+  cleanup of finished launches' workstation launch directories and Beam
+  staging; `receive` re-copies an already verified upload into its spool
+  (one extra copy of a large post bundle).
+- [ ] Measure upload throughput over a real `tsh` bridge (window/RTT bound,
+  base64 overhead) against `tsh scp` before tuning the window or adding a
+  second transport for very large post bundles.
+- [ ] Flaky: `forward::tests::startup_failure_includes_captured_diagnostics`
+  failed once (exit 23 reported without the captured stderr) and passed on
+  rerun; likely a race between process exit and draining its stderr.
 - [ ] Developer documentation is required alongside implementation:
   evolve `docs/development/launches.md` with the compiler/schema, an
   execution-order graph, explicit scripts-vs-packages/file dependencies,
@@ -139,8 +160,8 @@ SSH startup.
   explain output and fixture coverage; update binary READMEs in the same
   changes. Compiler behavior/examples and foreground execution/retry are
   documented, and so is the daemon path (ops, conditions, snapshot
-  boundary, retry/restart); real shell/TUI readiness walkthroughs remain
-  with those phases.
+  boundary, retry/restart), readiness reporting and the bridge upload flow;
+  a walkthrough of a real `beams ssh` launch remains with that phase.
 - [ ] Phase 2 remaining: parameterize specialized installs (versions,
   destination paths and profile environment). Source/keyring preparation
   dependencies, privileged file destinations and configurable admission/
@@ -156,10 +177,11 @@ SSH startup.
   checkout; run pre tasks through the daemon, prepare the shell before
   spawning it, and gate post tasks on shell startup + first TUI frame.
   Remove the new path's competing background fixed bootstrap.
-- [ ] Phase 4: batched background uploads with projected TUI progress,
-  receive-driven release of the (now waiting) artifact-ready conditions,
-  bounded task concurrency and retry/recovery. Submitting-client routing
-  for SSH key use landed 2026-11-06 with the SSH agent follow-ups.
+- [ ] Phase 4: projected upload progress in the session overlay/Beam TUI,
+  bounded task concurrency and retry/recovery. Background uploads and
+  receive-driven release of artifact-ready landed 2026-11-06 (`beams config
+  launch`); submitting-client routing for SSH key use landed with the SSH
+  agent follow-ups.
 - [ ] Phase 5: migrate the maintainer's setup onto a local profile,
   distribute a sanitized development default, adapt legacy `[startup]`,
   document customization, and validate on disposable Beams before

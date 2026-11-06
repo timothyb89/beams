@@ -27,6 +27,9 @@ use beams_protocol::{
     PROTOCOL, PROTOCOL_VERSION,
 };
 use crate::startup::{GrantConfig, GrantRecord, StartupConfig};
+
+mod launches;
+pub use launches::{LaunchRecord, LaunchStage};
 use serde::{Deserialize, Serialize};
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
 use uuid::Uuid;
@@ -200,6 +203,17 @@ enum ClientMessage {
     },
     /// `[ssh_agent] allowed_keys` changed: push keys to every Beam again.
     RefreshAgentKeys,
+    /// Drive the launch packed in `launch_dir` (`beams config pack`) onto a
+    /// Beam whose bridge this frontend ensured. Answered with
+    /// `LaunchChanged` events.
+    StartLaunch {
+        beam_id: String,
+        beam_uuid: String,
+        login: String,
+        launch_dir: String,
+        #[serde(default)]
+        gate: beams_protocol::launch::Gate,
+    },
     /// Version-independent control op (see `daemonctl`): accepted as the
     /// first message on a connection, without a hello. Never change it.
     Status,
@@ -227,6 +241,14 @@ pub enum ServerEvent {
         /// Usable startup SSH key grants.
         #[serde(default)]
         grants: Vec<GrantRecord>,
+        /// Configured launches this daemon drives.
+        #[serde(default)]
+        launches: Vec<LaunchRecord>,
+    },
+    /// A launch's workstation-side record changed (status, released
+    /// conditions, upload progress).
+    LaunchChanged {
+        launch: LaunchRecord,
     },
     /// A grant was issued, used, or ended (`ended` set).
     GrantChanged {
@@ -274,6 +296,9 @@ struct PersistedState {
     /// restarts.
     #[serde(default)]
     startup_submitted: BTreeSet<String>,
+    /// Configured launches, by launch ID (see `launches`).
+    #[serde(default)]
+    launches: BTreeMap<String, LaunchRecord>,
 }
 
 impl Default for PersistedState {
@@ -284,6 +309,7 @@ impl Default for PersistedState {
             requests: BTreeMap::new(),
             services: BTreeMap::new(),
             startup_submitted: BTreeSet::new(),
+            launches: BTreeMap::new(),
         }
     }
 }
@@ -409,6 +435,7 @@ struct Hub {
     frontend_ids: AtomicU64,
     /// `[startup]` config, read when a Beam first connects.
     startup_config: Box<dyn Fn() -> StartupConfig + Send + Sync>,
+    launch_runtime: Mutex<launches::Runtime>,
 }
 
 /// SSH agent relay state (see `crate::agent`). Nothing here is persisted:
@@ -546,6 +573,7 @@ impl Hub {
             agent: Mutex::new(AgentRuntime::default()),
             frontend_ids: AtomicU64::new(1),
             startup_config: Box::new(load_startup_config),
+            launch_runtime: Mutex::default(),
         }
     }
 
@@ -722,6 +750,7 @@ impl Hub {
             frontends: self.frontends.load(Ordering::SeqCst),
             grants,
             requests,
+            launches: state.launches.values().cloned().collect(),
             services: state.services.values().cloned().collect(),
             bridges: self
                 .bridges
@@ -2676,10 +2705,12 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
             if capabilities.iter().any(|c| c == CAPABILITY_STARTUP_MANIFEST) {
                 hub.submit_startup(&beam_uuid);
             }
+            hub.launch_bridge_connected(&beam_uuid, &capabilities);
         }
         crate::bridge::Event::Disconnected { beam_uuid, message } => {
             // The Beam fails its waiting sign requests when the bridge goes.
             hub.expire_agent_requests_for(&beam_uuid, "the Beam bridge disconnected");
+            hub.launch_bridge_disconnected(&beam_uuid);
             hub.end_grants_for(&beam_uuid, "the Beam bridge disconnected");
             let (record, check_existence) = {
                 let mut bridges = hub.bridges.lock().unwrap();
@@ -2838,15 +2869,13 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                 eprintln!("startup: {beam_uuid}: {manifest_id} finished ({})", if ok { "ok" } else { "with errors" });
                 hub.end_grants_where(|g| g.beam_uuid == beam_uuid && g.manifest_id == manifest_id, "startup finished");
             }
-            // Launches this workstation submitted (none yet: see `beams
-            // config launch`).
-            BeamToClient::LaunchUploadOffset { .. }
+            message @ (BeamToClient::LaunchUploadOffset { .. }
             | BeamToClient::LaunchUploaded { .. }
             | BeamToClient::LaunchUploadFailed { .. }
             | BeamToClient::LaunchAccepted { .. }
             | BeamToClient::LaunchRejected { .. }
             | BeamToClient::LaunchStatus { .. }
-            | BeamToClient::LaunchCondition { .. } => {}
+            | BeamToClient::LaunchCondition { .. }) => hub.launch_message(&beam_uuid, message),
         },
     }
 }
@@ -2946,6 +2975,25 @@ impl Frontend {
             },
         )
         .context("requesting Beam bridge")
+    }
+
+    pub fn start_launch(
+        &mut self,
+        target: &crate::bridge::Target,
+        launch_dir: &Path,
+        gate: beams_protocol::launch::Gate,
+    ) -> anyhow::Result<()> {
+        write_json(
+            &mut self.write_half,
+            &ClientMessage::StartLaunch {
+                beam_id: target.beam_id.clone(),
+                beam_uuid: target.beam_uuid.clone(),
+                login: target.login.clone(),
+                launch_dir: std::path::absolute(launch_dir)?.display().to_string(),
+                gate,
+            },
+        )
+        .context("starting launch")
     }
 
     pub fn decide_request(&mut self, request_id: &str, approve: bool) -> anyhow::Result<()> {
@@ -3578,6 +3626,12 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                     ClientMessage::RevokeGrant { grant_id } => {
                         hub.end_grants_where(|g| g.grant_id == grant_id, "revoked by local user");
                     }
+                    ClientMessage::StartLaunch { beam_id, beam_uuid, login, launch_dir, gate } => {
+                        let target = crate::bridge::Target { beam_id, beam_uuid, login };
+                        if let Err(err) = hub.start_launch(&target, Path::new(&launch_dir), gate) {
+                            let _ = tx.try_send(ServerEvent::Error { message: format!("starting launch: {err:#}") });
+                        }
+                    }
                     ClientMessage::RefreshAgentKeys => {
                         let beams: Vec<String> = hub.agent.lock().unwrap().capable.iter().cloned().collect();
                         for beam in beams {
@@ -3689,6 +3743,12 @@ fn default_state_path() -> anyhow::Result<PathBuf> {
 
 fn default_log_path() -> anyhow::Result<PathBuf> {
     Ok(config_dir()?.join("beams-client/daemon.log"))
+}
+
+/// Where `beams config launch` packs launches (kept: the daemon reads them
+/// until the launch finishes, and they are the record of what was sent).
+pub fn launches_dir() -> anyhow::Result<PathBuf> {
+    Ok(config_dir()?.join("beams-client/launches"))
 }
 
 pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
@@ -5025,5 +5085,133 @@ mod tests {
         assert_eq!(fs::metadata(&audit_path).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = fs::remove_file(sock);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_launch_is_driven_through_upload_submit_and_post_and_resumed_after_reconnecting() {
+        use beams_protocol::launch::{Blob, Compression, Gate, LaunchStatus, UPLOAD_CHUNK_BYTES, UPLOAD_WINDOW};
+        let dir = temp_path("beams-clientd-launch");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pre-data")).unwrap();
+        fs::create_dir_all(dir.join("post-data")).unwrap();
+        // Incompressible, so pre spans more than a window of chunks.
+        let mut x: u64 = 0x2545f4914f6cdd1d;
+        let noise: Vec<u8> = (0..(UPLOAD_WINDOW + 3) * UPLOAD_CHUNK_BYTES)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        fs::write(dir.join("pre-data/noise"), &noise).unwrap();
+        fs::write(dir.join("post-data/file"), "post").unwrap();
+        fs::write(
+            dir.join("environment.toml"),
+            "schema_version = 1\nextends = [\"builtin:core\"]\n\
+             [files.pre]\nsource = \"./pre-data\"\ntarget = \"~/pre-data\"\nphase = \"pre\"\n\
+             [files.post]\nsource = \"./post-data\"\ntarget = \"~/post-data\"\nphase = \"post\"\n",
+        )
+        .unwrap();
+        let launch_dir = dir.join("launch");
+        let declaration = crate::config::pack::prepare(
+            dir.join("environment.toml").to_str().unwrap(),
+            &launch_dir,
+            Compression::Gzip,
+        )
+        .unwrap();
+        let id = declaration.launch_id.clone();
+        let (hub, rx) = hub_with_bridge("beam-uuid");
+        let next = || rx.recv_timeout(Duration::from_secs(5)).expect("a message to the Beam");
+        let target = crate::bridge::Target {
+            beam_id: "beam-name".into(),
+            beam_uuid: "beam-uuid".into(),
+            login: "beams".into(),
+        };
+        let say = |message: BeamToClient| hub.launch_message("beam-uuid", message);
+        let record = || hub.state.lock().unwrap().launches[&id].clone();
+
+        // Recorded at once; nothing is sent until the bridge says it can.
+        hub.start_launch(&target, &launch_dir, Gate::Interactive).unwrap();
+        assert_eq!(record().stage, LaunchStage::Submitting);
+        assert!(rx.try_recv().is_err());
+        hub.launch_bridge_connected("beam-uuid", &[beams_protocol::CAPABILITY_LAUNCH.to_string()]);
+
+        let ClientToBeam::LaunchUploadBegin { blob: Blob::Declaration, bytes, .. } = next() else { panic!() };
+        // The Beam already holds it whole (a quick resubmission).
+        say(BeamToClient::LaunchUploadOffset { launch_id: id.clone(), blob: Blob::Declaration, offset: bytes });
+        say(BeamToClient::LaunchUploaded { launch_id: id.clone(), blob: Blob::Declaration });
+        let ClientToBeam::LaunchSubmit { plan_digest, gate, request_id, .. } = next() else { panic!() };
+        assert_eq!((plan_digest, gate), (declaration.plan_digest.clone(), Gate::Interactive));
+        say(BeamToClient::LaunchAccepted {
+            request_id,
+            launch_id: id.clone(),
+            existing: false,
+            status: LaunchStatus::Accepted,
+            released: Vec::new(),
+        });
+        assert_eq!(record().stage, LaunchStage::Accepted);
+
+        // Pre goes a window at a time.
+        let ClientToBeam::LaunchUploadBegin { blob: Blob::Pre, bytes: pre_bytes, descriptor, .. } = next() else {
+            panic!()
+        };
+        assert_eq!(descriptor.unwrap().bytes, pre_bytes);
+        assert!(pre_bytes > (UPLOAD_WINDOW * UPLOAD_CHUNK_BYTES) as u64, "{pre_bytes}");
+        say(BeamToClient::LaunchUploadOffset { launch_id: id.clone(), blob: Blob::Pre, offset: 0 });
+        let chunk = UPLOAD_CHUNK_BYTES as u64;
+        let mut offsets = Vec::new();
+        while let Ok(ClientToBeam::LaunchUploadChunk { offset, .. }) = rx.try_recv() {
+            offsets.push(offset);
+        }
+        assert_eq!(offsets, (0..UPLOAD_WINDOW as u64).map(|i| i * chunk).collect::<Vec<_>>());
+        say(BeamToClient::LaunchUploadOffset { launch_id: id.clone(), blob: Blob::Pre, offset: chunk });
+        let ClientToBeam::LaunchUploadChunk { offset, .. } = next() else { panic!() };
+        assert_eq!(offset, UPLOAD_WINDOW as u64 * chunk, "an ack opens one more");
+        say(BeamToClient::LaunchUploaded { launch_id: id.clone(), blob: Blob::Pre });
+        for condition in ["artifact-ready:pre", "interface-ready"] {
+            say(BeamToClient::LaunchCondition {
+                launch_id: id.clone(),
+                condition: condition.into(),
+                released: true,
+                message: None,
+            });
+        }
+        // Post is packed only now, then uploaded.
+        let ClientToBeam::LaunchUploadBegin { blob: Blob::Post, .. } = next() else { panic!() };
+        assert!(launch_dir.join("post/descriptor.json").exists());
+        while rx.try_recv().is_ok() {}
+
+        // A reconnect drives it again from what the Beam reports.
+        hub.launch_bridge_disconnected("beam-uuid");
+        hub.launch_bridge_connected("beam-uuid", &[beams_protocol::CAPABILITY_LAUNCH.to_string()]);
+        let ClientToBeam::LaunchUploadBegin { blob: Blob::Declaration, bytes, .. } = next() else { panic!() };
+        say(BeamToClient::LaunchUploadOffset { launch_id: id.clone(), blob: Blob::Declaration, offset: bytes });
+        say(BeamToClient::LaunchUploaded { launch_id: id.clone(), blob: Blob::Declaration });
+        let ClientToBeam::LaunchSubmit { request_id, .. } = next() else { panic!() };
+        say(BeamToClient::LaunchAccepted {
+            request_id,
+            launch_id: id.clone(),
+            existing: true,
+            status: LaunchStatus::Running,
+            released: vec!["artifact-ready:pre".into(), "interface-ready".into()],
+        });
+        let ClientToBeam::LaunchUploadBegin { blob: Blob::Post, bytes: post_bytes, .. } = next() else { panic!() };
+        // The Beam already holds all but the last byte: only that is sent.
+        say(BeamToClient::LaunchUploadOffset { launch_id: id.clone(), blob: Blob::Post, offset: post_bytes - 1 });
+        let ClientToBeam::LaunchUploadChunk { offset, data, .. } = next() else { panic!() };
+        assert_eq!((offset, beams_protocol::agent::b64_decode(&data).unwrap().len()), (post_bytes - 1, 1));
+        say(BeamToClient::LaunchUploaded { launch_id: id.clone(), blob: Blob::Post });
+        say(BeamToClient::LaunchStatus { launch_id: id.clone(), status: LaunchStatus::Ok, message: None });
+        assert_eq!(record().stage, LaunchStage::Finished);
+        assert_eq!(record().status, Some(LaunchStatus::Ok));
+
+        // Finished launches aren't driven again; the record persists.
+        hub.launch_bridge_connected("beam-uuid", &[beams_protocol::CAPABILITY_LAUNCH.to_string()]);
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+        let saved = serde_json::to_string(&*hub.state.lock().unwrap()).unwrap();
+        let reloaded: PersistedState = serde_json::from_str(&saved).unwrap();
+        assert_eq!(reloaded.launches[&id], record());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

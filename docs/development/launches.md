@@ -6,9 +6,10 @@ and `beams config explain` resolve and validate profiles without contacting
 Teleport, reading client state, installing packages, or invoking hooks.
 `beams ssh` still uses the existing startup path. The opt-in headless runner
 executes package/file/script graphs, and the daemon accepts launches, waits
-for their conditions and releases the interface from shell/TUI readiness;
-archive upload from the workstation and profile selection during SSH are
-pending. The full
+for their conditions and releases the interface from shell/TUI readiness.
+`beams config launch` drives a profile onto an existing Beam over its
+bridge (upload, submission, post after the interface). Using it from
+`beams ssh` (runtime delivery, shell preparation, Zellij) is pending. The full
 [launch design](../designs/LAUNCH_CONFIGURATION_DESIGN.md) records the
 proposal and migration.
 
@@ -397,6 +398,25 @@ LaunchUploadBegin{post, ...} ...              → ... LaunchUploaded
   the current status and released conditions, even after the declaration
   upload was consumed; that, and re-beginning uploads, is how a
   reconnecting workstation recovers. A different digest is rejected.
+
+- **Throughput.** Uploads are bounded by the window: about
+  256 KiB per bridge round trip (≈2.5 MiB/s at 100 ms), plus a third for
+  base64. That is ample for pre bundles and off the interface's critical
+  path for post, but unmeasured against real workstations; a large post
+  tree may want a larger window or a separate transport later
+  (`docs/designs/LAUNCH_CONFIGURATION_DESIGN.md`). The workstation bridge
+  writes each queued message immediately (it used to poll every 50 ms,
+  capping every bridge message, sign responses included, at 20/s).
+
+The workstation side is `beams config launch` (see
+[the client README](../../client/README.md#beams-config-launch)): the
+daemon records the launch before uploading, and each time the Beam's
+bridge connects it re-drives unfinished launches from the top (begin the
+declaration upload, which the Beam answers at once if it has it; submit;
+upload pre unless released; pack and upload post once `interface-ready`
+is). `client/tests/launch-bridge-smoke.sh` runs a headless and an
+interactive launch through the real workstation daemon, bridge adapter and
+Beam daemon with a fake `tsh`, including a multi-MiB post bundle.
 
 ### Package transactions and parallel work
 

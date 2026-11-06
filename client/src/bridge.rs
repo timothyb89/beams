@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -229,7 +229,10 @@ fn drive_child(
     });
 
     loop {
-        match commands.try_recv() {
+        // Wakes as soon as a message is queued (a sign response, an upload
+        // chunk), not on the next poll; the poll only bounds how quickly a
+        // dead reader or child is noticed.
+        match commands.recv_timeout(POLL_INTERVAL) {
             Ok(message) => {
                 if let ClientToBeam::AddSessionToken { session_token } = &message {
                     tokens.insert(session_token.clone());
@@ -239,8 +242,8 @@ fn drive_child(
                     break;
                 }
             }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return outcome(true);
@@ -266,7 +269,6 @@ fn drive_child(
                 break;
             }
         }
-        thread::sleep(POLL_INTERVAL);
     }
 
     let _ = child.kill();

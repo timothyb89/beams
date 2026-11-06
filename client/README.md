@@ -62,6 +62,8 @@ Traversal, escaping/dangling links and special files fail. The remote
 without installing targets. Upload only `launch.json` and the phase
 archive/descriptor, keeping `local-inputs.json` on the workstation.
 These are profile payload bundles; runtime/Zellij delivery is still pending.
+`beams config launch` (below) does the upload, submission and post packing
+for you.
 
 After unpacking to `STAGING/pre` and `STAGING/post`, bootstrap can execute
 the graph with `launch run-phase --launch launch.json --staging STAGING
@@ -70,6 +72,42 @@ and runs hooks through the existing executor. It requires a successful
 pre receipt for post and does not connect to the daemon or spawn Zellij.
 See [bootstrap's README](../bootstrap/README.md#foreground-launch-execution)
 and the developer guide for ordering and retry behavior.
+
+## `beams config launch`
+
+```sh
+beams config launch --profile /path/to/environment.toml [TARGET] [--headless] [--no-follow]
+```
+
+Packs the profile (as `config pack`, into
+`~/.config/beams-client/launches/<uuid>/`) and hands it to the local daemon,
+which drives it onto an existing Beam (`TARGET`: id, uuid or purpose;
+default the `default` purpose) over that Beam's bridge, so the Beam needs
+this build's `beam-bootstrap` running. No scp or extra SSH connection: the
+daemon uploads the declaration, submits it, then uploads the pre bundle in
+chunks over the already-open bridge; the Beam verifies and stages each
+bundle itself and starts the work that needs it. Once the Beam reports
+`interface-ready` the daemon packs post (so a large post tree never delays
+pre) and uploads it. The command prints status and upload progress until
+the launch finishes and exits 0/1 (`--no-follow` returns once the daemon
+has it).
+
+`--headless` releases post work as soon as pre succeeds. Without it, post
+waits for the Beam's initial shell and TUI to report ready
+(`BEAMS_LAUNCH_ID`), which `beams ssh` does not set up yet; until then use
+`--headless`, or `beam-bootstrap launch ready`/`launch signal` on the Beam.
+
+The daemon records each launch (Beam, launch directory, gate, last status
+and released conditions) in `daemon-state.json` before uploading anything.
+Whenever the Beam's bridge reconnects (including after a daemon restart),
+it drives unfinished launches again: the Beam answers with what it already
+holds, so a resubmission starts nothing new and an interrupted upload
+resumes from the bytes the Beam has. Frontends receive `launch_changed`
+events and the launches in the `snapshot`; the session overlay doesn't
+show them yet. Protocol and flow: the developer guide's
+[launches over the workstation bridge](../docs/development/launches.md#launches-over-the-workstation-bridge).
+`client/tests/launch-bridge-smoke.sh` runs it end to end against local
+daemons with a fake `tsh`.
 
 ## `beams ssh`
 

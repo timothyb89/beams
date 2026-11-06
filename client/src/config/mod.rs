@@ -1,7 +1,7 @@
 //! Offline launch configuration tools. Live `ssh` retains the existing startup
 //! path until the execution/transport milestones are implemented.
 
-mod pack;
+pub(crate) mod pack;
 mod plan;
 mod profile;
 #[cfg(test)]
@@ -28,6 +28,30 @@ pub enum Command {
         #[arg(long)]
         launch_dir: PathBuf,
     },
+    /// Pack a profile and drive it onto an existing Beam through the local
+    /// daemon: the declaration and pre bundle are uploaded over the Beam's
+    /// bridge and submitted; post is packed and uploaded once the Beam's
+    /// interface is ready. Follows the launch until it finishes (exit 1 if
+    /// it fails). Without `--headless`, post work waits for the Beam's
+    /// initial shell and TUI to report ready (see
+    /// docs/development/launches.md).
+    Launch {
+        #[arg(long, default_value = "builtin:development")]
+        profile: String,
+        /// Beam id, uuid, or tracked purpose (default: the `default` purpose).
+        target: Option<String>,
+        #[arg(long, default_value = "beams")]
+        login: String,
+        /// Release post work as soon as pre succeeds, without waiting for
+        /// a shell or TUI.
+        #[arg(long)]
+        headless: bool,
+        /// Return once the daemon has the launch instead of following it.
+        #[arg(long)]
+        no_follow: bool,
+        #[arg(long, value_enum, default_value = "gzip")]
+        compression: Codec,
+    },
     /// Validate a launch profile without connecting to or modifying a Beam.
     Validate {
         #[arg(long, default_value = "builtin:development")]
@@ -49,6 +73,69 @@ pub enum Codec {
     Gzip,
 }
 
+impl From<Codec> for Compression {
+    fn from(codec: Codec) -> Self {
+        match codec {
+            Codec::None => Compression::None,
+            Codec::Gzip => Compression::Gzip,
+        }
+    }
+}
+
+fn launch(
+    profile: &str,
+    target: Option<&str>,
+    login: &str,
+    headless: bool,
+    no_follow: bool,
+    compression: Compression,
+) -> anyhow::Result<u8> {
+    use crate::clientd::{LaunchStage, ServerEvent};
+    use beams_protocol::launch::{Gate, LaunchStatus};
+
+    let state = crate::state::State::load()?;
+    let beams = crate::tsh::list_beams()?;
+    let beam = crate::beamcmd::resolve(target.unwrap_or(crate::DEFAULT_PURPOSE), &state, &beams)?;
+    let target = crate::bridge::Target { beam_id: beam.id.clone(), beam_uuid: beam.uuid.clone(), login: login.to_string() };
+    let output = crate::clientd::launches_dir()?.join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(output.parent().expect("has a parent"))?;
+    let declaration = pack::prepare(profile, &output, compression)?;
+    let id = declaration.launch_id;
+    eprintln!("beams: launch {id} ({profile}) onto {}, packed at {}", target.beam_id, output.display());
+
+    let mut frontend = crate::clientd::connect_or_start()?;
+    frontend.ensure_bridge(&target, &uuid::Uuid::new_v4().to_string())?;
+    let gate = if headless { Gate::Headless } else { Gate::Interactive };
+    frontend.start_launch(&target, &output, gate)?;
+    let mut last = String::new();
+    while let Ok(event) = frontend.events.recv() {
+        let launch = match event {
+            ServerEvent::LaunchChanged { launch } if launch.launch_id == id => launch,
+            ServerEvent::Error { message } => anyhow::bail!("{message}"),
+            _ => continue,
+        };
+        if no_follow {
+            return Ok(0);
+        }
+        let mut line = format!(
+            "{}{}",
+            launch.status.map(|s| format!("{s:?}").to_lowercase()).unwrap_or_else(|| "submitting".into()),
+            launch.message.as_deref().map(|m| format!(": {m}")).unwrap_or_default()
+        );
+        if let Some(upload) = &launch.upload {
+            line.push_str(&format!(" ({} {}/{} bytes)", upload.blob.name(), upload.sent, upload.total));
+        }
+        if line != last {
+            eprintln!("beams: {line}");
+            last = line;
+        }
+        if launch.stage == LaunchStage::Finished {
+            return Ok(if launch.status == Some(LaunchStatus::Ok) { 0 } else { 1 });
+        }
+    }
+    anyhow::bail!("the local daemon disconnected before launch {id} finished")
+}
+
 pub fn run(command: Command) -> anyhow::Result<u8> {
     match command {
         Command::Pack {
@@ -56,16 +143,15 @@ pub fn run(command: Command) -> anyhow::Result<u8> {
             output,
             compression,
         } => {
-            let compression = match compression {
-                Codec::None => Compression::None,
-                Codec::Gzip => Compression::Gzip,
-            };
-            let declaration = pack::prepare(&profile, &output, compression)?;
+            let declaration = pack::prepare(&profile, &output, compression.into())?;
             println!(
                 "Prepared {} at {} (pre only; post sources deferred)",
                 declaration.launch_id,
                 output.display()
             );
+        }
+        Command::Launch { profile, target, login, headless, no_follow, compression } => {
+            return launch(&profile, target.as_deref(), &login, headless, no_follow, compression.into());
         }
         Command::PackPost { launch_dir } => {
             let descriptor = pack::prepare_post(&launch_dir)?;

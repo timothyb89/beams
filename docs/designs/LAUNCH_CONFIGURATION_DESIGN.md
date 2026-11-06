@@ -19,12 +19,14 @@ template definitions, package batches, artifact selections and graph validation.
 
 ## Implementation status and next-session handoff
 
-Updated 2026-11-06 after the daemon-launch slice (`090236d`, `e36c9f2` and
-the CLI/docs commit that follows them). Launches can now run either in the
-foreground (`run-phase`) or through the daemon, which accepts them durably,
-waits for external conditions, and keeps reconnectable task snapshots. Live
-`beams ssh` still uses Git delivery and the existing fixed startup path;
-all launch commands are explicit and opt-in.
+Updated 2026-11-06 after the readiness/bridge slice (`e8b571c`, `6cff233`
+and the workstation-driver commit that follows them). A workstation can now
+drive a whole launch onto an existing Beam with `beams config launch`: the
+declaration and bundles travel as chunks over the already-open bridge, the
+Beam stages each bundle itself (releasing `artifact-ready`), and an
+interactive launch's post work starts once the initial shell and the TUI
+report ready. Live `beams ssh` still uses Git delivery and the existing
+fixed startup path; nothing sets `BEAMS_LAUNCH_ID` in a real session yet.
 
 | Commit | Completed milestone | Main implementation |
 |---|---|---|
@@ -34,67 +36,70 @@ all launch commands are explicit and opt-in.
 | `0853c81` | Generic package/file/hook adapters, foreground phase execution, hook retry/history, Rust's apt split and manifest acceptance-order repair | `bootstrap/src/launch/`, `packages.rs`, `commandlog.rs`, `daemon.rs` |
 | `090236d` | Runner takes shared executor resources and a `Conditions` policy; reusable `verify_phase` | `bootstrap/src/launch/runner.rs` |
 | `e36c9f2` + CLI commit | Daemon acceptance by UUID/digest, waiting conditions, snapshots with a `seq` boundary, restart → interrupted, explicit retry; `launch submit/signal/status/retry`; hooks get the relay socket | `bootstrap/src/launch/daemon.rs`, `launch/mod.rs`, `daemon.rs` |
+| `e8b571c` | Shell/TUI readiness gate; Beam TUI loads launch snapshots on connect and on acceptance | `launch/daemon.rs`, `tui/app.rs`, `shell/fish/conf.d/beams-launch.fish` |
+| `6cff233` | `launch` bridge capability: chunked resumable uploads, submission by ID/digest, owner-routed status/conditions; the Beam stages each bundle itself (`launch receive`) | `protocol/src/lib.rs`, `launch/upload.rs`, `launch/daemon.rs` |
+| driver commit | Workstation driver and `beams config launch`; bridge writer stops polling | `client/src/clientd/launches.rs`, `client/src/config/mod.rs`, `client/src/bridge.rs` |
 
-Available commands are `beams config validate/explain/pack/pack-post` and
-`beam-bootstrap launch unpack/run-phase/submit/signal/status/retry/install-packages`.
+Available commands are `beams config validate/explain/pack/pack-post/launch`
+and `beam-bootstrap launch unpack/run-phase/submit/signal/ready/receive/status/retry/install-packages`.
 The [developer guide](../development/launches.md#run-a-launch-through-the-daemon)
-documents the daemon path, its ops, events and snapshot boundary; the
-binary READMEs document flags.
+documents the daemon path, readiness, the bridge flow, ops, events and the
+snapshot boundary; the binary READMEs document flags.
 
 ### Current execution boundary
 
 - The daemon runs pre then post for a launch on one worker with
   `Hub.resources`, so launches and manifests share destination/apt locks.
-  Merging both phases into one executor run would gain nothing: every post
-  node requires `interface-ready`, which requires all of pre.
-- `artifact-ready:<phase>` is released when the daemon verifies that
-  staging (at worker start or on `launch signal`); `interface-ready` by a
-  signal (interactive gate) or after pre (headless gate). Nothing sends
-  these automatically yet: the receive path and shell/TUI are still manual.
-- Acceptance (`accepted.json`) and snapshots (`snapshot.json`) live in
-  `launch-state/<launch ID>/` next to the daemon socket, the same root as
-  `run-phase` receipts and hook history. A restarted daemon reloads them;
-  unfinished launches become `interrupted` and resume only via retry.
-  Owned-subprocess reconciliation after a restart is not implemented, so
-  retry must not be used while an old installer may still run.
-- The Beam TUI renders launch `task_status` events (same shape, launch ID as
-  `manifest_id`) but doesn't request `launch_snapshot` on connect yet.
-- There is no cancellation op; a waiting condition waits until signalled
-  or the daemon stops. Staging-generation cleanup and privileged file
-  targets remain pending, as do configurable native installers.
-- Two follow-ups from the SSH agent work are done: a running manifest's
-  key use routes to its submitting client, and every git task (including
-  PR fetches) and every hook gets the relay socket and run tag.
+- `artifact-ready:<phase>` is released when the daemon stages a bundle it
+  received (bridge upload or `launch receive`), or verifies staging
+  unpacked some other way (worker start, `launch signal`).
+  `interface-ready` is released by `launch_ready` from both `shell` and
+  `tui` (interactive gate), by a signal, or after pre (headless).
+- The shell reports from fish's conf.d at the first prompt and the TUI
+  after its first frame with the launch on screen, both only with
+  `BEAMS_LAUNCH_ID`. Getting that into the Zellij session (and making sure
+  an existing session isn't attached instead) is the next slice.
+- Bridge uploads are bounded by an 8 × 32 KiB window per round trip and
+  base64; throughput over a real `tsh` bridge hasn't been measured, nor
+  compared with `tsh scp`. The bridge writer used to poll every 50 ms
+  (20 messages/s for all bridge traffic); it now writes on arrival.
+- The workstation records launches in `daemon-state.json` before
+  uploading and re-drives unfinished ones on every bridge connection; the
+  session overlay doesn't show them yet (only `beams config launch` does).
+- Acceptance, snapshots, staging and upload spools live under
+  `launch-state/` and `launch-uploads/` next to the daemon socket. A
+  restarted daemon marks unfinished launches `interrupted`; retry is a
+  Beam-side command only (not over the bridge), and owned-subprocess
+  reconciliation is still missing. No cancel op; no cleanup of finished
+  launches on either side.
 
 ### Next implementation slice
 
-Wire the daemon substrate into an opt-in launch path:
+The opt-in `beams ssh` launch path:
 
-1. **TUI snapshot on connect.** Request `launch_snapshot`, apply it, drop
-   events at or below its `seq`; show pending post work before readiness.
-   Then the TUI's first frame can be one half of `interface-ready`.
-2. **Readiness signals.** The initial shell wrapper reports process
-   startup and the TUI reports snapshot-loaded/first-frame, carrying the
-   launch ID; the daemon releases `interface-ready` when both arrive
-   (still no timer; a missing signal is a diagnosable state).
-3. **Bridge launch capability.** Small typed messages for submit (by ID,
-   digest and staged declaration path), status and condition transitions,
-   within the 64 KiB frame limit; the client daemon persists acceptance
-   on its side and receives the exact plan from `beams ssh`.
-4. **Transport and receive.** One bundle per phase over the existing
-   transport; the Beam-side receive verifies and releases
-   `artifact-ready:<phase>` itself, replacing the manual signal. Startup
-   grants installed before eligible SSH tasks are released.
-5. Then the opt-in `beams ssh` path: small runtime delivery, shell
-   preparation, Zellij/TUI spawn. `config init`, workstation profile
-   selection, timing/transport baseline, native parameterization,
-   sanitized default migration, known_hosts/git config seeding (see
-   `TODO.md`) and optional ControlMaster remain open.
+1. **Profile selection.** `beams ssh --profile P` (and the workstation
+   default profile) packs before or while the Beam is created.
+2. **Small runtime delivery.** Ship `beam-bootstrap` and the pre bundle
+   without the Git push; the bootstrap must already be running for the
+   bridge, so the first runtime still travels by the existing scp, with
+   the pre bundle alongside it and staged via `launch receive` (no second
+   connection).
+3. **Shell preparation and spawn.** Pre prepares fish config/PATH/relay
+   env; the session command exports `BEAMS_LAUNCH_ID` into a new Zellij
+   session (refuse or replace an existing one with a different launch),
+   with the TUI pane; remove the competing background fixed run on this
+   path.
+4. **Visibility.** Launch status and upload progress in the session
+   overlay (`ServerEvent::LaunchChanged`), retry over the bridge.
+5. Then timing/transport baselines (including bridge upload vs scp),
+   `config init`, native parameterization, sanitized default migration,
+   known_hosts/git config seeding (see `TODO.md`) and optional
+   ControlMaster.
 
 ### Validation at handoff
 
 Native client/bootstrap builds pass with no warnings. The Rust suites pass
-**325 tests**: bootstrap 129, client 172 unit + 3 CLI, protocol 16,
+**342 tests**: bootstrap 142, client 175 unit + 3 CLI, protocol 17,
 artifacts 5. Reproduce from the checkout root:
 
 ```sh
@@ -103,16 +108,24 @@ cargo test --manifest-path protocol/Cargo.toml
 cargo test --manifest-path client/Cargo.toml
 cargo test --manifest-path bootstrap/Cargo.toml -- --test-threads=1
 bootstrap/tests/launch-daemon-smoke.sh   # real binaries, scratch HOME/socket
+client/tests/launch-bridge-smoke.sh      # workstation daemon + bridge + Beam daemon, fake tsh
 ```
 
 The daemon fixture tests (`launch/tests.rs`, `daemon_launches`) cover
 waiting and release, duplicate and conflicting submissions, the snapshot
-boundary, pre failure/retry, staging that fails verification, two launches
-serialized by a shared resource (the permanent form of the earlier
-uncommitted overlap harness), and restart → interrupted → retry.
-`client-bridge-smoke.sh` and `ssh-agent-smoke.sh` still pass. Real apt,
-Zellij, a disposable Beam and the static musl build have not been
-exercised for the launch path; this session's own daemon was not restarted.
+boundary, pre failure/retry, staging that fails verification, shared
+resource serialization, restart → interrupted → retry, the readiness gate
+(both components, repeats, early reports, survival across retry), bridge
+upload → submit → staging → release with owner notifications, a bundle
+that fails to stage, and `launch receive`. `upload.rs` covers chunk
+ordering, resume, digest and size refusal; the client covers the upload
+window and a full drive/reconnect/resume cycle. The launch-daemon smoke
+runs the real TUI on a pseudo-terminal reporting readiness; the
+launch-bridge smoke pushes a 3 MiB post bundle through the real bridge.
+`client-bridge-smoke.sh` still passes. Real apt, Zellij, a real `tsh`
+bridge, a disposable Beam and the static musl build have not been
+exercised for the launch path; this session's own daemon was not
+restarted.
 
 ## Goals and recommendation
 
