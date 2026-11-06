@@ -530,6 +530,10 @@ then what the Beam reported (command, reason, task), marked unverified.
 Deny is the default. With no `beams ssh` attached, requests are denied
 without asking. See `docs/designs/SSH_AGENT_PROXY_DESIGN.md`.
 
+While `[ssh_agent]` is unset and this terminal's agent has keys, `beams ssh`
+offers once (a toast) to share one, and the home screen says so until you
+share a key or choose "Don't share any" (`a` opens the choice).
+
 Every decision (asked, signed, granted, denied, rejected, expired, failed)
 is appended to `~/.config/beams-client/ssh-agent-audit.jsonl`, one JSON
 object per line: time, Beam, request id, key fingerprint, the verified

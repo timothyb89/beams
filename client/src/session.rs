@@ -335,12 +335,14 @@ fn drive(
     let mut daemon_view = DaemonView::new(local_daemon);
     daemon_view.recents = recent::RecentPaths::load_default();
     // Offer to share a key once, if that was never set up and this
-    // terminal's agent has keys to offer (only meaningful with a daemon).
+    // terminal's agent has keys to offer (only meaningful with a daemon),
+    // and keep a hint on the home screen until it is.
     daemon_view.offer_key_setup = local_daemon.frontend.is_some()
         && !crate::agent::Config::configured()
         && crate::agent::own_agent_socket()
             .and_then(|sock| crate::agent::local_identities(&sock).ok())
             .is_some_and(|keys| !keys.is_empty());
+    daemon_view.key_setup_hint = daemon_view.offer_key_setup;
     let mut approval_takeover_guard = None;
     let mut palette_terminal = None;
     macro_rules! redraw_palette {
@@ -606,6 +608,9 @@ struct DaemonView {
     /// `[ssh_agent]` was never configured and this terminal's agent has
     /// keys: offer (once) to share one.
     offer_key_setup: bool,
+    /// The same condition, for a home-screen line that stays until a key
+    /// is shared or declined (the toast is easy to miss).
+    key_setup_hint: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1323,6 +1328,7 @@ impl DaemonView {
                 reviewing_from_toast: false,
                 input_guard_until: None,
                 offer_key_setup: false,
+                key_setup_hint: false,
             },
             None => Self {
                 beam_uuid,
@@ -1349,6 +1355,7 @@ impl DaemonView {
                 reviewing_from_toast: false,
                 input_guard_until: None,
                 offer_key_setup: false,
+                key_setup_hint: false,
             },
         }
     }
@@ -1682,6 +1689,7 @@ impl DaemonView {
                 if let Some(frontend) = &mut local_daemon.frontend {
                     let _ = frontend.refresh_agent_keys();
                 }
+                self.key_setup_hint = false;
                 self.notify(done, false);
             }
             Err(err) => self.notify(format!("could not update the SSH key config: {err:#}"), true),
@@ -3891,6 +3899,15 @@ mod tests {
         let mut daemon = managed_daemon();
         let mut view = DaemonView::new(&daemon);
         view.offer_key_setup = true;
+        view.key_setup_hint = true;
+        let home_text = |view: &DaemonView| {
+            ui::home_body(view, 80, 40)
+                .iter()
+                .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(home_text(&view).contains("No SSH key is shared"), "{}", home_text(&view));
         let mut policy = notices::ToastPolicy::default();
         let (toast, subject) = policy.current(&view, EscapeKey::Byte(0x1d), Instant::now()).unwrap();
         assert_eq!(toast.title, "Share an SSH key with Beams?");
@@ -3898,6 +3915,7 @@ mod tests {
 
         view.open_agent_keys_menu();
         assert!(!view.offer_key_setup, "offered once");
+        assert!(view.key_setup_hint, "the hint stays until a choice is made");
         let Screen::Menu(menu) = &view.screen else { panic!("keys menu") };
         assert_eq!(menu.title, "SSH keys for Beams");
         assert_eq!(menu.items[0].action, MenuAction::AllowKey(fingerprint.clone()));
@@ -3909,6 +3927,7 @@ mod tests {
         view.handle_key(Key::Char('1'), &mut daemon);
         assert_eq!(crate::agent::Config::load().unwrap().allowed_keys, vec![fingerprint.clone()]);
         assert!(crate::agent::Config::configured());
+        assert!(!home_text(&view).contains("No SSH key is shared"));
 
         // Now shared: the menu offers to stop, and no "don't ask" any more.
         view.handle_key(Key::Char('a'), &mut daemon);

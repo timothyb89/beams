@@ -920,9 +920,6 @@ Open:
   by design. The design's `ApprovalSurface` seam isn't factored out yet:
   the terminal flow lives in `clientd.rs` (`handle_agent_sign`,
   `decide_agent`).
-- [ ] The key-setup offer toast lasts 20s. If missed, the only hints are
-  `a ssh keys` in the menu and `beams agent-keys`. Consider a persistent
-  home-screen line while no key is shared and `[ssh_agent]` is unset.
 - [ ] Host certificates (`*-cert-v01@openssh.com` host keys,
   `@cert-authority` lines) aren't supported: such hosts show "verified key,
   unknown host" and can't match a grant.

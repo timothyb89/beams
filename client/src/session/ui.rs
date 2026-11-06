@@ -770,7 +770,7 @@ fn list_row(
     })
 }
 
-fn home_body(view: &DaemonView, width: usize, max_rows: usize) -> Vec<Line<'static>> {
+pub(super) fn home_body(view: &DaemonView, width: usize, max_rows: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("local daemon  ", theme::dim()),
@@ -795,6 +795,11 @@ fn home_body(view: &DaemonView, width: usize, max_rows: usize) -> Vec<Line<'stat
             ),
             theme::dim(),
         )));
+    }
+    if view.key_setup_hint {
+        for line in wrap("No SSH key is shared with Beams, so git over ssh won't work here. Press a to choose.", width) {
+            lines.push(Line::from(Span::styled(line, theme::warn())));
+        }
     }
     if let Some(notice) = &view.notice {
         let style = if notice.error {
