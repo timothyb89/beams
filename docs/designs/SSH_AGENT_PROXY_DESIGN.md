@@ -237,7 +237,9 @@ personal keys.
 grant (with a passive toast), approved or denied by the user, or denied
 automatically (timeout, no frontend, policy). Each outcome is written to a
 local audit log next to `daemon.log` (time, Beam, key, kind, verified host
-and user, decision, and how it was made).
+and user, decision, and how it was made). Implemented as
+`ssh-agent-audit.jsonl` (`agent::AuditEvent`); the format is in
+`client/README.md`.
 
 ### Approval surfaces
 
@@ -587,8 +589,8 @@ Not done yet, and noticed during the live run:
    countdown in the toast. RSA (sha2-256/512) and ECDSA P-256/384/521 host
    keys verified against real OpenSSH (`bootstrap/tests/ssh-agent-hostkey-algos.sh`,
    captured fixtures in `protocol/tests/fixtures/`). The audit trail is
-   `daemon.log` (one line per request and decision); a separate audit file
-   is not done.
+   `daemon.log` (one line per request and decision), plus (added later) a
+   separate JSON-lines audit file, `ssh-agent-audit.jsonl`.
 3. **Client-owned startup.** *Done.* `[startup]` in `config.toml`, sent once
    per Beam over `RunManifest` (persisted in `daemon-state.json`), with
    `wait-ssh-agent` added for ssh clones; `[startup.ssh_grant]` as designed,

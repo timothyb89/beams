@@ -1838,8 +1838,22 @@ impl Hub {
         }
     }
 
-    fn deny_agent(&self, beam_uuid: &str, beam_request_id: &str, why: &str) {
+    /// Records an SSH key decision in the local audit log, next to the
+    /// persisted state (none without one, as in most tests).
+    fn audit_agent(&self, event: crate::agent::AuditEvent) {
+        if let Some(path) = &self.state_path {
+            crate::agent::append_audit(&path.with_file_name("ssh-agent-audit.jsonl"), event);
+        }
+    }
+
+    fn deny_agent(&self, beam_uuid: &str, beam_request_id: &str, why: &str, context: &beams_protocol::AgentContext) {
         eprintln!("ssh-agent: {beam_uuid}: denied without asking: {why}");
+        let claimed = crate::agent::claimed_context(context);
+        self.audit_agent(crate::agent::AuditEvent {
+            message: Some(why),
+            claimed: Some(&claimed),
+            ..crate::agent::AuditEvent::new(beam_uuid, "denied")
+        });
         self.send_agent_response(beam_uuid, beam_request_id, &beams_protocol::agent::failure(), Some(why.to_string()));
     }
 
@@ -1854,13 +1868,14 @@ impl Hub {
     ) {
         let config = (self.agent_config)();
         if !config.enabled() {
-            return self.deny_agent(beam_uuid, &beam_request_id, "the SSH agent proxy is disabled on the workstation");
+            return self.deny_agent(beam_uuid, &beam_request_id, "the SSH agent proxy is disabled on the workstation", context);
         }
         if !self.has_agent_frontend(beam_uuid) {
             return self.deny_agent(
                 beam_uuid,
                 &beam_request_id,
                 "no interactive `beams ssh` session is attached to approve it",
+                context,
             );
         }
         let (binds, queued) = {
@@ -1869,7 +1884,7 @@ impl Hub {
             (agent.binds.binds(beam_uuid, conn_id), queued)
         };
         if queued >= crate::agent::MAX_PENDING_PER_BEAM {
-            return self.deny_agent(beam_uuid, &beam_request_id, "too many SSH key requests are already waiting");
+            return self.deny_agent(beam_uuid, &beam_request_id, "too many SSH key requests are already waiting", context);
         }
         let local_keys = self
             .agent_socket_for(beam_uuid, None)
@@ -1888,7 +1903,7 @@ impl Hub {
             expires_at_ms,
         ) {
             Ok(evaluated) => evaluated,
-            Err(why) => return self.deny_agent(beam_uuid, &beam_request_id, &why),
+            Err(why) => return self.deny_agent(beam_uuid, &beam_request_id, &why, context),
         };
         if let Some(grant) = self.take_grant_use(beam_uuid, &prompt) {
             return self.sign_with_grant(beam_uuid, beam_request_id, body, prompt, grant);
@@ -1910,6 +1925,10 @@ impl Hub {
             record.agent.as_ref().map(|p| p.summary()).unwrap_or_default(),
             record.request_id
         );
+        self.audit_agent(crate::agent::AuditEvent {
+            request_id: Some(&record.request_id),
+            ..crate::agent::AuditEvent::new(beam_uuid, "asked").prompt(record.agent.as_ref())
+        });
         let request_id = record.request_id.clone();
         self.agent.lock().unwrap().pending.insert(
             request_id.clone(),
@@ -2052,6 +2071,11 @@ impl Hub {
         let Some(sock) = self.agent_socket_for(beam_uuid, None) else {
             record.status = RequestStatus::Failed;
             record.message = Some("no attached terminal has an SSH agent".to_string());
+            self.audit_agent(crate::agent::AuditEvent {
+                request_id: Some(&record.request_id),
+                message: record.message.as_deref(),
+                ..crate::agent::AuditEvent::new(beam_uuid, "failed").prompt(record.agent.as_ref())
+            });
             self.send_agent_response(beam_uuid, &beam_request_id, &beams_protocol::agent::failure(), record.message.clone());
             self.broadcast(ServerEvent::RequestChanged { request: record });
             return;
@@ -2071,6 +2095,12 @@ impl Hub {
                     hub.send_agent_response(&beam_uuid, &beam_request_id, &beams_protocol::agent::failure(), record.message.clone());
                 }
             }
+            let event = if record.status == RequestStatus::Running { "granted" } else { "failed" };
+            hub.audit_agent(crate::agent::AuditEvent {
+                request_id: Some(&record.request_id),
+                message: record.message.as_deref(),
+                ..crate::agent::AuditEvent::new(&beam_uuid, event).prompt(record.agent.as_ref())
+            });
             hub.broadcast(ServerEvent::RequestChanged { request: record });
         });
     }
@@ -2087,6 +2117,16 @@ impl Hub {
         pending.record.status = status;
         pending.record.message = Some(why.to_string());
         eprintln!("ssh-agent: {}: {why} (request {request_id})", pending.record.beam_uuid);
+        let event = match status {
+            RequestStatus::Rejected => "rejected",
+            RequestStatus::Expired => "expired",
+            _ => "failed",
+        };
+        self.audit_agent(crate::agent::AuditEvent {
+            request_id: Some(request_id),
+            message: Some(why),
+            ..crate::agent::AuditEvent::new(&pending.record.beam_uuid, event).prompt(pending.record.agent.as_ref())
+        });
         self.send_agent_response(
             &pending.record.beam_uuid,
             &pending.beam_request_id,
@@ -2156,6 +2196,11 @@ impl Hub {
             let why = "this terminal has no SSH_AUTH_SOCK, so there is no agent to sign with";
             pending.record.status = RequestStatus::Failed;
             pending.record.message = Some(why.to_string());
+            self.audit_agent(crate::agent::AuditEvent {
+                request_id: Some(request_id),
+                message: Some(why),
+                ..crate::agent::AuditEvent::new(&beam_uuid, "failed").prompt(pending.record.agent.as_ref())
+            });
             self.send_agent_response(&beam_uuid, &pending.beam_request_id, &beams_protocol::agent::failure(), Some(why.to_string()));
             self.broadcast(ServerEvent::RequestChanged { request: pending.record });
             bail!("{why}");
@@ -2172,6 +2217,10 @@ impl Hub {
         thread::spawn(move || match crate::agent::local_sign(&sock, &body) {
             Ok(reply) => {
                 eprintln!("ssh-agent: {beam_uuid}: signed: {summary} (request {request_id})");
+                hub.audit_agent(crate::agent::AuditEvent {
+                    request_id: Some(&request_id),
+                    ..crate::agent::AuditEvent::new(&beam_uuid, "signed").prompt(record.agent.as_ref())
+                });
                 record.status = RequestStatus::Running;
                 record.message = Some("signed".to_string());
                 hub.send_agent_response(&beam_uuid, &beam_request_id, &reply, None);
@@ -2181,6 +2230,11 @@ impl Hub {
                 // Shown to the user through the request's message.
                 let why = format!("{err:#}");
                 eprintln!("ssh-agent: {beam_uuid}: signing failed: {why} (request {request_id})");
+                hub.audit_agent(crate::agent::AuditEvent {
+                    request_id: Some(&request_id),
+                    message: Some(&why),
+                    ..crate::agent::AuditEvent::new(&beam_uuid, "failed").prompt(record.agent.as_ref())
+                });
                 record.status = RequestStatus::Failed;
                 record.message = Some(why.clone());
                 hub.send_agent_response(&beam_uuid, &beam_request_id, &beams_protocol::agent::failure(), Some(why));
@@ -4471,7 +4525,11 @@ mod tests {
     }
 
     fn agent_hub(allowed: &str) -> (Arc<Hub>, Receiver<ClientToBeam>) {
-        let mut hub = Hub::with_state_path_and_program(PersistedState::default(), None, "tsh".to_string());
+        agent_hub_at(allowed, None)
+    }
+
+    fn agent_hub_at(allowed: &str, state_path: Option<PathBuf>) -> (Arc<Hub>, Receiver<ClientToBeam>) {
+        let mut hub = Hub::with_state_path_and_program(PersistedState::default(), state_path, "tsh".to_string());
         let allowed = allowed.to_string();
         hub.agent_config = Box::new(move || crate::agent::Config {
             allowed_keys: vec![allowed.clone()],
@@ -4828,7 +4886,9 @@ mod tests {
         let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         let blob = key.public_key().to_bytes().unwrap();
         let fingerprint = beams_protocol::agent_crypto::fingerprint(&blob).unwrap();
-        let (hub, commands) = agent_hub(&fingerprint);
+        let dir = std::env::temp_dir().join(format!("beams-agent-audit-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let (hub, commands) = agent_hub_at(&fingerprint, Some(dir.join("daemon-state.json")));
         let sock = fake_local_agent(blob.clone());
 
         handle_bridge_event(
@@ -4919,6 +4979,28 @@ mod tests {
         assert!(matches!(next_agent_message(&commands), ClientToBeam::AgentResponse { .. }));
         hub.agent_frontend_detached(7);
         assert_eq!(next_agent_message(&commands), ClientToBeam::AgentIdentities { keys: vec![] });
+
+        // Every decision is in the local audit log, in order, private.
+        let audit_path = dir.join("ssh-agent-audit.jsonl");
+        let audit: Vec<serde_json::Value> = fs::read_to_string(&audit_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let events: Vec<&str> = audit.iter().map(|e| e["event"].as_str().unwrap()).collect();
+        assert_eq!(
+            events,
+            ["denied", "asked", "signed", "asked", "rejected", "denied", "asked", "expired"]
+        );
+        assert!(audit.iter().all(|e| e["beam"] == "beam-uuid" && e["time"].as_str().is_some_and(|t| t.ends_with('Z'))));
+        assert_eq!(audit[2]["key"], fingerprint.as_str());
+        assert_eq!(audit[2]["request_id"], audit[1]["request_id"]);
+        assert_eq!(audit[2]["operation"], "SSH key: unverified host as git");
+        assert_eq!(audit[2]["claimed"]["reason"], "clone for review");
+        assert!(audit[5]["message"].as_str().unwrap().contains("allowed_keys"));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&audit_path).unwrap().permissions().mode() & 0o777, 0o600);
         let _ = fs::remove_file(sock);
+        let _ = fs::remove_dir_all(dir);
     }
 }

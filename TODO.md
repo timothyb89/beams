@@ -915,9 +915,6 @@ Open:
   scoped to Beam + key + verified host key + user, expiring no later than
   the Beam's TTL, listed and revocable like startup grants. Never matching
   an unverified host. (Design: "Grants and remembered rules".)
-- [ ] A separate local audit log of SSH key decisions. Today they're one
-  line each in `daemon.log` (`ssh-agent: <beam>: asking|signed|granted|
-  rejected|...`).
 - [ ] A GUI/OS approval surface (macOS notification or dialog) for when no
   `beams ssh` is attached. Today such requests are denied without asking,
   by design. The design's `ApprovalSurface` seam isn't factored out yet:
@@ -926,8 +923,6 @@ Open:
 - [ ] The key-setup offer toast lasts 20s. If missed, the only hints are
   `a ssh keys` in the menu and `beams agent-keys`. Consider a persistent
   home-screen line while no key is shared and `[ssh_agent]` is unset.
-- [ ] The "SSH key used" toast for grant uses doesn't say which repo or
-  task; the claimed `task_run` is available on the record.
 - [ ] `daemon-state.json`'s `startup_submitted` keeps one Beam UUID per
   Beam forever. Prune entries for Beams that no longer exist (the bridge
   retirement path already knows).

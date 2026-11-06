@@ -149,20 +149,22 @@ impl ToastPolicy {
             .map(|(_, r)| r)
         {
             let prompt = record.agent.as_ref().expect("filtered above");
-            let toast = Toast {
-                tone: Tone::Info,
-                title: "SSH key used".to_string(),
-                lines: vec![
-                    Line::from(Span::styled(
-                        ui::ellipsize(&prompt.summary(), LINE_WIDTH),
-                        theme::label_focused(),
-                    )),
-                    Line::from(Span::styled(
-                        ui::ellipsize(prompt.granted.as_deref().unwrap_or_default(), LINE_WIDTH),
-                        theme::dim(),
-                    )),
-                ],
-            };
+            let mut lines = vec![Line::from(Span::styled(
+                ui::ellipsize(&prompt.summary(), LINE_WIDTH),
+                theme::label_focused(),
+            ))];
+            // Which repo or task it was for (as the Beam claims it).
+            if let Some(task) = prompt.task_label() {
+                lines.push(Line::from(Span::styled(
+                    ui::ellipsize(&format!("for {task}"), LINE_WIDTH),
+                    theme::dim(),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                ui::ellipsize(prompt.granted.as_deref().unwrap_or_default(), LINE_WIDTH),
+                theme::dim(),
+            )));
+            let toast = Toast { tone: Tone::Info, title: "SSH key used".to_string(), lines };
             return Some((toast, Subject::Request(record.request_id.clone())));
         }
 

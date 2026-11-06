@@ -530,6 +530,17 @@ then what the Beam reported (command, reason, task), marked unverified.
 Deny is the default. With no `beams ssh` attached, requests are denied
 without asking. See `docs/designs/SSH_AGENT_PROXY_DESIGN.md`.
 
+Every decision (asked, signed, granted, denied, rejected, expired, failed)
+is appended to `~/.config/beams-client/ssh-agent-audit.jsonl`, one JSON
+object per line: time, Beam, request id, key fingerprint, the verified
+operation, the grant used, and the Beam's unverified claims. It's `0600`
+and rotates to `.1` at 4 MiB. For example:
+
+```sh
+jq -c 'select(.event == "signed" or .event == "granted") | [.time, .operation, .claimed.task_run]' \
+  ~/.config/beams-client/ssh-agent-audit.jsonl
+```
+
 ## State
 
 No server-side way exists to label a beam, so `~/.config/beams-client/state.json`

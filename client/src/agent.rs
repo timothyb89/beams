@@ -416,6 +416,25 @@ impl AgentPrompt {
         }
     }
 
+    /// The claimed task (`BEAMS_TASK_RUN`, `<manifest>/<task id>`) in short
+    /// form: `clone-git-repo:dest=/home/beams/src/x` becomes
+    /// `clone-git-repo ~/src/x`. Unverified, like every claim.
+    pub fn task_label(&self) -> Option<String> {
+        let run = self.claimed.task_run.as_deref()?;
+        let task = run.split_once('/').map_or(run, |(_, task)| task);
+        let Some((template, params)) = task.split_once(':') else {
+            return Some(task.to_string());
+        };
+        let values = params.split(',').map(|param| {
+            let value = param.split_once('=').map_or(param, |(_, value)| value);
+            match value.strip_prefix("/home/").and_then(|rest| rest.split_once('/')) {
+                Some((_, under_home)) => format!("~/{under_home}"),
+                None => value.to_string(),
+            }
+        });
+        Some(std::iter::once(template.to_string()).chain(values).collect::<Vec<_>>().join(" "))
+    }
+
     /// Detail lines `(text, warn)`: verified facts first, then the Beam's
     /// claims, labeled as such.
     pub fn describe(&self) -> Vec<(String, bool)> {
@@ -461,6 +480,76 @@ impl AgentPrompt {
             lines.extend(reported.into_iter().map(|line| (format!("  {line}"), false)));
         }
         lines
+    }
+}
+
+/// The local audit log rotates to `<name>.1` past this size.
+const AUDIT_MAX_BYTES: u64 = 4 << 20;
+
+/// One SSH key decision, as appended to the local audit log
+/// (`ssh-agent-audit.jsonl` next to `daemon-state.json`, one JSON object
+/// per line). `operation` and `key` were verified on the workstation;
+/// `claimed` is what the Beam reported and isn't.
+#[derive(Debug, Default, Serialize)]
+pub struct AuditEvent<'a> {
+    /// RFC 3339, UTC. Filled in by `append_audit`.
+    pub time: String,
+    pub beam: &'a str,
+    /// `asked`, `signed`, `granted`, `denied` (without asking), `rejected`
+    /// (by the user), `expired` or `failed`.
+    pub event: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub granted: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed: Option<&'a Claimed>,
+}
+
+impl<'a> AuditEvent<'a> {
+    pub fn new(beam: &'a str, event: &'a str) -> Self {
+        Self { beam, event, ..Default::default() }
+    }
+
+    /// Fills the verified and claimed fields from `prompt`.
+    pub fn prompt(mut self, prompt: Option<&'a AgentPrompt>) -> Self {
+        if let Some(prompt) = prompt {
+            self.key = Some(&prompt.key_fingerprint);
+            self.operation = Some(prompt.summary());
+            self.granted = prompt.granted.as_deref();
+            self.claimed = Some(&prompt.claimed);
+        }
+        self
+    }
+}
+
+/// Appends `event` to the audit log at `path` (created `0600`). Failures
+/// are reported to stderr (the daemon log) and otherwise ignored: the
+/// decision itself already happened.
+pub fn append_audit(path: &Path, mut event: AuditEvent) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    event.time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let result = (|| -> anyhow::Result<()> {
+        if fs::metadata(path).is_ok_and(|m| m.len() >= AUDIT_MAX_BYTES) {
+            let mut rotated = path.as_os_str().to_owned();
+            rotated.push(".1");
+            fs::rename(path, rotated)?;
+        }
+        let mut line = serde_json::to_vec(&event)?;
+        line.push(b'\n');
+        fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path)?.write_all(&line)?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        eprintln!("ssh-agent: writing audit log {}: {err:#}", path.display());
     }
 }
 
@@ -547,7 +636,7 @@ pub fn read_known_hosts() -> String {
     text
 }
 
-fn claimed_context(context: &AgentContext) -> Claimed {
+pub(crate) fn claimed_context(context: &AgentContext) -> Claimed {
     let command = context.chain.first().map(|p| summarize_command(&p.argv));
     // The first parent that isn't a plain `sh -c` wrapper (GIT_SSH_COMMAND).
     let parent = context
@@ -832,5 +921,27 @@ mod tests {
         store.close("beam", "c1");
         assert!(store.binds("beam", "c1").is_empty());
         assert!(store.add("beam", "c2", &agent::b64_encode(&[agent::msg::REQUEST_IDENTITIES])).is_err());
+    }
+
+    #[test]
+    fn task_label_shortens_the_claimed_run() {
+        let prompt = |run: Option<&str>| AgentPrompt {
+            key_fingerprint: "SHA256:x".into(),
+            key_comment: None,
+            operation: AgentOperation::Signature { namespace: "git".into() },
+            claimed: Claimed { task_run: run.map(str::to_string), ..Default::default() },
+            expires_at_ms: 0,
+            granted: None,
+        };
+        assert_eq!(
+            prompt(Some("manifest-3/clone-git-repo:dest=/home/beams/src/teleport")).task_label().as_deref(),
+            Some("clone-git-repo ~/src/teleport")
+        );
+        assert_eq!(prompt(Some("manifest-3/wait-ssh-agent")).task_label().as_deref(), Some("wait-ssh-agent"));
+        assert_eq!(
+            prompt(Some("manifest-3/checkout-pr-worktree:dest=/tmp/pr-7")).task_label().as_deref(),
+            Some("checkout-pr-worktree /tmp/pr-7")
+        );
+        assert_eq!(prompt(None).task_label(), None);
     }
 }
