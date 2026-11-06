@@ -923,9 +923,6 @@ Open:
 - [ ] The key-setup offer toast lasts 20s. If missed, the only hints are
   `a ssh keys` in the menu and `beams agent-keys`. Consider a persistent
   home-screen line while no key is shared and `[ssh_agent]` is unset.
-- [ ] `daemon-state.json`'s `startup_submitted` keeps one Beam UUID per
-  Beam forever. Prune entries for Beams that no longer exist (the bridge
-  retirement path already knows).
 - [ ] Host certificates (`*-cert-v01@openssh.com` host keys,
   `@cert-authority` lines) aren't supported: such hosts show "verified key,
   unknown host" and can't match a grant.

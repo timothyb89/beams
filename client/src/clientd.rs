@@ -802,8 +802,10 @@ impl Hub {
     /// has been failing for a while, retire it if its Beam no longer exists:
     /// drop the bridge (its supervisor exits when the command channel
     /// closes), stop that Beam's forwards and copies, and pause its syncs
-    /// (pausing is reversible). A later `beams ssh` to the same Beam simply
-    /// creates a fresh bridge, so a wrong call here heals itself.
+    /// (pausing is reversible), and forget that it was sent the startup
+    /// manifest. A later `beams ssh` to the same Beam simply creates a fresh
+    /// bridge, so a wrong call here heals itself, except that the Beam
+    /// would be sent `[startup]` (idempotent tasks, a fresh grant) again.
     fn retire_bridge_if_beam_gone(self: &Arc<Self>, beam_uuid: &str) {
         let Ok(existing) = (self.beam_lister)() else {
             return;
@@ -827,6 +829,10 @@ impl Hub {
             bridge.record
         };
         self.broadcast(ServerEvent::BridgeStatus { bridge: record });
+
+        if self.state.lock().unwrap().startup_submitted.remove(beam_uuid) {
+            let _ = self.save_state();
+        }
 
         let services = self
             .state
@@ -4346,6 +4352,7 @@ mod tests {
     #[test]
     fn bridges_to_deleted_beams_are_retired_after_failing_for_a_while() {
         let (hub, command_rx) = failing_bridge("gone-uuid", vec!["other-uuid"]);
+        hub.state.lock().unwrap().startup_submitted.extend(["gone-uuid".to_string(), "other-uuid".to_string()]);
         handle_bridge_event(
             &hub,
             crate::bridge::Event::Disconnected {
@@ -4358,6 +4365,11 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(!hub.bridges.lock().unwrap().contains_key("gone-uuid"));
+        // Only the retired Beam is forgotten.
+        assert_eq!(
+            hub.state.lock().unwrap().startup_submitted.iter().collect::<Vec<_>>(),
+            ["other-uuid"]
+        );
         // Dropping the command sender is what stops the bridge supervisor.
         assert!(matches!(
             command_rx.recv_timeout(Duration::from_millis(100)),
@@ -4368,8 +4380,10 @@ mod tests {
     #[test]
     fn bridges_are_kept_when_the_beam_exists_or_existence_is_unknown() {
         let (hub, _rx) = failing_bridge("live-uuid", vec!["live-uuid"]);
+        hub.state.lock().unwrap().startup_submitted.insert("live-uuid".to_string());
         hub.retire_bridge_if_beam_gone("live-uuid");
         assert!(hub.bridges.lock().unwrap().contains_key("live-uuid"));
+        assert!(hub.state.lock().unwrap().startup_submitted.contains("live-uuid"));
 
         let (mut hub, _rx) = failing_bridge("unknown-uuid", vec![]);
         Arc::get_mut(&mut hub).unwrap().beam_lister = Box::new(|| anyhow::bail!("not logged in"));
