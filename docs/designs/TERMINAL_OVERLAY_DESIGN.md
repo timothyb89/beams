@@ -28,8 +28,13 @@ graphics protocol. Do not advertise support for features solely because a
 Prefer preserving the remote session when its screen cannot be restored:
 
 - Do not paint a toast or open an overlay on an unobserved or unrepresentable
-  screen. Keep requests pending under their existing expiry policy; suppressing
-  a notification must never imply approval or rejection.
+  screen. When the remote uses the primary buffer and the conditions below
+  hold, borrow the alternate buffer for a manual menu without repainting the
+  unknown primary content. Otherwise defer local painting.
+- Keep requests pending under their existing expiry policy; suppressing a
+  notification must never imply approval or rejection. Send approval guidance
+  back to the requesting command, using the actual session's prefix and UI
+  availability.
 - A menu request can wait for a recoverable state; a second prefix press still
   sends the original encoding remotely. Define cancellation and availability
   feedback before shipping so the prefix does not appear broken.
@@ -46,6 +51,95 @@ falling back to legacy takeover would preserve menu availability, but would
 retain the audit's unknown-screen restoration risk. Decide this policy before
 integrating automatic eligibility checks; passing the three existing
 acceptance tests alone does not settle it.
+
+### Detecting when restoration is unsafe
+
+Track evidence in the output stream, rather than treating a Zellij process name
+as a guarantee. Initially, inherited cells and cursor/mode state are unknown.
+Observed initialization, clears and redraws can establish known regions and
+state; observing an alternate-buffer selection alone cannot. Mark unsupported
+changes, buffer transitions and uncertain resize behavior explicitly.
+
+Each paint request asks whether the affected cells and required cursor/drawing
+state can be restored. A toast may need less known content than a full menu.
+This detects an unsafe precondition, not proof that physical screen corruption
+has already occurred. A cursor report can establish cursor information but
+cannot recover arbitrary inherited cells.
+
+### Borrowing the alternate buffer for a plain-shell menu
+
+Refinement from the follow-up discussion: unknown primary-buffer cells do not
+necessarily make a manual menu impossible. If the remote is using the primary
+buffer and Beams can safely own the inactive alternate buffer, leave the
+primary contents untouched, show the menu in the alternate buffer, then return
+and replay remote output. This can preserve inherited content without reading
+or reconstructing it. It is a proposed additional display path, not behavior
+in the current client.
+
+Required conditions and behavior:
+
+- Establish the physical and remote buffer ownership, and verify switching
+  behavior in supported terminals. Do not assume an initial model default
+  proves the physical terminal starts in the primary buffer.
+- Preserve current and saved cursor state, drawing/input modes and any
+  relevant inactive-buffer content. In particular, blindly using `1049`
+  saves over a DECSC cursor slot. Buffer selection without implicit saving,
+  together with explicit state preservation, needs its own acceptance tests.
+- Drain and retain remote drawing output in a bounded buffer while the menu is
+  open, keeping it off both the borrowed UI and the preserved primary screen.
+  On close, restore the primary buffer/state before replaying those bytes.
+  Close before a retention limit forces any bytes to be discarded.
+- Continue answering queries and delivering terminal effects exactly once;
+  replay must not duplicate an already answered query or clipboard action.
+- If remote output starts an alternate-buffer transition, relinquish the
+  borrowed buffer and restore/replay in order before forwarding that transition.
+  Test resize/reflow and exit while borrowing as well.
+
+There is no extra buffer to borrow when the remote already uses the alternate
+buffer. Unknown or unsupported content there still requires deferred painting
+or an explicitly chosen takeover. Likewise, borrowing fails eligibility when
+cursor/mode state or inactive-buffer preservation cannot be established.
+Use this fallback for manual menus; ordinary toasts must not switch the whole
+screen just to display a notification.
+
+### Inline approval guidance over the existing control pipe
+
+Use a separate advisory notice, not a failed or decided request:
+
+```text
+SSH frontend -> workstation daemon -> client bridge
+             -> Beam daemon -> requesting command's socket -> stderr
+```
+
+The frontend reports its session token, configured prefix, menu availability
+(overlay, borrowed buffer, deferred, or disabled), notification availability,
+and a bounded reason code. Correlate the requesting shell's session token with
+the correct live frontend, including when several frontends share one Beam.
+The bridge currently carries a request without that origin token, so extend
+its advisory metadata as well as the frontend registration.
+
+Have the requesting command show approval guidance whenever the request is
+accepted, even when a toast is available. For example, with the default prefix
+and a usable overlay or borrowed buffer:
+
+```text
+beams: request sent; press Ctrl-] in your Beams SSH session to review and approve (Ctrl-C to withdraw)
+```
+
+When neither display path is usable, say that approval UI is unavailable and
+direct the user to a supported session or the explicit takeover option.
+Do not instruct them to press a disabled or ineffective prefix. Print through
+the requesting process's normal stderr so the shell or Zellij renders it in
+place; Beams does not paint over unknown cells to deliver this message.
+
+The transport exists, but current code needs changes: `RequestStatus`
+transitions reject `PendingApproval -> PendingApproval`, and `fetch.rs` ignores
+pending-status messages. Add a capability-negotiated request-notice message
+and structured availability data rather than weakening the approval state
+machine for presentation updates. Render it in `beams fetch` and the other
+waiting request CLIs, updating on meaningful availability changes without
+repeating notices on every frame. Older peers retain existing wait messages.
+Notices must not expose workstation paths or confer approval authority.
 
 ## Implementation sequence
 
@@ -172,21 +266,27 @@ keyboard protocols, graphics, resize/reflow and grapheme-width behavior; either
 support them or apply the declared compatibility policy. An ignored escape
 sequence must not automatically mean "safe to composite."
 
-Integrate the chosen UX policy, including pending menu cancellation, preservation
-of forms, and a useful way to discover when local UI is unavailable. Availability
-feedback must itself avoid painting an unknown screen. Keep compatibility
-reasons available in diagnostics without writing debug text into remote output.
+Integrate the chosen UX policy, including the guarded borrowed-buffer path,
+pending menu cancellation, preservation of forms and inline request notices.
+Availability feedback must itself avoid painting an unknown screen. Keep
+compatibility reasons available in diagnostics without writing debug text into
+remote output.
 
 Completion checks:
 
 - Seed an inherited primary screen with sentinel content and a nonzero cursor;
   run a plain shell, request a menu/toast, then type and inspect scrollback.
+  Test both borrowed-buffer eligibility and refusal; verify hidden output,
+  saved cursor slots, buffer changes and output-budget exhaustion survive.
 - Exercise transitions between known and unknown buffers and unsupported
   sequences arriving mid-dialog; remote bytes and subsequent behavior survive.
 - Oversized strings and unsupported graphics use the same tested eligibility
   policy. No fallback relies on an unconditional clear or guessed redraw.
 - A pending approval remains pending/expirable when UI is unavailable; prefix
   forwarding and cancellation remain usable.
+- A fetch without a local toast receives an accurate inline hint, including
+  custom/disabled prefixes, multiple frontends, disconnect/reconnect, recovery,
+  expiry and older peers. Sending a notice does not change approval status.
 
 ### 5. Restore only state owned by the client
 

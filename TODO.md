@@ -757,6 +757,16 @@ bootstrap `Task`s.
     UX before integrating it. Proposed default: defer unsafe painting, retain
     explicit best-effort takeover. Cover unknown inherited screens, common
     drawing protocols, resize/reflow invalidation and mid-dialog fallback.
+  - [ ] Guarded alternate-buffer menu fallback for unknown primary screens:
+    preserve primary content and cursor/mode state, establish inactive-buffer
+    ownership, close/replay before output overflow or a remote buffer switch,
+    and deliver queries/effects exactly once. Never nest over a remote-owned
+    alternate buffer or switch screens for ordinary toasts.
+  - [ ] Inline approval guidance over the control pipe, including when toasts
+    are suppressed. Correlate the request's originating session with frontend
+    prefix/UI availability; add capability-negotiated advisory notices and
+    render them in `beams fetch`/other waiting CLIs without changing approval
+    status. Test custom/disabled prefixes, multiple frontends and old peers.
   - [ ] Session-entry/exit state ownership and advanced keyboard/mode cleanup,
     including non-default outer-terminal state and partial-string termination.
   - [ ] Independent emulator comparison and recorded workstation matrix with
