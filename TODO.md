@@ -745,6 +745,10 @@ bootstrap `Task`s.
   Also resolve unknown initial/inactive screen state,
   unsupported drawing/input protocols, and independent
   workstation font/reflow/lifecycle validation before changing the default.
+  The [2026-11-06 handoff](docs/designs/TERMINAL_OVERLAY_DESIGN.md#implementation-status-and-next-session-handoff)
+  records completed commits, validation and implementation entry points.
+  Next: DECRQSS replies from remote state, then child-input backpressure;
+  the saved-cursor and origin/margins fixes do not complete compatibility work.
   Follow the [resolution plan](docs/designs/TERMINAL_OVERLAY_DESIGN.md) in
   separately reviewable milestones:
 

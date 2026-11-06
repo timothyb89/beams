@@ -11,6 +11,8 @@ compatibility/lifecycle behavior, independent validation and the final default
 switch. The model/backend foundation and represented cursor/margin painting
 are implemented. The saved-cursor and origin/margins gates pass; DCS queries
 and later compatibility/lifecycle milestones remain pending.
+The [next-session handoff](../designs/TERMINAL_OVERLAY_DESIGN.md#implementation-status-and-next-session-handoff)
+records the current commits, code entry points and concrete next steps.
 
 ## Recommended test coverage
 

@@ -378,8 +378,9 @@ bounded frames to the allocating parser. On hidden-output
 overflow, the driver closes the palette, restores the captured frame and
 replays the retained original prefix before forwarding the chunk tail.
 Remaining sequence bytes stay opaque; no clipboard payload is truncated or
-partially published by the model. This recovery still inherits the existing
-saved-cursor/origin restoration limitations until milestone 2 lands.
+partially published by the model. At the foundation commit, this recovery
+still inherited the saved-cursor/origin restoration limitations addressed by
+the following painting slice.
 
 Budget exhaustion suppresses further overlay menus/toasts until an observed
 full reset (`ESC c`). The input router keeps ordinary keys remote and supports
@@ -430,9 +431,115 @@ emulator restores saved wrap/origin differently from the VT/xterm model; hidden
 output that relies on those differences still needs terminal-specific support
 or conservative invalidation. Insert mode, character sets, OSC 8 links, more
 complex inactive-buffer mutations and resize/reflow provenance also remain.
-These complete milestone 2 alongside the compatibility work; the overlay stays
-opt-in. The independent graphical/workstation matrix remains pending.
+Resolving these remaining gaps is necessary to finish milestone 2 alongside
+the compatibility work; the overlay stays opt-in. The independent
+graphical/workstation matrix remains pending.
 
 Next: milestone 3's DECRQSS dispatch and remote-state replies using these
 snapshots, plus query-write backpressure. Retain the remaining painting and
 compatibility items above as explicit gates before the default switch.
+
+## Implementation status and next-session handoff
+
+As of 2026-11-06, implementation is at `28eb7a8`. **Keep the overlay opt-in;
+takeover remains the default.** Two original release gates now pass
+(`overlay_acceptance_saved_cursor`, `overlay_acceptance_origin_and_margins`).
+`overlay_acceptance_dcs_query` is still ignored and fails when explicitly run.
+The represented-state painting slice is complete; compatibility and content
+provenance are not.
+
+Completed work is preserved in these commits:
+
+| Commit | Result |
+| --- | --- |
+| `7e86344`, `318f309` | Initial input/relay hardening, expanded acceptance coverage and readiness audit |
+| `92ba010`, `db5d68c`, `f574a4e` | Resolution plan, guarded fallback policy and separation of mandatory logging from optional notices |
+| `e6dee81` | Durable `beams fetch` acknowledgement with generic workstation-menu guidance |
+| `cb5cc47` | Bounded stream framing, model snapshots, streaming DCS callbacks and conservative overflow recovery |
+| `28eb7a8` | Shared saved/current cursor, SGR, origin/margin restoration; toast and takeover fixes; independent replay fixtures |
+
+These commits were made locally in a detached worktree and have not been
+pushed. Start by reading `AGENTS.md`, this section, `TODO.md` and `git log`,
+and checking `git status` before changing anything. Push only when requested.
+Do not depend on previous conversation history or `/tmp` files surviving.
+
+Implementation entry points:
+
+| File | Responsibility |
+| --- | --- |
+| `client/src/terminal_stream.rs` | Shared framing, partial sequences, synchronized-output boundaries and the 64 KiB sequence budget |
+| `client/src/terminal_model.rs` | Remote shadow state, ordered events, query replies and the remaining DCS acceptance gate |
+| `client/src/terminal_paint.rs` | Shared local drawing setup and represented-state restoration |
+| `client/src/session.rs` | `drain_output`, hidden-output dispatch, raw replay, menu snapshots and child-input writes |
+| `client/src/session/toast.rs` | Physical-output tracker and toast paint/removal |
+| `client/vendor/vt100/BEAMS.md`, `client/vendor/vt100/src/state.rs` | Vendored changes, provenance and read-only drawing snapshots |
+| `client/tests/terminal-overlay-smoke.py`, `client/tests/terminal-paint-reference.cjs` | Live controlling-PTY coverage and optional independent replay |
+| `bootstrap/src/fetch.rs` | Persistent request acknowledgement; no new notice protocol |
+
+The next implementation slice is milestone 3, in separately reviewable changes:
+
+1. Establish the baseline using the
+   [repeatable validation commands](../development/terminal-overlay.md#repeatable-validation).
+   Run the remaining gate separately:
+   `cargo test --manifest-path client/Cargo.toml overlay_acceptance_dcs_query -- --ignored`.
+   Its failure is expected: the model currently emits `UnhandledDcs`, while the
+   original gate expects a query event.
+2. Add semantic dispatch for complete, bounded DECRQSS requests, starting with
+   SGR (`m`) and vertical margins (`r`). Answer from the remote state at the
+   query byte, before consuming subsequent state changes. Do not forward these
+   setting probes to a physical terminal whose settings local painting changed.
+   Distinguish terminated requests from cancelled strings; DCS callbacks alone
+   must not turn cancellation into a completed query.
+3. Change the original DCS gate to assert the correct remote-state reply and
+   unignore it once implemented. Add protocol-defined unsupported replies where
+   appropriate, and an explicit policy for unmodeled settings. Inventory other
+   probes separately; physical capability queries may be relayed only when
+   painting leaves their answer unchanged.
+4. Cover queries split across byte boundaries, cancellation/overflow, mixed
+   output, state changes immediately after a query and exactly-once replies.
+   Test both menu-open dispatch and passthrough, which must not acquire a
+   duplicate model-generated reply. Incoming physical replies must reach the
+   child without triggering menu actions.
+5. Address child-input backpressure. Replies still use synchronous
+   `write_all`/flush; the passing 512-query test does not establish behavior when
+   the peer stops reading. Use a bounded, ordered write path and exercise input,
+   signal, resize and output responsiveness under that pressure.
+6. Update the READMEs, audit and TODO with the implemented behavior and remaining
+   limits. Run the client suite/build and all three smoke paths. Rerun independent
+   replay when painting changes. Keep the default switch separate.
+
+The latest recorded validation is **206 passing client unit tests, one ignored
+DCS gate, and 3 passing integration tests**. The client build, takeover smoke,
+overlay smoke and protocol/PTY harness passed. Optional xterm.js 5.5 replay
+passed nine restoration traces and one actual menu-renderer trace; fetch's four
+targeted bootstrap tests passed in its acknowledgement slice. The audit
+contains the commands and historical results. One forward-diagnostics test
+missed captured stderr once and passed its isolated/full reruns; TODO tracks
+that unresolved flake.
+
+The independent replay compares painting with the same unpainted remote trace;
+it does **not** prove full model agreement. xterm.js 5.5 saved-wrap/origin
+semantics differ from the model. Recreate the pinned optional npm module using
+the audit's instructions rather than relying on this session's `/tmp` install.
+No real workstation font/reflow or graphical-terminal pass has been recorded.
+
+Retain these decisions and remaining gates:
+
+- Prefer deferring unsafe painting, with explicit best-effort takeover available.
+  Unknown inherited primary cells cannot be recovered from a cursor report.
+  Zellij helps but does not establish safety when users bypass it.
+- A borrowed alternate buffer is a planned, guarded menu fallback, not current
+  behavior. Establish ownership and safe replay first; never nest it over a
+  remote-owned alternate screen or use it for ordinary toasts.
+- Durable inline request logging is implemented in all accepted-fetch cases.
+  Session-specific prefix/uncertainty notices remain optional, skippable work;
+  generic menu guidance uses the existing return path today.
+- Extend model/paint eligibility for insert mode, character sets, OSC 8 links,
+  unsupported drawing/input protocols, every touched inactive buffer and
+  resize/reflow provenance. Resolve saved-wrap/origin compatibility by supporting
+  the target terminal or conservatively invalidating painting.
+- Finish entry/exit state ownership and advanced input-mode cleanup. Complete
+  independent model validation and the recorded workstation matrix with Zellij,
+  a plain shell, pager/editor, resize, scrollback, fonts and lifecycle checks.
+- Enable the overlay by default only after those gates pass, in a separate
+  change preserving explicit takeover and strict `--escape-key none` behavior.
