@@ -724,3 +724,357 @@ fn protected_home_directories_merge_but_cannot_be_replaced_wholesale() {
         "selected"
     );
 }
+
+// --- Daemon-accepted launches (`launch::daemon`) ---------------------------
+
+mod daemon_launches {
+    use super::*;
+    use crate::launch::daemon::{handle, Host, LaunchSnapshot, LaunchStatus, Launches, NodeStatus};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Condvar};
+    use std::time::{Duration, Instant};
+
+    /// A daemon stand-in: shared resources, a launch table, and one ordered
+    /// log of everything a single connection would receive (broadcasts and
+    /// direct replies alike).
+    struct FakeHost {
+        resources: crate::executor::Resources,
+        launches: Launches,
+        received: Mutex<Vec<Value>>,
+        changed: Condvar,
+    }
+    impl Host for FakeHost {
+        fn broadcast(&self, line: &str) {
+            self.received.lock().unwrap().push(serde_json::from_str(line).unwrap());
+            self.changed.notify_all();
+        }
+        fn resources(&self) -> &crate::executor::Resources {
+            &self.resources
+        }
+        fn launches(&self) -> &Launches {
+            &self.launches
+        }
+    }
+
+    fn host(f: &Fixture) -> Arc<FakeHost> {
+        let launches = Launches::new(f.state.clone(), f.home.clone());
+        launches.load();
+        Arc::new(FakeHost {
+            resources: Default::default(),
+            launches,
+            received: Mutex::default(),
+            changed: Condvar::new(),
+        })
+    }
+
+    /// Runs one op; its replies are returned and also appended to the
+    /// connection log, in order with broadcasts.
+    fn call(host: &Arc<FakeHost>, op: &str, request: Value) -> Value {
+        let replies = Mutex::new(Vec::new());
+        handle(host, op, &request, &|reply| {
+            host.received.lock().unwrap().push(reply.clone());
+            replies.lock().unwrap().push(reply);
+        });
+        let mut replies = replies.into_inner().unwrap();
+        assert_eq!(replies.len(), 1, "one reply per op: {replies:?}");
+        replies.pop().unwrap()
+    }
+
+    fn write_launch(f: &Fixture, launch: &Declaration) -> PathBuf {
+        let path = f.temp.0.join(format!("launch-{}.json", launch.launch_id));
+        beams_artifacts::write_json(&path, launch).unwrap();
+        path
+    }
+
+    fn submit(f: &Fixture, host: &Arc<FakeHost>, launch: &Declaration, gate: &str) -> Value {
+        call(
+            host,
+            "launch_submit",
+            json!({"launch": write_launch(f, launch), "staging": f.staging, "gate": gate}),
+        )
+    }
+
+    fn snapshot(host: &Arc<FakeHost>, id: &str) -> LaunchSnapshot {
+        let reply = call(host, "launch_snapshot", json!({"launch_id": id}));
+        serde_json::from_value(reply["launches"][0].clone()).unwrap()
+    }
+
+    fn node_status(snapshot: &LaunchSnapshot, id: &str) -> NodeStatus {
+        snapshot.nodes.iter().find(|n| n.id == id).unwrap().status
+    }
+
+    /// Polls the launch until `done` holds (5s at most).
+    fn wait_until(host: &Arc<FakeHost>, id: &str, what: &str, done: impl Fn(&LaunchSnapshot) -> bool) -> LaunchSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let current = snapshot(host, id);
+            if done(&current) {
+                return current;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}: {current:#?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn finished(snapshot: &LaunchSnapshot) -> bool {
+        matches!(snapshot.status, LaunchStatus::Ok | LaunchStatus::Failed)
+    }
+
+    fn hooks(f: &Fixture) -> BTreeMap<String, Selection> {
+        BTreeMap::from([("hooks".into(), Selection::Local(f.temp.0.join("hooks")))])
+    }
+
+    fn pre_post_launch(f: &Fixture) -> Declaration {
+        f.write("hooks/pre.sh", "printf 'pre\\n' >> \"$HOME/events\"");
+        f.write("hooks/post.sh", "printf 'post\\n' >> \"$HOME/events\"");
+        declaration(
+            vec![artifact("hooks", Phase::Pre, true)],
+            vec![
+                script("tasks:pre", Phase::Pre, "pre.sh", &["artifact-ready:pre"], Rerun::Manual),
+                script("tasks:post", Phase::Post, "post.sh", &["artifact-ready:pre", "tasks:pre"], Rerun::Manual),
+            ],
+        )
+    }
+
+    #[test]
+    fn accepted_launch_waits_for_its_staging_and_interface_then_runs_both_phases() {
+        let f = Fixture::new();
+        let launch = pre_post_launch(&f);
+        let id = launch.launch_id.clone();
+        let host = host(&f);
+
+        let accepted = submit(&f, &host, &launch, "interactive");
+        assert_eq!(accepted["type"], "launch_accepted", "{accepted}");
+        assert_eq!(accepted["existing"], false);
+        let state = wait_until(&host, &id, "the pre bundle wait", |s| {
+            node_status(s, "artifact-ready:pre") == NodeStatus::Waiting
+        });
+        assert_eq!(state.status, LaunchStatus::Running);
+        assert!(!f.home.join("events").exists(), "nothing runs before its bundle");
+
+        // An identical resubmission is the same launch; a different plan
+        // under the same ID is refused before any effect.
+        let again = submit(&f, &host, &launch, "interactive");
+        assert_eq!(again["existing"], true);
+        let mut conflicting = pre_post_launch(&f);
+        conflicting.plan.env.insert("EXTRA".into(), "1".into());
+        conflicting.plan_digest = beams_artifacts::json_digest(&conflicting.plan).unwrap();
+        conflicting.launch_id = id.clone();
+        let refused = submit(&f, &host, &conflicting, "interactive");
+        assert_eq!(refused["type"], "error");
+        assert!(refused["message"].as_str().unwrap().contains("different plan digest"), "{refused}");
+
+        // Signalling before anything is staged doesn't release it.
+        let early = call(&host, "launch_signal", json!({"launch_id": id, "condition": "artifact-ready:pre"}));
+        assert_eq!(early["released"], false, "{early}");
+
+        f.stage(&launch, Phase::Pre, &hooks(&f));
+        let released = call(&host, "launch_signal", json!({"launch_id": id, "condition": "artifact-ready:pre"}));
+        assert_eq!(released["released"], true, "{released}");
+        let state = wait_until(&host, &id, "the interface wait", |s| {
+            node_status(s, "interface-ready") == NodeStatus::Waiting
+        });
+        assert_eq!(fs::read_to_string(f.home.join("events")).unwrap(), "pre\n");
+        assert_eq!(node_status(&state, "tasks:pre"), NodeStatus::Ok);
+        assert_eq!(node_status(&state, "tasks:post"), NodeStatus::Pending, "post waits for the interface");
+
+        // Post work that only needs pre artifacts proceeds while the post
+        // bundle is still on its way.
+        call(&host, "launch_signal", json!({"launch_id": id, "condition": "interface-ready"}));
+        let state = wait_until(&host, &id, "post progress without its bundle", |s| {
+            node_status(s, "tasks:post") == NodeStatus::Ok
+        });
+        assert_eq!(node_status(&state, "artifact-ready:post"), NodeStatus::Waiting);
+        assert_eq!(state.status, LaunchStatus::Running);
+        f.stage(&launch, Phase::Post, &hooks(&f));
+        call(&host, "launch_signal", json!({"launch_id": id, "condition": "artifact-ready:post"}));
+        let state = wait_until(&host, &id, "completion", finished);
+        assert_eq!(state.status, LaunchStatus::Ok, "{state:#?}");
+        assert_eq!(fs::read_to_string(f.home.join("events")).unwrap(), "pre\npost\n");
+        assert!(state.nodes.iter().all(|n| matches!(n.status, NodeStatus::Ok | NodeStatus::Skip)), "{state:#?}");
+
+        // A finished launch can't be retried; a resubmission still answers.
+        let retry = call(&host, "launch_retry", json!({"launch_id": id}));
+        assert_eq!(retry["type"], "error");
+        assert_eq!(submit(&f, &host, &launch, "interactive")["existing"], true);
+    }
+
+    #[test]
+    fn a_snapshot_is_an_exact_boundary_in_the_event_stream() {
+        let f = Fixture::new();
+        f.write("hooks/pre.sh", "echo started; while [ ! -e \"$HOME/go\" ]; do sleep 0.02; done; echo finishing");
+        let launch = declaration(
+            vec![artifact("hooks", Phase::Pre, true)],
+            vec![script("tasks:pre", Phase::Pre, "pre.sh", &["artifact-ready:pre"], Rerun::Manual)],
+        );
+        let id = launch.launch_id.clone();
+        f.stage(&launch, Phase::Pre, &hooks(&f));
+        f.stage(&launch, Phase::Post, &hooks(&f));
+        let host = host(&f);
+        submit(&f, &host, &launch, "headless");
+        let middle = wait_until(&host, &id, "the hook to run", |s| {
+            s.nodes.iter().any(|n| n.id == "tasks:pre" && n.log.iter().any(|l| l.contains("started")))
+        });
+        assert_eq!(node_status(&middle, "tasks:pre"), NodeStatus::Running);
+        fs::write(f.home.join("go"), "").unwrap();
+        let last = wait_until(&host, &id, "completion", finished);
+        assert_eq!(last.status, LaunchStatus::Ok, "{last:#?}");
+        assert!(last.nodes.iter().find(|n| n.id == "tasks:pre").unwrap().log.iter().any(|l| l.contains("finishing")));
+
+        // Every snapshot reply sits exactly between the events it includes
+        // and the ones it doesn't; event numbers only grow.
+        let received = host.received.lock().unwrap().clone();
+        let mut previous = 0;
+        let boundary_reply = |m: &Value| ["launch_snapshot", "launch_accepted", "launch_retrying"].contains(&m["type"].as_str().unwrap_or_default());
+        let events = |range: &[Value]| -> Vec<u64> {
+            range.iter().filter(|m| !boundary_reply(m)).filter_map(|m| m["seq"].as_u64()).collect()
+        };
+        assert!(received.iter().filter(|m| boundary_reply(m)).count() >= 3, "accept plus polling snapshots");
+        for (index, message) in received.iter().enumerate() {
+            if boundary_reply(message) {
+                let boundary = message["seq"].as_u64().unwrap();
+                assert!(events(&received[..index]).iter().all(|seq| *seq <= boundary), "{message}");
+                assert!(events(&received[index + 1..]).iter().all(|seq| *seq > boundary), "{message}");
+            } else if let Some(seq) = message["seq"].as_u64() {
+                assert!(seq > previous, "seq must increase: {message}");
+                previous = seq;
+            }
+        }
+        // Broadcast task events keep the shape the Beam TUI renders.
+        assert!(received.iter().any(|m| m["type"] == "task_status"
+            && m["status"] == "ok"
+            && m["manifest_id"] == id.as_str()
+            && m["node"] == "tasks:pre"));
+    }
+
+    #[test]
+    fn a_pre_failure_blocks_post_and_an_explicit_retry_resumes() {
+        let f = Fixture::new();
+        f.write("hooks/pre.sh", "test -e \"$HOME/fixed\"");
+        f.write("hooks/post.sh", "touch \"$HOME/post-ran\"");
+        let launch = declaration(
+            vec![artifact("hooks", Phase::Pre, true)],
+            vec![
+                script("tasks:pre", Phase::Pre, "pre.sh", &["artifact-ready:pre"], Rerun::Manual),
+                script("tasks:post", Phase::Post, "post.sh", &["artifact-ready:pre"], Rerun::Manual),
+            ],
+        );
+        let id = launch.launch_id.clone();
+        f.stage(&launch, Phase::Pre, &hooks(&f));
+        f.stage(&launch, Phase::Post, &hooks(&f));
+        let host = host(&f);
+        submit(&f, &host, &launch, "headless");
+        let failed = wait_until(&host, &id, "failure", finished);
+        assert_eq!(failed.status, LaunchStatus::Failed);
+        assert_eq!(node_status(&failed, "tasks:pre"), NodeStatus::Error);
+        assert_eq!(node_status(&failed, "tasks:post"), NodeStatus::Blocked);
+        assert_eq!(node_status(&failed, "interface-ready"), NodeStatus::Blocked);
+        assert!(!f.home.join("post-ran").exists());
+
+        fs::write(f.home.join("fixed"), "").unwrap();
+        let retrying = call(&host, "launch_retry", json!({"launch_id": id}));
+        assert_eq!(retrying["type"], "launch_retrying", "{retrying}");
+        let done = wait_until(&host, &id, "the retry", finished);
+        assert_eq!(done.status, LaunchStatus::Ok, "{done:#?}");
+        assert!(f.home.join("post-ran").exists());
+    }
+
+    #[test]
+    fn staging_that_fails_verification_fails_its_condition() {
+        let f = Fixture::new();
+        let launch = pre_post_launch(&f);
+        let id = launch.launch_id.clone();
+        let manifest = f.stage(&launch, Phase::Pre, &hooks(&f));
+        // Tamper with a staged (read-only) hook.
+        let staged = f.staging.join("pre").join(&manifest.artifacts[0].root).join("pre.sh");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(staged.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&staged, "touch \"$HOME/tampered\"").unwrap();
+
+        let host = host(&f);
+        submit(&f, &host, &launch, "headless");
+        let failed = wait_until(&host, &id, "failure", finished);
+        assert_eq!(failed.status, LaunchStatus::Failed);
+        let ready = failed.nodes.iter().find(|n| n.id == "artifact-ready:pre").unwrap();
+        assert_eq!(ready.status, NodeStatus::Error);
+        assert!(ready.message.as_deref().unwrap().contains("failed verification"), "{ready:?}");
+        assert_eq!(node_status(&failed, "tasks:pre"), NodeStatus::Blocked);
+        assert!(!f.home.join("tampered").exists() && !f.home.join("events").exists());
+    }
+
+    #[test]
+    fn launches_sharing_a_resource_never_overlap_on_the_daemon() {
+        let f = Fixture::new();
+        f.write(
+            "hooks/locked.sh",
+            "date +%s%N >> \"$HOME/intervals\"; sleep 0.3; date +%s%N >> \"$HOME/intervals\"",
+        );
+        let make = || {
+            let mut locked = script("tasks:locked", Phase::Pre, "locked.sh", &["artifact-ready:pre"], Rerun::Manual);
+            locked.resources = vec!["fixture-shared".into()];
+            declaration(vec![artifact("hooks", Phase::Pre, true)], vec![locked])
+        };
+        let (first, second) = (make(), make());
+        let host = host(&f);
+        let mut stagings = Vec::new();
+        for launch in [&first, &second] {
+            let staging = f.temp.0.join(format!("stage-{}", launch.launch_id));
+            f.stage_at(launch, Phase::Pre, &hooks(&f), &staging);
+            f.stage_at(launch, Phase::Post, &hooks(&f), &staging);
+            stagings.push(staging);
+        }
+        for (launch, staging) in [&first, &second].into_iter().zip(&stagings) {
+            let reply = call(
+                &host,
+                "launch_submit",
+                json!({"launch": write_launch(&f, launch), "staging": staging, "gate": "headless"}),
+            );
+            assert_eq!(reply["type"], "launch_accepted", "{reply}");
+        }
+        for launch in [&first, &second] {
+            let done = wait_until(&host, &launch.launch_id, "completion", finished);
+            assert_eq!(done.status, LaunchStatus::Ok, "{done:#?}");
+        }
+        let times: Vec<u128> = fs::read_to_string(f.home.join("intervals"))
+            .unwrap()
+            .lines()
+            .map(|l| l.parse().unwrap())
+            .collect();
+        assert_eq!(times.len(), 4);
+        // start, end, start, end: the second started after the first ended.
+        assert!(times[0] < times[1] && times[1] <= times[2] && times[2] < times[3], "{times:?}");
+    }
+
+    #[test]
+    fn a_daemon_restart_leaves_running_launches_interrupted_until_retried() {
+        let f = Fixture::new();
+        f.write("hooks/pre.sh", "while [ ! -e \"$HOME/go\" ]; do sleep 0.02; done; printf 'pre\\n' >> \"$HOME/events\"");
+        let launch = declaration(
+            vec![artifact("hooks", Phase::Pre, true)],
+            vec![script("tasks:pre", Phase::Pre, "pre.sh", &["artifact-ready:pre"], Rerun::Manual)],
+        );
+        let id = launch.launch_id.clone();
+        f.stage(&launch, Phase::Pre, &hooks(&f));
+        f.stage(&launch, Phase::Post, &hooks(&f));
+        let before = host(&f);
+        submit(&f, &before, &launch, "headless");
+        wait_until(&before, &id, "the hook to start", |s| node_status(s, "tasks:pre") == NodeStatus::Running);
+
+        // A new daemon over the same state.
+        let after = host(&f);
+        let state = snapshot(&after, &id);
+        assert_eq!(state.status, LaunchStatus::Interrupted);
+        assert_eq!(node_status(&state, "tasks:pre"), NodeStatus::Interrupted);
+        assert_eq!(submit(&f, &after, &launch, "headless")["existing"], true, "resubmission doesn't restart it");
+
+        // Let the old run finish (its hook is still ours), then resume.
+        fs::write(f.home.join("go"), "").unwrap();
+        wait_until(&before, &id, "the old run", finished);
+        let retrying = call(&after, "launch_retry", json!({"launch_id": id}));
+        assert_eq!(retrying["type"], "launch_retrying", "{retrying}");
+        let done = wait_until(&after, &id, "the resumed run", finished);
+        assert_eq!(done.status, LaunchStatus::Ok, "{done:#?}");
+        assert_eq!(fs::read_to_string(f.home.join("events")).unwrap(), "pre\n", "the completed hook isn't rerun");
+    }
+}

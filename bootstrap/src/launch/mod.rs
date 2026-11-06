@@ -1,4 +1,5 @@
 //! Explicit launch tooling; never restarts the daemon or runs fixed startup.
+pub mod daemon;
 mod files;
 mod runner;
 #[cfg(test)]

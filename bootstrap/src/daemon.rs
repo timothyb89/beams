@@ -107,6 +107,8 @@ struct Hub {
     /// (`route_agent`) while it runs.
     manifest_owners: Mutex<HashMap<String, String>>,
     agent: AgentState,
+    /// Accepted launches (`launch::daemon`).
+    launches: crate::launch::daemon::Launches,
 }
 
 impl Default for Hub {
@@ -122,7 +124,27 @@ impl Default for Hub {
             client_services: Mutex::new(BTreeMap::new()),
             manifest_owners: Mutex::new(HashMap::new()),
             agent: AgentState::default(),
+            launches: crate::launch::daemon::Launches::new(
+                crate::pathutil::expand_tilde("~/.beam-bootstrap/launch-state"),
+                home_dir(),
+            ),
         }
+    }
+}
+
+fn home_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
+}
+
+impl crate::launch::daemon::Host for Hub {
+    fn broadcast(&self, line: &str) {
+        Hub::broadcast(self, line);
+    }
+    fn resources(&self) -> &executor::Resources {
+        &self.resources
+    }
+    fn launches(&self) -> &crate::launch::daemon::Launches {
+        &self.launches
     }
 }
 
@@ -350,7 +372,14 @@ pub fn serve(socket_path: &Path) -> anyhow::Result<()> {
     }
 
     let listener = UnixListener::bind(socket_path).with_context(|| format!("binding {}", socket_path.display()))?;
-    let hub = Arc::new(Hub::default());
+    let hub = Arc::new(Hub {
+        launches: crate::launch::daemon::Launches::new(
+            crate::launch::daemon::state_root(socket_path),
+            home_dir(),
+        ),
+        ..Hub::default()
+    });
+    hub.launches.load();
 
     // The SSH agent relay lives next to the daemon socket. Failing to start
     // it (say, another agent already owns the path) leaves the rest of the
@@ -453,6 +482,12 @@ fn handle_line(hub: &Arc<Hub>, line: &str, reply: &Sender<String>, context: &mut
         "run_manifest" => {
             let tasks_value = request.get("tasks").cloned().unwrap_or(Value::Null);
             run_manifest(hub, request_id, tasks_value, reply);
+        }
+        "launch_submit" | "launch_signal" | "launch_snapshot" | "launch_retry" => {
+            crate::launch::daemon::handle(hub, op, &request, &|mut message| {
+                message["request_id"] = json!(request_id);
+                let _ = reply.send(message.to_string());
+            });
         }
         "register_client_bridge" => {
             register_client_bridge(hub, request_id, &request, reply, context);
@@ -1498,6 +1533,27 @@ mod tests {
     /// already buffered but not yet handed back via `read_line`.
     fn connect() -> (UnixStream, BufReader<UnixStream>, thread::JoinHandle<()>) {
         connect_to(Arc::new(Hub::default()))
+    }
+
+    #[test]
+    fn launch_ops_reply_with_their_request_id() {
+        let root = std::env::temp_dir().join(format!("daemon-launch-ops-{}", uuid::Uuid::new_v4()));
+        let hub = Arc::new(Hub {
+            launches: crate::launch::daemon::Launches::new(root.clone(), root.join("home")),
+            ..Hub::default()
+        });
+        let (mut client, mut reader, _server) = connect_to(hub);
+        send(&mut client, r#"{"request_id":"s1","op":"launch_snapshot"}"#);
+        let empty = recv_type(&mut reader, "launch_snapshot");
+        assert_eq!(empty["request_id"], "s1");
+        assert_eq!(empty["launches"], json!([]));
+        send(&mut client, r#"{"request_id":"s2","op":"launch_submit","launch":"relative.json","staging":"/x"}"#);
+        let refused = recv_type(&mut reader, "error");
+        assert_eq!(refused["request_id"], "s2");
+        assert!(refused["message"].as_str().unwrap().contains("absolute"), "{refused}");
+        send(&mut client, r#"{"request_id":"s3","op":"launch_signal","launch_id":"nope","condition":"interface-ready"}"#);
+        assert_eq!(recv_type(&mut reader, "error")["request_id"], "s3");
+        let _ = fs::remove_dir_all(root);
     }
 
     fn agent_bridge(hub: &Hub, client_id: &str, bridge_id: &str, token: &str) {
