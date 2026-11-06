@@ -18,7 +18,7 @@ check() { local name=$1; shift; if "$@"; then pass "$name"; else fail "$name"; f
 cleanup() {
     for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null; done
     # The TUI and its `script` (matched by this run's unique socket path).
-    pkill -9 -f "$SOCK" 2>/dev/null
+    if [ -n "${SOCK:-}" ]; then pkill -9 -f "$SOCK" 2>/dev/null; fi
     if [ "${KEEP_TEST_DIR:-0}" = 1 ] || [ "$fails" -gt 0 ]; then echo "kept $S"; else chmod -R u+w "$S"; rm -rf "$S"; fi
 }
 trap cleanup EXIT
@@ -83,7 +83,6 @@ check "pre hook ran once" test "$(events)" = "pre "
 check "post work is still pending" status_has 'pending +post +Configure'
 
 "$C" config pack-post --launch-dir "$S/launch" >/dev/null
-unpack post
 check "launch ready is a no-op outside a launch" "$B" launch ready --socket "$SOCK" --component shell
 check "the shell reports ready" env BEAMS_LAUNCH_ID="$ID" "$B" launch ready --socket "$SOCK" --component shell
 check "the interface then waits only for the TUI" eventually status_has 'waiting +post +Shell and first TUI frame ready - waiting for the TUI to start'
@@ -99,13 +98,19 @@ else
     check "the TUI reports ready" "$B" launch ready --socket "$SOCK" --component tui --launch-id "$ID"
 fi
 check "interface-ready is released by both" eventually status_has 'released: \[.*interface-ready'
-check "the post bundle is released by signal" signal artifact-ready:post
+receive_post() {
+    "$B" launch receive --socket "$SOCK" --launch-id "$ID" --phase post \
+        --archive "$S/launch/post/bundle.tar.gz" --descriptor "$S/launch/post/descriptor.json" >/dev/null 2>&1
+}
+check "launch receive stages post and releases it" receive_post
 wait "$follower"
 check "the follower exits 0 when the launch succeeds" test $? -eq 0
 check "post ran after pre" test "$(events)" = "pre post "
 check "the follower printed the hook's output" grep -q 'stdout: preparing' "$S/follow.log"
 check "the follower reported completion" grep -q '^launch Ok' "$S/follow.log"
 check "a resubmission is the same launch" bash -c "'$B' launch submit --socket '$SOCK' --launch '$S/launch/launch.json' --staging '$S/stage' | grep -q 'already accepted'"
+check "receiving an already staged bundle succeeds again" receive_post
+check "a receive for another phase's descriptor is refused" bash -c "! '$B' launch receive --socket '$SOCK' --launch-id '$ID' --phase pre --archive '$S/launch/post/bundle.tar.gz' --descriptor '$S/launch/post/descriptor.json' 2>/dev/null"
 check "a finished launch can't be retried" bash -c "! '$B' launch retry --socket '$SOCK' --launch-id '$ID' 2>/dev/null"
 
 # A restarted daemon reloads the accepted launch.

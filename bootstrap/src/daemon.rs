@@ -77,7 +77,7 @@ use anyhow::Context;
 use beams_protocol::{
     ActionRequestProjection, BeamToClient, ClientToBeam, FetchSource, RequestProjection, RequestStatus,
     ServiceActionRequest, ServiceProjection, ServiceRequest, ServiceRequestKind, ServiceStatus,
-    CAPABILITY_FILE_FETCH, CAPABILITY_SSH_AGENT, ManifestParam, ManifestTask, MAX_FETCH_SOURCES, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
+    CAPABILITY_FILE_FETCH, CAPABILITY_LAUNCH, CAPABILITY_SSH_AGENT, ManifestParam, ManifestTask, MAX_FETCH_SOURCES, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -145,6 +145,21 @@ impl crate::launch::daemon::Host for Hub {
     }
     fn launches(&self) -> &crate::launch::daemon::Launches {
         &self.launches
+    }
+    fn notify(&self, client_id: &str, message: &BeamToClient) {
+        let senders: Vec<Sender<String>> = self
+            .bridges
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|bridge| {
+                bridge.client_id == client_id && bridge.ready && bridge.capabilities.contains(CAPABILITY_LAUNCH)
+            })
+            .map(|bridge| bridge.sender.clone())
+            .collect();
+        for sender in senders {
+            send_bridge_event(&sender, message);
+        }
     }
 }
 
@@ -483,7 +498,8 @@ fn handle_line(hub: &Arc<Hub>, line: &str, reply: &Sender<String>, context: &mut
             let tasks_value = request.get("tasks").cloned().unwrap_or(Value::Null);
             run_manifest(hub, request_id, tasks_value, reply);
         }
-        "launch_submit" | "launch_signal" | "launch_snapshot" | "launch_retry" | "launch_ready" => {
+        // Every launch op; `launch::daemon::handle` rejects unknown ones.
+        op if op.starts_with("launch_") => {
             crate::launch::daemon::handle(hub, op, &request, &|mut message| {
                 message["request_id"] = json!(request_id);
                 let _ = reply.send(message.to_string());
@@ -905,6 +921,20 @@ fn client_bridge_message(
             };
             run_bridge_manifest(hub, &client_id, manifest_request_id, tasks, reply);
             let _ = reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
+        }
+        message @ (ClientToBeam::LaunchUploadBegin { .. }
+        | ClientToBeam::LaunchUploadChunk { .. }
+        | ClientToBeam::LaunchSubmit { .. }) => {
+            let client_id = hub.bridges.lock().unwrap().get(bridge_id).map(|bridge| bridge.client_id.clone());
+            let Some(client_id) = client_id else {
+                let _ = reply.send(error_reply(request_id, "bridge is no longer registered"));
+                return;
+            };
+            // Replies are bridge events; a chunk gets no separate
+            // acknowledgement line.
+            crate::launch::daemon::bridge(hub, &client_id, bridge_id, message, &|event| {
+                send_bridge_event(reply, &event);
+            });
         }
         ClientToBeam::AgentIdentities { keys } => match hub.agent.set_identities(bridge_id, &keys) {
             Ok(()) => {
@@ -1569,6 +1599,47 @@ mod tests {
                 capabilities: [CAPABILITY_SSH_AGENT.to_string()].into(),
             },
         );
+    }
+
+    #[test]
+    fn launch_updates_go_only_to_the_owners_launch_capable_bridges() {
+        use crate::launch::daemon::Host as _;
+        let hub = Hub::default();
+        let mut receivers = Vec::new();
+        for (client, bridge, capabilities) in [
+            ("client-a", "a-launch", vec![CAPABILITY_LAUNCH]),
+            ("client-a", "a-old", vec![CAPABILITY_SSH_AGENT]),
+            ("client-b", "b-launch", vec![CAPABILITY_LAUNCH]),
+        ] {
+            let (sender, receiver) = mpsc::channel();
+            hub.bridges.lock().unwrap().insert(
+                bridge.to_string(),
+                BridgeRegistration {
+                    client_id: client.to_string(),
+                    bridge_id: bridge.to_string(),
+                    session_tokens: HashSet::new(),
+                    ready: true,
+                    sender,
+                    capabilities: capabilities.into_iter().map(str::to_string).collect(),
+                },
+            );
+            receivers.push((bridge, receiver));
+        }
+        let message = BeamToClient::LaunchStatus {
+            launch_id: "L".into(),
+            status: beams_protocol::launch::LaunchStatus::Running,
+            message: None,
+        };
+        hub.notify("client-a", &message);
+        for (bridge, receiver) in receivers {
+            let got: Vec<String> = receiver.try_iter().collect();
+            if bridge == "a-launch" {
+                assert_eq!(got.len(), 1, "{got:?}");
+                assert!(got[0].contains("launch_status"), "{got:?}");
+            } else {
+                assert!(got.is_empty(), "{bridge}: {got:?}");
+            }
+        }
     }
 
     #[test]

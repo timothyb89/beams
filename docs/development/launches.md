@@ -247,8 +247,8 @@ beam-bootstrap launch unpack ... --output /tmp/team-stage/pre
 beam-bootstrap launch signal --launch-id ID --condition artifact-ready:pre
 beam-bootstrap launch ready --launch-id ID --component shell   # the initial shell does this
 beam-bootstrap launch ready --launch-id ID --component tui     # the TUI does this
-beam-bootstrap launch unpack ... --output /tmp/team-stage/post
-beam-bootstrap launch signal --launch-id ID --condition artifact-ready:post
+beam-bootstrap launch receive --launch-id ID --phase post \
+  --archive /tmp/team-launch/post/bundle.tar.gz --descriptor /tmp/team-launch/post/descriptor.json
 beam-bootstrap launch status [--launch-id ID] [--json]
 beam-bootstrap launch retry --launch-id ID [--retry-interrupted]
 ```
@@ -265,9 +265,15 @@ worker probes both phases when it starts.
   (`~/.beam-bootstrap/launch-state/` by default, the same root `run-phase`
   uses, so receipts, locks and hook history agree).
 - **`artifact-ready:<phase>`** waits until the daemon verifies that phase's
-  staging itself, when the worker starts or on `launch signal`. Signalling
-  with nothing staged leaves it waiting (the CLI exits 1); staging that
-  fails verification fails the condition and blocks its consumers.
+  staging itself. `launch receive` (op `launch_receive`) hands it an
+  archive and descriptor: the daemon checks they belong to this launch,
+  plan and phase, verifies and publishes `<staging>/<phase>` (the same
+  `receive` as `unpack`), and releases the condition, exiting 0 once it is
+  released (also for an archive already staged) or 1 if staging fails.
+  Staging unpacked some other way is probed when the worker starts or on
+  `launch signal`; signalling with nothing staged leaves it waiting (the
+  CLI exits 1). Staging that fails verification fails the condition and
+  blocks its consumers.
 - **`interface-ready`**, with the default interactive gate, waits until
   both the initial shell and the TUI report `launch ready` (its waiting
   message names whichever is missing). `launch signal --condition
@@ -300,7 +306,7 @@ worker probes both phases when it starts.
 
 ### Daemon ops, events and snapshots
 
-The CLI is a thin client of five ops on the daemon socket:
+The CLI is a thin client of six ops on the daemon socket:
 
 ```json
 {"request_id": "1", "op": "launch_submit", "launch": "/abs/launch.json", "staging": "/abs/stage", "gate": "interactive"}
@@ -308,12 +314,15 @@ The CLI is a thin client of five ops on the daemon socket:
 {"request_id": "3", "op": "launch_snapshot", "launch_id": "..."}
 {"request_id": "4", "op": "launch_retry", "launch_id": "...", "retry_interrupted": false}
 {"request_id": "5", "op": "launch_ready", "launch_id": "...", "component": "shell"}
+{"request_id": "6", "op": "launch_receive", "launch_id": "...", "phase": "post", "archive": "/abs/bundle.tar.gz", "descriptor": "/abs/descriptor.json"}
 ```
 
 Replies are `launch_accepted` (`existing`, `seq`, `launch`),
 `launch_signaled` (`released`, `message`), `launch_snapshot` (`seq`,
 `launches`), `launch_retrying` (`seq`, `launch`), `launch_ready`
-(`accepted`: false when recorded ahead of acceptance) or `error`. A launch
+(`accepted`: false when recorded ahead of acceptance), `launch_receiving`
+(staging continues in the background; its outcome is a `launch_condition`)
+or `error`. A launch
 snapshot has the launch's `status` (`accepted`, `running`, `ok`, `failed`,
 `interrupted`), its gate, `ready` (interface components that reported),
 `released` (conditions released, in order), and every node with `status` (`pending`,
@@ -340,6 +349,54 @@ nodes (so pending post work is listed before it runs, labelled
 `bootstrap/tests/launch-daemon-smoke.sh` drives all of this with the real
 binaries in a scratch directory, including the real TUI on a pseudo-terminal
 reporting its readiness.
+
+### Launches over the workstation bridge
+
+A workstation drives the same daemon path over its bridge, with the
+`launch` capability (`CAPABILITY_LAUNCH`) advertised by both sides. It
+never sends a path: it uploads the declaration and each phase's bundle,
+and the Beam decides where they go.
+
+```text
+workstation                                  Beam
+LaunchUploadBegin{declaration, bytes, sha256} → LaunchUploadOffset{offset}
+LaunchUploadChunk{offset, data} ...           → LaunchUploadOffset{offset} ... LaunchUploaded
+LaunchSubmit{launch_id, plan_digest, gate}    → LaunchAccepted{existing, status, released}
+LaunchUploadBegin{pre, ..., descriptor} ...   → ... LaunchUploaded
+                                              ← LaunchCondition{artifact-ready:pre, released}
+                                              ← LaunchStatus{running} ...
+                                              ← LaunchCondition{interface-ready, released}
+LaunchUploadBegin{post, ...} ...              → ... LaunchUploaded
+                                              ← LaunchCondition{artifact-ready:post} ... LaunchStatus{ok}
+```
+
+- **Chunks.** At most `UPLOAD_CHUNK_BYTES` (32 KiB) of base64 data each,
+  so a frame stays well under the bridge's 64 KiB limit. The workstation
+  keeps at most `UPLOAD_WINDOW` (8) chunks unacknowledged, so an SSH agent
+  request queued behind a large post bundle waits for a few frames, not
+  the whole bundle. Each chunk is acknowledged with the bytes now held; a
+  duplicate or out-of-order chunk isn't written, and the reply says where
+  to continue. `LaunchUploadBegin` answers with the bytes already held, so
+  after a dropped bridge an upload resumes rather than restarting.
+- **Verification.** A blob is published only when its size and SHA-256
+  match what its upload began with (`LaunchUploadFailed` otherwise: begin
+  again). A bundle must name its descriptor, which must agree with the
+  upload, the launch and (once accepted) its plan digest. Declarations are
+  bounded at 4 MiB. Post can't be uploaded before the launch is accepted;
+  pre may arrive first and is staged at acceptance.
+- **Staging.** A complete bundle is received exactly as by `launch
+  receive`, into `launch-state/<launch ID>/staging/<phase>`, releasing
+  `artifact-ready:<phase>`; no signal is involved. Consumed uploads are
+  deleted. Spools live in `launch-uploads/<launch ID>/` next to the
+  daemon socket (0700, files 0600): `<blob>.json` (what the upload began
+  with), `<blob>.part`, then `<blob>`.
+- **Ownership.** The submitting workstation (its `client_id`) is recorded
+  in `accepted.json`; `LaunchStatus` and `LaunchCondition` go only to its
+  ready, launch-capable bridges, and node-level progress stays on the
+  Beam. A resubmission (same ID and digest) answers `existing: true` with
+  the current status and released conditions, even after the declaration
+  upload was consumed; that, and re-beginning uploads, is how a
+  reconnecting workstation recovers. A different digest is rejected.
 
 ### Package transactions and parallel work
 

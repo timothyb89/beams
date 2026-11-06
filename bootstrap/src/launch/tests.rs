@@ -729,7 +729,8 @@ fn protected_home_directories_merge_but_cannot_be_replaced_wholesale() {
 
 mod daemon_launches {
     use super::*;
-    use crate::launch::daemon::{handle, Host, LaunchSnapshot, LaunchStatus, Launches, NodeStatus};
+    use crate::launch::daemon::{bridge, handle, Host, LaunchSnapshot, LaunchStatus, Launches, NodeStatus};
+    use beams_protocol::{BeamToClient, ClientToBeam};
     use serde_json::{json, Value};
     use std::sync::{Arc, Condvar};
     use std::time::{Duration, Instant};
@@ -742,6 +743,8 @@ mod daemon_launches {
         launches: Launches,
         received: Mutex<Vec<Value>>,
         changed: Condvar,
+        /// Everything sent to a workstation: (client id, message).
+        notified: Mutex<Vec<(String, BeamToClient)>>,
     }
     impl Host for FakeHost {
         fn broadcast(&self, line: &str) {
@@ -754,6 +757,9 @@ mod daemon_launches {
         fn launches(&self) -> &Launches {
             &self.launches
         }
+        fn notify(&self, client_id: &str, message: &BeamToClient) {
+            self.notified.lock().unwrap().push((client_id.to_string(), message.clone()));
+        }
     }
 
     fn host(f: &Fixture) -> Arc<FakeHost> {
@@ -764,6 +770,7 @@ mod daemon_launches {
             launches,
             received: Mutex::default(),
             changed: Condvar::new(),
+            notified: Mutex::default(),
         })
     }
 
@@ -1134,6 +1141,7 @@ mod daemon_launches {
         let released: Vec<&str> = conditions.iter().map(|m| m["condition"].as_str().unwrap()).collect();
         assert_eq!(released.iter().filter(|c| **c == "interface-ready").count(), 1, "{conditions:?}");
         assert!(released.contains(&"artifact-ready:post"), "{conditions:?}");
+        assert!(host.notified.lock().unwrap().is_empty(), "a local launch has no workstation to tell");
     }
 
     #[test]
@@ -1167,5 +1175,201 @@ mod daemon_launches {
         let done = wait_until(&host, &id, "the retried run", finished);
         assert_eq!(done.status, LaunchStatus::Ok, "{done:#?}");
         assert_eq!(fs::read_to_string(f.home.join("events")).unwrap(), "pre\npost\n");
+    }
+
+    /// One bridge message from workstation `client-a`; its replies.
+    fn on_bridge(host: &Arc<FakeHost>, bridge_id: &str, message: ClientToBeam) -> Vec<BeamToClient> {
+        let replies = Mutex::new(Vec::new());
+        bridge(host, "client-a", bridge_id, message, &|reply| replies.lock().unwrap().push(reply));
+        replies.into_inner().unwrap()
+    }
+
+    /// Uploads `data` the way a workstation does: begin, then chunks from
+    /// whatever offset the Beam reports. Returns the last reply.
+    fn upload(host: &Arc<FakeHost>, id: &str, blob: Blob, data: &[u8], descriptor: Option<BundleDescriptor>) -> BeamToClient {
+        let (sha256, bytes) = beams_artifacts::hash_reader(data).unwrap();
+        let begin = ClientToBeam::LaunchUploadBegin { launch_id: id.into(), blob, bytes, sha256, descriptor };
+        let mut replies = on_bridge(host, "bridge-1", begin);
+        let mut chunks = 0;
+        loop {
+            match replies.pop().expect("a reply") {
+                BeamToClient::LaunchUploadOffset { offset, .. } => {
+                    let start = offset as usize;
+                    let end = (start + UPLOAD_CHUNK_BYTES).min(data.len());
+                    let chunk = ClientToBeam::LaunchUploadChunk {
+                        launch_id: id.into(),
+                        blob,
+                        offset,
+                        data: beams_protocol::agent::b64_encode(&data[start..end]),
+                    };
+                    chunks += 1;
+                    assert!(chunks < 1000, "no progress");
+                    replies = on_bridge(host, "bridge-1", chunk);
+                }
+                done => return done,
+            }
+        }
+    }
+
+    /// A phase's packed archive bytes and descriptor.
+    fn packed(f: &Fixture, launch: &Declaration, phase: Phase) -> (Vec<u8>, BundleDescriptor) {
+        let archive = f.temp.0.join(format!("archive-{}", uuid::Uuid::new_v4()));
+        let descriptor = beams_artifacts::pack(launch, phase, &hooks(f), &archive, Compression::Gzip).unwrap();
+        (fs::read(&archive).unwrap(), descriptor)
+    }
+
+    fn submit_over_bridge(host: &Arc<FakeHost>, launch: &Declaration, gate: Gate) -> BeamToClient {
+        let mut replies = on_bridge(
+            host,
+            "bridge-1",
+            ClientToBeam::LaunchSubmit {
+                request_id: "r1".into(),
+                launch_id: launch.launch_id.clone(),
+                plan_digest: launch.plan_digest.clone(),
+                gate,
+            },
+        );
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        replies.pop().unwrap()
+    }
+
+    /// Bytes gzip can't shrink, so a bundle spans several chunks.
+    fn noise(len: usize) -> String {
+        let mut x: u64 = 0x9e3779b97f4a7c15;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                char::from(b'!' + (x % 90) as u8)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_bridge_upload_is_accepted_staged_and_released_without_signals() {
+        let f = Fixture::new();
+        let launch = pre_post_launch(&f);
+        f.write("hooks/noise.txt", &noise(100 * 1024));
+        let id = launch.launch_id.clone();
+        let host = host(&f);
+        let (pre, pre_descriptor) = packed(&f, &launch, Phase::Pre);
+        assert!(pre.len() > 2 * UPLOAD_CHUNK_BYTES, "spans chunks: {}", pre.len());
+        let (post, post_descriptor) = packed(&f, &launch, Phase::Post);
+
+        // Nothing to submit before the declaration; no post before submission.
+        assert!(matches!(submit_over_bridge(&host, &launch, Gate::Headless), BeamToClient::LaunchRejected { .. }));
+        let early_post = upload(&host, &id, Blob::Post, &post, Some(post_descriptor.clone()));
+        assert!(matches!(early_post, BeamToClient::LaunchUploadFailed { .. }), "{early_post:?}");
+
+        let declaration = serde_json::to_vec(&launch).unwrap();
+        assert!(matches!(upload(&host, &id, Blob::Declaration, &declaration, None), BeamToClient::LaunchUploaded { .. }));
+        // Pre may arrive before the submission; it's staged on acceptance.
+        assert!(matches!(upload(&host, &id, Blob::Pre, &pre, Some(pre_descriptor.clone())), BeamToClient::LaunchUploaded { .. }));
+        let accepted = submit_over_bridge(&host, &launch, Gate::Headless);
+        assert!(matches!(accepted, BeamToClient::LaunchAccepted { existing: false, .. }), "{accepted:?}");
+
+        wait_until(&host, &id, "pre to run from its upload", |s| node_status(s, "tasks:pre") == NodeStatus::Ok);
+        assert!(matches!(upload(&host, &id, Blob::Post, &post, Some(post_descriptor)), BeamToClient::LaunchUploaded { .. }));
+        let done = wait_until(&host, &id, "completion", finished);
+        assert_eq!(done.status, LaunchStatus::Ok, "{done:#?}");
+        assert_eq!(fs::read_to_string(f.home.join("events")).unwrap(), "pre\npost\n");
+        assert!(!super::super::upload::root_for(&f.state).join(&id).exists(), "consumed uploads are removed");
+
+        // The submitting workstation heard every condition and the outcome.
+        let notified = host.notified.lock().unwrap().clone();
+        assert!(notified.iter().all(|(client, _)| client == "client-a"));
+        let released: Vec<String> = notified
+            .iter()
+            .filter_map(|(_, m)| match m {
+                BeamToClient::LaunchCondition { condition, released: true, .. } => Some(condition.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(released, ["artifact-ready:pre", "interface-ready", "artifact-ready:post"]);
+        assert!(matches!(
+            notified.last(),
+            Some((_, BeamToClient::LaunchStatus { status: LaunchStatus::Ok, .. }))
+        ));
+
+        // After a reconnect: resubmission and re-begun uploads need nothing
+        // re-sent, even though the declaration and bundles were consumed.
+        let again = submit_over_bridge(&host, &launch, Gate::Headless);
+        match again {
+            BeamToClient::LaunchAccepted { existing: true, status: LaunchStatus::Ok, released, .. } => {
+                assert_eq!(released.len(), 3, "{released:?}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let (sha256, bytes) = beams_artifacts::hash_reader(&pre[..]).unwrap();
+        let begin = ClientToBeam::LaunchUploadBegin {
+            launch_id: id.clone(),
+            blob: Blob::Pre,
+            bytes,
+            sha256,
+            descriptor: Some(pre_descriptor),
+        };
+        let replies = on_bridge(&host, "bridge-2", begin);
+        assert!(matches!(replies[0], BeamToClient::LaunchUploadOffset { offset, .. } if offset == bytes), "{replies:?}");
+        assert!(matches!(replies[1], BeamToClient::LaunchUploaded { .. }));
+        let mut conflicting = launch.clone();
+        conflicting.plan_digest = "0".repeat(64);
+        assert!(matches!(submit_over_bridge(&host, &conflicting, Gate::Headless), BeamToClient::LaunchRejected { .. }));
+    }
+
+    #[test]
+    fn a_bundle_that_fails_to_stage_fails_its_condition_and_blocks_its_consumers() {
+        let f = Fixture::new();
+        let launch = pre_post_launch(&f);
+        let id = launch.launch_id.clone();
+        let host = host(&f);
+        upload(&host, &id, Blob::Declaration, &serde_json::to_vec(&launch).unwrap(), None);
+        submit_over_bridge(&host, &launch, Gate::Headless);
+        // Intact bytes (the digest matches), but not an archive.
+        let (_, mut descriptor) = packed(&f, &launch, Phase::Pre);
+        let garbage = b"not a gzip stream".to_vec();
+        let (sha256, bytes) = beams_artifacts::hash_reader(&garbage[..]).unwrap();
+        descriptor.sha256 = sha256;
+        descriptor.bytes = bytes;
+        assert!(matches!(upload(&host, &id, Blob::Pre, &garbage, Some(descriptor)), BeamToClient::LaunchUploaded { .. }));
+        let state = wait_until(&host, &id, "the failure", finished);
+        assert_eq!(state.status, LaunchStatus::Failed, "{state:#?}");
+        assert_eq!(node_status(&state, "artifact-ready:pre"), NodeStatus::Error);
+        assert!(!f.home.join("events").exists());
+        let failed = host.notified.lock().unwrap().iter().any(|(_, m)| {
+            matches!(m, BeamToClient::LaunchCondition { condition, released: false, message: Some(why), .. }
+                if condition == "artifact-ready:pre" && why.contains("receiving the pre bundle"))
+        });
+        assert!(failed, "{:?}", host.notified.lock().unwrap());
+    }
+
+    #[test]
+    fn launch_receive_stages_a_local_archive_like_an_upload() {
+        let f = Fixture::new();
+        let launch = pre_post_launch(&f);
+        let id = launch.launch_id.clone();
+        let host = host(&f);
+        submit(&f, &host, &launch, "headless");
+        for phase in [Phase::Pre, Phase::Post] {
+            let archive = f.temp.0.join(format!("{}.tar.gz", phase.name()));
+            let descriptor = beams_artifacts::pack(&launch, phase, &hooks(&f), &archive, Compression::Gzip).unwrap();
+            let descriptor_path = f.temp.0.join(format!("{}.json", phase.name()));
+            beams_artifacts::write_json(&descriptor_path, &descriptor).unwrap();
+            let reply = call(
+                &host,
+                "launch_receive",
+                json!({"launch_id": id, "phase": phase, "archive": archive, "descriptor": descriptor_path}),
+            );
+            assert_eq!(reply["type"], "launch_receiving", "{reply}");
+        }
+        let done = wait_until(&host, &id, "completion", finished);
+        assert_eq!(done.status, LaunchStatus::Ok, "{done:#?}");
+        // A descriptor for another phase is refused up front.
+        let wrong = call(
+            &host,
+            "launch_receive",
+            json!({"launch_id": id, "phase": "post", "archive": f.temp.0.join("pre.tar.gz"), "descriptor": f.temp.0.join("pre.json")}),
+        );
+        assert_eq!(wrong["type"], "error", "{wrong}");
     }
 }

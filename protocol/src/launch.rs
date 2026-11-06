@@ -119,6 +119,80 @@ pub struct Declaration {
     pub plan: LaunchPlan,
 }
 
+/// How a daemon launch's `interface-ready` is released.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Gate {
+    /// Once the initial shell and the TUI report ready (or by an explicit
+    /// signal).
+    #[default]
+    Interactive,
+    /// As soon as pre succeeds: explicit headless initialization.
+    Headless,
+}
+
+/// A daemon launch's lifecycle.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LaunchStatus {
+    Accepted,
+    Running,
+    Ok,
+    Failed,
+    /// The daemon stopped while it was running; a retry resumes it.
+    Interrupted,
+}
+
+impl LaunchStatus {
+    pub fn finished(self) -> bool {
+        matches!(self, Self::Ok | Self::Failed | Self::Interrupted)
+    }
+}
+
+/// What a launch upload carries: the declaration (`launch.json`) or one
+/// phase's bundle archive.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum Blob {
+    Declaration,
+    Pre,
+    Post,
+}
+
+impl Blob {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Declaration => "declaration",
+            Self::Pre => "pre",
+            Self::Post => "post",
+        }
+    }
+
+    pub fn phase(self) -> Option<Phase> {
+        match self {
+            Self::Declaration => None,
+            Self::Pre => Some(Phase::Pre),
+            Self::Post => Some(Phase::Post),
+        }
+    }
+
+    pub fn of(phase: Phase) -> Self {
+        match phase {
+            Phase::Pre => Self::Pre,
+            Phase::Post => Self::Post,
+        }
+    }
+}
+
+/// Raw bytes per `LaunchUploadChunk` (base64 adds a third; the frame stays
+/// well under `MAX_FRAME_BYTES`).
+pub const UPLOAD_CHUNK_BYTES: usize = 32 * 1024;
+/// Chunks a workstation sends ahead of the Beam's acknowledgements, so other
+/// bridge traffic waits behind at most this many frames.
+pub const UPLOAD_WINDOW: usize = 8;
+/// Largest declaration a Beam accepts.
+pub const MAX_DECLARATION_BYTES: u64 = 4 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Compression {
@@ -126,7 +200,7 @@ pub enum Compression {
     Gzip,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BundleDescriptor {
     pub schema_version: u32,

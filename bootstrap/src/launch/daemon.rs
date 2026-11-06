@@ -11,7 +11,14 @@
 //! {"op": "launch_snapshot", "launch_id": "..."}
 //! {"op": "launch_retry", "launch_id": "...", "retry_interrupted": false}
 //! {"op": "launch_ready", "launch_id": "...", "component": "shell"}
+//! {"op": "launch_receive", "launch_id": "...", "phase": "pre", "archive": "/abs/bundle.tar.gz", "descriptor": "/abs/descriptor.json"}
 //! ```
+//!
+//! A workstation does the same over its bridge (`bridge`): it uploads the
+//! declaration and each phase's bundle in chunks (`upload`), submits, and
+//! receives `LaunchStatus`/`LaunchCondition` for the launches it submitted.
+//! A complete bundle is verified and staged here, which releases
+//! `artifact-ready:<phase>`; no separate signal is needed.
 //!
 //! An interactive launch's `interface-ready` is released once both the
 //! initial shell and the TUI have reported `launch_ready` (or by an explicit
@@ -26,12 +33,15 @@
 //! with `seq` at or below it.
 
 use super::runner::{self, Conditions, Verified};
+use super::upload::{self, Chunk, Uploads};
 use crate::executor;
 use anyhow::{bail, Context as _};
-use beams_protocol::launch::{Declaration, Phase};
+pub use beams_protocol::launch::{Gate, LaunchStatus};
+use beams_protocol::launch::{Blob, BundleDescriptor, Declaration, Phase, MAX_DECLARATION_BYTES};
+use beams_protocol::{BeamToClient, ClientToBeam};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -46,28 +56,9 @@ pub trait Host: Send + Sync + 'static {
     fn broadcast(&self, line: &str);
     fn resources(&self) -> &executor::Resources;
     fn launches(&self) -> &Launches;
-}
-
-/// How `interface-ready` is released.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Gate {
-    /// By `launch_signal` (the initial shell and TUI, once wired).
-    #[default]
-    Interactive,
-    /// As soon as pre succeeds: explicit headless initialization.
-    Headless,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum LaunchStatus {
-    Accepted,
-    Running,
-    Ok,
-    Failed,
-    /// The daemon stopped while it was running; `launch_retry` resumes it.
-    Interrupted,
+    /// Sends `message` to the workstation `client_id`'s connected bridges
+    /// that support launches.
+    fn notify(&self, client_id: &str, message: &BeamToClient);
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -132,6 +123,10 @@ struct Accepted {
     staging: PathBuf,
     gate: Gate,
     accepted_at_ms: u64,
+    /// The workstation that submitted it over its bridge; it gets the
+    /// launch's status and condition updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_client_id: Option<String>,
 }
 
 struct Entry {
@@ -154,11 +149,14 @@ pub struct Launches {
     root: PathBuf,
     home: PathBuf,
     table: Mutex<Table>,
+    /// Bridge uploads, in `launch-uploads/` next to `root`.
+    uploads: Uploads,
 }
 
 impl Launches {
     pub fn new(root: PathBuf, home: PathBuf) -> Self {
-        Self { root, home, table: Mutex::default() }
+        let uploads = Uploads::new(upload::root_for(&root));
+        Self { root, home, table: Mutex::default(), uploads }
     }
 
     /// Loads accepted launches persisted by an earlier daemon. Anything that
@@ -215,6 +213,7 @@ pub fn handle<H: Host>(host: &Arc<H>, op: &str, request: &Value, send: &dyn Fn(V
         "launch_snapshot" => snapshot(host, request, send),
         "launch_retry" => retry(host, request, send),
         "launch_ready" => ready(host, request).map(|reply| send(reply)),
+        "launch_receive" => receive_op(host, request).map(|reply| send(reply)),
         _ => Err(anyhow::anyhow!("unknown launch op {op:?}")),
     };
     if let Err(err) = result {
@@ -246,6 +245,22 @@ fn submit<H: Host>(host: &Arc<H>, request: &Value, send: &dyn Fn(Value)) -> anyh
         Some(gate) => serde_json::from_value(gate.clone()).context("gate must be interactive or headless")?,
     };
     let declaration: Declaration = beams_artifacts::read_json(&launch)?;
+    accept(host, declaration, staging, gate, None, &|existing, seq, snapshot| {
+        send(json!({"type": "launch_accepted", "existing": existing, "seq": seq, "launch": snapshot}));
+    })
+}
+
+/// Accepts `declaration` (or finds it already accepted with the same
+/// digest), calling `reply(existing, seq, snapshot)` while event numbering
+/// is held, so the reply precedes anything the new worker reports.
+fn accept<H: Host>(
+    host: &Arc<H>,
+    declaration: Declaration,
+    staging: PathBuf,
+    gate: Gate,
+    owner_client_id: Option<String>,
+    reply: &dyn Fn(bool, u64, &LaunchSnapshot),
+) -> anyhow::Result<()> {
     runner::validate(&declaration)?;
     let launches = host.launches();
     let id = declaration.launch_id.clone();
@@ -256,15 +271,10 @@ fn submit<H: Host>(host: &Arc<H>, request: &Value, send: &dyn Fn(Value)) -> anyh
                 bail!("launch {id} was already accepted with a different plan digest");
             }
             // An identical retry of the submission refers to the same launch.
-            send(json!({
-                "type": "launch_accepted",
-                "existing": true,
-                "seq": table.seq,
-                "launch": entry.snapshot,
-            }));
+            reply(true, table.seq, &entry.snapshot);
             return Ok(());
         }
-        let accepted = Accepted { declaration, staging, gate, accepted_at_ms: now_ms() };
+        let accepted = Accepted { declaration, staging, gate, accepted_at_ms: now_ms(), owner_client_id };
         let dir = launches.dir(&id);
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         beams_artifacts::set_mode(&dir, 0o700)?;
@@ -278,7 +288,7 @@ fn submit<H: Host>(host: &Arc<H>, request: &Value, send: &dyn Fn(Value)) -> anyh
         // The reply, like a snapshot, follows the event it includes, and
         // both are queued before anything the worker reports.
         host.broadcast(&json!({"type": "launch_status", "launch_id": id, "status": "accepted", "seq": table.seq}).to_string());
-        send(json!({"type": "launch_accepted", "existing": false, "seq": table.seq, "launch": snapshot}));
+        reply(false, table.seq, &snapshot);
     }
     spawn_worker(host, id, false);
     Ok(())
@@ -444,7 +454,13 @@ fn probe<H: Host>(host: &H, id: &str, conditions: &DaemonConditions, phase: Phas
 /// Numbers and broadcasts a condition transition (`launch_condition`). A
 /// release is recorded once; a failure is reported each time it happens.
 fn condition_changed<H: Host>(host: &H, id: &str, condition: &str, released: bool, message: Option<String>) {
-    update(host, id, true, |snapshot| {
+    let notify = BeamToClient::LaunchCondition {
+        launch_id: id.to_string(),
+        condition: condition.to_string(),
+        released,
+        message: message.clone(),
+    };
+    update_and_notify(host, id, true, Some(notify), |snapshot| {
         if released {
             if snapshot.released.iter().any(|c| c == condition) {
                 return None;
@@ -495,6 +511,19 @@ fn update<H: Host>(
     persist: bool,
     change: impl FnOnce(&mut LaunchSnapshot) -> Option<Value>,
 ) {
+    update_and_notify(host, id, persist, None, change);
+}
+
+/// `update`, also sending `notify` to the launch's owning workstation when
+/// the change produced an event (in event order, since both happen under
+/// the table lock).
+fn update_and_notify<H: Host>(
+    host: &H,
+    id: &str,
+    persist: bool,
+    notify: Option<BeamToClient>,
+    change: impl FnOnce(&mut LaunchSnapshot) -> Option<Value>,
+) {
     let launches = host.launches();
     let mut table = launches.table.lock().unwrap();
     let Table { seq, entries, .. } = &mut *table;
@@ -508,10 +537,14 @@ fn update<H: Host>(
         }
     }
     host.broadcast(&event.to_string());
+    if let (Some(owner), Some(message)) = (&entry.accepted.owner_client_id, notify) {
+        host.notify(owner, &message);
+    }
 }
 
 fn set_status<H: Host>(host: &H, id: &str, status: LaunchStatus, message: Option<String>) {
-    update(host, id, true, |snapshot| {
+    let notify = BeamToClient::LaunchStatus { launch_id: id.to_string(), status, message: message.clone() };
+    update_and_notify(host, id, true, Some(notify), |snapshot| {
         snapshot.status = status;
         snapshot.message = message.clone();
         Some(json!({"type": "launch_status", "launch_id": id, "status": status, "message": message}))
@@ -675,6 +708,8 @@ struct ConditionState {
     interface: bool,
     verified: BTreeMap<Phase, Verified>,
     failed: BTreeMap<Phase, String>,
+    /// Phases whose bundle is being received right now.
+    receiving: BTreeSet<Phase>,
 }
 
 type Waiting = Box<dyn Fn(&str, &str) + Send + Sync>;
@@ -708,6 +743,21 @@ impl DaemonConditions {
     fn release_interface(&self) {
         self.state.lock().unwrap().interface = true;
         self.changed.notify_all();
+    }
+
+    /// Fails `phase`'s artifact condition (its bundle couldn't be staged).
+    fn fail(&self, phase: Phase, why: String) {
+        self.state.lock().unwrap().failed.insert(phase, why);
+        self.changed.notify_all();
+    }
+
+    /// Claims `phase` for one receive at a time; false if one is running.
+    fn start_receiving(&self, phase: Phase) -> bool {
+        self.state.lock().unwrap().receiving.insert(phase)
+    }
+
+    fn done_receiving(&self, phase: Phase) {
+        self.state.lock().unwrap().receiving.remove(&phase);
     }
 
     /// Verifies `phase`'s staging if it is there. `Ok(false)`: nothing
@@ -783,6 +833,237 @@ impl Conditions for DaemonConditions {
     fn verified(&self, phase: Phase) -> Option<Verified> {
         self.state.lock().unwrap().verified.get(&phase).cloned()
     }
+}
+
+/// `launch_receive`: stage a bundle delivered some other way (a file on
+/// this machine) the same way a bridge upload is.
+fn receive_op<H: Host>(host: &Arc<H>, request: &Value) -> anyhow::Result<Value> {
+    let id = str_field(request, "launch_id")?;
+    let phase: Phase = serde_json::from_value(request.get("phase").cloned().unwrap_or(Value::Null))
+        .context("phase must be pre or post")?;
+    let archive = absolute(request, "archive")?;
+    let descriptor: BundleDescriptor = beams_artifacts::read_json(&absolute(request, "descriptor")?)?;
+    receive_bundle(host, id, phase, archive, descriptor, false)?;
+    Ok(json!({"type": "launch_receiving", "launch_id": id, "phase": phase}))
+}
+
+/// Verifies and publishes `archive` as launch `id`'s `phase` staging on a
+/// thread, then releases `artifact-ready:<phase>` (or fails it, blocking
+/// its consumers). `upload`: the archive is a bridge upload, removed once
+/// consumed.
+fn receive_bundle<H: Host>(
+    host: &Arc<H>,
+    id: &str,
+    phase: Phase,
+    archive: PathBuf,
+    descriptor: BundleDescriptor,
+    upload: bool,
+) -> anyhow::Result<()> {
+    let (conditions, staging) = {
+        let table = host.launches().table.lock().unwrap();
+        let entry = table.entries.get(id).with_context(|| format!("no launch {id}"))?;
+        let declaration = &entry.accepted.declaration;
+        if descriptor.launch_id != declaration.launch_id
+            || descriptor.plan_digest != declaration.plan_digest
+            || descriptor.phase != phase
+        {
+            bail!("that descriptor is for a different launch, plan or phase");
+        }
+        (Arc::clone(&entry.conditions), entry.accepted.staging.clone())
+    };
+    if !conditions.start_receiving(phase) {
+        return Ok(());
+    }
+    let host = Arc::clone(host);
+    let id = id.to_string();
+    thread::spawn(move || {
+        let output = staging.join(phase.name());
+        let result = fs::create_dir_all(&staging)
+            .with_context(|| format!("creating {}", staging.display()))
+            .and_then(|()| beams_artifacts::receive(&archive, &descriptor, &output));
+        conditions.done_receiving(phase);
+        match result {
+            Ok(_) => {
+                if upload {
+                    host.launches().uploads.remove(&id, Blob::of(phase));
+                }
+                let _ = probe(&*host, &id, &conditions, phase);
+            }
+            Err(err) => {
+                let why = format!("receiving the {} bundle: {err:#}", phase.name());
+                conditions.fail(phase, why.clone());
+                condition_changed(&*host, &id, &format!("artifact-ready:{}", phase.name()), false, Some(why));
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Stages every complete bundle upload of an accepted launch that isn't
+/// staged yet; forgets ones that already are.
+fn receive_uploaded<H: Host>(host: &Arc<H>, id: &str) {
+    let launches = host.launches();
+    let staging = {
+        let table = launches.table.lock().unwrap();
+        let Some(entry) = table.entries.get(id) else { return };
+        entry.accepted.staging.clone()
+    };
+    for phase in [Phase::Pre, Phase::Post] {
+        let blob = Blob::of(phase);
+        let Some((archive, meta)) = launches.uploads.complete(id, blob) else { continue };
+        if staging.join(phase.name()).exists() {
+            launches.uploads.remove(id, blob);
+            continue;
+        }
+        let Some(descriptor) = meta.descriptor else { continue };
+        if let Err(err) = receive_bundle(host, id, phase, archive, descriptor, true) {
+            eprintln!("daemon: launch {id}: {err:#}");
+        }
+    }
+}
+
+/// Handles a workstation's launch message from bridge `bridge_id` of
+/// `client_id`, replying on that bridge.
+pub fn bridge<H: Host>(host: &Arc<H>, client_id: &str, bridge_id: &str, message: ClientToBeam, reply: &dyn Fn(BeamToClient)) {
+    match message {
+        ClientToBeam::LaunchUploadBegin { launch_id, blob, bytes, sha256, descriptor } => {
+            let meta = upload::Meta { bytes, sha256, descriptor };
+            match upload_begin(host, bridge_id, &launch_id, blob, meta) {
+                Ok(offset) => {
+                    reply(BeamToClient::LaunchUploadOffset { launch_id: launch_id.clone(), blob, offset });
+                    if offset == bytes {
+                        reply(BeamToClient::LaunchUploaded { launch_id: launch_id.clone(), blob });
+                        if blob != Blob::Declaration {
+                            receive_uploaded(host, &launch_id);
+                        }
+                    }
+                }
+                Err(err) => reply(BeamToClient::LaunchUploadFailed { launch_id, blob, message: format!("{err:#}") }),
+            }
+        }
+        ClientToBeam::LaunchUploadChunk { launch_id, blob, offset, data } => {
+            let result = beams_protocol::agent::b64_decode(&data)
+                .map_err(|_| anyhow::anyhow!("chunk data is not base64"))
+                .and_then(|data| host.launches().uploads.chunk(bridge_id, &launch_id, blob, offset, &data));
+            match result {
+                Ok(Chunk::Offset(offset)) => reply(BeamToClient::LaunchUploadOffset { launch_id, blob, offset }),
+                Ok(Chunk::Complete) => {
+                    reply(BeamToClient::LaunchUploaded { launch_id: launch_id.clone(), blob });
+                    if blob != Blob::Declaration {
+                        receive_uploaded(host, &launch_id);
+                    }
+                }
+                Err(err) => reply(BeamToClient::LaunchUploadFailed { launch_id, blob, message: format!("{err:#}") }),
+            }
+        }
+        ClientToBeam::LaunchSubmit { request_id, launch_id, plan_digest, gate } => {
+            let rejected = |message: String| BeamToClient::LaunchRejected {
+                request_id: request_id.clone(),
+                launch_id: launch_id.clone(),
+                message,
+            };
+            let accepted = |existing: bool, _seq: u64, snapshot: &LaunchSnapshot| {
+                reply(BeamToClient::LaunchAccepted {
+                    request_id: request_id.clone(),
+                    launch_id: launch_id.clone(),
+                    existing,
+                    status: snapshot.status,
+                    released: snapshot.released.clone(),
+                })
+            };
+            if let Err(err) = bridge_submit(host, client_id, &launch_id, &plan_digest, gate, &accepted) {
+                reply(rejected(format!("{err:#}")));
+                return;
+            }
+            receive_uploaded(host, &launch_id);
+        }
+        _ => reply(BeamToClient::Error { message: "not a launch message".into() }),
+    }
+}
+
+/// Checks what an upload may be before storing any of it: a bounded
+/// declaration, or a bundle whose descriptor matches it, its launch and
+/// (once accepted) its plan. Post waits for acceptance.
+fn upload_begin<H: Host>(host: &Arc<H>, bridge_id: &str, id: &str, blob: Blob, meta: upload::Meta) -> anyhow::Result<u64> {
+    upload::check_id(id)?;
+    let launches = host.launches();
+    let (accepted_digest, staged) = {
+        let table = launches.table.lock().unwrap();
+        match table.entries.get(id) {
+            Some(entry) => (
+                Some(entry.accepted.declaration.plan_digest.clone()),
+                blob.phase().is_some_and(|phase| entry.accepted.staging.join(phase.name()).exists()),
+            ),
+            None => (None, false),
+        }
+    };
+    match blob {
+        Blob::Declaration => {
+            if meta.descriptor.is_some() {
+                bail!("a declaration upload has no descriptor");
+            }
+            if meta.bytes > MAX_DECLARATION_BYTES {
+                bail!("declaration is larger than {MAX_DECLARATION_BYTES} bytes");
+            }
+            // Already accepted: nothing more to send.
+            if accepted_digest.is_some() {
+                return Ok(meta.bytes);
+            }
+        }
+        Blob::Pre | Blob::Post => {
+            let descriptor = meta.descriptor.as_ref().context("a bundle upload needs its descriptor")?;
+            if descriptor.launch_id != id
+                || Some(descriptor.phase) != blob.phase()
+                || descriptor.bytes != meta.bytes
+                || descriptor.sha256 != meta.sha256
+            {
+                bail!("the descriptor doesn't match this upload");
+            }
+            match &accepted_digest {
+                Some(digest) if *digest != descriptor.plan_digest => bail!("the descriptor is for a different plan"),
+                Some(_) if staged => return Ok(meta.bytes),
+                Some(_) => {}
+                None if blob == Blob::Post => bail!("submit the launch before uploading its post bundle"),
+                None => {}
+            }
+        }
+    }
+    launches.uploads.begin(bridge_id, id, blob, meta)
+}
+
+fn bridge_submit<H: Host>(
+    host: &Arc<H>,
+    client_id: &str,
+    id: &str,
+    plan_digest: &str,
+    gate: Gate,
+    reply: &dyn Fn(bool, u64, &LaunchSnapshot),
+) -> anyhow::Result<()> {
+    upload::check_id(id)?;
+    let launches = host.launches();
+    {
+        let table = launches.table.lock().unwrap();
+        if let Some(entry) = table.entries.get(id) {
+            if entry.accepted.declaration.plan_digest != plan_digest {
+                bail!("launch {id} was already accepted with a different plan digest");
+            }
+            reply(true, table.seq, &entry.snapshot);
+            return Ok(());
+        }
+    }
+    let (path, _) = launches
+        .uploads
+        .complete(id, Blob::Declaration)
+        .context("upload the declaration before submitting")?;
+    let declaration: Declaration = beams_artifacts::read_json(&path)?;
+    if declaration.launch_id != id || declaration.plan_digest != plan_digest {
+        bail!("the uploaded declaration is for a different launch or plan");
+    }
+    let staging = launches.dir(id).join("staging");
+    accept(host, declaration, staging, gate, Some(client_id.to_string()), reply)?;
+    // accepted.json holds it now.
+    launches.uploads.remove(id, Blob::Declaration);
+    Ok(())
 }
 
 fn now_ms() -> u64 {

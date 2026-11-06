@@ -288,7 +288,10 @@ interrupted. `launch ready --component shell|tui [--launch-id ID]` reports
 an interface component (default launch `$BEAMS_LAUNCH_ID`; without one it
 does nothing): an interactive launch releases `interface-ready` once both
 have, which `shell/fish/conf.d/beams-launch.fish` and the TUI do on their
-own. State is `launch-state/` next to the daemon socket. The ops,
+own. `launch receive --launch-id ID --phase pre|post --archive A
+--descriptor D` stages a bundle for a daemon launch and releases its
+artifact-ready condition (a workstation's bridge uploads take the same
+path, and need no command here). State is `launch-state/` next to the daemon socket. The ops,
 events and snapshot `seq` boundary are documented in
 `docs/development/launches.md` ("Run a launch through the daemon"); the
 end-to-end check is `tests/launch-daemon-smoke.sh`.

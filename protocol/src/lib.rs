@@ -31,8 +31,14 @@ pub const CAPABILITY_SSH_AGENT: &str = "ssh_agent";
 /// The Beam runs a workstation-supplied startup manifest (`RunManifest`).
 pub const CAPABILITY_STARTUP_MANIFEST: &str = "startup_manifest";
 
+/// The workstation submits configured launches and uploads their bundles
+/// over the bridge (`LaunchUpload*`, `LaunchSubmit`); the Beam reports their
+/// status and conditions to the submitting workstation.
+pub const CAPABILITY_LAUNCH: &str = "launch";
+
 /// Every capability this build implements.
-pub const CAPABILITIES: &[&str] = &[CAPABILITY_FILE_FETCH, CAPABILITY_SSH_AGENT, CAPABILITY_STARTUP_MANIFEST];
+pub const CAPABILITIES: &[&str] =
+    &[CAPABILITY_FILE_FETCH, CAPABILITY_SSH_AGENT, CAPABILITY_STARTUP_MANIFEST, CAPABILITY_LAUNCH];
 
 /// Bounds on the advisory process context attached to an agent request, so
 /// a request always fits in `MAX_FRAME_BYTES`.
@@ -356,6 +362,37 @@ pub enum ClientToBeam {
         request_id: String,
         tasks: Vec<ManifestTask>,
     },
+    /// Starts (or resumes) uploading `blob` of launch `launch_id`: `bytes`
+    /// long with SHA-256 `sha256` (lowercase hex). A bundle names its
+    /// descriptor. Answered with `LaunchUploadOffset` (bytes the Beam
+    /// already holds). Requires `CAPABILITY_LAUNCH`.
+    LaunchUploadBegin {
+        launch_id: String,
+        blob: launch::Blob,
+        bytes: u64,
+        sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        descriptor: Option<launch::BundleDescriptor>,
+    },
+    /// Bytes `offset..` of an upload (base64, at most
+    /// `launch::UPLOAD_CHUNK_BYTES` decoded). Only the next expected offset
+    /// is accepted; each is acknowledged with `LaunchUploadOffset`.
+    LaunchUploadChunk {
+        launch_id: String,
+        blob: launch::Blob,
+        offset: u64,
+        data: String,
+    },
+    /// Accept launch `launch_id` from its uploaded declaration. Answered
+    /// with `LaunchAccepted` or `LaunchRejected`; resubmitting an accepted
+    /// launch (same digest) answers with its current state.
+    LaunchSubmit {
+        request_id: String,
+        launch_id: String,
+        plan_digest: String,
+        #[serde(default)]
+        gate: launch::Gate,
+    },
     /// The reply to an `AgentSignRequest`: a raw agent message body
     /// (`SSH_AGENT_SIGN_RESPONSE` or `SSH_AGENT_FAILURE`), base64.
     AgentResponse {
@@ -515,6 +552,56 @@ pub enum BeamToClient {
         manifest_id: String,
         ok: bool,
     },
+    /// How many bytes of an upload the Beam holds: the reply to
+    /// `LaunchUploadBegin` and the acknowledgement of each chunk.
+    LaunchUploadOffset {
+        launch_id: String,
+        blob: launch::Blob,
+        offset: u64,
+    },
+    /// An upload arrived whole and matched its digest. For a bundle, the
+    /// Beam then verifies and stages it (reported as `LaunchCondition`).
+    LaunchUploaded {
+        launch_id: String,
+        blob: launch::Blob,
+    },
+    /// An upload was refused or failed verification; begin it again.
+    LaunchUploadFailed {
+        launch_id: String,
+        blob: launch::Blob,
+        message: String,
+    },
+    LaunchAccepted {
+        request_id: String,
+        launch_id: String,
+        /// The launch had already been accepted (a resubmission).
+        existing: bool,
+        status: launch::LaunchStatus,
+        /// Conditions released so far (`artifact-ready:pre`,
+        /// `interface-ready`, ...).
+        released: Vec<String>,
+    },
+    LaunchRejected {
+        request_id: String,
+        launch_id: String,
+        message: String,
+    },
+    /// A launch's lifecycle changed. Sent to the client that submitted it.
+    LaunchStatus {
+        launch_id: String,
+        status: launch::LaunchStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// One of a launch's external conditions was released, or failed (a
+    /// bundle that didn't verify). Sent to the client that submitted it.
+    LaunchCondition {
+        launch_id: String,
+        condition: String,
+        released: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
 }
 
 impl BeamToClient {
@@ -532,6 +619,23 @@ impl BeamToClient {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_full_upload_chunk_fits_in_one_frame() {
+        use base64ct::Encoding;
+        let data = base64ct::Base64::encode_string(&vec![0xffu8; launch::UPLOAD_CHUNK_BYTES]);
+        let chunk = ClientToBeam::LaunchUploadChunk {
+            launch_id: "0".repeat(36),
+            blob: launch::Blob::Declaration,
+            offset: u64::MAX,
+            data,
+        };
+        let line = serde_json::to_string(&chunk).unwrap();
+        assert!(line.len() + 1 < MAX_FRAME_BYTES, "{} bytes", line.len());
+        let window = launch::UPLOAD_WINDOW * line.len();
+        assert!(window <= 512 * 1024, "the window stays small: {window}");
+        assert!(CAPABILITIES.contains(&CAPABILITY_LAUNCH));
+    }
 
     #[test]
     fn port_forward_request_has_a_stable_tagged_shape() {
@@ -704,7 +808,7 @@ mod tests {
     #[test]
     fn hello_capabilities_are_optional_both_ways() {
         let hello = serde_json::to_value(ClientToBeam::hello("c", "b", Vec::new())).unwrap();
-        assert_eq!(hello["capabilities"], json!(["file_fetch", "ssh_agent", "startup_manifest"]));
+        assert_eq!(hello["capabilities"], json!(["file_fetch", "ssh_agent", "startup_manifest", "launch"]));
         // A hello from a workstation that predates capabilities.
         let old: ClientToBeam = serde_json::from_value(json!({
             "type": "hello",

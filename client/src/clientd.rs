@@ -2838,6 +2838,15 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                 eprintln!("startup: {beam_uuid}: {manifest_id} finished ({})", if ok { "ok" } else { "with errors" });
                 hub.end_grants_where(|g| g.beam_uuid == beam_uuid && g.manifest_id == manifest_id, "startup finished");
             }
+            // Launches this workstation submitted (none yet: see `beams
+            // config launch`).
+            BeamToClient::LaunchUploadOffset { .. }
+            | BeamToClient::LaunchUploaded { .. }
+            | BeamToClient::LaunchUploadFailed { .. }
+            | BeamToClient::LaunchAccepted { .. }
+            | BeamToClient::LaunchRejected { .. }
+            | BeamToClient::LaunchStatus { .. }
+            | BeamToClient::LaunchCondition { .. } => {}
         },
     }
 }

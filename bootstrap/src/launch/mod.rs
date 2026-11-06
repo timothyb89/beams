@@ -2,6 +2,7 @@
 pub mod daemon;
 mod files;
 mod runner;
+pub mod upload;
 #[cfg(test)]
 mod tests;
 
@@ -99,6 +100,22 @@ pub enum Command {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// Hand a bundle archive on this machine to the daemon, which verifies
+    /// and stages it for an accepted launch and releases its
+    /// artifact-ready condition (as for a bundle uploaded over the bridge).
+    /// Exits once that condition is released (0) or fails (1).
+    Receive {
+        #[arg(long)]
+        launch_id: String,
+        #[arg(long, value_enum)]
+        phase: RunPhase,
+        #[arg(long)]
+        archive: PathBuf,
+        #[arg(long)]
+        descriptor: PathBuf,
+        #[arg(long)]
+        socket: Option<String>,
+    },
     /// Verify an archive and atomically publish staging, without installing it.
     Unpack {
         #[arg(long)]
@@ -113,6 +130,15 @@ pub enum Command {
 pub enum RunPhase {
     Pre,
     Post,
+}
+
+impl From<RunPhase> for Phase {
+    fn from(phase: RunPhase) -> Self {
+        match phase {
+            RunPhase::Pre => Phase::Pre,
+            RunPhase::Post => Phase::Post,
+        }
+    }
 }
 
 pub fn run(command: Command) -> anyhow::Result<()> {
@@ -169,6 +195,9 @@ pub fn run(command: Command) -> anyhow::Result<()> {
                 json!({"op": "launch_ready", "launch_id": launch_id, "component": component}),
             )?;
         }
+        Command::Receive { launch_id, phase, archive, descriptor, socket } => {
+            receive(socket, &launch_id, phase.into(), &archive, &descriptor)?;
+        }
         Command::Retry { launch_id, retry_interrupted, no_follow, socket } => {
             let mut conn = connect(socket)?;
             let reply = request(
@@ -188,10 +217,7 @@ pub fn run(command: Command) -> anyhow::Result<()> {
             let declaration: Declaration = beams_artifacts::read_json(&launch)?;
             let home = PathBuf::from(std::env::var("HOME")?);
             let state = state_dir.unwrap_or_else(|| home.join(".beam-bootstrap/launch-state"));
-            let phase = match phase {
-                RunPhase::Pre => Phase::Pre,
-                RunPhase::Post => Phase::Post,
-            };
+            let phase = Phase::from(phase);
             let id = declaration.launch_id.clone();
             let options = runner::Options {
                 home,
@@ -257,6 +283,54 @@ fn request(conn: &mut crate::taskcli::Connection, mut op: Value) -> anyhow::Resu
         }
         return Ok(reply);
     }
+}
+
+/// `launch receive`: waits for the condition's release or failure, which
+/// may be reported before the reply; a snapshot covers an archive that
+/// was already staged (and so releases nothing new).
+fn receive(
+    socket: Option<String>,
+    launch_id: &str,
+    phase: Phase,
+    archive: &std::path::Path,
+    descriptor: &std::path::Path,
+) -> anyhow::Result<()> {
+    let condition = format!("artifact-ready:{}", phase.name());
+    let mut conn = connect(socket)?;
+    conn.send(&json!({
+        "request_id": "launch-cli",
+        "op": "launch_receive",
+        "launch_id": launch_id,
+        "phase": phase,
+        "archive": std::path::absolute(archive)?,
+        "descriptor": std::path::absolute(descriptor)?,
+    }))?;
+    while let Some(event) = conn.recv()? {
+        let ours = event["request_id"] == "launch-cli";
+        match event["type"].as_str() {
+            Some("error") if ours => anyhow::bail!("{}", event["message"].as_str().unwrap_or("unknown error")),
+            Some("launch_receiving") if ours => {
+                conn.send(&json!({"request_id": "launch-cli", "op": "launch_snapshot", "launch_id": launch_id}))?;
+            }
+            Some("launch_snapshot") if ours => {
+                let launches: Vec<daemon::LaunchSnapshot> = serde_json::from_value(event["launches"].clone())?;
+                if launches.iter().any(|l| l.released.contains(&condition)) {
+                    println!("{condition} released");
+                    return Ok(());
+                }
+            }
+            Some("launch_condition") if event["launch_id"] == launch_id && event["condition"] == condition.as_str() => {
+                let message = event["message"].as_str().map(|m| format!(": {m}")).unwrap_or_default();
+                if event["released"] == true {
+                    println!("{condition} released{message}");
+                    return Ok(());
+                }
+                anyhow::bail!("{condition} failed{message}");
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("the daemon closed the connection before {condition} was released")
 }
 
 fn print_snapshot(launch: &daemon::LaunchSnapshot) {
