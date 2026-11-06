@@ -53,9 +53,9 @@ const MAX_CONTEXT_TEXT: usize = 16 * 1024;
 /// What the listener needs from the daemon's bridge registry.
 pub trait AgentBridges: Send + Sync + 'static {
     fn agent_state(&self) -> &AgentState;
-    /// The bridge to use for a requester carrying `session_token` (if any),
-    /// or why there is none.
-    fn route_agent(&self, session_token: Option<&str>) -> Result<String, String>;
+    /// The bridge to use for a requester carrying `session_token` and/or
+    /// claiming `task_run` (`BEAMS_TASK_RUN`), or why there is none.
+    fn route_agent(&self, session_token: Option<&str>, task_run: Option<&str>) -> Result<String, String>;
     /// Sends `message` over `bridge_id`; false if it's gone.
     fn send_agent(&self, bridge_id: &str, message: &BeamToClient) -> bool;
 }
@@ -163,6 +163,7 @@ fn handle_connection<B: AgentBridges>(bridges: &B, conn_id: String, mut conn: Un
     let chain = pid.map(process_chain).unwrap_or_default();
     let session_token = chain.iter().find_map(|p| p.session_token.clone());
     let context = build_context(pid, &chain);
+    let route = || bridges.route_agent(session_token.as_deref(), context.task_run.as_deref());
     // Bridges this connection sent binds or requests to, told when it closes.
     let mut announced: HashSet<String> = HashSet::new();
     let state = bridges.agent_state();
@@ -170,12 +171,12 @@ fn handle_connection<B: AgentBridges>(bridges: &B, conn_id: String, mut conn: Un
     let result = (|| -> anyhow::Result<()> {
         while let Some(body) = agent::read_message(&mut conn).context("reading agent request")? {
             let reply = match agent::parse_request(&body) {
-                Ok(AgentRequest::RequestIdentities) => match bridges.route_agent(session_token.as_deref()) {
+                Ok(AgentRequest::RequestIdentities) => match route() {
                     Ok(bridge_id) => agent::encode_identities_answer(&state.identities(&bridge_id)),
                     Err(_) => agent::encode_identities_answer(&[]),
                 },
                 Ok(AgentRequest::SessionBind(_)) => {
-                    if let Ok(bridge_id) = bridges.route_agent(session_token.as_deref()) {
+                    if let Ok(bridge_id) = route() {
                         let message = BeamToClient::AgentSessionBind {
                             conn_id: conn_id.clone(),
                             message: agent::b64_encode(&body),
@@ -187,7 +188,7 @@ fn handle_connection<B: AgentBridges>(bridges: &B, conn_id: String, mut conn: Un
                     agent::success()
                 }
                 Ok(AgentRequest::Sign { .. }) => {
-                    relay_sign(bridges, &conn_id, &body, &context, session_token.as_deref(), &mut announced)
+                    relay_sign(bridges, &conn_id, &body, &context, route(), &mut announced)
                 }
                 Ok(other) => {
                     eprintln!("ssh-agent: {conn_id}: refused {}", other.label());
@@ -214,10 +215,10 @@ fn relay_sign<B: AgentBridges>(
     conn_id: &str,
     body: &[u8],
     context: &AgentContext,
-    session_token: Option<&str>,
+    route: Result<String, String>,
     announced: &mut HashSet<String>,
 ) -> Vec<u8> {
-    let bridge_id = match bridges.route_agent(session_token) {
+    let bridge_id = match route {
         Ok(bridge_id) => bridge_id,
         Err(why) => {
             eprintln!("ssh-agent: {conn_id}: sign refused: {why}");
@@ -502,7 +503,7 @@ mod tests {
         fn agent_state(&self) -> &AgentState {
             &self.state
         }
-        fn route_agent(&self, _token: Option<&str>) -> Result<String, String> {
+        fn route_agent(&self, _token: Option<&str>, _task_run: Option<&str>) -> Result<String, String> {
             if self.routable {
                 Ok("bridge-1".into())
             } else {

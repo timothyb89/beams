@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use super::{Task, Template};
 use crate::graph::Capability;
-use crate::sshagent::discover_ssh_auth_sock;
+use crate::sshagent::relay_command;
 
 /// How often to poll `ssh-add -l` while waiting, and how long to wait
 /// before giving up - overridable via env vars (`BEAM_BOOTSTRAP_SSH_WAIT_*`)
@@ -43,9 +43,7 @@ impl WaitSshAgent {
     fn has_identity() -> bool {
         let mut cmd = Command::new(Self::ssh_add_bin());
         cmd.arg("-l");
-        if let Some(sock) = discover_ssh_auth_sock() {
-            cmd.env("SSH_AUTH_SOCK", sock);
-        }
+        relay_command(&mut cmd);
         cmd.output().map(|o| o.status.success()).unwrap_or(false)
     }
 }

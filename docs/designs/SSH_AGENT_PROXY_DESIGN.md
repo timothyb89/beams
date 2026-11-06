@@ -185,7 +185,11 @@ after verification, and keeps the binding in per-`conn_id` state, dropped on
 `AgentConnClosed` or when the bridge disconnects.
 
 Routing follows the existing rules: the managed-session token if present,
-otherwise the only connected client, otherwise reject. Agent requests use
+then, for a task of a running workstation-submitted manifest (by its
+claimed `BEAMS_TASK_RUN`), the client that submitted it, otherwise the
+only connected client, otherwise reject. The run tag is advisory, but
+routing on it grants nothing: the chosen workstation still evaluates the
+request. Agent requests use
 the same per-bridge rate limits and pending-queue bounds as service requests,
 with their own small cap (for example 8 pending per Beam) so a loop can't
 flood the UI.
@@ -509,7 +513,8 @@ apart from the Beam's claims.
   - Identity listings are answered from the keys the client pushed.
   - Session-binds are acknowledged at once and forwarded.
   - Sign requests wait up to 120s for the client's answer.
-  - Requests are routed by `BEAMS_SESSION_TOKEN`, or to the only connected
+  - Requests are routed by `BEAMS_SESSION_TOKEN`, then (added later) by a
+    running manifest's submitting client, or to the only connected
     capable bridge.
   - When a bridge goes away, its waiting requests fail immediately.
 - **Workstation (`client/src/agent.rs`, `clientd.rs`):**

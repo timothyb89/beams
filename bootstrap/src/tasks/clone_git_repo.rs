@@ -9,7 +9,7 @@ use anyhow::Context;
 use super::{Task, Template};
 use crate::graph::Capability;
 use crate::releaseutil::run_streaming;
-use crate::sshagent::discover_ssh_auth_sock;
+use crate::sshagent::relay_command;
 
 /// Clones `repo` to `dest` with a plain `git clone` - no assumptions
 /// about what kind of repo it is (GitHub, a beam, anything `git` itself
@@ -23,7 +23,7 @@ use crate::sshagent::discover_ssh_auth_sock;
 ///
 /// Each use of the key is approved on the workstation; a clone run by the
 /// workstation's startup manifest may be covered by its startup grant,
-/// which is why `run()` also passes `BEAMS_TASK_RUN`.
+/// which is why `run()` also passes `BEAMS_TASK_RUN` (`relay_command`).
 pub struct CloneGitRepo {
     pub repo: String,
     pub dest: PathBuf,
@@ -77,16 +77,9 @@ impl Task for CloneGitRepo {
         // isn't talking to a terminal (which it otherwise suppresses).
         let mut cmd = Command::new("git");
         cmd.args(["clone", "--progress", &self.repo, &self.dest.display().to_string()]);
-        if self.needs_ssh_agent() {
-            if let Some(sock) = discover_ssh_auth_sock() {
-                cmd.env("SSH_AUTH_SOCK", sock);
-            }
-        }
-        // Lets the workstation match this clone's key use to the startup
-        // manifest that asked for it (see `executor::current_task_run`).
-        if let Some(run) = crate::executor::current_task_run() {
-            cmd.env("BEAMS_TASK_RUN", run);
-        }
+        // The relay socket and run tag (an https:// or local `repo` just
+        // ignores both).
+        relay_command(&mut cmd);
         // Reduces each raw update (`run_streaming` already splits git's
         // own `\r`-delimited ticks into one call per tick - see that
         // function's doc comment) down to just the phase name and

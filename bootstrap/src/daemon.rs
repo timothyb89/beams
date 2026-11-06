@@ -63,7 +63,7 @@
 //! `task_status` broadcast carries a `manifest_id` when the task ran as
 //! part of a manifest (`null` for a standalone `run_task`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -102,6 +102,10 @@ struct Hub {
     client_requests: Mutex<BTreeMap<String, ClientRequestProjection>>,
     client_action_requests: Mutex<BTreeMap<String, ClientActionProjection>>,
     client_services: Mutex<BTreeMap<String, OwnedServiceProjection>>,
+    /// Running workstation-submitted manifests: manifest id -> the
+    /// `client_id` that submitted it. Routes its tasks' SSH key use
+    /// (`route_agent`) while it runs.
+    manifest_owners: Mutex<HashMap<String, String>>,
     agent: AgentState,
 }
 
@@ -116,6 +120,7 @@ impl Default for Hub {
             client_requests: Mutex::new(BTreeMap::new()),
             client_action_requests: Mutex::new(BTreeMap::new()),
             client_services: Mutex::new(BTreeMap::new()),
+            manifest_owners: Mutex::new(HashMap::new()),
             agent: AgentState::default(),
         }
     }
@@ -126,26 +131,44 @@ impl AgentBridges for Hub {
         &self.agent
     }
 
-    fn route_agent(&self, session_token: Option<&str>) -> Result<String, String> {
+    /// A shell's session token wins; else a task of a running
+    /// workstation-submitted manifest goes to the client that submitted
+    /// it; else the only connected client. The run tag is advisory (any
+    /// process can claim one), but routing on it gives a spoofer nothing
+    /// the last rule doesn't: the chosen workstation still evaluates and
+    /// approves the request itself.
+    fn route_agent(&self, session_token: Option<&str>, task_run: Option<&str>) -> Result<String, String> {
+        let owner = task_run
+            .and_then(|run| run.split_once('/').map(|(manifest, _)| manifest))
+            .and_then(|manifest| self.manifest_owners.lock().unwrap().get(manifest).cloned());
         let bridges = self.bridges.lock().unwrap();
         let capable: Vec<&BridgeRegistration> = bridges
             .values()
             .filter(|bridge| bridge.ready && bridge.capabilities.contains(CAPABILITY_SSH_AGENT))
             .collect();
+        let only = |keep: &dyn Fn(&BridgeRegistration) -> bool| match capable
+            .iter()
+            .filter(|bridge| keep(bridge))
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [bridge] => Some(bridge.bridge_id.clone()),
+            _ => None,
+        };
         if let Some(token) = session_token {
-            if let [bridge] = capable
-                .iter()
-                .filter(|bridge| bridge.session_tokens.contains(token))
-                .collect::<Vec<_>>()
-                .as_slice()
-            {
-                return Ok(bridge.bridge_id.clone());
+            if let Some(bridge_id) = only(&|bridge| bridge.session_tokens.contains(token)) {
+                return Ok(bridge_id);
+            }
+        }
+        if let Some(owner) = owner {
+            if let Some(bridge_id) = only(&|bridge| bridge.client_id == owner) {
+                return Ok(bridge_id);
             }
         }
         match capable.as_slice() {
             [bridge] => Ok(bridge.bridge_id.clone()),
             [] => Err("no managed beams client is connected".to_string()),
-            _ => Err("several beams clients are connected and none owns this shell's session".to_string()),
+            _ => Err("several beams clients are connected and none owns this shell's session or task".to_string()),
         }
     }
 
@@ -840,7 +863,12 @@ fn client_bridge_message(
             send_bridge_event(reply, &BeamToClient::Pong { nonce });
         }
         ClientToBeam::RunManifest { request_id: manifest_request_id, tasks } => {
-            run_bridge_manifest(hub, manifest_request_id, tasks, reply);
+            let client_id = hub.bridges.lock().unwrap().get(bridge_id).map(|bridge| bridge.client_id.clone());
+            let Some(client_id) = client_id else {
+                let _ = reply.send(error_reply(request_id, "bridge is no longer registered"));
+                return;
+            };
+            run_bridge_manifest(hub, &client_id, manifest_request_id, tasks, reply);
             let _ = reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
         }
         ClientToBeam::AgentIdentities { keys } => match hub.agent.set_identities(bridge_id, &keys) {
@@ -1301,8 +1329,15 @@ fn build_manifest(entries: Vec<ManifestEntry>) -> Result<Vec<Box<dyn Task>>, Str
 }
 
 /// `RunManifest` from a workstation bridge: the same as a local
-/// `run_manifest`, answered with typed bridge messages instead.
-fn run_bridge_manifest(hub: &Arc<Hub>, request_id: String, tasks: Vec<ManifestTask>, reply: &Sender<String>) {
+/// `run_manifest`, answered with typed bridge messages instead. While it
+/// runs, its tasks' SSH key use routes to `client_id` (`route_agent`).
+fn run_bridge_manifest(
+    hub: &Arc<Hub>,
+    client_id: &str,
+    request_id: String,
+    tasks: Vec<ManifestTask>,
+    reply: &Sender<String>,
+) {
     let entries = tasks
         .into_iter()
         .map(|task| ManifestEntry {
@@ -1323,11 +1358,14 @@ fn run_bridge_manifest(hub: &Arc<Hub>, request_id: String, tasks: Vec<ManifestTa
         })
         .collect();
     let finished_reply = reply.clone();
+    let finished_hub = Arc::clone(hub);
     let started = start_manifest(
         hub,
         entries,
         |manifest_id, plan| {
             eprintln!("daemon: workstation startup manifest accepted as {manifest_id}");
+            // Before the worker starts (`start_manifest` runs this first).
+            hub.manifest_owners.lock().unwrap().insert(manifest_id.to_string(), client_id.to_string());
             send_bridge_event(reply, &BeamToClient::ManifestAccepted {
                 request_id: request_id.clone(),
                 manifest_id: manifest_id.to_string(),
@@ -1335,6 +1373,7 @@ fn run_bridge_manifest(hub: &Arc<Hub>, request_id: String, tasks: Vec<ManifestTa
             });
         },
         move |manifest_id, ok| {
+            finished_hub.manifest_owners.lock().unwrap().remove(manifest_id);
             send_bridge_event(&finished_reply, &BeamToClient::ManifestFinished { manifest_id: manifest_id.to_string(), ok });
         },
     );
@@ -1459,6 +1498,44 @@ mod tests {
     /// already buffered but not yet handed back via `read_line`.
     fn connect() -> (UnixStream, BufReader<UnixStream>, thread::JoinHandle<()>) {
         connect_to(Arc::new(Hub::default()))
+    }
+
+    fn agent_bridge(hub: &Hub, client_id: &str, bridge_id: &str, token: &str) {
+        let (sender, _) = mpsc::channel();
+        hub.bridges.lock().unwrap().insert(
+            bridge_id.to_string(),
+            BridgeRegistration {
+                client_id: client_id.to_string(),
+                bridge_id: bridge_id.to_string(),
+                session_tokens: [token.to_string()].into(),
+                ready: true,
+                sender,
+                capabilities: [CAPABILITY_SSH_AGENT.to_string()].into(),
+            },
+        );
+    }
+
+    #[test]
+    fn agent_requests_route_by_session_then_running_manifest_owner() {
+        let hub = Hub::default();
+        agent_bridge(&hub, "client-a", "bridge-a", "token-a");
+        // One client: everything goes to it, tagged or not.
+        assert_eq!(hub.route_agent(None, None).unwrap(), "bridge-a");
+
+        agent_bridge(&hub, "client-b", "bridge-b", "token-b");
+        assert!(hub.route_agent(None, None).is_err(), "two clients and no hint is ambiguous");
+        assert_eq!(hub.route_agent(Some("token-b"), None).unwrap(), "bridge-b");
+
+        let run = "manifest-4/clone-git-repo:dest=/home/beams/x";
+        assert!(hub.route_agent(None, Some(run)).is_err(), "not a running manifest");
+        hub.manifest_owners.lock().unwrap().insert("manifest-4".into(), "client-b".into());
+        assert_eq!(hub.route_agent(None, Some(run)).unwrap(), "bridge-b");
+        // A shell's own session still wins over a claimed run tag.
+        assert_eq!(hub.route_agent(Some("token-a"), Some(run)).unwrap(), "bridge-a");
+
+        // The owner went away: fall back to the only remaining client.
+        hub.bridges.lock().unwrap().remove("bridge-b");
+        assert_eq!(hub.route_agent(None, Some(run)).unwrap(), "bridge-a");
     }
 
     fn connect_to(hub: Arc<Hub>) -> (UnixStream, BufReader<UnixStream>, thread::JoinHandle<()>) {

@@ -8,7 +8,7 @@ use super::clone_git_repo::CloneGitRepo;
 use super::{Task, Template};
 use crate::graph::Capability;
 use crate::releaseutil::run;
-use crate::sshagent::discover_ssh_auth_sock;
+use crate::sshagent::relay_command;
 
 /// Fetches PR `pr`'s head ref from `base`'s `origin` remote and checks it
 /// out into a new worktree at `dest`, as a separate working directory
@@ -57,13 +57,11 @@ impl Task for CheckoutPrWorktree {
         let refspec = format!("pull/{}/head:{}", self.pr, branch);
         let mut fetch = Command::new("git");
         fetch.current_dir(&self.base).args(["fetch", "origin", &refspec]);
-        // `origin` might be an ssh:// remote (same class of bug
-        // clone_git_repo had - see sshagent's module doc comment); an
-        // https:// or local one just ignores the extra env var, so this
-        // is unconditional rather than probing the remote URL to decide.
-        if let Some(sock) = discover_ssh_auth_sock() {
-            fetch.env("SSH_AUTH_SOCK", sock);
-        }
+        // `origin` might be an ssh:// remote: use the relay, and tag the
+        // fetch so a startup manifest's PR checkout is covered by its
+        // grant. An https:// or local one just ignores both, so this is
+        // unconditional rather than probing the remote URL to decide.
+        relay_command(&mut fetch);
         run(&mut fetch)?;
         run(Command::new("git").current_dir(&self.base).args([
             "worktree",

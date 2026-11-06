@@ -915,16 +915,6 @@ Open:
   scoped to Beam + key + verified host key + user, expiring no later than
   the Beam's TTL, listed and revocable like startup grants. Never matching
   an unverified host. (Design: "Grants and remembered rules".)
-- [ ] `BEAMS_TASK_RUN` is only set by `clone-git-repo`. `checkout-pr-worktree`
-  (its `git fetch`) and any future git-using task should set it too, so a
-  startup manifest's PR checkouts are covered by the grant. Probably better
-  centralized: one helper that prepares a task's `git` command with the
-  relay socket and the run tag.
-- [ ] Two workstations attached to one Beam: interactive shells route by
-  `BEAMS_SESSION_TOKEN`, but daemon tasks have no token and fall back to
-  "the only connected client", so with two clients attached, a startup
-  clone's key use is refused as ambiguous. Route a manifest's tasks to the
-  client that submitted it (the daemon knows it).
 - [ ] A separate local audit log of SSH key decisions. Today they're one
   line each in `daemon.log` (`ssh-agent: <beam>: asking|signed|granted|
   rejected|...`).
