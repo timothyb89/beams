@@ -1,0 +1,34 @@
+# Sanitized starter, embedded in the client. Optional work stays after the UI.
+# More of the old fixed startup will move here as execution primitives land.
+schema_version = 1
+extends = ["builtin:core"]
+
+[shell]
+program = "/usr/bin/fish"
+path = ["~/.local/bin", "~/.cargo/bin", "~/.local/toolchains/go/bin"]
+
+[packages.pre]
+add = ["fish"]
+
+[packages.post]
+add = ["micro", "less"]
+
+[files.fish]
+source = "assets/config.fish"
+target = "~/.config/fish/config.fish"
+phase = "pre"
+overwrite = "backup"
+
+[files.prompt]
+source = "assets/starship.toml"
+target = "~/.config/starship.toml"
+phase = "pre"
+overwrite = "backup"
+
+[tasks.go]
+label = "Install Go"
+template = "install-toolchain-go"
+
+[tasks.rust]
+label = "Install Rust"
+template = "install-toolchain-rust"

@@ -1,14 +1,19 @@
 # Configurable Beam launches
 
-Status: proposed design, 2026-11-06. This is a plan, not implemented
-configuration syntax. It builds on [DESIGN.md](DESIGN.md)'s task graph and
+Status: offline compiler milestone implemented, 2026-11-06. The supported
+profile syntax and `beams config validate/explain` are documented in the
+[developer guide](../development/launches.md). Runtime launch execution,
+archive packing/upload and SSH selection remain planned. This design
+builds on [DESIGN.md](DESIGN.md)'s task graph and
 [CLIENT_SERVICES_DESIGN.md](CLIENT_SERVICES_DESIGN.md)'s workstation-owned
 transport. [TODO.md](../../TODO.md)
 tracks the implementation sequence.
 
 The overall plan, graph direction, explicit readiness conditions, and
 developer documentation requirement were endorsed on 2026-11-06. The
-profile syntax and implementation details remain proposed.
+runtime implementation details remain proposed. The compiler establishes
+strict schema v1, local inheritance, named file/script/custom-template
+definitions, package batches, artifact selections and graph validation.
 
 ## Goals and recommendation
 
@@ -814,3 +819,11 @@ override. Completion means the fixtures resolve to the expected graph,
 invalid configurations fail clearly without creating a Beam, and the
 developer guide can explain that same graph. Add `config init` and runtime
 wiring once this foundation is reviewable.
+
+The offline compiler milestone is now implemented in `client/src/config/`
+with embedded core/development starters and a team override/helper fixture.
+The fixture verifies shared-root pre promotion, post data gating, package
+batch dependencies and disabling inherited tasks. Validation checks source
+metadata only; source snapshots, tar packing/digests, executable remote plan
+acceptance and launch IDs belong to subsequent milestones. Live startup
+continues to use the existing path.

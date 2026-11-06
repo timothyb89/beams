@@ -59,10 +59,11 @@ daemon, etc).
   subsystems (the daemon/task-graph architecture, client-owned services,
   the SSH agent proxy, folder sync, OpenSSH multiplexing).
 - [Configurable launches](docs/designs/LAUNCH_CONFIGURATION_DESIGN.md) —
-  proposed client-side profiles, batched uploads/packages, and pre/post
-  initialization tasks; not implemented yet.
-- [Launch developer guide](docs/development/launches.md) — draft execution
-  ordering and task extension guidance for the planned configuration system.
+  client-side profiles, batched uploads/packages, and pre/post tasks;
+  offline `beams config validate/explain` is implemented, runtime wiring
+  is planned.
+- [Launch developer guide](docs/development/launches.md) — supported profile
+  schema, checked examples and execution ordering for the planned runtime.
 
 ## Status
 

@@ -193,6 +193,15 @@ the startup steps: re-running `clone-git-repo` against an existing
 checkout, or `checkout-pr-worktree` against an existing worktree, is a
 no-op.
 
+Built-in template names and parameter schemas now live in
+`protocol/src/task_catalog.rs`, shared with the workstation's offline
+`beams config validate/explain` compiler. Bootstrap coverage tests check
+that catalog against actual instantiation and the task CLI. Runtime
+implementations and scheduling remain here; compiled launch plans and
+custom script templates are not daemon inputs yet. See
+[the launch developer guide](../docs/development/launches.md) for the
+compiler contract and next execution milestones.
+
 ### Daemon
 
 `beam-bootstrap daemon` listens on a UDS socket (`--socket`, defaults to

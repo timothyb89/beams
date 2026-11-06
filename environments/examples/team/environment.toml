@@ -1,0 +1,30 @@
+# Validate/explain offline. Copy into environments/local/ and customize.
+schema_version = 1
+extends = ["builtin:development"]
+
+[packages.post]
+add = ["jq", "curl"]
+
+[tasks.go]
+enabled = false
+
+[files.data]
+source = "./files/data"
+target = "~/projects/data"
+phase = "post"
+
+[tasks.prepare]
+label = "Prepare shell files"
+script = "./hooks/prepare.sh"
+script_root = "./hooks"
+phase = "pre"
+after = ["files:fish"]
+check = ["test", "-f", "${beam.home}/.config/team-ready"]
+
+[tasks.configure]
+label = "Configure project data"
+script = "./hooks/configure.sh"
+script_root = "./hooks"
+packages = ["jq"]
+after = ["files:data"]
+rerun = "on-change"

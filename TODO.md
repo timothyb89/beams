@@ -22,12 +22,14 @@ profiles compile into a versioned launch graph, with small pre-interface
 and background post-interface bundles/package batches. Reuse the existing
 executor and client transport. The design records current launch behavior,
 inheritance rules, hook semantics, recovery, migration, and acceptance
-criteria. The overall plan and graph/readiness-condition direction are endorsed; syntax
-remains provisional until implementation. The archive recommendation is
+criteria. The overall plan and graph/readiness-condition direction are endorsed;
+offline schema v1 is implemented and documented in the developer guide.
+The archive recommendation is
 standard tar with independent none/gzip compression, initially testing
 gzip level 1; complete verification/extraction releases artifact readiness.
 Script paths select local files relative to their declaring profile;
-entrypoints are automatically uploaded. An optional `script_root` selects
+entrypoints are automatically selected for upload (packing/transport pending).
+An optional `script_root` selects
 a helper directory to preserve on the Beam, with phase-aware packaging.
 
 - [x] Immediate prerequisite from review of `06060b5`/`651fc1c`: remove
@@ -43,17 +45,26 @@ a helper directory to preserve on the Beam, with phase-aware packaging.
   implement profile resolution/inheritance, validation, versioned plan,
   and `beams config init/validate/explain`. Bundled core/development
   profiles plus gitignored local configuration; keep new launch opt-in.
-  First compiler slice: typed profile/plan structures, inherited source
-  provenance, offline validate/explain, and fixtures proving package,
-  script/file artifact and phase/dependency ordering.
+  Remaining here: timing/transport baseline, `config init`, workstation
+  profile selection, content snapshots/digests and launch identities.
+- [x] First compiler slice: typed strict schema/plan, inherited source
+  provenance, offline `config validate/explain`, embedded core/development
+  starters, gitignored local off-ramp, and team override/helper fixtures.
+  Package union/promotion, script/file artifact assignment, custom template
+  parameters, automatic built-in prerequisites, dependency/phase/cycle and
+  destination validation are covered. The compiler does not execute or
+  upload; live `ssh` remains unchanged.
+- [x] Compiler developer documentation: supported schema, command examples,
+  annotated team fixture/explain output and checked script/file/package
+  ordering in `docs/development/launches.md`; binary READMEs updated.
 - [ ] Developer documentation is required alongside implementation:
   evolve `docs/development/launches.md` with the compiler/schema, an
   execution-order graph, explicit scripts-vs-packages/file dependencies,
   ready conditions, resource locks, task extension instructions, and
   retry/reconnect diagnosis. Deliver an annotated profile with matching
   explain output and fixture coverage; update binary READMEs in the same
-  changes. The initial draft is present; supported behavior/examples must
-  be completed as each phase lands.
+  changes. Compiler behavior/examples are documented; execution and
+  retry/reconnect walkthroughs must be completed as those phases land.
 - [ ] Phase 2: generic package transactions, file-install and script
   tasks/custom templates, including automatic entrypoint upload, explicit
   helper roots, remote working directories and shared-root promotion;

@@ -8,6 +8,37 @@ using your current `tsh` identity - no admin credentials, no dependency on
 `TshExecutor`, only covers 2 of the ~5 operations needed here, and would
 pull in a heavy gRPC/TLS dependency tree for that).
 
+## `beams config validate` / `explain`
+
+The offline launch-profile compiler is available for inspecting the new
+configuration contract:
+
+```sh
+beams config validate                     # bundled development starter
+beams config explain --profile builtin:core
+beams config validate --profile /path/to/environment.toml
+beams config explain --profile /path/to/environment.toml --json
+```
+
+Profiles use strict TOML (`schema_version = 1`), local/bundled inheritance,
+named files and script/template tasks, and pre/post package lists.
+Validation checks sources, parameters, package conflicts, destination
+conflicts, and graph ordering. Explain shows origins, batches, selected
+artifact roots and dependencies. It checks declared root metadata without
+recursively scanning directories. Both commands work without Teleport, a
+Beam, or a source checkout; built-in profiles/assets are embedded.
+
+`--json` includes workstation source metadata alongside a remote-facing
+`plan`; it is inspection output, not a daemon launch request yet. These
+commands do not install, upload, or execute anything. `beams ssh` still uses
+its existing startup path. Profile selection during SSH, archive packing,
+`config init` and runtime execution are pending.
+
+See the [developer guide](../docs/development/launches.md) for the supported
+schema, ordering rules, custom templates and a checked team example in
+`environments/examples/team/`. Copy the example to `environments/local/`
+(gitignored) to customize it.
+
 ## `beams ssh`
 
 ```sh

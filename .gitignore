@@ -6,3 +6,4 @@
 /protocol/target/
 /protocol/Cargo.lock
 /.claude/worktrees/
+/environments/local/

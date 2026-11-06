@@ -1,0 +1,7 @@
+# Bundled baseline. Runtime/Zellij provisioning remains owned by Beams.
+schema_version = 1
+
+[shell]
+program = "/bin/bash"
+path = ["~/.local/bin"]
+change_login_shell = false

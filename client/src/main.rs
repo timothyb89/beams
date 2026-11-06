@@ -4,6 +4,7 @@ mod startup;
 mod bridge;
 mod clientd;
 mod copy;
+mod config;
 mod daemonctl;
 mod forward;
 mod session;
@@ -44,6 +45,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Inspect configurable launch profiles offline (live launch wiring pending).
+    Config {
+        #[command(subcommand)]
+        command: config::Command,
+    },
     /// Connect to a beam, spawning or reusing one as needed.
     Ssh {
         /// Path to the beams repo checkout to copy onto a freshly spawned
@@ -264,6 +270,7 @@ fn main() -> anyhow::Result<ExitCode> {
     daemonctl::record_startup_exe();
     let args = Args::parse();
     let code = match args.command {
+        Commands::Config { command } => config::run(command)?,
         Commands::Ssh {
             repo,
             purpose,

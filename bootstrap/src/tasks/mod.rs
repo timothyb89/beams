@@ -31,8 +31,8 @@ pub mod wait_ssh_agent;
 
 
 use anyhow::{bail, Context};
-use serde::Serialize;
 use serde_json::Value;
+use beams_protocol::task_catalog::TemplateInfo;
 
 use crate::graph::{Capability, Node};
 use checkout_pr_worktree::CheckoutPrWorktree;
@@ -48,44 +48,6 @@ use wait_ssh_agent::WaitSshAgent;
 /// string.
 pub mod cap {
     pub const SSH_AGENT_READY: &str = "ssh-agent-ready";
-}
-
-/// One declared parameter of a template - just enough for a client (the
-/// TUI, eventually a GUI) to build an input field without hardcoding
-/// per-template knowledge: a name, a free-text type hint (not a closed
-/// enum - a new template can introduce a new hint as needed, a client
-/// that doesn't recognize one can still fall back to a plain text
-/// field), and whether it's required.
-///
-/// Hand-written and kept right next to each template's own params
-/// struct inside `instantiate` below, not derived from it - there's no
-/// reflection/schema-derive crate in this dependency tree, and adding
-/// one for two templates' worth of fields isn't worth it yet. Keeping
-/// the two side by side in the same `match` arm is what keeps them from
-/// drifting apart as templates change.
-#[derive(Serialize, Clone, Copy)]
-pub struct ParamSchema {
-    pub name: &'static str,
-    pub kind: &'static str,
-    pub required: bool,
-}
-
-/// A template's name plus its param schema - what `list_tasks` (the
-/// daemon op) and `beam-bootstrap list-tasks` (the CLI) both enumerate.
-///
-/// `run_once` marks a template whose whole job is a one-time, no-param
-/// bit of beam setup that `bin/beam-shell` already submits at startup
-/// (toolchain installs, waiting for the ssh-agent unlock): idempotent, so
-/// running it again just skips, which makes it noise in an interactive
-/// "what can I launch?" list. The TUI hides these from its template list
-/// (their startup runs still show up in its progress list as normal).
-/// They stay fully reachable via `task run`/`run-task`/manifests - this
-/// is purely a presentation hint, not an access control.
-#[derive(Serialize)]
-pub struct TemplateInfo {
-    pub template: &'static str,
-    pub params: &'static [ParamSchema],
-    pub run_once: bool,
 }
 
 /// A task instance, produced by instantiating a template with concrete
@@ -156,49 +118,20 @@ impl Node for Box<dyn Task> {
 /// template itself (stable across instances, e.g. `"clone-git-repo"`),
 /// distinct from a specific instance's `Task::id()`.
 ///
-/// This stays a plain Rust-level contract for now, not a dynamic
-/// registry with introspectable param schemas - that only becomes
-/// necessary once something needs to enumerate templates and build forms
-/// or a manifest schema from them (the TUI/daemon work, still ahead - see
-/// docs/designs/DESIGN.md's "Seeding manifest"). Designing that now, with exactly two
-/// example templates and no real consumer yet, would be guessing at a
-/// shape instead of discovering it from use.
+/// Instantiation stays a Rust-level contract. Shared metadata in
+/// `beams_protocol::task_catalog` supplies parameter forms and workstation
+/// profile validation; coverage tests require it to match this registry.
 pub trait Template: Task {
     const NAME: &'static str;
 }
 
 /// Every template's name + param schema, in a stable (if arbitrary)
 /// order - what `beam-bootstrap list-tasks` and the daemon's
-/// `list_tasks` op both enumerate. Schemas here must match
-/// `instantiate`'s `Params` structs below - see `ParamSchema`'s doc
-/// comment on why that's a manual, not derived, invariant.
+/// `list_tasks` op both enumerate. The shared catalog also supplies the
+/// workstation's offline profile validation. Coverage tests below keep its
+/// schemas in sync with `instantiate`'s actual parameter parsing.
 pub fn templates() -> Vec<TemplateInfo> {
-    vec![
-        TemplateInfo {
-            template: CloneGitRepo::NAME,
-            params: &[
-                ParamSchema { name: "repo", kind: "string", required: true },
-                ParamSchema { name: "dest", kind: "path", required: true },
-            ],
-            run_once: false,
-        },
-        TemplateInfo {
-            template: CheckoutPrWorktree::NAME,
-            params: &[
-                ParamSchema { name: "base", kind: "path", required: true },
-                ParamSchema { name: "pr", kind: "number", required: true },
-                ParamSchema { name: "dest", kind: "path", required: true },
-            ],
-            run_once: false,
-        },
-        TemplateInfo { template: InstallToolchainGo::NAME, params: &[], run_once: true },
-        TemplateInfo { template: InstallToolchainRust::NAME, params: &[], run_once: true },
-        // Also a one-shot install, but *not* submitted at startup (heavy,
-        // and not everyone wants it) - hiding it would leave no way to
-        // launch it from the TUI at all.
-        TemplateInfo { template: InstallCodeServer::NAME, params: &[], run_once: false },
-        TemplateInfo { template: WaitSshAgent::NAME, params: &[], run_once: true },
-    ]
+    beams_protocol::task_catalog::templates()
 }
 
 /// Just the names, for call sites that don't need the param schema too.
@@ -295,8 +228,7 @@ mod tests {
     }
 
     /// `templates()`'s hand-written schema and `instantiate`'s actual
-    /// `Params` structs are two separate declarations by design (see
-    /// `ParamSchema`'s doc comment) - this is what catches them drifting
+    /// `Params` structs are two separate declarations - this catches them drifting
     /// apart: build each template's params using *only* the fields its
     /// schema claims to need, and confirm `instantiate` actually accepts
     /// that.

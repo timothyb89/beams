@@ -6,6 +6,7 @@
 //! [`ClientToBeam`], whose sender is the workstation daemon.
 
 pub mod agent;
+pub mod task_catalog;
 #[cfg(feature = "agent-crypto")]
 pub mod agent_crypto;
 
