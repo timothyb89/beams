@@ -53,6 +53,10 @@ const LOCKS: u32 = 64 | 128;
 /// Decodes one input unit. Returns `None` for input the menu has no use for
 /// (Alt chords, function keys, mouse reports, focus events, ...).
 pub fn decode(encoded: &[u8]) -> Option<Decoded> {
+    if encoded.starts_with(b"\x1b[M") {
+        // Legacy mouse reports include three opaque coordinate bytes.
+        return None;
+    }
     match encoded {
         [] => None,
         [byte] => decode_byte(*byte).map(Decoded::Key),
@@ -84,6 +88,16 @@ fn decode_byte(byte: u8) -> Option<Key> {
 /// `rest` is everything after `ESC [`, ending in the final byte.
 fn decode_csi(rest: &[u8]) -> Option<Decoded> {
     let (&final_byte, parameters) = rest.split_last()?;
+    if final_byte == b'u'
+        && parameters
+            .split(|byte| *byte == b';')
+            .nth(1)
+            .and_then(|field| field.split(|byte| *byte == b':').nth(1))
+            == Some(b"3")
+    {
+        // Kitty key release is not another menu action.
+        return None;
+    }
     if parameters
         .first()
         .is_some_and(|byte| matches!(byte, b'<' | b'?' | b'>' | b'='))
@@ -235,6 +249,8 @@ mod tests {
         assert_eq!(key(b"\x1b[13u"), Some(Key::Enter));
         assert_eq!(key(b"\x1b[27u"), Some(Key::Esc));
         assert_eq!(key(b"\x1b[97;3u"), None, "alt chords are ignored");
+        assert_eq!(key(b"\x1b[113;1:3u"), None, "q release cannot close a menu");
+        assert_eq!(key(b"\x1b[121;1:3u"), None, "y release cannot approve");
     }
 
     #[test]

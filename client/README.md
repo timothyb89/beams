@@ -214,7 +214,14 @@ offending field and the form stays open with its input intact; `Enter`
 submits and `Esc` cancels. Menu keys are decoded from plain bytes, `ESC [`
 and application-cursor `ESC O` sequences, Kitty CSI-u, and modifyOtherKeys,
 so they work whichever keyboard mode the remote application left the outer
-terminal in.
+terminal in. Kitty key-release events do not act as menu keys, and holding
+the prefix cannot repeatedly toggle the menu. The menu enables bracketed
+paste and restores the remote setting on close. A menu prefix inside
+bracketed paste remains pasted text.
+Legacy X10, UTF-8, SGR, and urxvt mouse reports are consumed as whole reports
+while the menu is open; their coordinates cannot act as menu keys. Terminal
+query replies (including OSC clipboard and DCS replies) still reach the
+remote application while the menu owns keyboard input.
 
 The client does not nest another terminal alternate screen over remote zellij
 (alternate-screen state is not stackable). It drains up to 1 MiB of remote

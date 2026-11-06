@@ -455,6 +455,10 @@ fn drive(
         }
 
         let now = Instant::now();
+        if input_router.mode == InputMode::Passthrough {
+            input_router.mouse_utf8 = terminal_model.screen().mouse_protocol_encoding()
+                == vt100::MouseProtocolEncoding::Utf8;
+        }
         let mut keys_handled = false;
         let mut actions = Vec::new();
         let mut stdin_closed = false;
@@ -2025,6 +2029,13 @@ struct InputRouter {
     pending_since: Option<Instant>,
     /// An in-progress bracketed paste while the menu is open.
     paste: Option<Vec<u8>>,
+    /// Paste delimiters are also meaningful in passthrough: a prefix byte
+    /// in pasted text must never open the menu.
+    remote_paste: bool,
+    mouse_utf8: bool,
+    /// An oversized OSC/DCS reply is streamed without retaining its payload.
+    /// Keep consuming it opaquely through its terminator.
+    string_tail: Option<(bool, bool)>,
 }
 
 impl Default for InputRouter {
@@ -2034,6 +2045,9 @@ impl Default for InputRouter {
             pending: Vec::new(),
             pending_since: None,
             paste: None,
+            remote_paste: false,
+            mouse_utf8: false,
+            string_tail: None,
         }
     }
 }
@@ -2057,13 +2071,49 @@ impl InputRouter {
         let mut remote = Vec::new();
         let mut offset = 0;
         while offset < bytes.len() {
-            match parse_terminal_key(&bytes[offset..]) {
+            if let Some((osc, escaped)) = self.string_tail {
+                let byte = bytes[offset];
+                remote.push(byte);
+                self.string_tail = if (osc && byte == b'\x07') || (escaped && byte == b'\\') {
+                    None
+                } else {
+                    Some((osc, byte == b'\x1b'))
+                };
+                offset += 1;
+                continue;
+            }
+            let remaining = &bytes[offset..];
+            let parsed = if self.paste.is_some() || self.remote_paste {
+                // Paste is arbitrary text. Only its closing delimiter is a
+                // key sequence; OSCs and control bytes in it are just text.
+                const END: &[u8] = b"\x1b[201~";
+                if remaining.starts_with(END) {
+                    TerminalKeyParse::Sequence {
+                        len: END.len(),
+                        logical: None,
+                    }
+                } else if END.starts_with(remaining) {
+                    TerminalKeyParse::Incomplete
+                } else {
+                    TerminalKeyParse::Byte
+                }
+            } else {
+                parse_terminal_key(remaining, self.mouse_utf8)
+            };
+            match parsed {
                 TerminalKeyParse::Incomplete => {
                     self.pending.extend_from_slice(&bytes[offset..]);
                     self.pending_since = Some(now);
                     break;
                 }
                 TerminalKeyParse::Sequence { len, logical } => {
+                    if len >= MAX_PASTE_LEN && is_string_sequence(remaining) {
+                        let osc = remaining[1] == b']';
+                        let sequence = &remaining[..len];
+                        if !sequence.ends_with(b"\x1b\\") && !(osc && sequence.ends_with(b"\x07")) {
+                            self.string_tail = Some((osc, sequence.last() == Some(&b'\x1b')));
+                        }
+                    }
                     self.route_key(
                         escape_key,
                         &bytes[offset..offset + len],
@@ -2098,6 +2148,11 @@ impl InputRouter {
         now: Instant,
         on_key: &mut dyn FnMut(Key) -> bool,
     ) -> Vec<InputAction> {
+        if is_string_sequence(&self.pending) || self.pending.starts_with(b"\x1b[M") {
+            // Clipboard/terminal replies can arrive slowly. Waiting for ST
+            // keeps their payload from ever becoming menu keys.
+            return Vec::new();
+        }
         if self
             .pending_since
             .is_none_or(|since| now.duration_since(since) < INPUT_SEQUENCE_TIMEOUT)
@@ -2109,6 +2164,15 @@ impl InputRouter {
         self.pending_since = None;
         let mut actions = Vec::new();
         let mut remote = Vec::new();
+        // A partial report must not become menu keystrokes on timeout.
+        // In particular an OSC clipboard reply may contain "q", "y", etc.
+        if pending.len() > 1 && pending.starts_with(b"\x1b") {
+            if self.mode == InputMode::Passthrough {
+                remote.extend_from_slice(&pending);
+            }
+            flush_remote(&mut actions, &mut remote);
+            return actions;
+        }
         for byte in pending {
             self.route_key(
                 escape_key,
@@ -2124,6 +2188,9 @@ impl InputRouter {
     }
 
     fn poll_timeout(&self, now: Instant) -> Duration {
+        if is_string_sequence(&self.pending) || self.pending.starts_with(b"\x1b[M") {
+            return LOOP_TICK;
+        }
         self.pending_since
             .map(|since| {
                 INPUT_SEQUENCE_TIMEOUT
@@ -2143,7 +2210,12 @@ impl InputRouter {
         on_key: &mut dyn FnMut(Key) -> bool,
     ) {
         if self.mode == InputMode::Passthrough {
-            if logical.is_some() && escape_key.byte() == logical {
+            match keys::decode(encoded) {
+                Some(Decoded::PasteStart) => self.remote_paste = true,
+                Some(Decoded::PasteEnd) => self.remote_paste = false,
+                _ => {}
+            }
+            if !self.remote_paste && logical.is_some() && escape_key.byte() == logical {
                 flush_remote(actions, remote);
                 self.mode = InputMode::Palette;
                 actions.push(InputAction::OpenPalette);
@@ -2158,9 +2230,16 @@ impl InputRouter {
                 let text = String::from_utf8_lossy(paste).into_owned();
                 self.paste = None;
                 self.menu_key(Key::Paste(text), actions, on_key);
-            } else if paste.len() < MAX_PASTE_LEN {
-                paste.extend_from_slice(encoded);
+            } else {
+                let len = encoded.len().min(MAX_PASTE_LEN.saturating_sub(paste.len()));
+                paste.extend_from_slice(&encoded[..len]);
             }
+            return;
+        }
+        // Replies belong to the remote application even while the menu owns
+        // user input. Keep OSC/DCS payloads opaque to the local key decoder.
+        if is_terminal_reply(encoded) {
+            remote.extend_from_slice(encoded);
             return;
         }
         if logical.is_some() && escape_key.byte() == logical {
@@ -2209,7 +2288,7 @@ enum TerminalKeyParse {
 /// complete UTF-8 character, an SS3 (`ESC O x`) key, or a complete CSI
 /// sequence. `logical` is the control byte an enhanced-keyboard sequence
 /// stands for, used to recognize the menu prefix.
-fn parse_terminal_key(input: &[u8]) -> TerminalKeyParse {
+fn parse_terminal_key(input: &[u8], mouse_utf8: bool) -> TerminalKeyParse {
     let Some(&first) = input.first() else {
         return TerminalKeyParse::Incomplete;
     };
@@ -2237,6 +2316,25 @@ fn parse_terminal_key(input: &[u8]) -> TerminalKeyParse {
     if input.len() == 1 {
         return TerminalKeyParse::Incomplete;
     }
+    if matches!(input[1], b']' | b'P' | b'_' | b'^' | b'X') {
+        let osc = input[1] == b']';
+        let end = (2..input.len()).find(|&i| {
+            (osc && input[i] == b'\x07') || (input[i] == b'\\' && input[i - 1] == b'\x1b')
+        });
+        return match end {
+            Some(end) => TerminalKeyParse::Sequence {
+                len: end + 1,
+                logical: None,
+            },
+            None if input.len() < MAX_PASTE_LEN => TerminalKeyParse::Incomplete,
+            // Keep an oversized string opaque rather than interpreting its
+            // payload as approval/menu keys.
+            None => TerminalKeyParse::Sequence {
+                len: input.len(),
+                logical: None,
+            },
+        };
+    }
     if input[1] == b'O' {
         return if input.len() < 3 {
             TerminalKeyParse::Incomplete
@@ -2249,6 +2347,35 @@ fn parse_terminal_key(input: &[u8]) -> TerminalKeyParse {
     }
     if input[1] != b'[' {
         return TerminalKeyParse::Byte;
+    }
+    if input.starts_with(b"\x1b[M") {
+        // X10 / VT200 reports have three payload bytes after the CSI final
+        // byte. With mode 1005 the coordinates are UTF-8 characters.
+        let mut end = 3;
+        for _ in 0..3 {
+            let Some(&byte) = input.get(end) else {
+                return TerminalKeyParse::Incomplete;
+            };
+            let len = if mouse_utf8 {
+                match byte {
+                    0xc2..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    0xf0..=0xf4 => 4,
+                    _ => 1,
+                }
+            } else {
+                1
+            };
+            end += len;
+        }
+        return if input.len() < end {
+            TerminalKeyParse::Incomplete
+        } else {
+            TerminalKeyParse::Sequence {
+                len: end,
+                logical: None,
+            }
+        };
     }
 
     let Some(relative_end) = input[2..]
@@ -2275,10 +2402,32 @@ fn parse_terminal_key(input: &[u8]) -> TerminalKeyParse {
     }
 }
 
+fn is_terminal_reply(encoded: &[u8]) -> bool {
+    is_string_sequence(encoded)
+        || (encoded.starts_with(b"\x1b[")
+            && !encoded.starts_with(b"\x1b[M")
+            && (matches!(encoded.last(), Some(b'R' | b'c' | b'n' | b't' | b'y'))
+                || (encoded.starts_with(b"\x1b[?") && encoded.ends_with(b"u"))))
+}
+
+fn is_string_sequence(encoded: &[u8]) -> bool {
+    encoded.first() == Some(&b'\x1b')
+        && matches!(encoded.get(1), Some(b']' | b'P' | b'_' | b'^' | b'X'))
+}
+
 fn parse_kitty_key(parameters: &[u8]) -> Option<u8> {
     let mut fields = parameters.split(|byte| *byte == b';');
     let codepoint = parse_parameter(fields.next()?)?;
-    let modifiers = fields.next().and_then(parse_parameter).unwrap_or(1);
+    let modifier_field = fields.next();
+    if modifier_field
+        .and_then(|field| field.split(|byte| *byte == b':').nth(1))
+        .is_some_and(|event| event != b"1")
+    {
+        // A held/released prefix must not open and immediately close the
+        // menu when Kitty event-type reporting is enabled.
+        return None;
+    }
+    let modifiers = modifier_field.and_then(parse_parameter).unwrap_or(1);
     decode_terminal_key(codepoint, modifiers)
 }
 
@@ -2825,6 +2974,19 @@ mod tests {
     }
 
     #[test]
+    fn kitty_prefix_release_and_repeat_do_not_toggle_the_menu() {
+        let mut router = InputRouter::default();
+        let actions = router.route(
+            EscapeKey::default(),
+            b"\x1b[93;5:1u\x1b[93;5:2u\x1b[93;5:3u",
+            Instant::now(),
+            &mut |_| false,
+        );
+        assert_eq!(actions, vec![InputAction::OpenPalette]);
+        assert_eq!(router.mode, InputMode::Palette);
+    }
+
+    #[test]
     fn kitty_and_modify_other_keys_sequences_decode_control_keys() {
         let now = Instant::now();
         let mut router = InputRouter::default();
@@ -2849,6 +3011,157 @@ mod tests {
         assert_eq!(
             route_input(&mut mode, EscapeKey::default(), input),
             vec![InputAction::Remote(input.to_vec())]
+        );
+    }
+
+    #[test]
+    fn pasted_prefixes_remain_remote_text_across_reads() {
+        let mut router = InputRouter::default();
+        let now = Instant::now();
+        let input = b"\x1b[200~a\x1db\x1b[93;5u\x1b]text\x1b[201~";
+        let mut received = Vec::new();
+        for &byte in input {
+            for action in router.route(EscapeKey::default(), &[byte], now, &mut |_| {
+                panic!("pasted input reached the local menu")
+            }) {
+                match action {
+                    InputAction::Remote(bytes) => received.extend(bytes),
+                    other => panic!("paste opened the menu: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(received, input);
+        assert_eq!(router.mode, InputMode::Passthrough);
+        assert_eq!(
+            router.route(EscapeKey::default(), b"\x1d", now, &mut |_| false),
+            vec![InputAction::OpenPalette],
+            "prefix works again after paste ends"
+        );
+    }
+
+    #[test]
+    fn all_mouse_encodings_are_opaque_to_the_menu() {
+        for (mouse_utf8, input) in [
+            (false, b"\x1b[M qy".as_slice()),
+            (false, b"\x1b[<0;12;9M".as_slice()),
+            (false, b"\x1b[32;12;9M".as_slice()),
+            (true, "\x1b[M \u{171}\u{179}".as_bytes()),
+        ] {
+            let mut router = InputRouter {
+                mode: InputMode::Palette,
+                mouse_utf8,
+                ..InputRouter::default()
+            };
+            for byte in input {
+                assert!(router
+                    .route(EscapeKey::default(), &[*byte], Instant::now(), &mut |key| {
+                        panic!("mouse became a menu key: {key:?}")
+                    })
+                    .is_empty());
+            }
+            assert!(router.pending.is_empty());
+            router.mode = InputMode::Passthrough;
+            assert_eq!(
+                router.route(EscapeKey::default(), input, Instant::now(), &mut |_| false),
+                vec![InputAction::Remote(input.to_vec())]
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_replies_bypass_menu_keys_across_reads() {
+        for reply in [
+            b"\x1b[12;34R".as_slice(),
+            b"\x1b[?1;2c".as_slice(),
+            b"\x1b[8;24;100t".as_slice(),
+            b"\x1b[?2004;1$y".as_slice(),
+            b"\x1b]52;c;cXk=\x1b\\".as_slice(),
+            b"\x1bP1$r0m\x1b\\".as_slice(),
+        ] {
+            let mut router = InputRouter {
+                mode: InputMode::Palette,
+                ..InputRouter::default()
+            };
+            let now = Instant::now();
+            for byte in &reply[..reply.len() - 1] {
+                assert!(router
+                    .route(EscapeKey::default(), &[*byte], now, &mut |key| {
+                        panic!("terminal reply became a menu key: {key:?}")
+                    })
+                    .is_empty());
+            }
+            assert_eq!(
+                router.route(
+                    EscapeKey::default(),
+                    &reply[reply.len() - 1..],
+                    now,
+                    &mut |_| { panic!("terminal reply reached menu") }
+                ),
+                vec![InputAction::Remote(reply.to_vec())]
+            );
+        }
+    }
+
+    #[test]
+    fn partial_mouse_or_terminal_reply_does_not_become_menu_input_on_timeout() {
+        let now = Instant::now();
+        for input in [b"\x1b[M q".as_slice(), b"\x1b]52;c;qyn".as_slice()] {
+            let mut router = InputRouter {
+                mode: InputMode::Palette,
+                ..InputRouter::default()
+            };
+            assert!(router
+                .route(EscapeKey::default(), input, now, &mut |_| false)
+                .is_empty());
+            assert!(router
+                .flush_expired(
+                    EscapeKey::default(),
+                    now + INPUT_SEQUENCE_TIMEOUT,
+                    &mut |key| { panic!("partial report became a key: {key:?}") }
+                )
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn slow_and_oversized_clipboard_replies_stay_opaque_and_bounded() {
+        let now = Instant::now();
+        let mut router = InputRouter {
+            mode: InputMode::Palette,
+            ..InputRouter::default()
+        };
+        assert!(router
+            .route(EscapeKey::default(), b"\x1b]52;c;", now, &mut |_| false)
+            .is_empty());
+        assert!(router
+            .flush_expired(
+                EscapeKey::default(),
+                now + Duration::from_secs(1),
+                &mut |_| { panic!("slow clipboard reply became a key") }
+            )
+            .is_empty());
+        assert_eq!(router.poll_timeout(now + Duration::from_secs(1)), LOOP_TICK);
+        let mut payload = vec![b'y'; MAX_PASTE_LEN];
+        let first = router.route(EscapeKey::default(), &payload, now, &mut |_| {
+            panic!("oversized clipboard reply became a key")
+        });
+        assert!(router.pending.is_empty(), "no unbounded pending reply");
+        assert_eq!(first.len(), 1);
+        payload.splice(0..0, b"\x1b]52;c;".iter().copied());
+        assert_eq!(first, vec![InputAction::Remote(payload)]);
+        assert_eq!(
+            router.route(EscapeKey::default(), b"qyn\x1b\\", now, &mut |_| {
+                panic!("streaming reply tail became a key")
+            }),
+            vec![InputAction::Remote(b"qyn\x1b\\".to_vec())]
+        );
+        assert!(router.string_tail.is_none());
+        assert_eq!(
+            router.route(EscapeKey::default(), b"q", now, &mut |key| {
+                assert_eq!(key, Key::Char('q'));
+                true
+            }),
+            vec![InputAction::ClosePalette]
         );
     }
 

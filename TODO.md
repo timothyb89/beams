@@ -728,6 +728,11 @@ bootstrap `Task`s.
   for OSC title and clipboard requests, bracketed paste, mouse encodings,
   alternate-screen transitions, wide/combining characters, resize, and
   input/query response behavior before considering this path for default use.
+  Input-routing audit (2026-11-06): remote paste protects embedded menu
+  prefixes; legacy/UTF-8/SGR/urxvt mouse payloads and terminal replies stay
+  opaque to local keys, and Kitty prefix repeats/releases do not toggle the
+  menu. Split-read and slow/oversized-reply regressions cover these fixes.
+  Output/restoration validation is continuing.
 - [x] Local menu overhaul: one renderer (`client/src/session/ui.rs`) for both
   takeover and overlay modes (the overlay previously had a cut-down copy that
   hid most copy/sync form fields and printed services with `{:?}`); a
