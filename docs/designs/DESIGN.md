@@ -15,8 +15,10 @@ Configurable environment launches and the split between pre-interface
 prerequisites and initialization shown in the TUI are proposed in
 `docs/designs/LAUNCH_CONFIGURATION_DESIGN.md`. That proposal builds on this executor,
 replaces hard-coded startup selection with client-resolved profiles, and
-adds launch readiness conditions and task snapshots. It is not implemented
-yet; the current Git delivery and fixed-step startup paths remain in use.
+adds launch readiness conditions and task snapshots. Offline compilation,
+verified phase archives and a foreground/headless executor adapter are
+implemented; daemon/SSH integration and real interface readiness remain
+pending. Current Git delivery and fixed-step startup paths remain in use.
 
 ## Why
 

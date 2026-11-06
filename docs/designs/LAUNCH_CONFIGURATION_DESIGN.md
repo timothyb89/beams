@@ -1,9 +1,10 @@
 # Configurable Beam launches
 
-Status: offline compiler milestone implemented, 2026-11-06. The supported
-profile syntax and `beams config validate/explain` are documented in the
-[developer guide](../development/launches.md). Runtime launch execution,
-archive packing/upload and SSH selection remain planned. This design
+Status: offline compiler, phase archive packing/verification and foreground
+execution foundation implemented, 2026-11-06. The supported profile syntax
+and explicit pack/unpack/run commands are documented in the
+[developer guide](../development/launches.md). Live daemon launch acceptance,
+shell/TUI readiness, archive upload and SSH selection remain planned. This design
 builds on [DESIGN.md](DESIGN.md)'s task graph and
 [CLIENT_SERVICES_DESIGN.md](CLIENT_SERVICES_DESIGN.md)'s workstation-owned
 transport. [TODO.md](../../TODO.md)
@@ -68,8 +69,9 @@ Gaps that shape the design:
   Manifests resolve capabilities only within their own submission.
 - `apt-install` always does update/install, and the background fixed
   run repeats the synchronous invocation. Kubectl and Rust perform
-  additional apt operations. Rust holds the scheduler's `apt` resource
-  throughout rustup, including its network work.
+  additional apt operations. Rust's coarse scheduler `apt` hold has now
+  been replaced with the shared package helper, releasing apt before
+  rustup's network work; the compiled launch batch supplies gcc first.
 - Daemon task events are broadcasts without stored task snapshots.
   `list_tasks` lists templates, not running/completed instances. A TUI
   that connects late can miss startup events.
@@ -828,5 +830,12 @@ metadata only. `config pack/pack-post` now snapshot the selected phase into
 deterministic tar/gzip spools with launch IDs, plan/entry digests and a shared
 bundle manifest. `beam-bootstrap launch unpack` verifies bytes, validates
 extraction and atomically publishes read-only staging. Runtime/Zellij
-delivery, executable daemon acceptance and transport wiring remain pending;
+delivery, executable daemon acceptance and transport wiring remain pending.
+`launch run-phase` now adapts packages/files/scripts/native tasks to the
+existing executor as explicit foreground phases, with verified staging,
+pre receipts and a headless post gate. Hook checks, content-based history,
+interrupted retry and file merge/overwrite policies are implemented. A shared
+package helper probes installed versions and serializes refresh/install
+transactions; Rust releases apt before rustup. Daemon snapshots/resources,
+native installer parameterization and real interface readiness are next;
 live startup continues to use the existing path.

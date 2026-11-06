@@ -2,10 +2,9 @@ use std::path::Path;
 use std::process::Command;
 
 use super::{Task, Template};
-use crate::aptlock;
 use crate::graph::Capability;
 use crate::pathutil::expand_tilde;
-use crate::releaseutil::{download, run};
+use crate::releaseutil::download;
 
 /// Installs the Rust toolchain via `rustup` (the same command
 /// `bootstrap/README.md`'s "Building" section already tells a human to
@@ -24,37 +23,28 @@ impl Task for InstallToolchainRust {
     }
 
     fn exclusive_resources(&self) -> Vec<Capability> {
-        // apt-get install gcc below shares the real apt/dpkg lock
-        // steps::apt/steps::kubectl already tag themselves against (see
-        // steps::resource::APT's doc comment) - held for this task's
-        // entire run(), not just the apt-get call specifically, since
-        // there's no API yet for a task to release/reacquire a resource
-        // mid-run. Coarser than ideal (blocks other apt-touching tasks
-        // for the whole rustup install, not just the gcc install), but
-        // simple and correct; narrow it if that ever actually matters.
-        //
-        // This only serializes other tasks in the *same*
-        // `executor::run` call, though - it doesn't protect against the
-        // fixed startup sequence's `apt-install`, a wholly separate OS
-        // process, running `apt-get` at the same moment. `aptlock::apt_get`
-        // below is what actually closes that gap (see its own doc
-        // comment); this tag is still worth keeping too, since it avoids
-        // even starting a second apt-touching task concurrently within
-        // one process, rather than starting it and then blocking inside
-        // `apt_get`'s `flock`.
-        vec![crate::steps::resource::APT.into()]
+        // The shared package helper holds apt only for its transaction.
+        // Rustup itself holds toolchain destinations, so it can overlap apt.
+        vec![
+            format!("path:{}", expand_tilde("~/.cargo").display()).into(),
+            format!("path:{}", expand_tilde("~/.rustup").display()).into(),
+        ]
     }
 
     fn run(&self) -> anyhow::Result<Option<String>> {
+        self.run_with_progress(&|_| {})
+    }
+
+    fn run_with_progress(&self, progress: &dyn Fn(&str)) -> anyhow::Result<Option<String>> {
         let rustc = expand_tilde("~/.cargo/bin/rustc");
         if already_installed(&rustc) {
             return Ok(None);
         }
 
-        aptlock::apt_get(&["update"])?;
-        aptlock::apt_get(&["install", "-y", "gcc"])?;
+        crate::packages::PackageManager::default().install(&["gcc".into()], progress)?;
 
-        let script = std::env::temp_dir().join(format!("beam-bootstrap-rustup-init-{}", std::process::id()));
+        let script =
+            std::env::temp_dir().join(format!("beam-bootstrap-rustup-init-{}", std::process::id()));
         download("https://sh.rustup.rs", &script)?;
         // rustup's own installer fetches and verifies the actual
         // toolchain itself - no separate checksum step needed here, as
@@ -70,16 +60,22 @@ impl Task for InstallToolchainRust {
         // otherwise become the *script's* `$1`/`$2`, which is exactly
         // what failed running this for real the first time (rustup-init
         // reported "unexpected argument '-s'").
-        run(Command::new("sh").arg(&script).args([
-            "-y",
-            "--default-toolchain",
-            "stable",
-            "--profile",
-            "minimal",
-        ]))?;
+        crate::commandlog::run(
+            Command::new("sh").arg(&script).args([
+                "-y",
+                "--default-toolchain",
+                "stable",
+                "--profile",
+                "minimal",
+            ]),
+            progress,
+        )?;
         let _ = std::fs::remove_file(&script);
 
-        Ok(Some(format!("installed rust toolchain via rustup to {}", rustc.display())))
+        Ok(Some(format!(
+            "installed rust toolchain via rustup to {}",
+            rustc.display()
+        )))
     }
 }
 
@@ -88,5 +84,10 @@ impl Template for InstallToolchainRust {
 }
 
 fn already_installed(rustc: &Path) -> bool {
-    Command::new(rustc).arg("--version").output().ok().filter(|o| o.status.success()).is_some()
+    Command::new(rustc)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some()
 }

@@ -198,7 +198,8 @@ Built-in template names and parameter schemas now live in
 `beams config validate/explain` compiler. Bootstrap coverage tests check
 that catalog against actual instantiation and the task CLI. Runtime
 implementations and scheduling remain here; compiled launch plans and
-custom script templates are not daemon inputs yet. See
+custom script templates can run through the foreground launch executor
+below, but are not daemon inputs yet. See
 [the launch developer guide](../docs/development/launches.md) for the
 compiler contract and next execution milestones.
 
@@ -218,6 +219,78 @@ against existing staging verifies its receipt and contents rather than
 replacing it. A failed receive leaves no published staging.
 See the [developer guide](../docs/development/launches.md) for pack/unpack
 examples and the distinction between artifact readiness and installation.
+
+### Foreground launch execution
+
+After unpacking to `STAGING/pre`, execute the declared pre graph:
+
+```sh
+beam-bootstrap launch run-phase --launch launch.json --staging STAGING --phase pre
+# After packing/uploading/unpacking the post bundle to STAGING/post:
+beam-bootstrap launch run-phase --launch launch.json --staging STAGING --phase post --headless
+```
+
+This opt-in command uses the existing dependency-driven executor and emits
+JSON-lines `task_status` events on stdout, with bounded stdout/stderr
+subprocess progress. It exits 0 on success, 1 on failure. It installs
+selected packages/files and executes hooks; it does not start Zellij or
+restart the daemon. Post requires the same launch's successful pre receipt
+and explicit `--headless`. Actual shell/TUI readiness signals and daemon
+broadcasts are pending, so this is a development/headless execution path.
+Shell PATH directories and hook environment are prepared; shell spawning,
+login-shell changes and specialized native installer configuration remain
+later work.
+
+Staging is verified against the launch UUID/plan digest before tasks run.
+File copies merge directories, preserve ordinary modes/internal links and
+skip matching leaves. `overwrite = "deny"` rejects differing leaves,
+`backup` preserves them in UUID-named sibling backups, and `replace`
+replaces files/links without deleting existing directory trees. Destination
+parents must be real directories. `mode = "link"` points into the immutable
+staging generation, which must be retained while those links are in use.
+`~/.ssh` and `~/.claude` support directory merges but cannot be replaced
+wholesale.
+Destinations requiring root are not handled by this file adapter.
+
+Hooks run with declared argv, defaulting to their extracted script's
+directory. `BEAMS_SCRIPT_DIR` and `BEAMS_SCRIPT_ROOT` locate bundled helpers;
+`${beam.home}` and `${beam.launch_id}` expand on the Beam. Profile/task env
+and configured PATH apply to hooks, which inherit the caller's relay/session
+environment. Bundled helpers are read-only; write output to a target path.
+
+State defaults to `~/.beam-bootstrap/launch-state/` (`--state-dir` overrides
+launch/hook state). A per-launch lock prevents overlapping phase attempts.
+Completed unchecked hooks skip within that launch; `rerun = "on-change"`
+also reuses successful content/configuration records across generations.
+`check` probes desired state on every attempt and after execution. Failed
+attempts can retry; interrupted unchecked hooks require
+`--retry-interrupted` after reviewing their effects. A failed pre retry
+revokes its success receipt, blocking post. Missing staging blocks only
+artifact-dependent tasks; unpack it and retry. Foreground progress is not
+retained as reconnectable task snapshots yet.
+
+### Shared package transactions
+
+Package actions batch one install per phase and skip when a batched
+`dpkg-query` probe confirms all requested architectures/versions. The
+shared helper holds `~/.beam-bootstrap/apt.lock` across re-probing, refreshing
+and installing, interoperating with existing `aptlock` callers. It refreshes
+indexes on first use, source/keyring content changes or missing index files,
+then installs noninteractively and verifies the result. Successful refresh
+fingerprints live in `~/.beam-bootstrap/apt-index.json`.
+
+Hooks that mutate apt should use this helper:
+
+```sh
+beam-bootstrap launch install-packages jq curl
+```
+
+Prefer declaring task `packages` in the profile to contribute requirements
+to its phase batch. Direct helper calls can add another install transaction.
+`install-toolchain-rust` now uses this helper for gcc, releasing the apt
+lock before rustup downloads/installations and streaming installer progress;
+an already-installed Rust toolchain still skips. Its toolchain destination
+resources remain exclusive while independent apt work can continue.
 
 ### Daemon
 
@@ -254,6 +327,9 @@ what lets `checkout-pr-worktree` and the `clone-git-repo` it depends on
 be requested together in one call. Each entry starts as soon as the
 entries it depends on finish (independent ones run concurrently); a
 failure only blocks its dependents, which get a `"blocked"` status.
+Local and workstation bridge manifest acceptance is queued before their
+worker starts, so their start/progress/completion events cannot overtake
+the acceptance reply.
 Neither op blocks the connection or other submissions - both reply
 `accepted` and run in the background, serialized only where tasks share
 an exclusive resource (e.g. `apt`) or are the very same task id:

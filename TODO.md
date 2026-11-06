@@ -28,7 +28,7 @@ The archive recommendation is
 standard tar with independent none/gzip compression, initially testing
 gzip level 1; complete verification/extraction releases artifact readiness.
 Script paths select local files relative to their declaring profile;
-entrypoints are automatically selected for upload (packing/transport pending).
+entrypoints are automatically selected and packed (SSH transport pending).
 An optional `script_root` selects
 a helper directory to preserve on the Beam, with phase-aware packaging.
 
@@ -65,20 +65,43 @@ a helper directory to preserve on the Beam, with phase-aware packaging.
   Tests cover codecs, deferral, source edits, metadata, bad hashes/bindings,
   truncation, modified staging, unsupported files and malformed entries.
   Runtime/Zellij assets and SSH upload/readiness wiring remain pending.
+- [x] Foreground execution foundation: `launch run-phase` adapts generic
+  packages/files/scripts and native templates to the existing executor;
+  post explicitly requires headless mode and a matching successful pre
+  receipt. Verified staging, launch-scoped dependency identities and phase
+  locks; whole-graph/native-template validation before effects; named JSON
+  task/progress events.
+  Directory merges, overwrite/backup policies, ordinary modes/internal links,
+  protected home-directory merge boundaries,
+  hook helpers/cwd/env, checks, content-based `on-change` records and explicit
+  interrupted-hook retry are covered. Failure blocks dependents, unrelated
+  work continues, and failed pre retries revoke old success receipts.
+- [x] Shared package helper probes architectures/versions, batches installs
+  under aptlock's cross-process lock, fingerprints sources/keyrings for
+  refresh reuse and emits bounded subprocess progress. Rust releases apt
+  before rustup and keeps toolchain destination locks. Fake-apt fixtures
+  cover batches, refresh changes, failures and concurrency. CLI smoke with
+  an isolated HOME proves pre/post gates, deferred bundles, helper/file
+  execution, repeat skips and apt/independent-hook overlap without real apt.
+- [x] Verification exposed an existing daemon acceptance-order race:
+  local and bridge manifests now synchronously queue their acceptance
+  before starting the worker, so start/progress/completion cannot overtake
+  it. A delayed-acceptance empty-manifest regression fixture covers this.
 - [ ] Developer documentation is required alongside implementation:
   evolve `docs/development/launches.md` with the compiler/schema, an
   execution-order graph, explicit scripts-vs-packages/file dependencies,
   ready conditions, resource locks, task extension instructions, and
   retry/reconnect diagnosis. Deliver an annotated profile with matching
   explain output and fixture coverage; update binary READMEs in the same
-  changes. Compiler behavior/examples are documented; execution and
-  retry/reconnect walkthroughs must be completed as those phases land.
-- [ ] Phase 2: generic package transactions, file-install and script
-  tasks/custom templates, including automatic entrypoint upload, explicit
-  helper roots, remote working directories and shared-root promotion;
-  parameterize specialized installs. Split
-  Rust's apt prerequisite from rustup. Add task snapshots/bounded logs
-  and durable, deduplicated launch acceptance.
+  changes. Compiler behavior/examples and foreground execution/retry are
+  documented; real readiness/reconnect walkthroughs remain with those phases.
+- [ ] Phase 2 remaining: parameterize specialized installs (versions,
+  destination paths and profile environment), attach launch tasks to the
+  daemon's shared resource scheduler, add durable/deduplicated acceptance,
+  task snapshots and retained bounded logs. Source/keyring preparation
+  dependencies, privileged file destinations and configurable admission/
+  concurrency bounds remain. Foreground adapters/package transactions and
+  Rust's apt split are implemented; this is not live startup yet.
 - [ ] Phase 3: ship a small runtime/pre archive independently of a Git
   checkout; run pre tasks through the daemon, prepare the shell before
   spawning it, and gate post tasks on shell startup + first TUI frame.

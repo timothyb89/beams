@@ -1,11 +1,12 @@
 # Developing configurable launches
 
-Status: offline compiler and verified archive tooling implemented, 2026-11-06. `beams config validate`
+Status: offline compiler, verified archive tooling and foreground execution
+foundation implemented, 2026-11-06. `beams config validate`
 and `beams config explain` resolve and validate profiles without contacting
 Teleport, reading client state, installing packages, or invoking hooks.
-`beams ssh` still uses the existing startup path. Execution, archive
-upload, readiness signals, and profile selection during SSH are
-the next milestones. The full
+`beams ssh` still uses the existing startup path. The opt-in headless runner
+executes package/file/script graphs; daemon acceptance, archive upload,
+shell/TUI readiness signals and profile selection during SSH are pending. The full
 [launch design](../designs/LAUNCH_CONFIGURATION_DESIGN.md) records the
 proposal and migration.
 
@@ -85,7 +86,7 @@ File targets and shell PATH entries use absolute Beam paths, `~/...` or
 `${beam.home}/...`. The compiler normalizes these without using the
 workstation's HOME. Interpreter/check argv and environment values remain
 remote inputs. A script `working_dir` may also be relative to its
-extracted entrypoint directory. The future runner resolves Beam variables
+extracted entrypoint directory. The runner resolves Beam variables
 and supplies `BEAMS_SCRIPT_DIR` / `BEAMS_SCRIPT_ROOT`; inspection does
 not perform remote expansion.
 
@@ -181,8 +182,109 @@ archive retries are supported; byte-offset resume is not.
 
 Packing/receiving alone never installs files or executes hooks. Only
 successful receive can release `artifact-ready:<phase>`; a subsequent
-file-install task will release `files:<ID>`. Installation and automated
-readiness signaling remain the next runtime milestone.
+file-install task releases `files:<ID>`. Foreground installation is now
+implemented; automated shell/TUI readiness signaling remains pending.
+
+## Execute a verified graph today
+
+`beam-bootstrap launch run-phase` is an opt-in foreground adapter to the
+existing executor. It mutates the Beam's targets, runs selected hooks and
+installs selected packages. It does not start/restart the daemon or spawn
+Zellij. With the team bundles from the preceding example:
+
+```sh
+# On the target Beam, after pre has been unpacked:
+beam-bootstrap launch run-phase \
+  --launch /tmp/team-launch/launch.json --staging /tmp/team-stage --phase pre
+
+# After the workstation packs post and the Beam unpacks it:
+beam-bootstrap launch run-phase \
+  --launch /tmp/team-launch/launch.json --staging /tmp/team-stage \
+  --phase post --headless
+```
+
+Post requires an explicit headless policy and a matching successful pre
+receipt. It never silently substitutes a timeout for shell/TUI readiness.
+Each invocation verifies staged contents and launch/plan/phase identity.
+Whole-graph dependency, phase and native-template validation precedes task
+effects. The foreground `runtime-ready` adapter prepares configured PATH
+directories; it assumes this bootstrap runtime is already delivered.
+Session spawning, shell selection/export and login-shell changes belong
+to the upcoming launcher.
+
+Nodes provide launch-scoped capabilities. Post may omit a pre dependency
+only after that launch's successful pre receipt; a different launch's
+capabilities cannot satisfy it. Within the selected phase the existing
+dependency-driven executor schedules ready tasks immediately. It does not
+wait for unrelated tasks to finish a wave. Missing post staging fails its
+condition and blocks its consumers while post tasks using a promoted pre
+helper root can still run. Unpack the missing bundle and retry; asynchronous
+waiting for an upload is a future daemon behavior.
+
+JSON-lines `task_status` events go to stdout with the launch UUID as
+`manifest_id`, namespaced task IDs and `start`/`progress`/`ok`/`skip`/
+`error`/`blocked` states. The process exits 0/1 for the phase result.
+Both stdout and stderr from hooks/apt are drained with bounded chunks
+and queues. These foreground events are not yet daemon broadcasts or
+retained reconnectable snapshots.
+
+### Package transactions and parallel work
+
+The compiler produces at most one package action in each phase.
+`packages = ["jq"]` on a task contributes jq to that batch and creates an
+edge to it; a task without package requirements can overlap apt. Each
+action probes requested names/architectures/versions in one `dpkg-query`
+call. An already-satisfied batch skips without apt.
+
+The shared package helper acquires the same kernel lock as legacy
+`aptlock`: `~/.beam-bootstrap/apt.lock`. It probes again under the lock,
+fingerprints apt source/keyring contents, refreshes indexes on first use,
+changed inputs or missing index files, installs the batch noninteractively,
+then checks installed versions. The cache records a successful refresh,
+not assumed package installation. The lock covers this transaction and
+does not cover a later user-space download.
+
+Rust's native task now uses this helper for gcc and releases apt before
+rustup; the compiled Rust task already waits for its phase's gcc batch,
+so the native prerequisite probe skips there. Standalone Rust tasks retain
+the same prerequisite protection. Toolchain destination resources remain
+exclusive during rustup.
+
+Hooks that add repositories or otherwise need their own apt install must
+use `beam-bootstrap launch install-packages PACKAGE...`, rather than
+direct apt calls that bypass the shared lock. Prefer profile package
+requirements to preserve the two-batch goal. Same-phase package source/
+keyring preparation edges are not exposed by schema v1 yet; preparation
+can be placed in pre when only the post batch needs it.
+
+### File and hook execution
+
+File copies merge declared directories, preserving unrelated entries.
+Matching leaf content/modes or link targets skip. Differing leaves use
+the selected policy: deny, backup to a UUID-named sibling, or replace.
+Replace does not delete an existing directory tree to install a leaf.
+Ordinary directory/file modes and selected internal symlinks are restored.
+Publication is atomic per leaf, not for the whole merged target tree;
+retry completes a partial merge. Target parents must be real directories,
+and this adapter does not elevate privileges. `~/.ssh` and `~/.claude` allow
+directory merges, never wholesale replacement. `mode = "link"` targets the
+read-only staging generation, whose lifetime must cover the link's use.
+
+Interpreter, arguments and checks are argv vectors, not shell fragments.
+Default cwd is the extracted entrypoint directory; a relative `working_dir`
+is resolved there. Hooks receive expanded profile env and configured PATH,
+then task env overrides. They inherit relay/session env from the invoking
+process. `BEAMS_SCRIPT_DIR`, `BEAMS_SCRIPT_ROOT`, `BEAMS_LAUNCH_ID` and
+`BEAMS_TASK_RUN` are supplied by the runner/executor. Helpers share the
+caller's logs/resources. Staging is read-only, so hooks should write output
+to declared target/home paths.
+
+Only `${beam.home}` and `${beam.launch_id}` are expanded at execution;
+custom `${param.NAME}` substitution already happened in the compiler.
+Native template parameters also receive Beam expansion, but specialized
+installers still use their existing paths/process environment. Profile env
+currently applies to hooks; configurable native versions/destinations/env
+are a remaining milestone.
 
 ## Ownership and execution
 
@@ -300,7 +402,8 @@ work or separate TUI status.
    CLIs and TUI metadata, and preserve existing schema/coverage checks.
    Add its package/capability/resource rules to the profile compiler
    (`client/src/config/plan.rs`) and matching ordering fixtures. Custom
-   script templates use the same planned graph and progress contracts.
+   script templates compile to ordinary script nodes and use the same
+   executor/progress contracts.
 3. Declare file/script artifacts and dependency edges. Check inherited
    source origins and phase promotion in the compiled plan; do not depend
    on TOML entry order, an installer subprocess changing a pane's
@@ -316,8 +419,8 @@ work or separate TUI status.
 
 ## Failures and recovery
 
-The following is the runtime contract to implement, not current compiler
-functionality:
+The foreground runner implements dependency failure and hook retry
+semantics. Session/UI recovery remains a daemon/launcher milestone:
 
 A failed task blocks its dependents; unrelated tasks continue. A pre
 failure prevents session creation. A post failure remains visible without
@@ -325,11 +428,29 @@ closing the shell. `check` runs again on retry; successful `on-change`
 records include the script/helper content identity. Interrupted unchecked
 scripts require explicit retry.
 
-The launch ID makes acceptance retries refer to the same launch. A task
-snapshot restores progress on UI reconnect. Upload retries restart the
-archive in the first implementation, and only verified staging releases
-artifact readiness. Inspecting a plan or explaining ordering runs offline
-and never installs packages or invokes hooks.
+Foreground launch/hook state defaults to `~/.beam-bootstrap/launch-state/`
+and can be overridden with `--state-dir`; apt lock/cache stay under
+`~/.beam-bootstrap/`. A per-launch lock serializes phase attempts. Successful
+unchecked hooks skip on retry of that launch. `on-change` records include
+the task recipe, helper-root content, physical HOME, profile env and shell
+PATH, excluding launch UUIDs/extracted generation paths. Identical recipes
+across generations reuse success, with a per-recipe lock against duplicate
+execution. A check always takes precedence over success records so drift
+can be repaired.
+
+A successful phase writes a receipt bound to its UUID and plan digest.
+Retry invalidates its old receipt before task execution; a failed pre
+retry cannot authorize post using an earlier success. Interrupted unchecked
+hooks retain a started record and need `--retry-interrupted` after review
+of their effects. Known failed attempts can retry normally. Reuse the same
+declaration/staging, not modified source files, for a transport retry.
+`config pack-post` similarly reuses frozen archive bytes once packed.
+
+Durable daemon acceptance and UI task snapshots are still planned. The
+launch ID will deduplicate submissions, and a snapshot will restore progress
+on reconnect. Upload retries restart the archive in the first implementation;
+only verified staging releases artifact readiness. Inspecting a plan or
+explaining ordering runs offline and never installs packages or invokes hooks.
 
 ## Documentation required during implementation
 
@@ -380,11 +501,22 @@ not execute fish or require the fish package. Session creation waits for
 both. Post apt can overlap the post upload. Configure waits for data and
 apt, but its helpers are already staged. Rust waits for the post batch
 because its gcc prerequisite is included there; Go has no apt dependency.
-The old Rust task still performs its own apt work today; splitting that
-task is required before wiring this compiled graph into launches.
+The native Rust task now probes gcc through the shared package helper and
+releases apt before rustup; the compiled batch supplies gcc first.
 
 `client/src/config/tests.rs` checks this profile's batches, artifact
 assignment, named-entry removal, and dependencies, along with invalid
 graphs and inherited sources. `client/tests/config.rs` runs the real CLI
 outside a checkout with a trap `tsh`, checking offline behavior and no
 fallback on invalid configuration.
+
+`artifacts/src/tests.rs` covers deterministic archives, phase deferral,
+source edits, metadata/links, malformed entries and verified publication.
+`bootstrap/src/launch/tests.rs` covers phase identity/gates, helper/env
+execution, file merges/policies, failure blocking, missing-bundle retry,
+receipt invalidation and hook history/drift. `bootstrap/src/packages.rs`
+tests use fake apt/dpkg commands and private state, including concurrency.
+An end-to-end CLI smoke with isolated HOME and fake apt also verified
+deferred pack/unpack, the explicit post gate, repeat skips and apt/download
+overlap: apt waited for an independent hook's marker before completing.
+No test reruns startup or restarts this session's daemon.

@@ -32,7 +32,8 @@ Beam, or a source checkout; built-in profiles/assets are embedded.
 `plan`; it is inspection output, not a daemon launch request yet. These
 commands do not install, upload, or execute anything. `beams ssh` still uses
 its existing startup path. Profile selection during SSH, archive upload,
-`config init` and runtime execution are pending.
+and `config init` are pending. An opt-in foreground execution command is
+available in bootstrap; daemon acceptance/readiness wiring remains pending.
 
 See the [developer guide](../docs/development/launches.md) for the supported
 schema, ordering rules, custom templates and a checked team example in
@@ -61,6 +62,14 @@ Traversal, escaping/dangling links and special files fail. The remote
 without installing targets. Upload only `launch.json` and the phase
 archive/descriptor, keeping `local-inputs.json` on the workstation.
 These are profile payload bundles; runtime/Zellij delivery is still pending.
+
+After unpacking to `STAGING/pre` and `STAGING/post`, bootstrap can execute
+the graph with `launch run-phase --launch launch.json --staging STAGING
+--phase pre`, then `--phase post --headless`. This installs selected targets
+and runs hooks through the existing executor. It requires a successful
+pre receipt for post and does not connect to the daemon or spawn Zellij.
+See [bootstrap's README](../bootstrap/README.md#foreground-launch-execution)
+and the developer guide for ordering and retry behavior.
 
 ## `beams ssh`
 

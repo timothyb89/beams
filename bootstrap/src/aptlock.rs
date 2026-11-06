@@ -11,13 +11,10 @@
 //! wave is still running could race both on the real apt/dpkg lock
 //! (found as a gap while adding the toolchain tasks, see TODO.md).
 //!
-//! Fixed here with a well-known lock file and the system `flock(1)`
-//! utility wrapping every actual `apt-get` invocation, rather than a
-//! hand-rolled `fcntl`/`flock(2)` binding - no new dependency (this
-//! crate otherwise has none for raw syscalls), and the lock is released
-//! by the kernel the instant the wrapped process exits, crash or not,
-//! same guarantee a Drop-based Rust-level lock would give but without
-//! needing one.
+//! Legacy steps wrap individual apt commands with `flock(1)` here.
+//! `packages::PackageManager` uses the same file with `flock(2)`, holding
+//! it across installed-version probes, refresh and the batched install.
+//! Both cooperate through the kernel lock, released on process exit.
 
 use std::path::PathBuf;
 use std::process::Command;

@@ -1323,21 +1323,24 @@ fn run_bridge_manifest(hub: &Arc<Hub>, request_id: String, tasks: Vec<ManifestTa
         })
         .collect();
     let finished_reply = reply.clone();
-    let started = start_manifest(hub, entries, move |manifest_id, ok| {
-        send_bridge_event(&finished_reply, &BeamToClient::ManifestFinished { manifest_id: manifest_id.to_string(), ok });
-    });
-    let message = match started {
-        Ok((manifest_id, plan)) => {
-            eprintln!("daemon: workstation startup manifest started as {manifest_id}");
-            BeamToClient::ManifestAccepted {
-                request_id,
-                manifest_id,
-                task_ids: plan.into_iter().map(|planned| planned.task_id).collect(),
-            }
-        }
-        Err(message) => BeamToClient::ManifestRejected { request_id, message },
-    };
-    send_bridge_event(reply, &message);
+    let started = start_manifest(
+        hub,
+        entries,
+        |manifest_id, plan| {
+            eprintln!("daemon: workstation startup manifest accepted as {manifest_id}");
+            send_bridge_event(reply, &BeamToClient::ManifestAccepted {
+                request_id: request_id.clone(),
+                manifest_id: manifest_id.to_string(),
+                task_ids: plan.iter().map(|planned| planned.task_id.clone()).collect(),
+            });
+        },
+        move |manifest_id, ok| {
+            send_bridge_event(&finished_reply, &BeamToClient::ManifestFinished { manifest_id: manifest_id.to_string(), ok });
+        },
+    );
+    if let Err(message) = started {
+        send_bridge_event(reply, &BeamToClient::ManifestRejected { request_id, message });
+    }
 }
 
 fn run_manifest(hub: &Arc<Hub>, request_id: Option<&str>, tasks_value: Value, reply: &Sender<String>) {
@@ -1348,8 +1351,10 @@ fn run_manifest(hub: &Arc<Hub>, request_id: Option<&str>, tasks_value: Value, re
             return;
         }
     };
-    match start_manifest(hub, entries, |_, _| {}) {
-        Ok((manifest_id, plan)) => {
+    if let Err(message) = start_manifest(
+        hub,
+        entries,
+        |manifest_id, plan| {
             let _ = reply.send(
                 json!({
                     "request_id": request_id,
@@ -1359,33 +1364,36 @@ fn run_manifest(hub: &Arc<Hub>, request_id: Option<&str>, tasks_value: Value, re
                 })
                 .to_string(),
             );
-        }
-        Err(message) => {
-            let _ = reply.send(error_reply(request_id, &message));
-        }
+        },
+        |_, _| {},
+    ) {
+        let _ = reply.send(error_reply(request_id, &message));
     }
 }
 
-/// Validates and starts a manifest on its own thread, returning its id and
-/// plan; `on_finish(manifest_id, ok)` runs once every task is done.
+/// Validates a manifest, synchronously queues acceptance, then starts its
+/// worker. No start/progress/completion can overtake that acceptance.
+/// `on_finish(manifest_id, ok)` runs once every task is done.
 fn start_manifest(
     hub: &Arc<Hub>,
     entries: Vec<ManifestEntry>,
+    on_accept: impl FnOnce(&str, &[executor::PlannedTask]),
     on_finish: impl FnOnce(&str, bool) + Send + 'static,
-) -> Result<(String, Vec<executor::PlannedTask>), String> {
+) -> Result<(), String> {
     let instances = build_manifest(entries)?;
 
     // Resolved against *this manifest's own* instances only - see the
     // module doc comment on why a dependency on an earlier, separate
     // run's capability doesn't work (and what to do instead). Just for
-    // the `accepted` reply's `waves` list below - `executor::run` (which
+    // the `accepted` reply's task/dependency list - `executor::run` (which
     // actually runs these) resolves the same graph again itself, per
     // `executor::plan`'s own doc comment.
     let plan = executor::plan(&instances).map_err(|err| err.to_string())?;
 
     let manifest_id = hub.next_manifest_id();
+    on_accept(&manifest_id, &plan);
     let hub = Arc::clone(hub);
-    let id = manifest_id.clone();
+    let id = manifest_id;
     thread::spawn(move || {
         hub.broadcast(&json!({"type": "manifest_status", "manifest_id": id, "status": "start"}).to_string());
         let on_event = |event: executor::Event| hub.broadcast(&task_event_line(event, Some(&id)));
@@ -1397,12 +1405,12 @@ fn start_manifest(
         hub.broadcast(&json!({"type": "manifest_status", "manifest_id": id, "status": status}).to_string());
         on_finish(&id, ok);
     });
-    Ok((manifest_id, plan))
+    Ok(())
 }
 
 /// The `task_status` broadcast for one executor event - shared by
 /// `run_task` and `run_manifest` so the shape can't drift between them.
-fn task_event_line(event: executor::Event, manifest_id: Option<&str>) -> String {
+pub(crate) fn task_event_line(event: executor::Event, manifest_id: Option<&str>) -> String {
     let (task_id, status, message) = match event {
         executor::Event::Start { task_id } => (task_id, "start", None),
         executor::Event::Progress { task_id, message } => (task_id, "progress", Some(message)),
@@ -1692,6 +1700,35 @@ mod tests {
             BeamToClient::ManifestRejected { request_id, .. } if request_id == "startup-2"
         ));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn manifest_acceptance_is_queued_before_even_an_empty_manifest_starts() {
+        let hub = Arc::new(Hub::default());
+        let (_, reply, receiver) = hub.register();
+        start_manifest(
+            &hub,
+            vec![],
+            |id, plan| {
+                // A slow acceptance path must not let the worker overtake it.
+                thread::sleep(Duration::from_millis(25));
+                assert!(receiver.try_recv().is_err());
+                assert!(plan.is_empty());
+                reply.send(json!({"type": "accepted", "manifest_id": id}).to_string()).unwrap();
+            },
+            |_, _| {},
+        ).unwrap();
+        let recv = || -> Value {
+            serde_json::from_str(&receiver.recv_timeout(Duration::from_secs(2)).unwrap()).unwrap()
+        };
+        let accepted = recv();
+        assert_eq!(accepted["type"], "accepted");
+        for status in ["start", "ok"] {
+            let event = recv();
+            assert_eq!(event["type"], "manifest_status");
+            assert_eq!(event["status"], status);
+            assert_eq!(event["manifest_id"], accepted["manifest_id"]);
+        }
     }
 
     #[test]
