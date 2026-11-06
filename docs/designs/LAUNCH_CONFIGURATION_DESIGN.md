@@ -12,9 +12,117 @@ tracks the implementation sequence.
 
 The overall plan, graph direction, explicit readiness conditions, and
 developer documentation requirement were endorsed on 2026-11-06. The
-runtime implementation details remain proposed. The compiler establishes
-strict schema v1, local inheritance, named file/script/custom-template
-definitions, package batches, artifact selections and graph validation.
+remaining daemon/launcher/transport details are proposed; the implementation
+boundary and handoff below identify what is available today. The compiler
+establishes strict schema v1, local inheritance, named file/script/custom-
+template definitions, package batches, artifact selections and graph validation.
+
+## Implementation status and next-session handoff
+
+Updated 2026-11-06 against `0853c81`. The configurable launch foundation is
+implemented through foreground/headless execution. Live `beams ssh` still
+uses Git delivery and the existing fixed startup path; the new commands
+are explicit, opt-in tools.
+
+| Commit | Completed milestone | Main implementation |
+|---|---|---|
+| `38109e3` | Fresh-checkout repair; preserve Beam-managed SSH state, link only `bin` | `bootstrap/src/steps/link.rs` |
+| `2462cbb` | Strict schema v1, inheritance/provenance, offline validation/explanation, sanitized embedded starters and team fixture | `client/src/config/`, `environments/`, `protocol/src/task_catalog.rs` |
+| `6595f3d` | Launch UUID/plan digest, deterministic phase-local tar/gzip snapshots, deferred post packing, frozen replay and verified atomic read-only staging | `protocol/src/launch.rs`, `artifacts/`, `client/src/config/pack.rs` |
+| `0853c81` | Generic package/file/hook adapters, foreground phase execution, hook retry/history, Rust's apt split and manifest acceptance-order repair | `bootstrap/src/launch/`, `packages.rs`, `commandlog.rs`, `daemon.rs` |
+
+Available commands are `beams config validate/explain/pack/pack-post` and
+`beam-bootstrap launch unpack/run-phase/install-packages`. The
+[developer guide](../development/launches.md#execute-a-verified-graph-today)
+documents their supported ordering and recovery behavior; the binary
+READMEs document flags. Script sources remain workstation-local and are
+automatically packed; explicit helper roots retain their layout and are
+promoted to pre when shared across phases.
+
+### Current execution boundary
+
+- `run-phase` uses the existing executor, verifies staging identity/content,
+  and runs one selected phase. Post requires that launch's successful pre
+  receipt and explicit `--headless`; real shell/TUI signals are not wired.
+  Foreground `runtime-ready` prepares PATH directories and assumes the
+  bootstrap executable is already delivered. It does not provision Zellij,
+  spawn a shell, change the login shell or start/restart the daemon.
+- Foreground task events reuse the daemon's JSON shape on stdout. They are
+  not daemon broadcasts or retained task snapshots. A missing bundle fails
+  its artifact condition and blocks dependents; asynchronous waiting for
+  uploads remains daemon work.
+- Phase/hook state lives in `~/.beam-bootstrap/launch-state/`, with a
+  per-launch lock, success receipts, desired-state checks, content-based
+  `on-change` records and explicit interrupted unchecked-hook retry.
+  A failed pre retry revokes its previous success receipt. This is not
+  durable daemon acceptance/deduplication of launch submissions.
+- Each foreground invocation currently creates its own executor resources.
+  Resource tags therefore serialize work within that invocation; apt's
+  filesystem lock also serializes cooperating processes. Daemon integration
+  must use `Hub.resources` so concurrent submissions share destination locks.
+- File installation merges directories, preserves unrelated entries and
+  ordinary modes/internal links, and applies explicit leaf overwrite/
+  backup policies. `~/.ssh` and `~/.claude` cannot be replaced wholesale.
+  Privileged installation and staging-generation cleanup are pending.
+- Profile/task environment and prepared PATH apply to hooks. Native template
+  parameters receive Beam variable expansion, but specialized installers
+  retain their current process environment, versions and destination paths.
+  Configurable native installers remain part of phase 2.
+
+### Next implementation slice
+
+Start with **daemon-side launch acceptance and task snapshots**, before
+changing the SSH startup path:
+
+1. Reuse the typed declaration, validation and task adapters rather than
+   introducing another scheduler. Execute with the daemon's shared
+   `Hub.resources`. Durably bind acceptance to launch UUID/plan digest:
+   identical retries refer to the same launch; conflicting declarations
+   fail before effects. Preserve launch-scoped dependency identity.
+2. Store task metadata, pending/running/terminal state and bounded logs;
+   provide snapshot/subscription ordering so a late or reconnecting TUI
+   cannot miss startup progress. Include pre results. Preserve the repaired
+   ordering in which local/bridge manifest acceptance is queued before
+   start/progress/completion.
+3. Make `artifact-ready` and `interface-ready` actual external conditions,
+   with missing inputs waiting visibly. Verified receive releases only its
+   launch/phase condition. Interactive interface readiness requires both
+   initial shell startup and the TUI's loaded snapshot/first frame;
+   retain headless initialization as an explicit separate policy.
+4. Cover duplicate submission, daemon/UI reconnect, condition identity,
+   resource contention, pre failure and independent post progress with
+   isolated fixtures. Update the guide/READMEs/TODO in the same changes.
+
+After that substrate, integrate small runtime delivery, shell preparation,
+Zellij/TUI readiness reporting and client-owned deferred uploads into an
+opt-in SSH path. `config init`, workstation profile selection, timing/
+transport baseline, native parameterization, sanitized default migration
+and optional ControlMaster remain open. Existing transport/agent relay
+ownership and the implementation sequence below still apply.
+
+### Validation at handoff
+
+Native client/bootstrap builds passed. The Rust suites passed **315 tests**:
+bootstrap 120, client 171 unit + 3 CLI, protocol 16, artifacts 5.
+Reproduce the committed suites from the checkout root:
+
+```sh
+cargo test --manifest-path artifacts/Cargo.toml
+cargo test --manifest-path protocol/Cargo.toml
+cargo test --manifest-path client/Cargo.toml
+cargo test --manifest-path bootstrap/Cargo.toml -- --test-threads=1
+```
+
+An additional manual CLI smoke used an isolated HOME and fake apt/dpkg/
+sudo, exercising pre/post pack/unpack/run, explicit headless gating,
+helpers/file installation and repeat skips. Fake apt waited for an
+independent hook's marker before completing, proving graph-level overlap.
+That scratch harness is not committed; make it a permanent regression
+fixture during daemon integration rather than depending on session files.
+Real apt/Zellij/disposable-Beam acceptance and the static musl build have
+not been exercised for this implementation. This session's daemon and
+fixed startup were not restarted. Implementation commits are local;
+no push has been performed.
 
 ## Goals and recommendation
 
@@ -103,20 +211,18 @@ setup, not a default per-Beam customization. Keep the new design alongside
 the existing designs in `docs/designs/`, and use the new root README to
 point users to the configuration proposal.
 
-There is one immediate startup regression to fix before broader migration:
-`bootstrap/src/steps/link.rs` still includes `(".ssh", true)` in `LINKS`.
-The latest committed tree has no `.ssh` directory, the client only stages
-the bootstrap binary, and `ensure_symlink` errors when its source does not
-exist. `bin/beam-shell` calls `--only link-files` synchronously under
-`set -e`, so fresh Git-delivered environments stop before Zellij. Removing
+The review found one immediate startup regression, repaired in `38109e3`:
+`bootstrap/src/steps/link.rs` still included `(".ssh", true)` in `LINKS`.
+The cleaned-up committed tree had no `.ssh` directory, the client only staged
+the bootstrap binary, and `ensure_symlink` errored when its source did not
+exist. `bin/beam-shell` ran `--only link-files` synchronously under
+`set -e`, so fresh Git-delivered environments stopped before Zellij. Removing
 tracked data did not remove this runtime dependency. Existing checkouts
-with leftover local `.ssh` files can hide the issue.
+with leftover local `.ssh` files could hide the issue.
 
-Make removal of this legacy forced directory link an immediate prerequisite,
-preserving the Beam's own `~/.ssh`. Validate the link step with a fixture
-representing a clean committed checkout, no repo `.ssh`, and existing
-Beam-managed SSH state. Individual known-host file customization remains
-an explicit profile choice. The independent repair is now implemented:
+The independent repair removed the forced link, preserving the Beam's own
+`~/.ssh`. Individual known-host file customization remains an explicit
+profile choice. The repair is implemented:
 `link-files` only links `bin`, with isolated fixtures covering clean
 checkout/repeat behavior and preservation of real or symlinked SSH state.
 The running session's startup sequence and daemon were not restarted.
@@ -807,35 +913,9 @@ the fastest practical core bundle/Zellij delivery, and whether one post
 bundle is sufficient for typical profiles. None requires changing the
 profile ownership or adding another execution engine.
 
-After the independent fresh-checkout repair, the first reviewable
-configuration implementation should be the offline profile compiler and
-a sanitized extraction of the existing config, including an example local
-override and `config explain` output. That establishes the user-facing
-contract before changing live startup or its transport.
-
-For that compiler milestone, first implement typed profile/plan structures,
-local inheritance with source provenance, and offline `config validate` /
-`config explain`. Include package batching, script/file artifact assignment,
-phase/dependency validation, and two fixture profiles with an inherited
-override. Completion means the fixtures resolve to the expected graph,
-invalid configurations fail clearly without creating a Beam, and the
-developer guide can explain that same graph. Add `config init` and runtime
-wiring once this foundation is reviewable.
-
-The offline compiler milestone is now implemented in `client/src/config/`
-with embedded core/development starters and a team override/helper fixture.
-The fixture verifies shared-root pre promotion, post data gating, package
-batch dependencies and disabling inherited tasks. Validation checks source
-metadata only. `config pack/pack-post` now snapshot the selected phase into
-deterministic tar/gzip spools with launch IDs, plan/entry digests and a shared
-bundle manifest. `beam-bootstrap launch unpack` verifies bytes, validates
-extraction and atomically publishes read-only staging. Runtime/Zellij
-delivery, executable daemon acceptance and transport wiring remain pending.
-`launch run-phase` now adapts packages/files/scripts/native tasks to the
-existing executor as explicit foreground phases, with verified staging,
-pre receipts and a headless post gate. Hook checks, content-based history,
-interrupted retry and file merge/overwrite policies are implemented. A shared
-package helper probes installed versions and serializes refresh/install
-transactions; Rust releases apt before rustup. Daemon snapshots/resources,
-native installer parameterization and real interface readiness are next;
-live startup continues to use the existing path.
+The completed milestones and next implementation slice are recorded in
+[the handoff](#implementation-status-and-next-session-handoff) above.
+The sequence is partially complete: compiler, archive and foreground
+execution foundations are available; daemon/interactive launch integration
+and rollout remain open. Keep the existing startup path available until
+the opt-in replacement passes the acceptance checks.

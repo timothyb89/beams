@@ -32,6 +32,11 @@ entrypoints are automatically selected and packed (SSH transport pending).
 An optional `script_root` selects
 a helper directory to preserve on the Beam, with phase-aware packaging.
 
+The [2026-11-06 handoff](docs/designs/LAUNCH_CONFIGURATION_DESIGN.md#implementation-status-and-next-session-handoff)
+records completed commits, execution limits and validation. Next: daemon
+launch acceptance/deduplication and task snapshots with shared resources
+and external readiness conditions, before changing live SSH startup.
+
 - [x] Immediate prerequisite from review of `06060b5`/`651fc1c`: remove
   the stale forced repo `.ssh` link in `bootstrap/src/steps/link.rs`.
   The current tracked tree no longer contains `.ssh`, but the synchronous
@@ -102,6 +107,10 @@ a helper directory to preserve on the Beam, with phase-aware packaging.
   dependencies, privileged file destinations and configurable admission/
   concurrency bounds remain. Foreground adapters/package transactions and
   Rust's apt split are implemented; this is not live startup yet.
+- [ ] Preserve the manual cross-binary CLI smoke as a committed regression
+  fixture during daemon integration: isolated HOME/fake apt, an independent
+  hook completing while apt waits, deferred bundles, explicit gates and
+  retry skips. The successful scratch harness is not session-persistent.
 - [ ] Phase 3: ship a small runtime/pre archive independently of a Git
   checkout; run pre tasks through the daemon, prepare the shell before
   spawning it, and gate post tasks on shell startup + first TUI frame.

@@ -19,6 +19,9 @@ adds launch readiness conditions and task snapshots. Offline compilation,
 verified phase archives and a foreground/headless executor adapter are
 implemented; daemon/SSH integration and real interface readiness remain
 pending. Current Git delivery and fixed-step startup paths remain in use.
+See the [launch handoff](LAUNCH_CONFIGURATION_DESIGN.md#implementation-status-and-next-session-handoff)
+for completed commits, validation, current execution limits and the next
+daemon acceptance/snapshot milestone.
 
 ## Why
 
