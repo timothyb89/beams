@@ -907,7 +907,12 @@ terminal's own agent. Startup clones can be covered by a scoped startup
 grant. Keys are opted in with `beams agent-keys --allow N`, the one-time
 offer toast, or `a` in the menu. Phases 0-3 and most of phase 4 landed on
 2026-11-04 (commits `0f3e664`..`f618adf`); the design doc's "Handoff notes"
-lists the code map, tests, and gotchas.
+lists the code map, tests, and gotchas. 2026-11-06 closed the small
+follow-ups: run tags on every git task, routing a manifest's key use to
+its submitting client, the `ssh-agent-audit.jsonl` audit log, task names
+in grant-use toasts, pruning retired Beams from `startup_submitted`, a
+home-screen key-setup hint, and typing-proof input guards. Pre-switch
+Beams (staged key, old CLAUDE.md merge) have all aged out (24h TTL).
 
 Open:
 
@@ -923,12 +928,12 @@ Open:
 - [ ] Host certificates (`*-cert-v01@openssh.com` host keys,
   `@cert-authority` lines) aren't supported: such hosts show "verified key,
   unknown host" and can't match a grant.
-- [ ] `--approval-takeover` with SSH key requests hasn't been exercised
-  live; the input guard should cover it, but check it.
-- [ ] Beams created before the switch keep the staged key, `ssh-agent-init`
-  and the unlock pane until recycled (deliberately not migrated). The
-  CLAUDE.md merge step only appends once (marker check), so already-merged
-  Beams also lack the `SSH_KEY_REASON` guidance.
+- [ ] `--approval-takeover` with SSH key requests (checked 2026-11-06):
+  the guards now restart on every key, so continuous typing can't
+  approve. Still possible: pause, `Enter` (opens the review), pause, `y`
+  or `Up`+`Enter`. If that's too loose, don't take over for SSH key
+  requests (show the toast instead) or drop the review's `y` hotkey when
+  takeover opened it. Not exercised live yet.
 - [ ] The hidden `beam-bootstrap agent-proxy-spike` subcommand
   (`bootstrap/src/agentspike.rs`) is kept for
   `bootstrap/tests/ssh-agent-proxy-spike.sh` and `ssh-agent-hostkey-algos.sh`.

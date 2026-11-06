@@ -51,11 +51,15 @@ use keys::{Decoded, Key};
 
 const LOOP_TICK: Duration = Duration::from_millis(25);
 const INPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
+/// Keys are ignored this long after `--approval-takeover` opens the menu,
+/// restarted by each ignored key (like `AGENT_INPUT_GUARD`).
 const APPROVAL_TAKEOVER_GUARD: Duration = Duration::from_millis(300);
 const MAX_INPUT_SEQUENCE_LEN: usize = 64;
 const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
 const REDRAW_RESIZE_DELAY: Duration = Duration::from_millis(40);
-/// How long keys are ignored after an SSH key request's menu opens.
+/// How long keys are ignored after an SSH key request's menu opens. Each
+/// ignored key restarts it, so it ends only after a pause in typing: a
+/// steady stream of keys meant for the shell can't outlast it.
 const AGENT_INPUT_GUARD: Duration = Duration::from_millis(500);
 const DAEMON_RECONNECT_RETRY: Duration = Duration::from_secs(1);
 const DEFERRED_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -476,10 +480,11 @@ fn drive(
             let mut on_key = |key: Key| -> bool {
                 keys_handled = true;
                 // A request can arrive while the user is typing into the
-                // remote shell. Don't let already-buffered keys approve or
-                // manipulate the newly opened menu; the prefix key still
+                // remote shell. Don't let already-buffered keys, or keys
+                // still being typed, approve or manipulate the newly opened
+                // menu: each one restarts the guard. The prefix key still
                 // closes it immediately (handled by the router).
-                if approval_takeover_guard.is_some_and(|until| Instant::now() < until) {
+                if takeover_guard_drops(&mut approval_takeover_guard, Instant::now()) {
                     return false;
                 }
                 daemon_view.handle_key(key, local_daemon)
@@ -571,6 +576,18 @@ fn drive(
         if keys_handled && input_router.mode == InputMode::Palette && palette_terminal.is_some() {
             redraw_palette!();
         }
+    }
+}
+
+/// Whether the `--approval-takeover` guard drops a key arriving at `now`;
+/// a dropped key restarts it.
+fn takeover_guard_drops(guard: &mut Option<Instant>, now: Instant) -> bool {
+    match guard {
+        Some(until) if now < *until => {
+            *until = now + APPROVAL_TAKEOVER_GUARD;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1714,7 +1731,9 @@ impl DaemonView {
     /// should close.
     fn handle_key(&mut self, key: Key, local_daemon: &mut LocalDaemon) -> bool {
         if let Some(until) = self.input_guard_until {
-            if Instant::now() < until && key != Key::Esc {
+            let now = Instant::now();
+            if now < until && key != Key::Esc {
+                self.input_guard_until = Some(now + AGENT_INPUT_GUARD);
                 return false;
             }
             self.input_guard_until = None;
@@ -4006,11 +4025,33 @@ mod tests {
         view.handle_key(Key::Enter, &mut daemon);
         assert!(matches!(view.screen, Screen::Menu(_)), "guarded keys must not decide");
 
+        // Typing that continues past the original window is still dropped:
+        // each dropped key restarts the guard.
+        let nearly = Instant::now() + Duration::from_millis(20);
+        view.input_guard_until = Some(nearly);
+        view.handle_key(Key::Up, &mut daemon);
+        assert!(view.input_guard_until.is_some_and(|until| until > nearly + AGENT_INPUT_GUARD / 2));
+        view.handle_key(Key::Char('y'), &mut daemon);
+        assert!(matches!(view.screen, Screen::Menu(_)), "keys still being typed must not decide");
+
         // Once the guard passes, keys work again; Enter takes the default (Deny).
         view.input_guard_until = Some(Instant::now() - Duration::from_millis(1));
         view.handle_key(Key::Enter, &mut daemon);
         assert!(matches!(view.screen, Screen::Home));
         assert!(view.notice.as_ref().is_some_and(|notice| notice.text.contains("rejected") || notice.error));
+    }
+
+    #[test]
+    fn approval_takeover_guard_lasts_until_typing_pauses() {
+        let start = Instant::now();
+        let mut guard = Some(start + APPROVAL_TAKEOVER_GUARD);
+        // Keys 200ms apart keep it closed well past the first 300ms.
+        for step in 1..=5 {
+            assert!(takeover_guard_drops(&mut guard, start + Duration::from_millis(200 * step)));
+        }
+        let last = start + Duration::from_millis(1000);
+        assert!(!takeover_guard_drops(&mut guard, last + APPROVAL_TAKEOVER_GUARD), "a pause ends it");
+        assert!(!takeover_guard_drops(&mut None, start));
     }
 
     #[test]
