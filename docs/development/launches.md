@@ -218,15 +218,100 @@ capabilities cannot satisfy it. Within the selected phase the existing
 dependency-driven executor schedules ready tasks immediately. It does not
 wait for unrelated tasks to finish a wave. Missing post staging fails its
 condition and blocks its consumers while post tasks using a promoted pre
-helper root can still run. Unpack the missing bundle and retry; asynchronous
-waiting for an upload is a future daemon behavior.
+helper root can still run. Unpack the missing bundle and retry, or submit
+the launch to the daemon, which waits for it (next section).
 
 JSON-lines `task_status` events go to stdout with the launch UUID as
 `manifest_id`, namespaced task IDs and `start`/`progress`/`ok`/`skip`/
 `error`/`blocked` states. The process exits 0/1 for the phase result.
 Both stdout and stderr from hooks/apt are drained with bounded chunks
-and queues. These foreground events are not yet daemon broadcasts or
-retained reconnectable snapshots.
+and queues. These foreground events are not daemon broadcasts or retained
+snapshots; the daemon path below provides both.
+
+## Run a launch through the daemon
+
+`beam-bootstrap launch submit` hands a verified declaration to the running
+`beam-bootstrapd`. It accepts the launch durably, then runs pre and post on
+one worker with the daemon's shared executor resources, so concurrent
+launches and manifests serialize on the same `exclusive_resources` (apt,
+destination paths, a hook's declared `resources`). External conditions wait
+instead of failing:
+
+```sh
+beam-bootstrap launch submit --launch /tmp/team-launch/launch.json --staging /tmp/team-stage
+# elsewhere, as inputs arrive:
+beam-bootstrap launch unpack ... --output /tmp/team-stage/pre
+beam-bootstrap launch signal --launch-id ID --condition artifact-ready:pre
+beam-bootstrap launch signal --launch-id ID --condition interface-ready
+beam-bootstrap launch unpack ... --output /tmp/team-stage/post
+beam-bootstrap launch signal --launch-id ID --condition artifact-ready:post
+beam-bootstrap launch status [--launch-id ID] [--json]
+beam-bootstrap launch retry --launch-id ID [--retry-interrupted]
+```
+
+`submit` follows the launch until it finishes and exits 0/1 (`--no-follow`
+returns once accepted). Staging may be unpacked before submission: the
+worker probes both phases when it starts.
+
+- **Acceptance.** Keyed by launch UUID and plan digest, written to
+  `<state>/<launch ID>/accepted.json` before any effect. Resubmitting the
+  same declaration returns the existing launch (`existing: true`) and
+  starts nothing; the same UUID with a different digest is refused.
+  `<state>` is `launch-state/` next to the daemon socket
+  (`~/.beam-bootstrap/launch-state/` by default, the same root `run-phase`
+  uses, so receipts, locks and hook history agree).
+- **`artifact-ready:<phase>`** waits until the daemon verifies that phase's
+  staging itself, when the worker starts or on `launch signal`. Signalling
+  with nothing staged leaves it waiting (the CLI exits 1); staging that
+  fails verification fails the condition and blocks its consumers.
+- **`interface-ready`** waits for `launch signal --condition
+  interface-ready` with the default interactive gate. The initial shell and
+  TUI will send it once the launcher is wired; until then the CLI does.
+  `--headless` releases it as soon as pre succeeds. There is no timer.
+  Post nodes that need only pre artifacts proceed once the interface is
+  ready, while post-bundle consumers still wait for their bundle.
+- **Failure and retry.** A failed pre blocks every post node and fails the
+  launch. `launch retry` reruns a failed or interrupted launch with its
+  accepted plan (completed hooks skip as usual; `--retry-interrupted` as for
+  `run-phase`). Running or successful launches refuse retry.
+- **Restart.** A restarted daemon reloads accepted launches. One that
+  hadn't finished becomes `interrupted` with its unfinished nodes; it is not
+  resumed automatically (an old installer may still be running), only by
+  `launch retry`.
+- **Environment.** Hooks get the agent relay as `SSH_AUTH_SOCK` (unless the
+  profile or task sets one) and `BEAMS_TASK_RUN`, like native tasks, since
+  the daemon's own environment predates the relay.
+
+### Daemon ops, events and snapshots
+
+The CLI is a thin client of four ops on the daemon socket:
+
+```json
+{"request_id": "1", "op": "launch_submit", "launch": "/abs/launch.json", "staging": "/abs/stage", "gate": "interactive"}
+{"request_id": "2", "op": "launch_signal", "launch_id": "...", "condition": "artifact-ready:post"}
+{"request_id": "3", "op": "launch_snapshot", "launch_id": "..."}
+{"request_id": "4", "op": "launch_retry", "launch_id": "...", "retry_interrupted": false}
+```
+
+Replies are `launch_accepted` (`existing`, `seq`, `launch`),
+`launch_signaled` (`released`, `message`), `launch_snapshot` (`seq`,
+`launches`), `launch_retrying` (`seq`, `launch`) or `error`. A launch
+snapshot has the launch's `status` (`accepted`, `running`, `ok`, `failed`,
+`interrupted`), its gate, and every node with `status` (`pending`,
+`waiting`, `running`, `ok`, `skip`, `error`, `blocked`, `interrupted`),
+its last message and its last 10 progress lines. Snapshots are persisted
+on lifecycle transitions as `snapshot.json`.
+
+Broadcasts are `launch_status` and `task_status` events. `task_status` has
+the shape the Beam TUI already renders, with `manifest_id` set to the
+launch ID, plus `launch_id`, `node`, and `waiting: true` while a condition
+waits. Every launch event carries a daemon-wide `seq`. Replies that carry
+launch state are queued while holding the lock under which events are
+numbered, so they are exact boundaries: a client that connects (every
+connection receives broadcasts), requests a snapshot, applies it, and
+ignores events with `seq` at or below the snapshot's neither misses nor
+duplicates a transition. `bootstrap/tests/launch-daemon-smoke.sh` drives
+all of this with the real binaries in a scratch directory.
 
 ### Package transactions and parallel work
 
@@ -273,8 +358,9 @@ read-only staging generation, whose lifetime must cover the link's use.
 Interpreter, arguments and checks are argv vectors, not shell fragments.
 Default cwd is the extracted entrypoint directory; a relative `working_dir`
 is resolved there. Hooks receive expanded profile env and configured PATH,
-then task env overrides. They inherit relay/session env from the invoking
-process. `BEAMS_SCRIPT_DIR`, `BEAMS_SCRIPT_ROOT`, `BEAMS_LAUNCH_ID` and
+then task env overrides. They get the agent relay as `SSH_AUTH_SOCK`
+unless that env sets one, and otherwise inherit the invoking process's
+environment. `BEAMS_SCRIPT_DIR`, `BEAMS_SCRIPT_ROOT`, `BEAMS_LAUNCH_ID` and
 `BEAMS_TASK_RUN` are supplied by the runner/executor. Helpers share the
 caller's logs/resources. Staging is read-only, so hooks should write output
 to declared target/home paths.

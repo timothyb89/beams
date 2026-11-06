@@ -255,8 +255,9 @@ Destinations requiring root are not handled by this file adapter.
 Hooks run with declared argv, defaulting to their extracted script's
 directory. `BEAMS_SCRIPT_DIR` and `BEAMS_SCRIPT_ROOT` locate bundled helpers;
 `${beam.home}` and `${beam.launch_id}` expand on the Beam. Profile/task env
-and configured PATH apply to hooks, which inherit the caller's relay/session
-environment. Bundled helpers are read-only; write output to a target path.
+and configured PATH apply to hooks. Hooks get the agent relay as
+`SSH_AUTH_SOCK` unless the profile or task sets one, and otherwise inherit
+the caller's environment. Bundled helpers are read-only; write output to a target path.
 
 State defaults to `~/.beam-bootstrap/launch-state/` (`--state-dir` overrides
 launch/hook state). A per-launch lock prevents overlapping phase attempts.
@@ -267,7 +268,23 @@ attempts can retry; interrupted unchecked hooks require
 `--retry-interrupted` after reviewing their effects. A failed pre retry
 revokes its success receipt, blocking post. Missing staging blocks only
 artifact-dependent tasks; unpack it and retry. Foreground progress is not
-retained as reconnectable task snapshots yet.
+retained as reconnectable task snapshots; the daemon path below is.
+
+### Daemon launch execution
+
+`beam-bootstrap launch submit --launch launch.json --staging STAGING
+[--headless] [--no-follow] [--socket PATH]` hands a launch to the running
+daemon, which accepts it durably (by launch UUID and plan digest), runs pre
+then post on its shared executor resources, and waits for external
+conditions instead of failing: `launch signal --launch-id ID --condition
+artifact-ready:pre|artifact-ready:post|interface-ready` releases one (the
+daemon verifies staging itself first). `launch status [--launch-id ID]
+[--json]` prints the retained snapshot; `launch retry --launch-id ID
+[--retry-interrupted]` reruns a failed launch, or one a daemon restart left
+interrupted. State is `launch-state/` next to the daemon socket. The ops,
+events and snapshot `seq` boundary are documented in
+`docs/development/launches.md` ("Run a launch through the daemon"); the
+end-to-end check is `tests/launch-daemon-smoke.sh`.
 
 ### Shared package transactions
 

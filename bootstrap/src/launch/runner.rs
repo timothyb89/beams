@@ -649,6 +649,12 @@ impl LaunchTask {
         if let Some(run) = executor::current_task_run() {
             environment.insert("BEAMS_TASK_RUN".into(), run);
         }
+        // The Beam's agent relay, as for native tasks (`sshagent`): a hook
+        // run by the daemon would otherwise inherit its pre-relay
+        // environment. Profile/task env may still set its own.
+        if let Some(sock) = crate::sshagent::discover_ssh_auth_sock() {
+            environment.entry("SSH_AUTH_SOCK".into()).or_insert(sock);
+        }
         // Exclude transport/session nonces and extracted generation paths.
         let key = beams_artifacts::json_digest(&(
             &self.node,

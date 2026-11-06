@@ -407,6 +407,11 @@ fn record_event<H: Host>(host: &H, id: &str, event: executor::Event) {
         if !(progress && node.status == NodeStatus::Waiting) {
             node.status = status;
         }
+        // A terminal event without a message (skip) clears a stale one,
+        // such as a released condition's "waiting for …".
+        if message.is_none() && status.terminal() {
+            node.message = None;
+        }
         if let Some(message) = message {
             node.message = Some(message.clone());
             if progress {
@@ -619,10 +624,12 @@ impl Conditions for DaemonConditions {
                     ),
                 };
                 drop(state);
-                if let Some(on_waiting) = &*self.on_waiting.lock().unwrap() {
-                    on_waiting(condition, &message);
+                // Marks the node waiting and broadcasts it; without a
+                // worker attached (never in practice), plain progress.
+                match &*self.on_waiting.lock().unwrap() {
+                    Some(on_waiting) => on_waiting(condition, &message),
+                    None => progress(&message),
                 }
-                progress(&message);
                 state = self.state.lock().unwrap();
                 continue;
             }

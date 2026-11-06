@@ -1,10 +1,10 @@
 # Configurable Beam launches
 
-Status: offline compiler, phase archive packing/verification and foreground
-execution foundation implemented, 2026-11-06. The supported profile syntax
+Status: offline compiler, phase archive packing/verification, foreground
+execution and daemon launch acceptance/snapshots implemented, 2026-11-06. The supported profile syntax
 and explicit pack/unpack/run commands are documented in the
-[developer guide](../development/launches.md). Live daemon launch acceptance,
-shell/TUI readiness, archive upload and SSH selection remain planned. This design
+[developer guide](../development/launches.md). Shell/TUI readiness
+signals, archive upload/receive and SSH selection remain planned. This design
 builds on [DESIGN.md](DESIGN.md)'s task graph and
 [CLIENT_SERVICES_DESIGN.md](CLIENT_SERVICES_DESIGN.md)'s workstation-owned
 transport. [TODO.md](../../TODO.md)
@@ -19,10 +19,12 @@ template definitions, package batches, artifact selections and graph validation.
 
 ## Implementation status and next-session handoff
 
-Updated 2026-11-06 against `0853c81`. The configurable launch foundation is
-implemented through foreground/headless execution. Live `beams ssh` still
-uses Git delivery and the existing fixed startup path; the new commands
-are explicit, opt-in tools.
+Updated 2026-11-06 after the daemon-launch slice (`090236d`, `e36c9f2` and
+the CLI/docs commit that follows them). Launches can now run either in the
+foreground (`run-phase`) or through the daemon, which accepts them durably,
+waits for external conditions, and keeps reconnectable task snapshots. Live
+`beams ssh` still uses Git delivery and the existing fixed startup path;
+all launch commands are explicit and opt-in.
 
 | Commit | Completed milestone | Main implementation |
 |---|---|---|
@@ -30,99 +32,87 @@ are explicit, opt-in tools.
 | `2462cbb` | Strict schema v1, inheritance/provenance, offline validation/explanation, sanitized embedded starters and team fixture | `client/src/config/`, `environments/`, `protocol/src/task_catalog.rs` |
 | `6595f3d` | Launch UUID/plan digest, deterministic phase-local tar/gzip snapshots, deferred post packing, frozen replay and verified atomic read-only staging | `protocol/src/launch.rs`, `artifacts/`, `client/src/config/pack.rs` |
 | `0853c81` | Generic package/file/hook adapters, foreground phase execution, hook retry/history, Rust's apt split and manifest acceptance-order repair | `bootstrap/src/launch/`, `packages.rs`, `commandlog.rs`, `daemon.rs` |
+| `090236d` | Runner takes shared executor resources and a `Conditions` policy; reusable `verify_phase` | `bootstrap/src/launch/runner.rs` |
+| `e36c9f2` + CLI commit | Daemon acceptance by UUID/digest, waiting conditions, snapshots with a `seq` boundary, restart → interrupted, explicit retry; `launch submit/signal/status/retry`; hooks get the relay socket | `bootstrap/src/launch/daemon.rs`, `launch/mod.rs`, `daemon.rs` |
 
 Available commands are `beams config validate/explain/pack/pack-post` and
-`beam-bootstrap launch unpack/run-phase/install-packages`. The
-[developer guide](../development/launches.md#execute-a-verified-graph-today)
-documents their supported ordering and recovery behavior; the binary
-READMEs document flags. Script sources remain workstation-local and are
-automatically packed; explicit helper roots retain their layout and are
-promoted to pre when shared across phases.
+`beam-bootstrap launch unpack/run-phase/submit/signal/status/retry/install-packages`.
+The [developer guide](../development/launches.md#run-a-launch-through-the-daemon)
+documents the daemon path, its ops, events and snapshot boundary; the
+binary READMEs document flags.
 
 ### Current execution boundary
 
-- `run-phase` uses the existing executor, verifies staging identity/content,
-  and runs one selected phase. Post requires that launch's successful pre
-  receipt and explicit `--headless`; real shell/TUI signals are not wired.
-  Foreground `runtime-ready` prepares PATH directories and assumes the
-  bootstrap executable is already delivered. It does not provision Zellij,
-  spawn a shell, change the login shell or start/restart the daemon.
-- Foreground task events reuse the daemon's JSON shape on stdout. They are
-  not daemon broadcasts or retained task snapshots. A missing bundle fails
-  its artifact condition and blocks dependents; asynchronous waiting for
-  uploads remains daemon work.
-- Phase/hook state lives in `~/.beam-bootstrap/launch-state/`, with a
-  per-launch lock, success receipts, desired-state checks, content-based
-  `on-change` records and explicit interrupted unchecked-hook retry.
-  A failed pre retry revokes its previous success receipt. This is not
-  durable daemon acceptance/deduplication of launch submissions.
-- Each foreground invocation currently creates its own executor resources.
-  Resource tags therefore serialize work within that invocation; apt's
-  filesystem lock also serializes cooperating processes. Daemon integration
-  must use `Hub.resources` so concurrent submissions share destination locks.
-- File installation merges directories, preserves unrelated entries and
-  ordinary modes/internal links, and applies explicit leaf overwrite/
-  backup policies. `~/.ssh` and `~/.claude` cannot be replaced wholesale.
-  Privileged installation and staging-generation cleanup are pending.
-- Profile/task environment and prepared PATH apply to hooks. Native template
-  parameters receive Beam variable expansion, but specialized installers
-  retain their current process environment, versions and destination paths.
-  Configurable native installers remain part of phase 2.
+- The daemon runs pre then post for a launch on one worker with
+  `Hub.resources`, so launches and manifests share destination/apt locks.
+  Merging both phases into one executor run would gain nothing: every post
+  node requires `interface-ready`, which requires all of pre.
+- `artifact-ready:<phase>` is released when the daemon verifies that
+  staging (at worker start or on `launch signal`); `interface-ready` by a
+  signal (interactive gate) or after pre (headless gate). Nothing sends
+  these automatically yet: the receive path and shell/TUI are still manual.
+- Acceptance (`accepted.json`) and snapshots (`snapshot.json`) live in
+  `launch-state/<launch ID>/` next to the daemon socket, the same root as
+  `run-phase` receipts and hook history. A restarted daemon reloads them;
+  unfinished launches become `interrupted` and resume only via retry.
+  Owned-subprocess reconciliation after a restart is not implemented, so
+  retry must not be used while an old installer may still run.
+- The Beam TUI renders launch `task_status` events (same shape, launch ID as
+  `manifest_id`) but doesn't request `launch_snapshot` on connect yet.
+- There is no cancellation op; a waiting condition waits until signalled
+  or the daemon stops. Staging-generation cleanup and privileged file
+  targets remain pending, as do configurable native installers.
+- Two follow-ups from the SSH agent work are done: a running manifest's
+  key use routes to its submitting client, and every git task (including
+  PR fetches) and every hook gets the relay socket and run tag.
 
 ### Next implementation slice
 
-Start with **daemon-side launch acceptance and task snapshots**, before
-changing the SSH startup path:
+Wire the daemon substrate into an opt-in launch path:
 
-1. Reuse the typed declaration, validation and task adapters rather than
-   introducing another scheduler. Execute with the daemon's shared
-   `Hub.resources`. Durably bind acceptance to launch UUID/plan digest:
-   identical retries refer to the same launch; conflicting declarations
-   fail before effects. Preserve launch-scoped dependency identity.
-2. Store task metadata, pending/running/terminal state and bounded logs;
-   provide snapshot/subscription ordering so a late or reconnecting TUI
-   cannot miss startup progress. Include pre results. Preserve the repaired
-   ordering in which local/bridge manifest acceptance is queued before
-   start/progress/completion.
-3. Make `artifact-ready` and `interface-ready` actual external conditions,
-   with missing inputs waiting visibly. Verified receive releases only its
-   launch/phase condition. Interactive interface readiness requires both
-   initial shell startup and the TUI's loaded snapshot/first frame;
-   retain headless initialization as an explicit separate policy.
-4. Cover duplicate submission, daemon/UI reconnect, condition identity,
-   resource contention, pre failure and independent post progress with
-   isolated fixtures. Update the guide/READMEs/TODO in the same changes.
-
-After that substrate, integrate small runtime delivery, shell preparation,
-Zellij/TUI readiness reporting and client-owned deferred uploads into an
-opt-in SSH path. `config init`, workstation profile selection, timing/
-transport baseline, native parameterization, sanitized default migration
-and optional ControlMaster remain open. Existing transport/agent relay
-ownership and the implementation sequence below still apply.
+1. **TUI snapshot on connect.** Request `launch_snapshot`, apply it, drop
+   events at or below its `seq`; show pending post work before readiness.
+   Then the TUI's first frame can be one half of `interface-ready`.
+2. **Readiness signals.** The initial shell wrapper reports process
+   startup and the TUI reports snapshot-loaded/first-frame, carrying the
+   launch ID; the daemon releases `interface-ready` when both arrive
+   (still no timer; a missing signal is a diagnosable state).
+3. **Bridge launch capability.** Small typed messages for submit (by ID,
+   digest and staged declaration path), status and condition transitions,
+   within the 64 KiB frame limit; the client daemon persists acceptance
+   on its side and receives the exact plan from `beams ssh`.
+4. **Transport and receive.** One bundle per phase over the existing
+   transport; the Beam-side receive verifies and releases
+   `artifact-ready:<phase>` itself, replacing the manual signal. Startup
+   grants installed before eligible SSH tasks are released.
+5. Then the opt-in `beams ssh` path: small runtime delivery, shell
+   preparation, Zellij/TUI spawn. `config init`, workstation profile
+   selection, timing/transport baseline, native parameterization,
+   sanitized default migration, known_hosts/git config seeding (see
+   `TODO.md`) and optional ControlMaster remain open.
 
 ### Validation at handoff
 
-Native client/bootstrap builds passed. The Rust suites passed **315 tests**:
-bootstrap 120, client 171 unit + 3 CLI, protocol 16, artifacts 5.
-Reproduce the committed suites from the checkout root:
+Native client/bootstrap builds pass with no warnings. The Rust suites pass
+**325 tests**: bootstrap 129, client 172 unit + 3 CLI, protocol 16,
+artifacts 5. Reproduce from the checkout root:
 
 ```sh
 cargo test --manifest-path artifacts/Cargo.toml
 cargo test --manifest-path protocol/Cargo.toml
 cargo test --manifest-path client/Cargo.toml
 cargo test --manifest-path bootstrap/Cargo.toml -- --test-threads=1
+bootstrap/tests/launch-daemon-smoke.sh   # real binaries, scratch HOME/socket
 ```
 
-An additional manual CLI smoke used an isolated HOME and fake apt/dpkg/
-sudo, exercising pre/post pack/unpack/run, explicit headless gating,
-helpers/file installation and repeat skips. Fake apt waited for an
-independent hook's marker before completing, proving graph-level overlap.
-That scratch harness is not committed; make it a permanent regression
-fixture during daemon integration rather than depending on session files.
-Real apt/Zellij/disposable-Beam acceptance and the static musl build have
-not been exercised for this implementation. This session's daemon and
-fixed startup were not restarted. Implementation commits are local;
-no push has been performed.
+The daemon fixture tests (`launch/tests.rs`, `daemon_launches`) cover
+waiting and release, duplicate and conflicting submissions, the snapshot
+boundary, pre failure/retry, staging that fails verification, two launches
+serialized by a shared resource (the permanent form of the earlier
+uncommitted overlap harness), and restart → interrupted → retry.
+`client-bridge-smoke.sh` and `ssh-agent-smoke.sh` still pass. Real apt,
+Zellij, a disposable Beam and the static musl build have not been
+exercised for the launch path; this session's own daemon was not restarted.
 
 ## Goals and recommendation
 
@@ -706,7 +696,7 @@ phase/status)` when provisioning starts, not only after upload succeeds.
 Record launch acceptance durably on both sides. Submission retries use
 the same ID and receive the existing record; only acknowledgments advance
 local state. Task snapshots and success records live under
-`~/.beam-bootstrap/launches/`; they disappear with the Beam as expected.
+`~/.beam-bootstrap/launch-state/`; they disappear with the Beam as expected.
 
 An interrupted launch resumes its same plan, probes idempotent work, and
 leaves unchecked interrupted scripts awaiting explicit retry. A failed

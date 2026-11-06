@@ -5,7 +5,9 @@ mod runner;
 #[cfg(test)]
 mod tests;
 
+use anyhow::Context as _;
 use beams_protocol::launch::{BundleDescriptor, Declaration, Phase};
+use serde_json::{json, Value};
 use clap::{Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -32,6 +34,58 @@ pub enum Command {
         #[arg(required = true)]
         packages: Vec<String>,
     },
+    /// Submit a verified launch to the running daemon, which runs pre then
+    /// post on its shared resources and waits for external conditions.
+    /// Follows its progress until it finishes (exit 1 if it fails).
+    Submit {
+        #[arg(long)]
+        launch: PathBuf,
+        /// Staging root holding (or later receiving) `pre/` and `post/`.
+        #[arg(long)]
+        staging: PathBuf,
+        /// Release interface-ready as soon as pre succeeds.
+        #[arg(long)]
+        headless: bool,
+        /// Return once accepted instead of following progress.
+        #[arg(long)]
+        no_follow: bool,
+        /// Daemon socket (default ~/.beam-bootstrap/daemon.sock).
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Release a daemon launch's external condition: `interface-ready`, or
+    /// `artifact-ready:pre|post` (the daemon verifies that staging first).
+    Signal {
+        #[arg(long)]
+        launch_id: String,
+        #[arg(long)]
+        condition: String,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Show daemon launches and their nodes.
+    Status {
+        #[arg(long)]
+        launch_id: Option<String>,
+        /// Print the raw snapshot JSON.
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Restart a failed or interrupted daemon launch with its accepted plan.
+    Retry {
+        #[arg(long)]
+        launch_id: String,
+        /// Also rerun unchecked hooks that were interrupted (review their
+        /// effects first).
+        #[arg(long)]
+        retry_interrupted: bool,
+        #[arg(long)]
+        no_follow: bool,
+        #[arg(long)]
+        socket: Option<String>,
+    },
     /// Verify an archive and atomically publish staging, without installing it.
     Unpack {
         #[arg(long)]
@@ -50,6 +104,54 @@ pub enum RunPhase {
 
 pub fn run(command: Command) -> anyhow::Result<()> {
     match command {
+        Command::Submit { launch, staging, headless, no_follow, socket } => {
+            let mut conn = connect(socket)?;
+            let reply = request(
+                &mut conn,
+                json!({
+                    "op": "launch_submit",
+                    "launch": std::path::absolute(&launch)?,
+                    "staging": std::path::absolute(&staging)?,
+                    "gate": if headless { "headless" } else { "interactive" },
+                }),
+            )?;
+            follow(&mut conn, &reply, no_follow)?;
+        }
+        Command::Signal { launch_id, condition, socket } => {
+            let reply = request(
+                &mut connect(socket)?,
+                json!({"op": "launch_signal", "launch_id": launch_id, "condition": condition}),
+            )?;
+            println!("{}", reply["message"].as_str().unwrap_or_default());
+            if reply["released"] != true {
+                anyhow::bail!("{condition} was not released");
+            }
+        }
+        Command::Status { launch_id, json, socket } => {
+            let reply = request(
+                &mut connect(socket)?,
+                json!({"op": "launch_snapshot", "launch_id": launch_id}),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&reply["launches"])?);
+            } else {
+                let launches: Vec<daemon::LaunchSnapshot> = serde_json::from_value(reply["launches"].clone())?;
+                if launches.is_empty() {
+                    println!("no launches");
+                }
+                for launch in &launches {
+                    print_snapshot(launch);
+                }
+            }
+        }
+        Command::Retry { launch_id, retry_interrupted, no_follow, socket } => {
+            let mut conn = connect(socket)?;
+            let reply = request(
+                &mut conn,
+                json!({"op": "launch_retry", "launch_id": launch_id, "retry_interrupted": retry_interrupted}),
+            )?;
+            follow(&mut conn, &reply, no_follow)?;
+        }
         Command::RunPhase {
             launch,
             staging,
@@ -109,4 +211,96 @@ pub fn run(command: Command) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn connect(socket: Option<String>) -> anyhow::Result<crate::taskcli::Connection> {
+    let path = crate::pathutil::expand_tilde(&socket.unwrap_or_else(crate::daemon::default_socket_path));
+    crate::taskcli::Connection::connect(&path)
+}
+
+/// Sends one op and returns its direct reply (failing on an error reply).
+fn request(conn: &mut crate::taskcli::Connection, mut op: Value) -> anyhow::Result<Value> {
+    op["request_id"] = json!("launch-cli");
+    conn.send(&op)?;
+    loop {
+        let reply = conn.recv()?.context("the daemon closed the connection without replying")?;
+        if reply["request_id"] != "launch-cli" {
+            continue;
+        }
+        if reply["type"] == "error" {
+            anyhow::bail!("{}", reply["message"].as_str().unwrap_or("unknown error"));
+        }
+        return Ok(reply);
+    }
+}
+
+fn print_snapshot(launch: &daemon::LaunchSnapshot) {
+    println!(
+        "{} {:?} ({:?} gate){}",
+        launch.launch_id,
+        launch.status,
+        launch.gate,
+        launch.message.as_deref().map(|m| format!(": {m}")).unwrap_or_default()
+    );
+    for node in &launch.nodes {
+        println!(
+            "  {:<11} {:<4} {}{}",
+            format!("{:?}", node.status).to_lowercase(),
+            node.phase.name(),
+            node.label,
+            node.message.as_deref().map(|m| format!(" - {m}")).unwrap_or_default()
+        );
+    }
+}
+
+/// Prints a launch's progress from an accepting reply (a snapshot
+/// boundary) until it finishes.
+fn follow(conn: &mut crate::taskcli::Connection, reply: &Value, no_follow: bool) -> anyhow::Result<()> {
+    let launch: daemon::LaunchSnapshot = serde_json::from_value(reply["launch"].clone())?;
+    let id = launch.launch_id.clone();
+    if reply["existing"] == true {
+        println!("already accepted:");
+    }
+    print_snapshot(&launch);
+    let terminal = |status: daemon::LaunchStatus| match status {
+        daemon::LaunchStatus::Ok => Some(Ok(())),
+        daemon::LaunchStatus::Failed => Some(Err(anyhow::anyhow!("launch {id} failed"))),
+        daemon::LaunchStatus::Interrupted => Some(Err(anyhow::anyhow!(
+            "launch {id} was interrupted; `beam-bootstrap launch retry --launch-id {id}` resumes it"
+        ))),
+        _ => None,
+    };
+    if let Some(done) = terminal(launch.status) {
+        return done;
+    }
+    if no_follow {
+        return Ok(());
+    }
+    let boundary = reply["seq"].as_u64().unwrap_or_default();
+    while let Some(event) = conn.recv()? {
+        if event["launch_id"] != id.as_str() || event["seq"].as_u64().is_none_or(|seq| seq <= boundary) {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("task_status") => println!(
+                "  {:<11} {}{}",
+                if event["waiting"] == true { "waiting" } else { event["status"].as_str().unwrap_or("?") },
+                event["node"].as_str().unwrap_or("?"),
+                event["message"].as_str().map(|m| format!(" - {m}")).unwrap_or_default()
+            ),
+            Some("launch_status") => {
+                let status: daemon::LaunchStatus = serde_json::from_value(event["status"].clone())?;
+                println!(
+                    "launch {:?}{}",
+                    status,
+                    event["message"].as_str().map(|m| format!(": {m}")).unwrap_or_default()
+                );
+                if let Some(done) = terminal(status) {
+                    return done;
+                }
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("the daemon closed the connection before launch {id} finished")
 }

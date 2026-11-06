@@ -206,7 +206,7 @@ fn pre_post_files_helpers_environment_and_repeated_runs_follow_graph() {
     );
     f.write(
         "hooks/lib/common.sh",
-        "test \"$TEAM\" = fixture; test -n \"$BEAMS_LAUNCH_ID\"; test -n \"$BEAMS_TASK_RUN\"",
+        "test \"$TEAM\" = fixture; test -n \"$BEAMS_LAUNCH_ID\"; test -n \"$BEAMS_TASK_RUN\"; case \"$SSH_AUTH_SOCK\" in *ssh-agent.sock) ;; *) exit 9;; esac",
     );
     f.write(
         "hooks/post.sh",

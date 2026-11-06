@@ -33,9 +33,11 @@ An optional `script_root` selects
 a helper directory to preserve on the Beam, with phase-aware packaging.
 
 The [2026-11-06 handoff](docs/designs/LAUNCH_CONFIGURATION_DESIGN.md#implementation-status-and-next-session-handoff)
-records completed commits, execution limits and validation. Next: daemon
-launch acceptance/deduplication and task snapshots with shared resources
-and external readiness conditions, before changing live SSH startup.
+records completed commits, execution limits and validation. Daemon
+acceptance, waiting conditions and snapshots are done (2026-11-06). Next:
+TUI snapshot-on-connect, shell/TUI readiness signals, the bridge launch
+capability and transport-driven artifact release, before changing live
+SSH startup.
 
 - [x] Immediate prerequisite from review of `06060b5`/`651fc1c`: remove
   the stale forced repo `.ssh` link in `bootstrap/src/steps/link.rs`.
@@ -115,6 +117,20 @@ and external readiness conditions, before changing live SSH startup.
   local and bridge manifests now synchronously queue their acceptance
   before starting the worker, so start/progress/completion cannot overtake
   it. A delayed-acceptance empty-manifest regression fixture covers this.
+- [x] Daemon launches: `launch_submit/signal/snapshot/retry` ops and
+  `beam-bootstrap launch submit/signal/status/retry`. Durable acceptance by
+  UUID/digest (identical resubmission = same launch, conflicting digest
+  refused before effects), one worker per launch on `Hub.resources`,
+  waiting `artifact-ready`/`interface-ready` conditions (daemon-verified
+  staging; interactive or headless gate), per-node state with bounded logs
+  persisted on transitions, a daemon-wide `seq` making state-carrying
+  replies exact event-stream boundaries, restart -> interrupted, explicit
+  retry. Hooks get the relay `SSH_AUTH_SOCK`. Fixture tests plus
+  `bootstrap/tests/launch-daemon-smoke.sh`.
+- [ ] Launch daemon follow-ups: reconcile owned subprocesses after a
+  daemon restart before allowing retry to overlap an old installer; a
+  cancel op (a condition otherwise waits until signalled); the Beam TUI
+  requesting `launch_snapshot` on connect.
 - [ ] Developer documentation is required alongside implementation:
   evolve `docs/development/launches.md` with the compiler/schema, an
   execution-order graph, explicit scripts-vs-packages/file dependencies,
@@ -122,25 +138,28 @@ and external readiness conditions, before changing live SSH startup.
   retry/reconnect diagnosis. Deliver an annotated profile with matching
   explain output and fixture coverage; update binary READMEs in the same
   changes. Compiler behavior/examples and foreground execution/retry are
-  documented; real readiness/reconnect walkthroughs remain with those phases.
+  documented, and so is the daemon path (ops, conditions, snapshot
+  boundary, retry/restart); real shell/TUI readiness walkthroughs remain
+  with those phases.
 - [ ] Phase 2 remaining: parameterize specialized installs (versions,
-  destination paths and profile environment), attach launch tasks to the
-  daemon's shared resource scheduler, add durable/deduplicated acceptance,
-  task snapshots and retained bounded logs. Source/keyring preparation
+  destination paths and profile environment). Source/keyring preparation
   dependencies, privileged file destinations and configurable admission/
-  concurrency bounds remain. Foreground adapters/package transactions and
-  Rust's apt split are implemented; this is not live startup yet.
-- [ ] Preserve the manual cross-binary CLI smoke as a committed regression
-  fixture during daemon integration: isolated HOME/fake apt, an independent
-  hook completing while apt waits, deferred bundles, explicit gates and
-  retry skips. The successful scratch harness is not session-persistent.
+  concurrency bounds remain. Foreground adapters/package transactions,
+  Rust's apt split, and daemon acceptance/shared resources/snapshots are
+  implemented; this is not live startup yet.
+- [ ] Cross-binary smoke, remaining part: `launch-daemon-smoke.sh` covers
+  deferred bundles, explicit gates, resubmission, retry refusal and daemon
+  restart, and fixture tests cover resource serialization, but no committed
+  cross-binary test yet runs fake apt with an independent hook completing
+  while apt waits.
 - [ ] Phase 3: ship a small runtime/pre archive independently of a Git
   checkout; run pre tasks through the daemon, prepare the shell before
   spawning it, and gate post tasks on shell startup + first TUI frame.
   Remove the new path's competing background fixed bootstrap.
 - [ ] Phase 4: batched background uploads with projected TUI progress,
-  artifact-ready conditions, bounded task concurrency, retry/recovery,
-  and submitting-client routing for startup SSH grants.
+  receive-driven release of the (now waiting) artifact-ready conditions,
+  bounded task concurrency and retry/recovery. Submitting-client routing
+  for SSH key use landed 2026-11-06 with the SSH agent follow-ups.
 - [ ] Phase 5: migrate the maintainer's setup onto a local profile,
   distribute a sanitized development default, adapt legacy `[startup]`,
   document customization, and validate on disposable Beams before
