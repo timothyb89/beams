@@ -41,8 +41,10 @@ Beam with a profile (see
 [below](#launch-a-new-beam-beams-ssh---profile)); `config init` is not
 implemented yet.
 
-The development starter selects fish and its configuration before the
-interface, with micro/less and Go/Rust afterward. It contains no SSH keys,
+The development starter selects fish, its configuration and starship (the
+`install-starship` template, downloaded while pre's apt batch runs) before
+the interface, so the first prompt is complete, with micro/less and
+Go/Rust afterward. It contains no SSH keys,
 cluster bot, Kubernetes settings, or maintainer project checkouts. The
 old startup's remaining optional installers will move into this profile
 as their generic execution primitives become available.

@@ -194,9 +194,13 @@ path (runtime delivery, shell preparation, Zellij/TUI with
   `startup.rs`, `RunManifest` startup grants unless launch tasks reuse
   them), `bin/beam-shell`'s fixed background run and the Git-push
   delivery, the `~/beams/bin/beam-client-bridge` fallback, and the
-  implicit Go/Rust defaults. Move the maintainer's clones/toolchains into
-  a local profile first (clones need `KnownHostsCommand` below and grant
-  routing for launch tasks).
+  implicit Go/Rust defaults, and the fixed `install-starship` step (now
+  the `install-starship` template in `builtin:development`'s pre). The
+  maintainer's clones and grant are in gitignored
+  `environments/local/personal.toml` (2026-11-07; `KnownHostsCommand`
+  and launch grants landed). Still to decide: which other fixed steps
+  (claude update/CLAUDE.md merge, kubectl, teleport binary from the
+  staging CDN, k3s bot/tbot/kubeconfig) become profile tasks.
 - [x] `beams ssh` never reused a Beam once the maximum Beam TTL dropped to
   12h (`MIN_TTL_HOURS` was 12; ~11h left observed 2026-11-07). Now 6h,
   plus `beams ssh --beam ID|UUID|PURPOSE` to connect to a specific Beam

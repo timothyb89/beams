@@ -363,6 +363,10 @@ fn builtin_edges(task: &Task) -> anyhow::Result<(Vec<String>, Vec<String>, Vec<S
     let mut requires = Vec::new();
     let mut resources = Vec::new();
     match task.template.as_deref().unwrap() {
+        "install-starship" => {
+            provides.push("starship-installed".into());
+            resources.push("path:/usr/local/bin/starship".into());
+        }
         "install-toolchain-go" => {
             provides.push("go-toolchain-installed".into());
             resources.push("path:${beam.home}/.local/toolchains/go".into());

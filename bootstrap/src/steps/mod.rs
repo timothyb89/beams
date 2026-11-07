@@ -16,6 +16,7 @@ mod teleport_bin;
 mod tool_paths;
 mod zellij;
 
+pub(crate) use starship::install as install_starship;
 pub(crate) use zellij::InstallZellij;
 
 use std::path::{Path, PathBuf};

@@ -25,6 +25,7 @@
 pub mod checkout_pr_worktree;
 pub mod clone_git_repo;
 pub mod install_code_server;
+mod install_starship;
 pub mod install_toolchain_go;
 pub mod install_toolchain_rust;
 pub mod wait_ssh_agent;
@@ -38,6 +39,7 @@ use crate::graph::{Capability, Node};
 use checkout_pr_worktree::CheckoutPrWorktree;
 use clone_git_repo::CloneGitRepo;
 use install_code_server::InstallCodeServer;
+use install_starship::InstallStarship;
 use install_toolchain_go::InstallToolchainGo;
 use install_toolchain_rust::InstallToolchainRust;
 use wait_ssh_agent::WaitSshAgent;
@@ -176,6 +178,7 @@ pub fn instantiate(name: &str, params: Value) -> anyhow::Result<Box<dyn Task>> {
                 dest: crate::pathutil::expand_tilde(&p.dest),
             }))
         }
+        InstallStarship::NAME => Ok(Box::new(InstallStarship)),
         InstallToolchainGo::NAME => Ok(Box::new(InstallToolchainGo)),
         InstallToolchainRust::NAME => Ok(Box::new(InstallToolchainRust)),
         InstallCodeServer::NAME => Ok(Box::new(InstallCodeServer)),

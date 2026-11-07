@@ -64,6 +64,8 @@ fn bundled_profiles_have_no_checkout_dependency_and_minimal_pre_work() {
     assert!(!depends(&dev, "tasks:go", "packages:post"));
     assert!(!depends(&dev, "interface-ready", "tasks:rust"));
     assert!(depends(&dev, "interface-ready", "files:fish"));
+    assert_eq!(node(&dev, "tasks:starship").phase, Phase::Pre, "the first prompt has it");
+    assert!(depends(&dev, "interface-ready", "tasks:starship"));
     assert!(dev.sources.values().all(|s| match s {
         Source::Embedded(name) => !super::profile::embedded_asset(name).unwrap().is_empty(),
         _ => false,

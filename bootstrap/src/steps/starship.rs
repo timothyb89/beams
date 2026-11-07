@@ -26,44 +26,51 @@ impl Step for InstallStarship {
     }
 
     fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {
-        if already_installed() {
-            return Ok(None);
-        }
-
-        let target = arch_target("starship")?;
-        let base =
-            format!("https://github.com/starship/starship/releases/download/{VERSION}/starship-{target}");
-        let tmp =
-            std::env::temp_dir().join(format!("beam-bootstrap-starship-{}", std::process::id()));
-        fs::create_dir_all(&tmp).context("creating temp dir")?;
-        let archive = tmp.join("starship.tar.gz");
-        let checksum_file = tmp.join("starship.sha256");
-
-        download(&format!("{base}.tar.gz"), &archive)?;
-        download(&format!("{base}.tar.gz.sha256"), &checksum_file)?;
-        // Unlike zellij's release, starship's published checksum covers
-        // the tar.gz asset itself, not the extracted binary.
-        verify_checksum(&archive, &checksum_file, "starship")?;
-
-        run(Command::new("tar").args([
-            "-xzf",
-            archive.to_str().unwrap(),
-            "-C",
-            tmp.to_str().unwrap(),
-        ]))?;
-
-        let binary = tmp.join("starship");
-        run(Command::new("sudo").args([
-            "install",
-            "-m",
-            "0755",
-            binary.to_str().unwrap(),
-            INSTALL_PATH,
-        ]))?;
-
-        let _ = fs::remove_dir_all(&tmp);
-        Ok(Some(format!("installed starship {VERSION} to {INSTALL_PATH}")))
+        install()
     }
+}
+
+/// Installs the pinned release (`Ok(None)` if it's already there). Shared
+/// by this fixed step and the `install-starship` template that profiles
+/// use (`tasks::install_starship`).
+pub(crate) fn install() -> anyhow::Result<Option<String>> {
+    if already_installed() {
+        return Ok(None);
+    }
+
+    let target = arch_target("starship")?;
+    let base =
+        format!("https://github.com/starship/starship/releases/download/{VERSION}/starship-{target}");
+    let tmp =
+        std::env::temp_dir().join(format!("beam-bootstrap-starship-{}", std::process::id()));
+    fs::create_dir_all(&tmp).context("creating temp dir")?;
+    let archive = tmp.join("starship.tar.gz");
+    let checksum_file = tmp.join("starship.sha256");
+
+    download(&format!("{base}.tar.gz"), &archive)?;
+    download(&format!("{base}.tar.gz.sha256"), &checksum_file)?;
+    // Unlike zellij's release, starship's published checksum covers
+    // the tar.gz asset itself, not the extracted binary.
+    verify_checksum(&archive, &checksum_file, "starship")?;
+
+    run(Command::new("tar").args([
+        "-xzf",
+        archive.to_str().unwrap(),
+        "-C",
+        tmp.to_str().unwrap(),
+    ]))?;
+
+    let binary = tmp.join("starship");
+    run(Command::new("sudo").args([
+        "install",
+        "-m",
+        "0755",
+        binary.to_str().unwrap(),
+        INSTALL_PATH,
+    ]))?;
+
+    let _ = fs::remove_dir_all(&tmp);
+    Ok(Some(format!("installed starship {VERSION} to {INSTALL_PATH}")))
 }
 
 fn already_installed() -> bool {

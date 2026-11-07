@@ -298,6 +298,9 @@ enum TaskCommand {
         #[arg(long)]
         dest: String,
     },
+    /// Install the pinned starship release to /usr/local/bin (see
+    /// `tasks::install_starship`). No params.
+    InstallStarship,
     /// Install the Go toolchain via the official release (see
     /// `tasks::install_toolchain_go`). No params.
     InstallToolchainGo,
@@ -649,6 +652,7 @@ fn task_command_to_instance(command: TaskCommand) -> (&'static str, Value) {
         TaskCommand::CheckoutPrWorktree { base, pr, dest } => {
             (tasks::checkout_pr_worktree::CheckoutPrWorktree::NAME, json!({"base": base, "pr": pr, "dest": dest}))
         }
+        TaskCommand::InstallStarship => ("install-starship", json!({})),
         TaskCommand::InstallToolchainGo => (tasks::install_toolchain_go::InstallToolchainGo::NAME, json!({})),
         TaskCommand::InstallToolchainRust => (tasks::install_toolchain_rust::InstallToolchainRust::NAME, json!({})),
         TaskCommand::InstallCodeServer => (tasks::install_code_server::InstallCodeServer::NAME, json!({})),

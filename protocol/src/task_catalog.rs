@@ -59,6 +59,11 @@ pub fn templates() -> Vec<TemplateInfo> {
             run_once: false,
         },
         TemplateInfo {
+            template: "install-starship",
+            params: &[],
+            run_once: true,
+        },
+        TemplateInfo {
             template: "install-toolchain-go",
             params: &[],
             run_once: true,

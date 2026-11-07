@@ -25,6 +25,13 @@ target = "~/.config/starship.toml"
 phase = "pre"
 overwrite = "backup"
 
+# Before the interface: the first fish prompt uses it (config.fish runs
+# `starship init` only when it's installed). Downloads alongside pre's apt.
+[tasks.starship]
+label = "Install starship"
+template = "install-starship"
+phase = "pre"
+
 [tasks.go]
 label = "Install Go"
 template = "install-toolchain-go"
