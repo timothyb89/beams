@@ -397,6 +397,7 @@ fn drive(
             overlay_enabled,
             &mut terminal_state.output,
             Some(writer),
+            &mut painter,
         )?;
         let output_changed = output.changed;
         if let Some(resume) = output.resume {
@@ -404,6 +405,9 @@ fn drive(
             // restores the last model state and replays that prefix before
             // the remaining bytes resume raw passthrough.
             painter.forget();
+            if !output.replay_pending {
+                terminal_state.output.cancel_pending();
+            }
             close_palette(
                 master,
                 terminal_state,
@@ -472,6 +476,14 @@ fn drive(
 
         if let Ok(size) = current_size() {
             if size != last_size {
+                if overlay_enabled && input_router.mode == InputMode::Palette {
+                    // Close using the last represented snapshot. The outer
+                    // terminal may already have reflowed it: fidelity during
+                    // a covered resize remains an explicit compatibility gate.
+                    close_palette(master, terminal_state, &mut palette_terminal,
+                        &mut input_router.mode, &mut deferred, last_size,
+                        terminal_model, overlay_enabled)?;
+                }
                 master.resize(size).context("resizing local PTY")?;
                 terminal_model.resize(size);
                 last_size = size;
@@ -545,6 +557,9 @@ fn drive(
                 }
                 InputAction::OpenPalette => {
                     painter.forget();
+                    if overlay_enabled {
+                        terminal_model.begin_overlay();
+                    }
                     terminal_state.open_palette(terminal_model.screen())?;
                     palette_terminal = Some(new_palette_terminal()?);
                     // The prefix while a request's toast is up goes straight
@@ -2655,6 +2670,7 @@ struct OutputUpdate {
     /// The chunk tail to forward after closing an unsafe overlay. The bounded
     /// unfinished prefix is held by the physical output tracker.
     resume: Option<Vec<u8>>,
+    replay_pending: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2667,6 +2683,7 @@ fn drain_output(
     overlay_enabled: bool,
     tracker: &mut toast::OutputTracker,
     remote_writer: Option<&ChildInput>,
+    painter: &mut toast::ToastPainter,
 ) -> anyhow::Result<OutputUpdate> {
     let mut stdout = io::stdout().lock();
     let mut wrote = false;
@@ -2675,10 +2692,20 @@ fn drain_output(
         match rx.try_recv() {
             Ok(OutputEvent::Data(bytes)) => {
                 changed = true;
+                if mode == InputMode::Passthrough {
+                    // Remove a toast using the last represented state before
+                    // new output can invalidate it. Raw output then stays raw.
+                    let clear = painter.clear(terminal_model);
+                    if !clear.is_empty() {
+                        stdout.write_all(&clear).context("removing toast before remote output")?;
+                        wrote = true;
+                    }
+                }
                 let mut offset = 0;
                 while offset < bytes.len() {
-                    let consumed =
-                        terminal_model.process_with_events(&bytes[offset..], |event| {
+                    let (consumed, rejected) =
+                        terminal_model.process_guarded_with_events(&bytes[offset..],
+                            mode == InputMode::Palette && overlay_enabled, |event| {
                             if mode == InputMode::Palette && overlay_enabled {
                                 if let TerminalEvent::Reply(reply) = event {
                                     remote_writer
@@ -2693,11 +2720,20 @@ fn drain_output(
                                 }
                             }
                             Ok::<(), anyhow::Error>(())
-                        })?;
+                        }, true)?;
                     if overlay_enabled || mode == InputMode::Passthrough {
                         tracker.feed(&bytes[offset..offset + consumed], Instant::now());
                     }
                     offset += consumed;
+                    if let Some(mut rejected) = rejected {
+                        rejected.extend_from_slice(&bytes[offset..]);
+                        stdout.flush().context("flushing effects before unsupported output")?;
+                        return Ok(OutputUpdate {
+                            changed,
+                            resume: Some(rejected),
+                            replay_pending: false,
+                        });
+                    }
                     if offset < bytes.len() {
                         terminal_model.discard_oversized_sequence();
                         if mode == InputMode::Palette && overlay_enabled {
@@ -2707,6 +2743,7 @@ fn drain_output(
                             return Ok(OutputUpdate {
                                 changed,
                                 resume: Some(bytes[offset..].to_vec()),
+                                replay_pending: true,
                             });
                         }
                     }
@@ -2736,6 +2773,7 @@ fn drain_output(
     Ok(OutputUpdate {
         changed,
         resume: None,
+        replay_pending: true,
     })
 }
 
@@ -2756,6 +2794,7 @@ fn finish_output(
             false,
             &mut toast::OutputTracker::default(),
             None,
+            &mut toast::ToastPainter::default(),
         )?;
         if !*finished {
             thread::sleep(Duration::from_millis(5));
@@ -2771,7 +2810,7 @@ fn close_palette(
     mode: &mut InputMode,
     deferred: &mut DeferredOutput,
     size: PtySize,
-    terminal_model: &TerminalModel,
+    terminal_model: &mut TerminalModel,
     overlay_enabled: bool,
 ) -> anyhow::Result<()> {
     if terminal_state.palette_open {
@@ -2828,6 +2867,7 @@ fn close_palette(
         terminal_state.menu_snapshot = None;
     }
     *mode = InputMode::Passthrough;
+    terminal_model.end_overlay();
     Ok(())
 }
 

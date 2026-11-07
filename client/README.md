@@ -343,6 +343,22 @@ sends it remotely. This is a conservative recovery for budget exhaustion,
 not yet the general unknown-screen compatibility policy. Silence does not
 end an unfinished string or synchronized update.
 
+Overlay menus and toasts also require observed drawing state. Both buffers
+start unknown: a cursor report, buffer selection or clear cannot establish
+inherited modes and save slots. Currently an observed full reset (`ESC c`)
+is required to establish the complete baseline. The client does not send that
+reset itself. Unsupported sequences and resize suppress painting until another
+observed reset. This conservative policy can defer menus in ordinary shells
+and TUIs; explicit takeover remains available.
+
+If unsupported output arrives during a menu, the client restores the last
+represented state before forwarding the complete original sequence and its
+continuation. Forms survive for reopening. Every buffer touched while hidden
+is restored, including inactive-buffer updates in round trips. Toasts withdraw
+before incoming output. A resize closes the menu and invalidates eligibility;
+restoration during covered resize is still best effort because the outer
+terminal may already have reflowed.
+
 The client uses a focused, vendored `vt100` 0.18.1 extension in
 `vendor/vt100` for read-only current/saved cursor and attribute snapshots,
 per-buffer origin/margins, streaming DCS callbacks and reset notifications.

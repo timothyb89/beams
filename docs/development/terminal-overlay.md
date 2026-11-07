@@ -208,3 +208,13 @@ tests, client build and protocol/PTY smoke pass. DECRQM mouse/keypad/buffer
 reports use remote state; unmodeled ANSI/DEC modes receive status 0. XTGETXRES
 receives a negative response while hidden. Kitty flags, xterm modifier options
 and version probes are physical, and split replies bypass menu actions.
+
+Conservative eligibility/recovery pass (2026-11-07): 220 unit tests and 3
+integration tests, client build, both managed-session display modes and the
+protocol/PTY smoke pass. The PTY smoke also passes with the independent
+xterm.js renderer comparison. Tests cover inherited-state refusal, rejection
+before model mutation at every frame split, exact replay of unsupported
+output, inactive-buffer round trips and reopening a preserved form. Only RIS
+establishes a complete baseline today. Covered resize closes the menu and
+invalidates eligibility, but restoring after the physical terminal has
+already reflowed remains best effort and a release gate.

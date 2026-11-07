@@ -12,6 +12,7 @@ mod session;
 mod stage;
 mod state;
 mod sync;
+mod terminal_eligibility;
 mod terminal_model;
 mod terminal_paint;
 mod terminal_stream;

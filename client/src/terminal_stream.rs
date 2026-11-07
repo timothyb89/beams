@@ -38,6 +38,20 @@ impl TerminalStream {
         bytes: &[u8],
         mut frame: impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<usize, E> {
+        self.advance_guarded(bytes, |bytes, _| {
+            frame(bytes)?;
+            Ok(true)
+        })
+        .map(|(consumed, _)| consumed)
+    }
+
+    /// Stop before applying a rejected frame. Return its complete original
+    /// bytes (including an earlier read's prefix) for ordered physical replay.
+    pub fn advance_guarded<E>(
+        &mut self,
+        bytes: &[u8],
+        mut frame: impl FnMut(&[u8], &[u8]) -> Result<bool, E>,
+    ) -> Result<(usize, Option<Vec<u8>>), E> {
         let mut i = 0;
         while i < bytes.len() {
             if self.state == State::Ground {
@@ -58,12 +72,18 @@ impl TerminalStream {
                     for &byte in &bytes[tail..i] {
                         self.text_byte(byte);
                     }
-                    frame(&bytes[start..i])?;
+                    if !frame(&bytes[start..i], &bytes[start..i])? {
+                        self.cancel_pending();
+                        return Ok((i, Some(bytes[start..i].to_vec())));
+                    }
                     continue;
                 }
                 if bytes[i] != 0x1b {
                     self.text_byte(bytes[i]);
-                    frame(&bytes[i..i + 1])?;
+                    if !frame(&bytes[i..i + 1], &bytes[i..i + 1])? {
+                        self.cancel_pending();
+                        return Ok((i + 1, Some(bytes[i..i + 1].to_vec())));
+                    }
                     i += 1;
                     continue;
                 }
@@ -74,7 +94,7 @@ impl TerminalStream {
             }
 
             if !self.discarding && self.pending.len() == CONTROL_SEQUENCE_LIMIT {
-                return Ok(i);
+                return Ok((i, None));
             }
             let byte = bytes[i];
             if self.state == State::StringEscape
@@ -84,7 +104,11 @@ impl TerminalStream {
                 // Keep ST together so consumers can distinguish a completed
                 // DCS from vte's unhook on ESC/CAN/SUB. Any other ESC command
                 // aborts the string; emit its prefix before the new command.
-                frame(&self.pending[self.prefix_emitted..])?;
+                if !frame(&self.pending[self.prefix_emitted..], &self.pending)? {
+                    let replay = self.pending.clone();
+                    self.cancel_pending();
+                    return Ok((i, Some(replay)));
+                }
                 self.pending.clear();
                 self.pending.push(0x1b);
                 self.prefix_emitted = 1;
@@ -100,7 +124,11 @@ impl TerminalStream {
                 && matches!(previous, State::Csi | State::EscapeIntermediate)
                 && !self.discarding
             {
-                frame(&self.pending[self.prefix_emitted..])?;
+                if !frame(&self.pending[self.prefix_emitted..], &self.pending)? {
+                    let replay = self.pending.clone();
+                    self.cancel_pending();
+                    return Ok((i, Some(replay)));
+                }
                 self.pending.clear();
                 self.pending.push(0x1b);
                 self.prefix_emitted = 1;
@@ -109,14 +137,18 @@ impl TerminalStream {
             }
             if self.state == State::Ground {
                 if !self.discarding {
-                    frame(&self.pending[self.prefix_emitted..])?;
+                    if !frame(&self.pending[self.prefix_emitted..], &self.pending)? {
+                        let replay = self.pending.clone();
+                        self.cancel_pending();
+                        return Ok((i, Some(replay)));
+                    }
                 }
                 self.pending.clear();
                 self.prefix_emitted = 0;
                 self.discarding = false;
             }
         }
-        Ok(i)
+        Ok((i, None))
     }
 
     /// Observe the raw stream without retaining oversized sequence tails.
@@ -140,6 +172,14 @@ impl TerminalStream {
 
     pub fn pending(&self) -> &[u8] {
         &self.pending
+    }
+
+    pub fn cancel_pending(&mut self) {
+        self.state = State::Ground;
+        self.utf8_pending = 0;
+        self.pending.clear();
+        self.prefix_emitted = 0;
+        self.discarding = false;
     }
 
     pub fn synchronized_update(&self) -> bool {

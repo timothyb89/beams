@@ -47,7 +47,10 @@ def fake_tsh(args):
 
     signal.signal(signal.SIGWINCH, size_changed)
     size_changed()
-    os.write(1, b"\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?2004hREMOTE READY")
+    if os.environ.get("BEAMS_OVERLAY_INITIALIZED", "1") == "1":
+        os.write(1, b"\x1bc\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?2004hREMOTE READY")
+    else:
+        os.write(1, b"PLAIN REMOTE READY")
     (root / "ready").touch()
     command = 1
     pending = b""
@@ -89,7 +92,7 @@ def fake_tsh(args):
 
 
 class Session:
-    def __init__(self, root, binary):
+    def __init__(self, root, binary, initialized=True):
         self.root = root
         self.command = 0
         self.output = bytearray()
@@ -119,6 +122,7 @@ class Session:
                     XDG_RUNTIME_DIR=str(root / "runtime"),
                     BEAMS_OVERLAY_FIXTURE=str(root),
                     TERM="xterm-256color",
+                    BEAMS_OVERLAY_INITIALIZED="1" if initialized else "0",
                 )
                 os.execve(binary, [binary, "ssh", "--terminal-overlay", "--no-client-daemon",
                                    "--purpose", "managed-session-test"], env)
@@ -167,10 +171,10 @@ class Session:
         self.wait(lambda: (self.root / "ack").exists()
                   and (self.root / "ack").read_text() == str(self.command), "remote output command")
 
-    def open(self):
+    def open(self, label=b"Beams local menu"):
         offset = len(self.output)
         self.send(b"\x1d")
-        self.wait(lambda: b"Beams local menu" in self.output[offset:], "menu opening", timeout=2)
+        self.wait(lambda: label in self.output[offset:], "menu opening", timeout=2)
 
     def close(self):
         for pid_file in ["remote-pid"]:
@@ -273,6 +277,9 @@ def run_checks(root, binary):
         for rows, cols in [(30, 90), (8, 32), (24, 100)]:
             fcntl.ioctl(session.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
             session.wait(lambda: f"{rows} {cols}\n" in (root / "sizes").read_text(), "PTY resize")
+        session.emit(b"\x1bc\x1b[?1049hREINITIALIZED AFTER RESIZE")
+        session.wait(lambda: b"REINITIALIZED AFTER RESIZE" in session.output, "resize recovery")
+        session.open()
         session.emit("\x1b[H界e\u0301 \x1b[7mdefault inverse\x1b[0m".encode())
         # A partial remote CSI must be replayed before passthrough resumes.
         session.emit(b"\x1b[38;2;")
@@ -374,7 +381,10 @@ def run_input_pressure(root, binary, outcome):
         session.wait(lambda: b"PRESSURE DRAINED" in session.output,
                      "output and query dispatch while the child stops reading")
         if outcome == "resume":
+            close_offset = len(session.output)
             session.send(b"qTYPED UNDER PRESSURE")
+            session.wait(lambda: b"\x1b[?9l\x1b[?1000l" in session.output[close_offset:],
+                         "menu closes while child input is blocked", timeout=2)
             fcntl.ioctl(session.master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 90, 0, 0))
             session.wait(lambda: "30 90\n" in (root / "sizes").read_text(),
                          "menu input and resize while the child stops reading", timeout=2)
@@ -406,6 +416,40 @@ def run_input_pressure(root, binary, outcome):
     finally:
         session.close()
 
+def run_unknown_and_recovery(root, binary):
+    session = Session(root, binary, initialized=False)
+    try:
+        offset = len(session.output)
+        session.send(b"\x1dy\x1d\x1dORDINARY INPUT")
+        session.wait(lambda: session.remote_input() == b"y\x1dORDINARY INPUT",
+                     "unknown screen defers menus and forwards ordinary/doubled-prefix input")
+        assert b"Beams local menu" not in session.output[offset:]
+        session.emit(b"\x1bc\x1b[?1049hRECOVERED BASELINE")
+        session.wait(lambda: b"RECOVERED BASELINE" in session.output, "observed initialization")
+        session.open()
+        session.send(b"f8080")
+        session.wait(lambda: b"Forward a Beam port" in session.output, "form before recovery")
+        offset = len(session.output)
+        unsafe = b"\x1b_Ga=q;opaque qy\x1b\\AFTER UNSUPPORTED"
+        session.emit(unsafe[:8])
+        session.emit(unsafe[8:])
+        session.wait(lambda: unsafe in session.output[offset:], "unsupported sequence replay after close")
+        assert session.output[offset:].count(unsafe) == 1
+        baseline = session.remote_input()
+        session.send(b"\x1dyUNSEEN KEY")
+        session.wait(lambda: session.remote_input() == baseline + b"yUNSEEN KEY",
+                     "unsupported state cannot consume unseen approval keys")
+        session.emit(b"\x1bc\x1b[?1049hRECOVERED AGAIN")
+        session.wait(lambda: b"RECOVERED AGAIN" in session.output, "second baseline recovery")
+        session.open(b"Forward a Beam port")
+        session.wait(lambda: b"8080" in session.output[offset:], "form input preserved after recovery")
+        os.kill(session.pid, signal.SIGTERM)
+        session.wait(lambda: session.status is not None, "termination during recovered form")
+        assert session.status == 143
+        session.assert_termios_restored()
+    finally:
+        session.close()
+
 
 def main():
     client = Path(__file__).resolve().parent.parent
@@ -415,6 +459,9 @@ def main():
         normal = root / "normal"
         normal.mkdir()
         run_checks(normal, binary)
+        recovery = root / "recovery"
+        recovery.mkdir()
+        run_unknown_and_recovery(recovery, binary)
         for outcome in ["resume", "signal", "overflow"]:
             pressure = root / f"pressure-{outcome}"
             pressure.mkdir()

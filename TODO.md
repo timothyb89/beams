@@ -855,7 +855,8 @@ bootstrap `Task`s.
   The [2026-11-07 handoff](docs/designs/TERMINAL_OVERLAY_DESIGN.md#implementation-status-and-next-session-handoff)
   records completed commits, validation and implementation entry points.
   DECRQSS SGR/margin replies use remote state, and child-input writes now use a
-  bounded worker queue. Next: remaining probe inventory and content provenance;
+  bounded worker queue. The explicit query inventory and conservative frame
+  recovery are implemented. Next: common drawing state and richer content provenance;
   the saved-cursor and origin/margins fixes do not complete compatibility work.
   Follow the [resolution plan](docs/designs/TERMINAL_OVERLAY_DESIGN.md) in
   separately reviewable milestones:
@@ -874,8 +875,10 @@ bootstrap `Task`s.
     relay drains each frame, including 512-query bursts. Silence never implies
     a sequence terminator. Fixtures and the controlling-PTY harness cover this.
   - [ ] Complete snapshot/eligibility coverage for further drawing/input state
-    and content provenance. The foundation's loss flag handles byte-budget
-    exhaustion, not unknown initial cells or every unsupported protocol.
+    and content provenance. Conservative evidence now rejects inherited
+    state, unsupported sequences and resize; only observed RIS establishes
+    the complete baseline. Extend initialization/region evidence without
+    guessing inherited modes/save slots.
   - [x] Shared painting for represented saved/current cursors, SGR attributes,
     origin mode and vertical margins. Menus and toasts draw under full margins
     with origin off; close restores per-buffer saved slots, including hidden
@@ -907,9 +910,10 @@ bootstrap `Task`s.
     a synchronous fixture write that made its responsiveness check depend
     on output throughput. The separately tracked forward diagnostic flake remains.
   - [ ] Content provenance and unsupported-feature policy; settle compatibility
-    UX before integrating it. Proposed default: defer unsafe painting, retain
-    explicit best-effort takeover. Cover unknown inherited screens, common
-    drawing protocols, resize/reflow invalidation and mid-dialog fallback.
+    UX before default use. Unsafe painting is now deferred; explicit best-effort
+    takeover remains. A guarded frame closes/replays unsupported output before
+    model mutation, preserving forms and bytes. Toasts withdraw before new
+    output. Complete common drawing-state coverage and covered-resize fidelity.
   - [ ] Guarded alternate-buffer menu fallback for unknown primary screens:
     preserve primary content and cursor/mode state, establish inactive-buffer
     ownership, close/replay before output overflow or a remote buffer switch,

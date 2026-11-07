@@ -62,6 +62,10 @@ impl OutputTracker {
         self.stream.pending()
     }
 
+    pub fn cancel_pending(&mut self) {
+        self.stream.cancel_pending();
+    }
+
     pub fn synchronized_update(&self) -> bool {
         self.stream.synchronized_update()
     }
@@ -365,12 +369,14 @@ mod tests {
     use ratatui::text::Span;
 
     fn model(rows: u16, cols: u16) -> TerminalModel {
-        TerminalModel::new(PtySize {
+        let mut model = TerminalModel::new(PtySize {
             rows,
             cols,
             pixel_width: 0,
             pixel_height: 0,
-        })
+        });
+        model.process(b"\x1bc");
+        model
     }
 
     fn toast(text: &str) -> Toast {

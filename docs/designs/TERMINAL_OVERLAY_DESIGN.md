@@ -472,6 +472,29 @@ write. Painting bytes did not change; workstation gates remain pending.
 
 ## Implementation status and next-session handoff
 
+Conservative repaint eligibility and frame recovery are implemented (2026-11-07).
+Inherited state starts unknown in both buffers; cursor reports, alternate
+selection and clears alone cannot establish inherited modes/save slots.
+Currently only an observed RIS (`ESC c`) establishes the complete baseline.
+This is intentionally restrictive; richer initialization/region evidence is
+future work, not permission to assume an ordinary TUI initialized every mode.
+Unsupported controls and resize invalidate eligibility until another RIS.
+Reasons distinguish inherited state, unsupported output, resize and budgets.
+
+The shared framer now returns a rejected frame's complete original bytes,
+including earlier-read prefixes. A covered unsupported frame stops before
+model mutation. The driver restores the last representable screen, closes the
+menu and resumes those bytes exactly once. Resets also close/replay physically.
+Form contents and selection survive. Toasts are removed from the last good
+state before incoming raw output can invalidate it. Menus track every buffer
+touched while hidden, including inactive-buffer updates in round trips.
+
+Covered resize remains a fidelity gate: the outer terminal may already have
+reflowed before the client sees SIGWINCH. Closing from the last snapshot is
+best effort; new painting is then suppressed. This does not establish lossless
+resize/reflow support and must not enable the default switch. Safe borrowing
+and terminal-specific resize validation remain separate work.
+
 The additional query-policy slice is implemented (2026-11-07). DEC mode reports
 cover application cursor/keypad, origin, visibility, alternate buffers, modeled
 mouse tracking/encoding and paste. Unmodeled ANSI/DEC modes receive DECRQM
@@ -535,8 +558,9 @@ Next work, in separately reviewable changes:
    all three gates; none should be ignored.
 2. Query-policy coverage above is implemented. Any new probes must extend the
    explicit inventory and preserve exactly-once replies.
-3. Implement content provenance and common drawing state, including guarded
-   fallback and mid-dialog recovery. The remaining gates below still apply.
+3. Extend common drawing state and guarded fallback. The conservative
+   eligibility/recovery slice above is implemented; initialization beyond RIS,
+   regional evidence and covered resize fidelity remain open.
 4. Update READMEs, audit and TODO with each slice. Run the client suite/build
    and all three smoke paths. Rerun independent replay when painting changes.
    Keep the default switch separate.

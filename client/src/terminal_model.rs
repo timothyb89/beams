@@ -16,6 +16,7 @@ use ratatui::style::{Color as TuiColor, Modifier, Style};
 use ratatui::Frame;
 use vt100::{Callbacks, Color as VtColor, Parser, Screen};
 
+use crate::terminal_eligibility::{self, Evidence, Unavailable};
 use crate::terminal_stream::{TerminalStream, CONTROL_SEQUENCE_LIMIT};
 
 const MAX_EVENTS: usize = 128;
@@ -418,6 +419,8 @@ pub struct TerminalModel {
     parser: Parser<EventCallbacks>,
     stream: TerminalStream,
     integrity_lost: bool,
+    evidence: Evidence,
+    overlay_buffers: Option<[bool; 2]>,
 }
 
 impl TerminalModel {
@@ -431,21 +434,24 @@ impl TerminalModel {
             ),
             stream: TerminalStream::default(),
             integrity_lost: false,
+            evidence: Evidence::default(),
+            overlay_buffers: None,
         }
     }
 
     pub fn process(&mut self, bytes: &[u8]) {
         let mut remaining = bytes;
         while !remaining.is_empty() {
-            let consumed = self
-                .stream
-                .advance(remaining, |frame| {
-                    process_frame(&mut self.parser, frame);
-                    if std::mem::take(&mut self.parser.callbacks_mut().reset_observed) {
-                        self.integrity_lost = false;
-                    }
-                    Ok::<(), std::convert::Infallible>(())
-                })
+            let (consumed, _) = self
+                .process_guarded_with_events(
+                    remaining,
+                    false,
+                    |_| {
+                        // Preserve events for offline callers, as before.
+                        Ok::<(), std::convert::Infallible>(())
+                    },
+                    false,
+                )
                 .unwrap();
             remaining = &remaining[consumed..];
             if !remaining.is_empty() {
@@ -456,31 +462,80 @@ impl TerminalModel {
 
     /// Drain events at each frame so query/effect floods cannot overflow the
     /// live relay's bounded event queue. Stop before exceeding the byte budget.
+    #[cfg(test)]
     pub fn process_with_events<E>(
         &mut self,
         bytes: &[u8],
         mut event: impl FnMut(TerminalEvent) -> Result<(), E>,
     ) -> Result<usize, E> {
-        self.stream.advance(bytes, |frame| {
+        self.process_guarded_with_events(bytes, false, &mut event, true)
+            .map(|(consumed, _)| consumed)
+    }
+
+    pub fn process_guarded_with_events<E>(
+        &mut self,
+        bytes: &[u8],
+        covered: bool,
+        mut event: impl FnMut(TerminalEvent) -> Result<(), E>,
+        drain: bool,
+    ) -> Result<(usize, Option<Vec<u8>>), E> {
+        self.stream.advance_guarded(bytes, |frame, original| {
+            let supported = terminal_eligibility::supported(original, self.parser.screen());
+            if covered && (!supported || original == b"\x1bc") {
+                return Ok(false);
+            }
+            if !supported {
+                self.evidence.invalidate(Unavailable::UnsupportedSequence);
+            }
+            if let Some(buffers) = &mut self.overlay_buffers {
+                buffers[usize::from(self.parser.screen().alternate_screen())] = true;
+            }
             process_frame(&mut self.parser, frame);
             if std::mem::take(&mut self.parser.callbacks_mut().reset_observed) {
                 self.integrity_lost = false;
+                self.evidence.observe(b"\x1bc", false);
+            } else {
+                self.evidence
+                    .observe(original, self.parser.screen().alternate_screen());
             }
-            for item in self.parser.callbacks_mut().take() {
-                event(item)?;
+            if let Some(buffers) = &mut self.overlay_buffers {
+                buffers[usize::from(self.parser.screen().alternate_screen())] = true;
             }
-            Ok(())
+            if drain {
+                for item in self.parser.callbacks_mut().take() {
+                    event(item)?;
+                }
+            }
+            Ok(true)
         })
     }
 
     pub fn discard_oversized_sequence(&mut self) {
         self.integrity_lost = true;
+        self.evidence.invalidate(Unavailable::SequenceBudget);
         self.stream.discard_sequence();
     }
 
     /// Budget exhaustion makes repainting unsafe until an observed full reset.
     pub fn can_paint(&self) -> bool {
         !self.integrity_lost
+            && self.unavailable_reason().is_none()
+            && self.evidence.can_paint(self.screen().alternate_screen())
+    }
+
+    pub fn unavailable_reason(&self) -> Option<Unavailable> {
+        self.evidence.reason
+    }
+
+    pub fn begin_overlay(&mut self) {
+        self.overlay_buffers = Some([
+            !self.screen().alternate_screen(),
+            self.screen().alternate_screen(),
+        ]);
+    }
+
+    pub fn end_overlay(&mut self) {
+        self.overlay_buffers = None;
     }
 
     pub fn drawing_state(&self) -> vt100::DrawingState {
@@ -489,6 +544,7 @@ impl TerminalModel {
 
     pub fn resize(&mut self, size: PtySize) {
         self.parser.set_size(nonzero(size.rows), nonzero(size.cols));
+        self.evidence.invalidate(Unavailable::Resize);
     }
 
     pub fn screen(&self) -> &Screen {
@@ -509,11 +565,16 @@ impl TerminalModel {
         *copy.screen_mut() = screen.clone();
         let active = self.drawing_state().alternate_screen;
         let mut bytes = crate::terminal_paint::BEGIN.to_vec();
-        let buffers = if covered_alternate == active {
-            vec![active]
-        } else {
-            vec![covered_alternate, active]
-        };
+        let touched = self.overlay_buffers.unwrap_or([false; 2]);
+        let mut buffers = Vec::new();
+        for alternate in [!active, active] {
+            if alternate == active
+                || alternate == covered_alternate
+                || touched[usize::from(alternate)]
+            {
+                buffers.push(alternate);
+            }
+        }
         for alternate in buffers {
             // Mode 47 selects a buffer without clearing it or overwriting
             // the application's DECSC saved-cursor slot as 1049 would.
@@ -621,6 +682,99 @@ mod tests {
         }
     }
 
+    #[test]
+    fn inherited_cells_and_modes_never_become_known_from_cursor_or_buffer_selection() {
+        let mut model = TerminalModel::new(size());
+        for trace in [
+            b"c".as_slice(),
+            b"\x1b[3;4H",
+            b"\x1b[6n",
+            b"\x1b[?1049h",
+            b"\x1b[2J",
+        ] {
+            model.process(trace);
+            assert!(!model.can_paint(), "trace {trace:?}");
+            assert_eq!(
+                model.unavailable_reason(),
+                Some(Unavailable::InheritedState)
+            );
+        }
+        model.process(b"\x1bc");
+        assert!(model.can_paint());
+        model.resize(size());
+        assert_eq!(model.unavailable_reason(), Some(Unavailable::Resize));
+        assert!(!model.can_paint());
+        model.process(b"\x1b[2J\x1b[H");
+        assert!(
+            !model.can_paint(),
+            "resize needs drawing/saved-state evidence, not just cells"
+        );
+        model.process(b"\x1bc");
+        assert!(model.can_paint());
+    }
+
+    #[test]
+    fn covered_unsupported_frames_stop_before_mutation_and_replay_exactly_at_every_split() {
+        for unsafe_frame in [
+            b"\x1b_Ga=q;opaque qy\x1b\\".as_slice(),
+            b"\x1b[4h",
+            b"\x1b]8;;https://example.test\x1b\\",
+        ] {
+            let trace = [b"\x1b[31msafe".as_slice(), unsafe_frame, b"after"].concat();
+            for split in 0..=trace.len() {
+                let mut model = TerminalModel::new(size());
+                model.process(b"\x1bc\x1b[?1049h");
+                model.begin_overlay();
+                let chunks = [&trace[..split], &trace[split..]];
+                let mut replay = None;
+                for (index, chunk) in chunks.iter().enumerate() {
+                    let (consumed, rejected) = model
+                        .process_guarded_with_events(chunk, true, |_| Ok::<(), ()>(()), true)
+                        .unwrap();
+                    if let Some(mut rejected) = rejected {
+                        rejected.extend_from_slice(&chunk[consumed..]);
+                        for tail in &chunks[index + 1..] {
+                            rejected.extend_from_slice(tail);
+                        }
+                        replay = Some(rejected);
+                        break;
+                    }
+                }
+                assert!(model.can_paint(), "last good snapshot remains restorable");
+                assert_eq!(model.screen().contents(), "safe");
+                assert_eq!(
+                    replay.as_deref(),
+                    Some([unsafe_frame, b"after"].concat().as_slice()),
+                    "split {split}"
+                );
+                model.end_overlay();
+                model.process(replay.as_ref().unwrap());
+                assert_eq!(
+                    model.unavailable_reason(),
+                    Some(Unavailable::UnsupportedSequence)
+                );
+                model.process(b"\x1bc");
+                assert!(model.can_paint());
+            }
+        }
+    }
+
+    #[test]
+    fn restoration_includes_inactive_buffers_touched_during_a_round_trip() {
+        let mut model = TerminalModel::new(size());
+        let before = b"\x1bc\x1b[?1049hentry";
+        model.process(before);
+        model.begin_overlay();
+        model.process(b"\x1b[?47lprimary\x1b7\x1b[?47halternate");
+        let mut physical = Parser::new(nonzero(4), nonzero(12), 0);
+        physical.process(before);
+        physical.process(b"\x1b[HLOCAL MENU");
+        physical.process(&model.restore_bytes(true));
+        physical.process(b"\x1b[?47l\x1b8!");
+        model.process(b"\x1b[?47l\x1b8!");
+        assert_eq!(physical.screen().contents(), model.screen().contents());
+        assert_eq!(physical.screen().drawing_state(), model.drawing_state());
+    }
     #[test]
     fn tracks_screen_content_and_styles() {
         let mut model = TerminalModel::new(size());
