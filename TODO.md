@@ -193,10 +193,10 @@ path (runtime delivery, shell preparation, Zellij/TUI with
   implicit Go/Rust defaults. Move the maintainer's clones/toolchains into
   a local profile first (clones need `KnownHostsCommand` below and grant
   routing for launch tasks).
-- [ ] `beams ssh` never reuses a Beam on identities whose Beams get <= 12h
-  TTL: `MIN_TTL_HOURS = 12` vs. ~11h observed for this sandbox's bot
-  identity 2026-11-07 (a second `beams ssh --purpose X` created a new
-  Beam). Make the threshold relative to the Beam's total TTL, or smaller.
+- [x] `beams ssh` never reused a Beam once the maximum Beam TTL dropped to
+  12h (`MIN_TTL_HOURS` was 12; ~11h left observed 2026-11-07). Now 6h,
+  plus `beams ssh --beam ID|UUID|PURPOSE` to connect to a specific Beam
+  regardless of time left.
 - [ ] Profile-launch follow-ups: a reattached Beam keeps the runtime it
   was launched with (no runtime upgrade path); `launch start`'s pre
   progress repeats `pending` lines; measure scp vs. bridge upload for

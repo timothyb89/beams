@@ -109,10 +109,9 @@ flags.
   a later `beams ssh` doesn't reach existing panes (same as legacy).
 - **Process matching.** Cleanup that matches `pkill -f` against a
   scratch path also matches the shell running the command; kill by PID.
-- **Beam TTL here.** This sandbox's Beams get ~11h TTL, under
-  `MIN_TTL_HOURS` (12), so `beams ssh` never reuses one and a second
-  invocation creates a new Beam; test reattachment by rerunning `launch
-  start` directly.
+- **Beam TTL.** Beams now get at most 12h; `beams ssh` reuses a tracked
+  one with more than `MIN_TTL_HOURS` (6) left, and `beams ssh --beam ID`
+  connects to a specific Beam regardless (reattaching a profile launch).
 - **Event-thread rule.** Bridge events for a Beam are handled on one
   workstation thread, and the bridge reader drops the connection if that
   thread's queue (256) fills. Keep slow work (packing post, hashing) off
@@ -160,7 +159,7 @@ done and Zellij/TUI drawn 35, `interface-ready` + `artifact-ready:post`
 the plan PATH, `BEAMS_LAUNCH_ID`, fish and the relay socket. Rerunning
 `launch start` reattached without rerunning pre. Not exercised: the
 static musl build, `--push-repo`, `builtin:core` (bash), a pre failure on
-a real Beam, `beams ssh` reuse (TTL, above).
+a real Beam, `beams ssh` reuse (the TTL threshold was 12h then; now 6h and `--beam`).
 
 ## Goals and recommendation
 

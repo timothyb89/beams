@@ -28,7 +28,9 @@ use chrono::{DateTime, Duration, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
-const MIN_TTL_HOURS: i64 = 12;
+/// A tracked Beam is reused only with more TTL than this left; `--beam`
+/// connects regardless.
+const MIN_TTL_HOURS: i64 = 6;
 const MAX_CONCURRENT_BEAMS: usize = 5;
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 const DEFAULT_LOGIN: &str = "beams";
@@ -93,6 +95,11 @@ enum Commands {
         /// legacy path does (the launch itself doesn't need it).
         #[arg(long)]
         push_repo: bool,
+        /// Connect to this existing Beam (id, uuid, or tracked purpose)
+        /// however little TTL it has left; never creates one or changes
+        /// which Beam a purpose tracks.
+        #[arg(long, conflicts_with_all = ["purpose", "region", "push_repo"])]
+        beam: Option<String>,
     },
     /// Run the workstation-side service daemon in the foreground. Normal
     /// `beams ssh` invocations start it automatically as needed.
@@ -288,6 +295,7 @@ fn main() -> anyhow::Result<ExitCode> {
             terminal_overlay,
             profile,
             push_repo,
+            beam,
         } => ssh(
             &SshOptions {
                 repo: expand_tilde(&repo),
@@ -297,6 +305,7 @@ fn main() -> anyhow::Result<ExitCode> {
                 no_client_daemon,
                 profile,
                 push_repo,
+                beam,
             },
             escape_key,
             session::DisplayOptions {
@@ -541,6 +550,7 @@ struct SshOptions {
     no_client_daemon: bool,
     profile: Option<String>,
     push_repo: bool,
+    beam: Option<String>,
 }
 
 fn ssh(
@@ -563,24 +573,39 @@ fn ssh(
     let mut state = state::State::load()?;
     let beams = tsh::list_beams()?;
 
-    let existing = state
-        .purposes
-        .get(purpose)
-        .and_then(|entry| beams.iter().find(|b| b.uuid == entry.uuid).map(|beam| (beam, entry.launch.clone())))
-        .filter(|(beam, _)| has_ttl_remaining(beam, MIN_TTL_HOURS));
+    let existing = match &options.beam {
+        Some(target) => {
+            let beam = beamcmd::resolve(target, &state, &beams)?;
+            if !has_ttl_remaining(beam, 0) {
+                bail!("beam {} has expired", beam.id);
+            }
+            // A launch recorded under any purpose tracking this Beam.
+            let launch = state.purposes.values().filter(|e| e.uuid == beam.uuid).find_map(|e| e.launch.clone());
+            Some((beam, launch))
+        }
+        None => state
+            .purposes
+            .get(purpose)
+            .and_then(|entry| beams.iter().find(|b| b.uuid == entry.uuid).map(|beam| (beam, entry.launch.clone())))
+            .filter(|(beam, _)| has_ttl_remaining(beam, MIN_TTL_HOURS)),
+    };
 
     let (beam, launch) = match existing {
         Some((beam, launch)) => {
+            let label = match &options.beam {
+                Some(_) => "as requested".to_string(),
+                None => format!("for purpose {purpose:?}"),
+            };
             match (&profile, &launch) {
                 (Some(wanted), Some(launch)) if &launch.profile != wanted => bail!(
-                    "beam {} (purpose {purpose:?}) was launched with profile {}, not {wanted}; use \
+                    "beam {} ({label}) was launched with profile {}, not {wanted}; use \
                      --purpose NAME for a new Beam, or remove this one with `tsh beams rm {}`",
                     beam.id,
                     launch.profile,
                     beam.id
                 ),
                 (Some(wanted), None) if options.profile.is_some() => bail!(
-                    "beam {} (purpose {purpose:?}) uses the legacy startup, not profile {wanted}; use \
+                    "beam {} ({label}) uses the legacy startup, not profile {wanted}; use \
                      --purpose NAME for a new Beam, or remove this one with `tsh beams rm {}`",
                     beam.id,
                     beam.id
@@ -588,7 +613,7 @@ fn ssh(
                 _ => {}
             }
             eprintln!(
-                "beams: reusing beam {} ({}) for purpose {purpose:?}{}",
+                "beams: reusing beam {} ({}) {label}{}",
                 beam.id,
                 beam.uuid,
                 launch.as_ref().map(|l| format!(", launch {} ({})", l.launch_id, l.profile)).unwrap_or_default()

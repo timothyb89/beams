@@ -18,7 +18,7 @@ The first half runs inside the ephemeral Beams environment:
 Secondarily, we'll want a client app to spawn beams and interact with the remote installer/management app:
 - Rough UX: `beams ssh` by default spawns a "fully configured" beam *or* reuses one if "available". If a fresh instance is required, it copies files (`tsh beams scp ...`), runs minimal install (bootstrap), and drops into a "minimally viable" env as quickly as possible (zellij) with a pane showing async task progress if any.
 - The wrapper should run `tsh beams add -f json` to create a new beam and retrieve its ID
-- On "availability": it should spawn a new beam there either is no existing beam instance, or if it expires in under 12 hours (they have a 24 hour TTL which cannot be extended).
+- On "availability": it should spawn a new beam there either is no existing beam instance, or if it expires in under 6 hours (Beams now have a 12 hour maximum TTL, earlier 24, which cannot be extended). `beams ssh --beam ID` connects to a specific Beam regardless of time left.
 - Additional beams can be spawned on the fly for other reasons (e.g. checking out a specific PR for review). Global maximum is ~5 concurrent beams.
 - The client app should be able to sync files between the beam and client machine - this `beams` repo itself (bootstrap - it contains the ssh key, so git clone can't work)
 - Git repo sync is also of interest long term, between client PC and beam, so we'll want to discuss options for that eventually. git push/pull can work (if we build a nice UX on top) or something like docker mutagen to mirror the filesystems live. We're already using that for `rdocker` (~/rdocker)

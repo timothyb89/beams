@@ -114,10 +114,11 @@ daemons with a fake `tsh`.
 ```sh
 beams ssh [--repo ~/beams] [--purpose default] [--region REGION] [--login beams]
           [--profile PROFILE [--push-repo]]
+beams ssh --beam ID|UUID|PURPOSE [--profile PROFILE]
 ```
 
 1. Looks up the beam tracked for `--purpose` (see "State" below). If it
-   exists and has more than 12 hours of TTL left (beams can't have their
+   exists and has more than 6 hours of TTL left (beams can't have their
    TTL extended), reuses it - no file copy, straight to connecting.
 2. Otherwise spawns a new beam (`tsh beams add`), refusing if already at
    the 5-concurrent-beam limit (`tsh beams rm` something first).
@@ -157,6 +158,11 @@ beams ssh [--repo ~/beams] [--purpose default] [--region REGION] [--login beams]
 
 On reuse, steps 3-4 are skipped entirely - a reused beam is assumed to
 already be bootstrapped from a prior run.
+
+`--beam` skips the lookup: it connects to that existing Beam however
+little TTL it has left (only an expired one is refused), never creates
+one, and leaves purpose tracking alone. A Beam launched from a profile
+(recorded under any purpose) reattaches through `launch start`.
 
 ### Profile launches (`--profile`, opt-in)
 
