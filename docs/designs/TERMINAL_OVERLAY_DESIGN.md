@@ -435,18 +435,47 @@ Resolving these remaining gaps is necessary to finish milestone 2 alongside
 the compatibility work; the overlay stays opt-in. The independent
 graphical/workstation matrix remains pending.
 
-Next: milestone 3's DECRQSS dispatch and remote-state replies using these
-snapshots, plus query-write backpressure. Retain the remaining painting and
-compatibility items above as explicit gates before the default switch.
+Milestone 3's DECRQSS slice below now uses these snapshots. Retain the remaining
+painting and compatibility items above as explicit gates before the default switch.
+
+## Remote setting query slice
+
+Implemented 2026-11-07. The shared framer holds a string's ST together, and
+separates an aborting ESC command. DCS unhook alone is no longer treated as
+completion: CAN/SUB, an aborting escape and budget exhaustion never synthesize
+a reply. Complete bounded DECRQSS `m` and `r` requests receive SGR and vertical
+margin replies from the remote snapshot at ST, before subsequent output.
+
+Unmodeled DECRQSS settings receive `DCS 0 $ r ST`. SGR also receives that negative
+response after an unmodeled attribute until an observed full reset; a partial
+attribute snapshot is not advertised as complete. Hidden XTGETTCAP receives
+`DCS 0 + r ST`, because its dynamically adjusted key capabilities may depend on
+temporary local input modes. Other DCS commands remain unsupported while
+hidden. With the menu closed, original requests reach the physical terminal
+and the model injects no replies. Incoming physical DCS replies remain opaque
+to local menu shortcuts.
+
+The protocol encoding follows xterm's official control-sequence specification,
+under "Request Status String (DECRQSS)" and "Request Termcap/Terminfo String
+(XTGETTCAP)". This is a limited setting-query implementation, not a complete
+terminal-probe inventory or a general unsupported-feature policy.
+
+Validation: all 212 client unit tests and 3 integration tests pass, with all
+three acceptance gates unignored. The client build, both managed-session modes
+and expanded controlling-PTY harness pass. Fixtures cover every request split,
+cancellation, overflow, immediate state changes, unsupported responses,
+split physical DCS replies and exactly-once passthrough. The existing burst
+responsiveness assertion missed its two-second deadline once and passed on
+rerun; retain this timing sensitivity in future validation. Painting bytes did
+not change; independent replay and workstation gates remain as recorded below.
 
 ## Implementation status and next-session handoff
 
-As of 2026-11-06, implementation is at `28eb7a8`. **Keep the overlay opt-in;
-takeover remains the default.** Two original release gates now pass
-(`overlay_acceptance_saved_cursor`, `overlay_acceptance_origin_and_margins`).
-`overlay_acceptance_dcs_query` is still ignored and fails when explicitly run.
-The represented-state painting slice is complete; compatibility and content
-provenance are not.
+As of 2026-11-07, the represented-state painting and remote setting query
+slices are implemented. **Keep the overlay opt-in; takeover remains the
+default.** All three original release gates pass unignored, including
+`overlay_acceptance_dcs_query`. Compatibility and content provenance remain
+incomplete; passing these three fixtures does not establish default readiness.
 
 Completed work is preserved in these commits:
 
@@ -469,7 +498,7 @@ Implementation entry points:
 | File | Responsibility |
 | --- | --- |
 | `client/src/terminal_stream.rs` | Shared framing, partial sequences, synchronized-output boundaries and the 64 KiB sequence budget |
-| `client/src/terminal_model.rs` | Remote shadow state, ordered events, query replies and the remaining DCS acceptance gate |
+| `client/src/terminal_model.rs` | Remote shadow state, ordered events and remote-state CPR/DECRQSS replies |
 | `client/src/terminal_paint.rs` | Shared local drawing setup and represented-state restoration |
 | `client/src/session.rs` | `drain_output`, hidden-output dispatch, raw replay, menu snapshots and child-input writes |
 | `client/src/session/toast.rs` | Physical-output tracker and toast paint/removal |
@@ -477,37 +506,24 @@ Implementation entry points:
 | `client/tests/terminal-overlay-smoke.py`, `client/tests/terminal-paint-reference.cjs` | Live controlling-PTY coverage and optional independent replay |
 | `bootstrap/src/fetch.rs` | Persistent request acknowledgement; no new notice protocol |
 
-The next implementation slice is milestone 3, in separately reviewable changes:
+Next work, in separately reviewable changes:
 
 1. Establish the baseline using the
    [repeatable validation commands](../development/terminal-overlay.md#repeatable-validation).
-   Run the remaining gate separately:
-   `cargo test --manifest-path client/Cargo.toml overlay_acceptance_dcs_query -- --ignored`.
-   Its failure is expected: the model currently emits `UnhandledDcs`, while the
-   original gate expects a query event.
-2. Add semantic dispatch for complete, bounded DECRQSS requests, starting with
-   SGR (`m`) and vertical margins (`r`). Answer from the remote state at the
-   query byte, before consuming subsequent state changes. Do not forward these
-   setting probes to a physical terminal whose settings local painting changed.
-   Distinguish terminated requests from cancelled strings; DCS callbacks alone
-   must not turn cancellation into a completed query.
-3. Change the original DCS gate to assert the correct remote-state reply and
-   unignore it once implemented. Add protocol-defined unsupported replies where
-   appropriate, and an explicit policy for unmodeled settings. Inventory other
-   probes separately; physical capability queries may be relayed only when
-   painting leaves their answer unchanged.
-4. Cover queries split across byte boundaries, cancellation/overflow, mixed
-   output, state changes immediately after a query and exactly-once replies.
-   Test both menu-open dispatch and passthrough, which must not acquire a
-   duplicate model-generated reply. Incoming physical replies must reach the
-   child without triggering menu actions.
-5. Address child-input backpressure. Replies still use synchronous
+   `cargo test --manifest-path client/Cargo.toml overlay_acceptance` now runs
+   all three gates; none should be ignored.
+2. Address child-input backpressure. Replies still use synchronous
    `write_all`/flush; the passing 512-query test does not establish behavior when
    the peer stops reading. Use a bounded, ordered write path and exercise input,
    signal, resize and output responsiveness under that pressure.
-6. Update the READMEs, audit and TODO with the implemented behavior and remaining
-   limits. Run the client suite/build and all three smoke paths. Rerun independent
-   replay when painting changes. Keep the default switch separate.
+3. Inventory additional DECRQM, physical probes and advanced keyboard queries.
+   Extend represented state or return explicit unsupported results; only relay
+   a physical query when temporary painting leaves its answer unchanged.
+4. Implement content provenance and common drawing state, including guarded
+   fallback and mid-dialog recovery. The remaining gates below still apply.
+5. Update READMEs, audit and TODO with each slice. Run the client suite/build
+   and all three smoke paths. Rerun independent replay when painting changes.
+   Keep the default switch separate.
 
 The overlay slice's recorded validation is **206 passing client unit tests, one ignored
 DCS gate, and 3 passing integration tests**. The client build, takeover smoke,

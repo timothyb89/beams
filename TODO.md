@@ -848,14 +848,13 @@ bootstrap `Task`s.
   inverse default colors, bisected wide toast glyphs, output starvation and
   ordinary mode cleanup on termination. Private CPR and common input-mode
   reports also use remote state. Saved-cursor and origin/margins acceptance
-  gates now pass in the ordinary suite; the DCS query gate remains ignored
-  and failing. Keep opt-in.
+  gates and the DCS query gate now pass in the ordinary suite. Keep opt-in.
   Also resolve unknown initial/inactive screen state,
   unsupported drawing/input protocols, and independent
   workstation font/reflow/lifecycle validation before changing the default.
   The [2026-11-06 handoff](docs/designs/TERMINAL_OVERLAY_DESIGN.md#implementation-status-and-next-session-handoff)
   records completed commits, validation and implementation entry points.
-  Next: DECRQSS replies from remote state, then child-input backpressure;
+  DECRQSS SGR/margin replies now use remote state. Next: child-input backpressure;
   the saved-cursor and origin/margins fixes do not complete compatibility work.
   Follow the [resolution plan](docs/designs/TERMINAL_OVERLAY_DESIGN.md) in
   separately reviewable milestones:
@@ -889,9 +888,11 @@ bootstrap `Task`s.
     from the model. Establish the supported terminal behavior or defer painting
     on those variants before changing the default.
   - [ ] Ordered remote/physical query dispatch, starting with DECRQSS and
-    origin-relative CPR. Unignore the DCS acceptance gate; test exactly-once
-    replies and bounded query pressure. Origin-relative CPR is implemented;
-    audit child-input backpressure (reply writes are still synchronous).
+    origin-relative CPR. Both are implemented and all three acceptance gates
+    are unignored. Split/cancelled DCS and exactly-once replies have model/PTY
+    regressions. Unsupported DECRQSS settings and hidden XTGETTCAP receive
+    negative replies; unknown DCS remains unsupported. Complete the probe
+    inventory and audit child-input backpressure (writes are still synchronous).
   - [ ] Content provenance and unsupported-feature policy; settle compatibility
     UX before integrating it. Proposed default: defer unsafe painting, retain
     explicit best-effort takeover. Cover unknown inherited screens, common

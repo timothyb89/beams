@@ -25,7 +25,10 @@ const MAX_EVENT_BYTES: usize = 256 * 1024;
 pub enum TerminalEvent {
     AudibleBell,
     VisualBell,
-    ResizeRequest { rows: u16, cols: u16 },
+    ResizeRequest {
+        rows: u16,
+        cols: u16,
+    },
     WindowTitle(Vec<u8>),
     WindowIconName(Vec<u8>),
     CopyToClipboard {
@@ -41,7 +44,7 @@ pub enum TerminalEvent {
     Reply(Vec<u8>),
     /// Device/color/window queries still belong to the physical terminal.
     Query(Vec<u8>),
-    /// Bounded DCS callback exposure; semantic query dispatch is still pending.
+    /// Unsupported DCS commands are diagnostic-only while output is hidden.
     UnhandledDcs(Vec<u8>),
     /// Explicit diagnostic for a consumer that did not drain its event queue.
     EventOverflow,
@@ -56,6 +59,8 @@ struct EventCallbacks {
     events: VecDeque<TerminalEvent>,
     event_bytes: usize,
     dcs: Option<Vec<u8>>,
+    ended_dcs: Option<Vec<u8>>,
+    attributes_unknown: bool,
     reset_observed: bool,
 }
 
@@ -93,6 +98,8 @@ impl Callbacks for EventCallbacks {
     fn terminal_reset(&mut self, _: &mut Screen) {
         self.reset_observed = true;
         self.dcs = None;
+        self.ended_dcs = None;
+        self.attributes_unknown = false;
     }
 
     fn dcs_hook(
@@ -129,10 +136,9 @@ impl Callbacks for EventCallbacks {
     }
 
     fn dcs_unhook(&mut self, _: &mut Screen) {
-        if let Some(mut dcs) = self.dcs.take() {
-            dcs.extend_from_slice(b"\x1b\\");
-            self.push(TerminalEvent::UnhandledDcs(dcs));
-        }
+        // vte unhooks on ESC as well as CAN/SUB. The stream controller must
+        // confirm ST before dispatching this candidate.
+        self.ended_dcs = self.dcs.take();
     }
 
     fn audible_bell(&mut self, _: &mut Screen) {
@@ -183,6 +189,11 @@ impl Callbacks for EventCallbacks {
         params: &[&[u16]],
         final_byte: char,
     ) {
+        if i1.is_none() && i2.is_none() && final_byte == 'm' {
+            // The backend rejected an attribute. Do not report a partial SGR
+            // state as complete; a full reset reestablishes confidence.
+            self.attributes_unknown = true;
+        }
         if i2.is_none() && final_byte == 'n' {
             if i1.is_none() && params == [&[5][..]] {
                 self.push(TerminalEvent::Reply(b"\x1b[0n".to_vec()));
@@ -322,6 +333,57 @@ impl TerminalEvent {
     }
 }
 
+/// The framer delivers a complete ST in the same frame as its string, and
+/// separates an aborting ESC command. Never infer completion from unhook.
+fn process_frame(parser: &mut Parser<EventCallbacks>, frame: &[u8]) {
+    parser.process(frame);
+    let Some(mut dcs) = parser.callbacks_mut().ended_dcs.take() else {
+        return;
+    };
+    if !frame.ends_with(b"\x1b\\") {
+        return;
+    }
+    let event = if let Some(setting) = dcs.strip_prefix(b"\x1bP$q") {
+        let state = parser.screen().drawing_state();
+        let value = match setting {
+            b"m" if !parser.callbacks().attributes_unknown => {
+                // Snapshot SGR is a reset followed by attribute commands.
+                // DECRQSS returns their parameters as one CSI payload.
+                let params = state
+                    .attributes
+                    .split("\x1b[")
+                    .filter_map(|s| s.strip_suffix('m'))
+                    .map(|s| if s.is_empty() { "0" } else { s })
+                    .collect::<Vec<_>>()
+                    .join(";");
+                Some(format!("{params}m"))
+            }
+            b"r" => {
+                let buffer = if state.alternate_screen {
+                    state.alternate
+                } else {
+                    state.primary
+                };
+                let (top, bottom) = buffer.scroll_region;
+                Some(format!("{};{}r", top + 1, bottom + 1))
+            }
+            _ => None,
+        };
+        TerminalEvent::Reply(match value {
+            Some(value) => format!("\x1bP1$r{value}\x1b\\").into_bytes(),
+            None => b"\x1bP0$r\x1b\\".to_vec(),
+        })
+    } else if dcs.starts_with(b"\x1bP+q") {
+        // XTGETTCAP includes dynamically adjusted key capabilities. Local UI
+        // changes input modes; do not relay probes against those settings.
+        TerminalEvent::Reply(b"\x1bP0+r\x1b\\".to_vec())
+    } else {
+        dcs.extend_from_slice(b"\x1b\\");
+        TerminalEvent::UnhandledDcs(dcs)
+    };
+    parser.callbacks_mut().push(event);
+}
+
 pub struct TerminalModel {
     parser: Parser<EventCallbacks>,
     stream: TerminalStream,
@@ -348,7 +410,7 @@ impl TerminalModel {
             let consumed = self
                 .stream
                 .advance(remaining, |frame| {
-                    self.parser.process(frame);
+                    process_frame(&mut self.parser, frame);
                     if std::mem::take(&mut self.parser.callbacks_mut().reset_observed) {
                         self.integrity_lost = false;
                     }
@@ -370,7 +432,7 @@ impl TerminalModel {
         mut event: impl FnMut(TerminalEvent) -> Result<(), E>,
     ) -> Result<usize, E> {
         self.stream.advance(bytes, |frame| {
-            self.parser.process(frame);
+            process_frame(&mut self.parser, frame);
             if std::mem::take(&mut self.parser.callbacks_mut().reset_observed) {
                 self.integrity_lost = false;
             }
@@ -990,15 +1052,15 @@ mod tests {
     }
 
     #[test]
-    fn dcs_callbacks_preserve_split_headers_and_bodies() {
-        let query = b"\x1bP$qm\x1b\\";
+    fn dcs_queries_preserve_split_headers_and_bodies() {
+        let query = b"\x1b[31m\x1bP$qm\x1b\\\x1b[32m";
         for split in 0..=query.len() {
             let mut model = TerminalModel::new(size());
             model.process(&query[..split]);
             model.process(&query[split..]);
             assert_eq!(
                 model.take_events(),
-                vec![TerminalEvent::UnhandledDcs(query.to_vec())],
+                vec![TerminalEvent::Reply(b"\x1bP1$r0;31m\x1b\\".to_vec())],
                 "split at {split}",
             );
         }
@@ -1054,13 +1116,74 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "default gate: DECRQSS/DCS query relay and remote-state replies"]
     fn overlay_acceptance_dcs_query() {
         let mut model = TerminalModel::new(size());
-        model.process(b"\x1bP$qm\x1b\\");
+        model.process(b"\x1b[1;38;2;10;20;30m\x1b[2;4r\x1bP$qm\x1b\\\x1bP$qr\x1b\\\x1b[0m\x1b[r");
         assert_eq!(
             model.take_events(),
-            vec![TerminalEvent::Query(b"\x1bP$qm\x1b\\".to_vec())]
+            vec![
+                TerminalEvent::Reply(b"\x1bP1$r0;38;2;10;20;30;1m\x1b\\".to_vec()),
+                TerminalEvent::Reply(b"\x1bP1$r2;4r\x1b\\".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dcs_cancellation_and_overflow_never_answer_a_partial_request() {
+        for cancel in [b"\x18".as_slice(), b"\x1a", b"\x1b[31m", b"\x1bc"] {
+            let mut trace = b"\x1bP$qm".to_vec();
+            trace.extend_from_slice(cancel);
+            trace.extend_from_slice(b"after\x1bP$qr\x1b\\");
+            for split in 0..=trace.len() {
+                let mut model = TerminalModel::new(size());
+                model.process(&trace[..split]);
+                model.process(&trace[split..]);
+                let replies: Vec<_> = model
+                    .take_events()
+                    .into_iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            TerminalEvent::Reply(_) | TerminalEvent::UnhandledDcs(_)
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    replies,
+                    vec![TerminalEvent::Reply(b"\x1bP1$r1;4r\x1b\\".to_vec())],
+                    "cancel {cancel:?}, split {split}"
+                );
+            }
+        }
+        let mut model = TerminalModel::new(size());
+        let mut trace = b"\x1bP$q".to_vec();
+        trace.extend(std::iter::repeat_n(b'm', CONTROL_SEQUENCE_LIMIT));
+        trace.extend_from_slice(b"\x1b\\");
+        model.process(&trace);
+        assert!(model.take_events().is_empty());
+        assert!(!model.can_paint());
+    }
+
+    #[test]
+    fn unsupported_setting_and_capability_queries_receive_negative_replies() {
+        let mut model = TerminalModel::new(size());
+        model.process(b"\x1bP$q q\x1b\\\x1bP$qunknown\x1b\\\x1bP+q436f\x1b\\");
+        assert_eq!(
+            model.take_events(),
+            vec![
+                TerminalEvent::Reply(b"\x1bP0$r\x1b\\".to_vec()),
+                TerminalEvent::Reply(b"\x1bP0$r\x1b\\".to_vec()),
+                TerminalEvent::Reply(b"\x1bP0+r\x1b\\".to_vec()),
+            ]
+        );
+        model.process(b"\x1b[9m\x1bP$qm\x1b\\");
+        assert!(model
+            .take_events()
+            .contains(&TerminalEvent::Reply(b"\x1bP0$r\x1b\\".to_vec())));
+        model.process(b"\x1bc\x1bP$qm\x1b\\");
+        assert_eq!(
+            model.take_events(),
+            vec![TerminalEvent::Reply(b"\x1bP1$r0m\x1b\\".to_vec())]
         );
     }
 }

@@ -1,16 +1,16 @@
 # Terminal overlay readiness audit
 
-Audit date: 2026-11-06. **Keep `--terminal-overlay` opt-in.** The recommended
+Audit date: 2026-11-06; updated 2026-11-07. **Keep `--terminal-overlay` opt-in.** The recommended
 tests exposed interactive bugs, now covered by regressions, and three original
-release gates. Two gates are resolved. Passing the ordinary test suite is
+release gates. All three gates are resolved. Passing the ordinary test suite is
 not sufficient to enable this path by default.
 
 The proposed [resolution plan](../designs/TERMINAL_OVERLAY_DESIGN.md) sequences
 bounded parsing and state snapshots, reversible painting, query dispatch,
 compatibility/lifecycle behavior, independent validation and the final default
 switch. The model/backend foundation and represented cursor/margin painting
-are implemented. The saved-cursor and origin/margins gates pass; DCS queries
-and later compatibility/lifecycle milestones remain pending.
+are implemented. Saved-cursor, origin/margins and DCS queries pass; input
+backpressure and later compatibility/lifecycle milestones remain pending.
 The [next-session handoff](../designs/TERMINAL_OVERLAY_DESIGN.md#implementation-status-and-next-session-handoff)
 records the current commits, code entry points and concrete next steps.
 
@@ -39,8 +39,7 @@ against an unpainted baseline.
 ## Reproducible blockers
 
 Three acceptance tests in `client/src/terminal_model.rs` are executable release
-gates. The first two now pass unignored; the remaining DCS gate is still ignored
-and failing:
+gates. All three now pass unignored:
 
 1. **Saved cursor/attributes:** `overlay_acceptance_saved_cursor`. An
    application can issue DECSC (`ESC 7`) while hidden, then DECRC (`ESC 8`)
@@ -62,15 +61,16 @@ and failing:
    (`DCS $ q ... ST`) requests. A remote application that probes terminal
    settings while hidden can wait indefinitely or time out. A focused backend
    extension now exposes bounded DCS callbacks, but they are not yet
-   dispatched as queries. Attribute/mode queries must use remote state where
-   the dialog has temporarily changed physical state; forwarding alone is
-   insufficient.
+   dispatched as queries. **Resolved:** complete ST-terminated DECRQSS SGR and
+   margin requests now receive remote-state replies before subsequent output
+   changes state. CAN/SUB/aborting ESC and oversized strings never fabricate
+   replies. Unmodeled settings and hidden XTGETTCAP receive negative replies;
+   other DCS remains unsupported. Passthrough never adds a model reply.
 
-Run the passing gates and the remaining failing gate separately:
+Run all three gates in the ordinary suite:
 
 ```sh
 cargo test --manifest-path client/Cargo.toml overlay_acceptance
-cargo test --manifest-path client/Cargo.toml overlay_acceptance -- --ignored
 ```
 
 Additional audit findings to resolve or explicitly handle with a compatibility

@@ -306,6 +306,17 @@ model (including origin-relative cursor reports), and device/window queries
 reach the physical terminal. The output queue is bounded and yields to
 input/resize handling during long bursts.
 
+Complete, bounded DECRQSS requests for SGR (`m`) and vertical margins (`r`)
+also receive remote-state replies at the request's terminator, before later
+output changes those settings. Cancelled or oversized DCS strings receive no
+synthetic reply. Unmodeled DECRQSS settings receive the protocol's unsupported
+response; SGR also reports unsupported after an unmodeled attribute until a
+full reset. XTGETTCAP receives an unsupported response while hidden because
+its dynamic keyboard capabilities may reflect the menu's temporary input
+modes. Other DCS commands remain unsupported while hidden. In passthrough,
+original probes and physical replies remain byte-exact and the model sends
+no extra replies.
+
 The model and physical-output tracker share a bounded stream framer. It holds
 at most 64 KiB of an unfinished control sequence and feeds complete sequences
 to the allocating emulator only when they fit that budget. If hidden output
@@ -321,11 +332,11 @@ The client uses a focused, vendored `vt100` 0.18.1 extension in
 `vendor/vt100` for read-only current/saved cursor and attribute snapshots,
 per-buffer origin/margins, streaming DCS callbacks and reset notifications.
 Bursts of complete query/effect sequences are drained at each parsed frame,
-avoiding event-queue pressure. DCS query answers and support for further
-drawing/input state remain pending.
+avoiding event-queue pressure. Broader drawing/input state and content
+provenance remain pending.
 
 The [readiness audit](../docs/development/terminal-overlay.md) records the
-expanded coverage and remaining default blockers: DCS queries, unknown
+expanded coverage and remaining default blockers: unknown
 initial/inactive screens, differing saved-state semantics across emulators,
 and unsupported drawing/input protocols. The existing
 takeover path remains the fallback and default.

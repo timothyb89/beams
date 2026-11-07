@@ -16,7 +16,7 @@ The client terminal overlay's default-readiness work is planned in
 remote-state restoration, query routing, compatibility policy and independent
 terminal validation. The overlay remains opt-in until those gates pass.
 See the [overlay handoff](TERMINAL_OVERLAY_DESIGN.md#implementation-status-and-next-session-handoff)
-for completed commits, validation and the next query-dispatch work.
+for completed commits, validation and the remaining query/compatibility work.
 
 Configurable environment launches and the split between pre-interface
 prerequisites and initialization shown in the TUI are proposed in

@@ -77,6 +77,19 @@ impl TerminalStream {
                 return Ok(i);
             }
             let byte = bytes[i];
+            if self.state == State::StringEscape
+                && !matches!(byte, b'\\' | 0x18 | 0x1a)
+                && !self.discarding
+            {
+                // Keep ST together so consumers can distinguish a completed
+                // DCS from vte's unhook on ESC/CAN/SUB. Any other ESC command
+                // aborts the string; emit its prefix before the new command.
+                frame(&self.pending[self.prefix_emitted..])?;
+                self.pending.clear();
+                self.pending.push(0x1b);
+                self.prefix_emitted = 1;
+                self.state = State::Escape;
+            }
             if !self.discarding {
                 self.pending.push(byte);
             }
@@ -84,10 +97,7 @@ impl TerminalStream {
             self.step(byte);
             i += 1;
             if byte == 0x1b
-                && matches!(
-                    previous,
-                    State::Osc | State::String | State::Csi | State::EscapeIntermediate
-                )
+                && matches!(previous, State::Csi | State::EscapeIntermediate)
                 && !self.discarding
             {
                 frame(&self.pending[self.prefix_emitted..])?;

@@ -206,6 +206,27 @@ def run_checks(root, binary):
         session.wait(lambda: session.remote_input() == storm_baseline + b"\x1b[0n" * 512,
                      "query burst answered without queue loss")
 
+        # Settings observe remote state at ST, before following state changes.
+        # Aborting a DCS with ESC/CAN/SUB must never produce a reply.
+        dcs_baseline = session.remote_input()
+        session.emit(b"\x1b[31m\x1b[2;23r\x1bP$q")
+        session.emit(b"m\x1b")
+        session.emit(b"\\\x1b[32m\x1bP$qr\x1b\\\x1b[r"
+                     b"\x1bP$q q\x1b\\\x1bP+q436f\x1b\\")
+        dcs_replies = (b"\x1bP1$r0;31m\x1b\\\x1bP1$r2;23r\x1b\\"
+                       b"\x1bP0$r\x1b\\\x1bP0+r\x1b\\")
+        session.wait(lambda: session.remote_input() == dcs_baseline + dcs_replies,
+                     "split DECRQSS remote-state and unsupported replies")
+        session.emit(b"\x1bP$qm\x18\x1bP$qm\x1a\x1bP$qm\x1b[0m\x1b[5n")
+        session.wait(lambda: session.remote_input() == dcs_baseline + dcs_replies + b"\x1b[0n",
+                     "cancelled DECRQSS requests produce no replies")
+        # Physical DCS replies are opaque even with menu keys in their body.
+        physical_reply = b"\x1bP1$rqy\x1b\\"
+        session.send(physical_reply[:6])
+        session.send(physical_reply[6:])
+        session.wait(lambda: session.remote_input().endswith(physical_reply),
+                     "split physical DCS reply bypasses menu shortcuts")
+
         # Emit an OSC split across commands, including its ST terminator.
         session.emit(b"\x1b]2;OVERLAY TITLE")
         session.emit(b"\x1b\\\x1b]52;c;SGVsbG8=\x07\x1b]52;c;?\x07")
@@ -229,6 +250,15 @@ def run_checks(root, binary):
         session.wait(lambda: b"1;2;3mAFTER CLOSE" in session.output, "remote continuation")
         session.send(b"REMOTE INPUT")
         session.wait(lambda: session.remote_input().endswith(b"REMOTE INPUT"), "input after menu close")
+        # Only the physical terminal answers in passthrough.
+        passthrough_baseline = session.remote_input()
+        passthrough_offset = len(session.output)
+        session.emit(b"\x1bP$qm\x1b\\PASSTHROUGH QUERY")
+        session.wait(lambda: b"\x1bP$qm\x1b\\PASSTHROUGH QUERY" in session.output[passthrough_offset:],
+                     "passthrough DECRQSS reaches the physical terminal")
+        session.send(b"\x1bP1$r0m\x1b\\")
+        session.wait(lambda: session.remote_input() == passthrough_baseline + b"\x1bP1$r0m\x1b\\",
+                     "exactly one physical DECRQSS reply in passthrough")
         assert "24 99\n" not in (root / "sizes").read_text(), "overlay injected a resize pulse"
         assert session.output.count(b"\x1b]52;c;SGVsbG8=\x1b\\") == 1, "clipboard effect duplicated"
 
