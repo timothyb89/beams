@@ -729,6 +729,10 @@ mod tests {
             b"\x1b_Ga=q;opaque qy\x1b\\".as_slice(),
             b"\x1b[7777h",
             b"\x1b]50;unmodeled-font\x1b\\",
+            b"\x1b[3J",
+            b"\x1b[?999n",
+            b"\x1b[?1;2$p",
+            b"\x05",
         ] {
             let trace = [b"\x1b[31msafe".as_slice(), unsafe_frame, b"after"].concat();
             for split in 0..=trace.len() {
@@ -870,6 +874,7 @@ mod tests {
             b"\x1b[7 q",
             b"\x1b(A",
             b"\x1b]8;id=x;\x1b\\",
+            b"\x1b)0\x0e\x1b7\x1b)B\x0f\x1b8",
         ] {
             let mut model = TerminalModel::new(size());
             model.process(b"\x1bc");

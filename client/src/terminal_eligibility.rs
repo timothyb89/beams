@@ -54,7 +54,28 @@ impl Evidence {
 /// remains authoritative for represented state; rejected output stays raw.
 pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
     if !frame.starts_with(b"\x1b") {
-        return true;
+        return std::str::from_utf8(frame).is_ok_and(|text| {
+            text.chars().all(|c| {
+                if c.is_control() {
+                    matches!(
+                        c,
+                        '\0' | '\x07'
+                            | '\x08'
+                            | '\t'
+                            | '\n'
+                            | '\x0b'
+                            | '\x0c'
+                            | '\r'
+                            | '\x0e'
+                            | '\x0f'
+                            | '\x18'
+                            | '\x1a'
+                    )
+                } else {
+                    c != '\u{fffd}'
+                }
+            })
+        });
     }
     if matches!(frame, b"\x1b7" | b"\x1b[s" | b"\x1b[0s")
         && screen.drawing_state().hyperlink.is_some()
@@ -71,7 +92,9 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
         } else {
             state.primary
         };
-        return !buffer.saved_cursor.origin_mode && buffer.saved_cursor.col < screen.size().1.get();
+        return !buffer.saved_cursor.origin_mode
+            && buffer.saved_cursor.col < screen.size().1.get()
+            && buffer.saved_character_sets == state.character_sets;
     }
     if let Some(body) = frame.strip_prefix(b"\x1b[") {
         let Some((&action, args)) = body.split_last() else {
@@ -102,11 +125,23 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
                         })
                 });
             }
-            return matches!(action, b'c' | b'n' | b'u' | b'm')
-                || (action == b'p' && args.ends_with(b"$"));
+            return action == b'c'
+                || (action == b'n' && modes == b"6")
+                || (action == b'u' && matches!(modes, b"" | b"0"))
+                || (action == b'm' && matches!(modes, b"" | b"0" | b"1" | b"2" | b"3" | b"4"))
+                || (action == b'p'
+                    && modes
+                        .strip_suffix(b"$")
+                        .and_then(|s| std::str::from_utf8(s).ok())
+                        .and_then(|s| s.parse::<u16>().ok())
+                        .is_some());
         }
         if matches!(action, b'p') && args.ends_with(b"$") {
-            return true;
+            return args
+                .strip_suffix(b"$")
+                .and_then(|s| std::str::from_utf8(s).ok())
+                .and_then(|s| s.parse::<u16>().ok())
+                .is_some();
         }
         if args.starts_with(b">") || args.starts_with(b"=") {
             return action == b'c' || (action == b'q' && args == b">0");
@@ -156,6 +191,21 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
         }
         if args.iter().any(|b| !b.is_ascii_digit() && *b != b';') {
             return false;
+        }
+        if args.split(|b| *b == b';').any(|arg| {
+            !arg.is_empty()
+                && std::str::from_utf8(arg)
+                    .ok()
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .is_none()
+        }) {
+            return false;
+        }
+        if matches!(action, b'J' | b'K') {
+            return matches!(args, b"" | b"0" | b"1" | b"2");
+        }
+        if action == b'n' {
+            return matches!(args, b"5" | b"6");
         }
         return matches!(
             action,

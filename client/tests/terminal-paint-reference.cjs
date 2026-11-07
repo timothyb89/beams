@@ -44,6 +44,18 @@ async function main() {
     const expected = new Terminal(options);
     const actual = new Terminal(options);
     try {
+      if (trace.expectedModes) {
+        await write(actual, trace.physical);
+        for (const [name, value] of Object.entries(trace.expectedModes)) {
+          assert.equal(actual.modes[name], value, `${trace.name}: ${name}`);
+        }
+        const pen = actual._core._inputHandler._curAttrData;
+        assert.equal(!!pen.isBold(), trace.expectedPen.bold, `${trace.name}: bold`);
+        assert.equal(pen.getFgColor(), trace.expectedPen.fg, `${trace.name}: foreground`);
+        assert.equal(actual.buffer.active.type, trace.expectedBuffer, `${trace.name}: buffer`);
+        assert.equal(actual._core.coreService.isCursorHidden, trace.expectedHidden, `${trace.name}: visibility`);
+        continue;
+      }
       await write(expected, [...trace.before, ...trace.hidden, ...trace.after]);
       await write(actual, trace.physical ||
         [...trace.before, ...trace.paint, ...trace.restore, ...trace.after]);

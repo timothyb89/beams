@@ -60,7 +60,7 @@ pub fn restore(screen: &Screen, restore_saved: bool, out: &mut Vec<u8>) {
     });
 }
 
-fn character_sets(sets: vt100::CharacterSets, out: &mut Vec<u8>) {
+pub(crate) fn character_sets(sets: vt100::CharacterSets, out: &mut Vec<u8>) {
     out.extend_from_slice(if sets.g0_dec { b"\x1b(0" } else { b"\x1b(B" });
     out.extend_from_slice(if sets.g1_dec { b"\x1b)0" } else { b"\x1b)B" });
     out.push(if sets.shift_out { 0x0e } else { 0x0f });
@@ -76,7 +76,7 @@ fn margins(buffer: &BufferState, out: &mut Vec<u8>) {
     .expect("writing to a Vec");
 }
 
-fn cursor(screen: &Screen, cursor: CursorState, margins: (u16, u16), out: &mut Vec<u8>) {
+pub(crate) fn cursor(screen: &Screen, cursor: CursorState, margins: (u16, u16), out: &mut Vec<u8>) {
     out.extend_from_slice(if cursor.origin_mode {
         b"\x1b[?6h"
     } else {

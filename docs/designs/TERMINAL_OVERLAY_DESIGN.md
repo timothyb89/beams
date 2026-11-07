@@ -472,6 +472,27 @@ write. Painting bytes did not change; workstation gates remain pending.
 
 ## Implementation status and next-session handoff
 
+Observed entry/exit ownership is implemented (2026-11-07). Before forwarding
+child output, a 200 ms / 8192-byte capture queries recognized ANSI/DEC modes,
+SGR, margins/cursor style, Kitty current flags and xterm modifier options.
+Ordinary input waits for the normal router; expected probe replies are
+consumed only in this bounded window. Cleanup restores observed values,
+disables mouse modes before enabling the observed protocol and selects
+buffers without clearing or saving. Coupled unknown mouse state is preserved.
+Origin/margins require an observed final cursor and buffer ownership; an
+unchanged DECOM is not written because it homes the cursor. Known settings
+have normal-exit and SIGTERM/partial-string PTY checks and independent mode/
+attribute/buffer/visibility comparison. Strict disabled-prefix sessions send
+no entry probes, local responses or exit cleanup bytes; only termios is owned.
+
+This is not complete lifecycle fidelity. Unanswered settings remain unknown;
+a killed remote may leave them unbalanced. Current Kitty flags can be
+restored, but the original stack history is unqueryable and no unowned stack
+is popped. Saved slots/character-set baselines and real resize/reflow remain
+unestablished. Early setup returns now kill/reap the spawned child through a
+guard, with a real-PTY regression.
+Keep these gates open and keep the overlay opt-in.
+
 Common drawing-state coverage is implemented (2026-11-07): ANSI insert mode,
 ASCII/DEC G0/G1 designations and SO/SI, per-buffer saved character sets, basic
 blink/invisible/crossed-out SGR and independent bold/faint, and OSC 8 cell
@@ -482,6 +503,9 @@ and URI lengths are bounded. Malformed colors, richer underline attributes,
 other charsets and active-link cursor saves/restores defer painting. Twelve
 independent xterm.js traces now compare basic SGR and URI/id metadata as well
 as cells, cursor and origin. These additions do not establish reflow fidelity.
+Cursor restores whose saved character sets differ from the current sets defer
+painting as well; the reference emulator's saved-map semantics differ from
+the VT model's saved designations.
 
 Conservative repaint eligibility and frame recovery are implemented (2026-11-07).
 Inherited state starts unknown in both buffers; cursor reports, alternate
@@ -564,9 +588,11 @@ Implementation entry points:
 | --- | --- |
 | `client/src/terminal_stream.rs` | Shared framing, partial sequences, synchronized-output boundaries and the 64 KiB sequence budget |
 | `client/src/terminal_model.rs` | Remote shadow state, ordered events and remote-state CPR/DECRQSS replies |
+| `client/src/terminal_eligibility.rs` | Conservative evidence, availability reasons and the supported control inventory |
 | `client/src/terminal_paint.rs` | Shared local drawing setup and represented-state restoration |
 | `client/src/session.rs` | `drain_output`, hidden-output dispatch, raw replay, menu snapshots and child-input writes |
 | `client/src/session/input.rs` | Ordered 256 KiB input/reply queue and blocking-write worker, with asynchronous error reporting |
+| `client/src/session/baseline.rs`, `client/src/session/child.rs` | Bounded entry probes, observed-state cleanup and child ownership on setup errors |
 | `client/src/session/toast.rs` | Physical-output tracker and toast paint/removal |
 | `client/vendor/vt100/BEAMS.md`, `client/vendor/vt100/src/state.rs` | Vendored changes, provenance and read-only drawing snapshots |
 | `client/tests/terminal-overlay-smoke.py`, `client/tests/terminal-paint-reference.cjs` | Live controlling-PTY coverage and optional independent replay |
@@ -580,9 +606,10 @@ Next work, in separately reviewable changes:
    all three gates; none should be ignored.
 2. Query-policy coverage above is implemented. Any new probes must extend the
    explicit inventory and preserve exactly-once replies.
-3. Extend common drawing state and guarded fallback. The conservative
-   eligibility/recovery slice above is implemented; initialization beyond RIS,
-   regional evidence and covered resize fidelity remain open.
+3. Extend eligibility beyond RIS and establish regional/inactive-buffer evidence.
+   Common drawing state and conservative recovery are implemented. Safe
+   borrowing still needs stronger ownership evidence and independent switching
+   tests; covered resize fidelity remains open.
 4. Update READMEs, audit and TODO with each slice. Run the client suite/build
    and all three smoke paths. Rerun independent replay when painting changes.
    Keep the default switch separate.
@@ -601,11 +628,12 @@ fixture stall that made a fairness assertion depend on output throughput.
 This failure policy bounds memory; it does not promise continued service for
 a peer that never drains its input.
 
-Current validation: **215 client unit tests and 3 integration tests pass, with
+Current validation: **227 client unit tests and 3 integration tests pass, with
 zero ignored tests**. The client build, takeover and overlay managed-session
 smokes, and expanded protocol/PTY harness pass. Pinned xterm.js 5.5 replay again
-passes all nine restoration traces and the actual renderer trace. The corrected
-burst fixture passes both with and without the independent module. No real
+passes twelve restoration traces, the actual renderer trace and two live
+non-default lifecycle traces. The harness also covers deferred recovery and
+strict disabled-prefix partial-string termination. No real
 workstation font/reflow or graphical-terminal validation has been recorded.
 
 The earlier painting slice's recorded validation was **206 passing client unit tests, one ignored
@@ -640,11 +668,12 @@ Retain these decisions and remaining gates:
 - Durable inline request logging is implemented in all accepted-fetch cases.
   Session-specific prefix/uncertainty notices remain optional, skippable work;
   generic menu guidance uses the existing return path today.
-- Extend model/paint eligibility for insert mode, character sets, OSC 8 links,
-  unsupported drawing/input protocols, every touched inactive buffer and
-  resize/reflow provenance. Resolve saved-wrap/origin compatibility by supporting
-  the target terminal or conservatively invalidating painting.
-- Finish entry/exit state ownership and advanced input-mode cleanup. Complete
+- Common insert/character-set/SGR/link state and every touched inactive buffer
+  are represented. Extend initialization/region evidence and resize/reflow
+  provenance. Saved-wrap/origin/changed-character-set variants conservatively
+  invalidate painting; richer support needs agreement with the target terminal.
+- Finish unqueryable entry/exit state and remote keyboard-stack ownership.
+  Observed settings and early child cleanup are implemented. Complete
   independent model validation and the recorded workstation matrix with Zellij,
   a plain shell, pager/editor, resize, scrollback, fonts and lifecycle checks.
 - Enable the overlay by default only after those gates pass, in a separate

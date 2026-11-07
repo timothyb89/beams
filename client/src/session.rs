@@ -10,7 +10,7 @@
 //!   through `tsh` to the remote PTY);
 //! - a configurable one-byte prefix opens a local ratatui palette;
 //! - remote output is drained and bounded while that palette is visible;
-//! - terminal modes are restored on every normal/error/signal exit path.
+//! - observed terminal settings are restored on normal/error/signal exit paths.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -38,6 +38,8 @@ use beams_protocol::{
 use crate::clientd::{BridgeRecord, Frontend, RequestRecord, ServerEvent, ServiceRecord};
 use crate::terminal_model::{TerminalEvent, TerminalModel};
 
+mod baseline;
+mod child;
 mod form;
 mod input;
 mod keys;
@@ -239,9 +241,10 @@ pub fn run(
 
     let mut command = CommandBuilder::new(program);
     command.args(args);
-    let mut child = slave
-        .spawn_command(command)
-        .with_context(|| format!("spawning {program} under local PTY"))?;
+    let mut child = child::ChildGuard::new(
+        slave.spawn_command(command)
+            .with_context(|| format!("spawning {program} under local PTY"))?,
+    );
     drop(slave);
 
     let mut reader = master
@@ -260,36 +263,47 @@ pub fn run(
             "beams: {} opens the local menu; press it twice to send it to the remote session",
             EscapeKey::Byte(key).label()
         );
-    } else {
-        eprintln!("beams: local menu disabled (--escape-key none)");
     }
 
     let mut terminal_state = TerminalState::enter_raw().context("enabling raw terminal mode")?;
+    terminal_state.managed = escape_key != EscapeKey::Disabled;
     let mut terminal_model = TerminalModel::new(initial_size);
-    let drive_result = drive(
-        &*master,
-        &writer,
-        &mut *child,
-        &output_rx,
-        &signal_rx,
-        &info,
-        escape_key,
-        initial_size,
-        &mut terminal_state,
-        &mut local_daemon,
-        &mut terminal_model,
-        overlay_enabled,
-    );
+    let drive_result = (|| {
+        if terminal_state.managed {
+            terminal_state.capture_baseline()?;
+        }
+        drive(
+            &*master,
+            &writer,
+            &mut *child,
+            &output_rx,
+            &signal_rx,
+            &info,
+            escape_key,
+            initial_size,
+            &mut terminal_state,
+            &mut local_daemon,
+            &mut terminal_model,
+            overlay_enabled,
+        )
+    })();
 
     // Restore the local terminal before waiting/printing any error. The child
     // is explicitly killed on a local driver error; on success it has already
     // exited and `kill` is unnecessary.
+    if terminal_model.can_paint() {
+        terminal_state.final_screen = Some(terminal_model.screen().clone());
+        if overlay_enabled && terminal_state.palette_open {
+            let _ = restore_terminal_model(&terminal_model, terminal_state.covered_alternate);
+            terminal_state.palette_open = false;
+        }
+    }
     terminal_state.restore();
     if drive_result.is_err() {
         let _ = child.kill();
     }
     drop(writer);
-    let _ = child.wait();
+    let _ = child.reap();
 
     // Closing the signal handle wakes its blocking iterator. Dropping a
     // JoinHandle detaches the thread; neither helper thread owns state needed
@@ -513,6 +527,10 @@ fn drive(
                 keys_handled = true;
                 daemon_view.handle_key(key, local_daemon)
             };
+            let initial_input = std::mem::take(&mut terminal_state.initial_input);
+            if !initial_input.is_empty() {
+                actions.extend(input_router.route(escape_key, &initial_input, now, &mut on_key));
+            }
             actions.extend(input_router.flush_expired(escape_key, now, &mut on_key));
             let poll_timeout = input_router.poll_timeout(now);
             if stdin_ready(poll_timeout).context("polling terminal input")? {
@@ -2126,6 +2144,9 @@ impl InputRouter {
         now: Instant,
         on_key: &mut dyn FnMut(Key) -> bool,
     ) -> Vec<InputAction> {
+        if escape_key == EscapeKey::Disabled && self.mode == InputMode::Passthrough {
+            return if input.is_empty() { Vec::new() } else { vec![InputAction::Remote(input.to_vec())] };
+        }
         let mut bytes = std::mem::take(&mut self.pending);
         self.pending_since = None;
         bytes.extend_from_slice(input);
@@ -2972,6 +2993,10 @@ fn signal_watcher() -> anyhow::Result<(Receiver<i32>, SignalHandle, thread::Join
 
 struct TerminalState {
     raw: bool,
+    managed: bool,
+    baseline: baseline::Baseline,
+    final_screen: Option<vt100::Screen>,
+    initial_input: Vec<u8>,
     palette_open: bool,
     /// Remote sequence state (including hidden overlay output), so toasts
     /// paint between sequences and menu close can resume an unfinished one.
@@ -2987,6 +3012,10 @@ impl TerminalState {
         terminal::enable_raw_mode()?;
         Ok(Self {
             raw: true,
+            managed: true,
+            baseline: baseline::Baseline::default(),
+            final_screen: None,
+            initial_input: Vec::new(),
             palette_open: false,
             output: toast::OutputTracker::default(),
             menu_prefix: Vec::new(),
@@ -2994,6 +3023,31 @@ impl TerminalState {
             covered_alternate: false,
             unavailable_notice: false,
         })
+    }
+
+    fn capture_baseline(&mut self) -> anyhow::Result<()> {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(&baseline::Baseline::probes()).context("querying terminal baseline")?;
+        stdout.flush().context("flushing terminal baseline probes")?;
+        drop(stdout);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut capture = baseline::Capture::default();
+        while !capture.complete() && Instant::now() < deadline {
+            if stdin_ready(deadline.saturating_duration_since(Instant::now()).min(LOOP_TICK))? {
+                let mut bytes = [0u8; 4096];
+                let read = io::stdin().read(&mut bytes)?;
+                if read == 0 { break; }
+                capture.feed(&bytes[..read]);
+                if capture.input.len() > 8192 {
+                    bail!("terminal input exceeded the 8192-byte baseline capture budget");
+                }
+            }
+        }
+        let (baseline, input) = capture.finish();
+        self.baseline = baseline;
+        if input.len() > 8192 { bail!("terminal input exceeded the 8192-byte baseline capture budget"); }
+        self.initial_input = input;
+        Ok(())
     }
 
     fn open_palette(&mut self, screen: &vt100::Screen) -> io::Result<()> {
@@ -3030,21 +3084,22 @@ impl TerminalState {
         if !self.raw && !self.palette_open {
             return;
         }
-        // A killed SSH child cannot be relied on to send its application's
-        // terminal cleanup. End any partial string/update before restoring
-        // ordinary shell input modes and leaving the remote alternate screen.
-        let mut stdout = io::stdout().lock();
-        let _ = stdout.write_all(
-            b"\x18\x1b\\\x1b[?2026l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\
-              \x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?2004l\x1b[?1l\x1b>\
-              \x1b[?1049l\x1b[?47l\x1b[0m\x1b[?25h",
-        );
-        let _ = stdout.flush();
-        drop(stdout);
-        if self.palette_open {
-            let _ = self.close_palette(false);
-        } else {
-            let _ = execute!(io::stdout(), Show);
+        if self.managed {
+            // Cancel an unfinished parser and restore only settings observed
+            // before the first child output. Never clear an inherited buffer,
+            // pop an unowned keyboard stack or invent unknown shell defaults.
+            if self.palette_open {
+                if let Some(snapshot) = &self.menu_snapshot {
+                    let mut restore = crate::terminal_paint::BEGIN.to_vec();
+                    crate::terminal_paint::restore(snapshot, false, &mut restore);
+                    restore.extend_from_slice(crate::terminal_paint::END);
+                    let _ = io::stdout().write_all(&restore);
+                }
+                self.palette_open = false;
+            }
+            let mut stdout = io::stdout().lock();
+            let _ = stdout.write_all(&self.baseline.restore(self.final_screen.as_ref()));
+            let _ = stdout.flush();
         }
         if self.raw {
             let _ = terminal::disable_raw_mode();

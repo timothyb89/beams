@@ -92,11 +92,14 @@ def fake_tsh(args):
 
 
 class Session:
-    def __init__(self, root, binary, initialized=True):
+    def __init__(self, root, binary, initialized=True, baseline=None, disabled=False):
         self.root = root
         self.command = 0
         self.output = bytearray()
         self.status = None
+        self.disabled = disabled
+        self.baseline_replied = False
+        self.baseline = baseline or {}
         config = root / "config" / "beams-client"
         config.mkdir(parents=True)
         fixture = Path(__file__).parent / "fixtures/config/beams-client/state.json"
@@ -124,8 +127,11 @@ class Session:
                     TERM="xterm-256color",
                     BEAMS_OVERLAY_INITIALIZED="1" if initialized else "0",
                 )
-                os.execve(binary, [binary, "ssh", "--terminal-overlay", "--no-client-daemon",
-                                   "--purpose", "managed-session-test"], env)
+                command = [binary, "ssh", "--terminal-overlay", "--no-client-daemon",
+                           "--purpose", "managed-session-test"]
+                if disabled:
+                    command.extend(["--escape-key", "none"])
+                os.execve(binary, command, env)
             except BaseException:
                 os._exit(99)
         try:
@@ -147,6 +153,22 @@ class Session:
             pid, status = os.waitpid(self.pid, os.WNOHANG)
             if pid:
                 self.status = os.waitstatus_to_exitcode(status)
+        if (not self.disabled and not self.baseline_replied and b"\x1b[?4m" in self.output
+                and (self.root / "ready").exists()):
+            modes = [1, 6, 9, 25, 47, 66, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 2004, 2026]
+            reports = b""
+            for mode in modes:
+                enabled = self.baseline.get(mode, mode == 25)
+                value = 0 if enabled is None else 1 if enabled else 2
+                reports += f"\x1b[?{mode};{value}$y".encode()
+            reports += f"\x1b[4;{1 if self.baseline.get(4, False) else 2}$y".encode()
+            reports += b"\x1bP1$r" + self.baseline.get("sgr", b"0") + b"m\x1b\\"
+            reports += b"\x1bP1$r" + self.baseline.get("margins", b"1;24") + b"r\x1b\\"
+            reports += f"\x1bP1$r{self.baseline.get('style', 0)} q\x1b\\".encode()
+            reports += f"\x1b[?{self.baseline.get('kitty', 0)}u".encode()
+            reports += f"\x1b[>4;{self.baseline.get('modifiers', 0)}m".encode()
+            self.send(reports + self.baseline.get("input", b""))
+            self.baseline_replied = True
 
     def wait(self, predicate, description, timeout=5):
         deadline = time.monotonic() + timeout
@@ -451,6 +473,66 @@ def run_unknown_and_recovery(root, binary):
         session.close()
 
 
+def run_lifecycle(root, binary, outcome):
+    disabled = outcome == "disabled"
+    settings = {25: False, 47: True, 66: True, 1: True, 4: True, 6: True,
+                1002: True, 1006: True, 2004: True, "sgr": b"0;1;31",
+                "kitty": 9, "modifiers": 2, "margins": b"2;20",
+                "input": b"EARLY USER INPUT", "style": 5}
+    session = Session(root, binary, baseline=settings, disabled=disabled)
+    try:
+        if disabled:
+            assert b"$p" not in session.output and b"\x1bP$q" not in session.output
+            before = len(session.output)
+            user = b"literal\x1d\x1b[?9u\x1b[27;5;93~\x1b]reply qy\x1b\\"
+            session.send(user)
+            session.wait(lambda: session.remote_input() == user, "strict disabled input passthrough")
+            raw = b"\x1b]2;DISABLED TITLE\x1b\\\x1b[6n\x1bP$qm\x1b\\DISABLED OUTPUT"
+            session.emit(raw)
+            session.wait(lambda: raw in session.output[before:], "strict disabled output passthrough")
+            session.pump()
+            assert bytes(session.output[before:]) == raw, "disabled session injected local output"
+            # Exit while a physical OSC remains unfinished: strict passthrough
+            # must not add CAN/ST or mode resets on termination.
+            partial = b"\x1b]0;STRICT PARTIAL"
+            session.emit(partial)
+            session.wait(lambda: partial in session.output[before:], "strict partial string")
+            os.kill(session.pid, signal.SIGTERM)
+            session.wait(lambda: session.status is not None, "strict SIGTERM")
+            assert bytes(session.output[before:]) == raw + partial
+        else:
+            session.wait(lambda: session.remote_input() == b"EARLY USER INPUT", "input retained during probes")
+            if outcome == "signal":
+                session.open()
+                session.emit(b"\x1b]0;UNFINISHED EXIT STRING")
+                os.kill(session.pid, signal.SIGTERM)
+            else:
+                session.command += 1
+                (root / f"command-{session.command}").write_bytes(b"EXIT")
+            session.wait(lambda: session.status is not None, "baseline lifecycle exit")
+            tail = session.output[-1024:]
+            for mode in [b"\x1b[?25l", b"\x1b[?47h", b"\x1b=", b"\x1b[?1h",
+                         b"\x1b[4h", b"\x1b[?6h", b"\x1b[2;20r", b"\x1b[?1002h",
+                         b"\x1b[?1006h", b"\x1b[?2004h", b"\x1b[0;1;31m",
+                         b"\x1b[=9u", b"\x1b[>4;2m", b"\x1b[5 q"]:
+                assert mode in tail, f"nondefault baseline not restored: {mode!r}"
+            assert b"\x1b[<" not in tail, "cleanup popped an unowned Kitty stack"
+            if module := os.environ.get("BEAMS_TEST_XTERM_MODULE"):
+                trace = dict(name=f"live {outcome} baseline cleanup", rows=24, cols=100,
+                             physical=list(session.output), expectedModes={
+                                 "mouseTrackingMode": "drag", "applicationCursorKeysMode": True,
+                                 "applicationKeypadMode": True, "bracketedPasteMode": True,
+                                 "insertMode": True, "originMode": True},
+                             expectedPen={"bold": True, "fg": 1}, expectedBuffer="alternate",
+                             expectedHidden=True)
+                subprocess.run(["node", str(Path(__file__).with_name("terminal-paint-reference.cjs")), module],
+                               input=json.dumps([trace]), text=True, check=True)
+        assert session.status == (143 if outcome != "normal" else 17)
+        session.assert_termios_restored()
+    finally:
+        session.close()
+
+
 def main():
     client = Path(__file__).resolve().parent.parent
     binary = str(client / "target/debug/beams")
@@ -462,6 +544,10 @@ def main():
         recovery = root / "recovery"
         recovery.mkdir()
         run_unknown_and_recovery(recovery, binary)
+        for outcome in ["normal", "signal", "disabled"]:
+            lifecycle = root / f"lifecycle-{outcome}"
+            lifecycle.mkdir()
+            run_lifecycle(lifecycle, binary, outcome)
         for outcome in ["resume", "signal", "overflow"]:
             pressure = root / f"pressure-{outcome}"
             pressure.mkdir()
@@ -475,7 +561,7 @@ def main():
             session.wait(lambda: session.status is not None, "handled SIGTERM")
             assert session.status == 143, f"wrong SIGTERM status: {session.status}"
             session.assert_termios_restored()
-            for mode in [b"\x1b[?1002l", b"\x1b[?1006l", b"\x1b[?2004l", b"\x1b[?1049l"]:
+            for mode in [b"\x1b[?1002l", b"\x1b[?1006l", b"\x1b[?2004l", b"\x1b[?47l"]:
                 assert mode in session.output[-512:], f"mode cleanup missing on SIGTERM: {mode!r}"
         finally:
             session.close()

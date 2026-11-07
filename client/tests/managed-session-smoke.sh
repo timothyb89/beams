@@ -60,6 +60,17 @@ set +e
 # dropdown lists the matching directory (Esc hides it, Esc cancels).
 mkdir -p "$TEST_DIR/picker/Downloads-smoke"
 {
+    # Entry probes finish before remote output is forwarded. Synchronize on
+    # that handoff so fixed typing delays do not race the capture window.
+    INPUT_ATTEMPTS=0
+    while ! grep -q "REMOTE READY" "$TRANSCRIPT" 2>/dev/null; do
+        INPUT_ATTEMPTS=$((INPUT_ATTEMPTS + 1))
+        if [ "$INPUT_ATTEMPTS" -ge 200 ]; then
+            echo "managed session did not forward its first remote frame" >&2
+            exit 1
+        fi
+        sleep 0.01
+    done
     printf 'hello\r\033[93;5u'
     sleep 0.1
     printf 'f'

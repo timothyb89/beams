@@ -364,6 +364,22 @@ before incoming output. A resize closes the menu and invalidates eligibility;
 restoration during covered resize is still best effort because the outer
 terminal may already have reflowed.
 
+Managed sessions query an outer-terminal baseline before forwarding child
+output: recognized ANSI/DEC input modes, SGR, margins/cursor style, Kitty flags
+and xterm modifier options. This window is bounded to 200 ms and 8192 bytes
+of ordinary input, which is retained for normal routing after handoff. Exit,
+driver errors and handled signals restore observed settings rather than
+forcing shell defaults. Mouse modes are disabled before the observed mode is
+enabled, and buffer selection avoids clearing or saving over a cursor slot.
+Origin/margins are restored only with an observed final cursor and known
+buffer ownership; unchanged origin mode is not written because it homes the
+cursor. Unsupported/unanswered settings stay unknown. Such terminals may
+retain modes left unbalanced by a killed remote application. Kitty cleanup
+restores observed current flags without popping an unowned keyboard stack;
+original stack history and unqueryable saved state remain compatibility gates.
+`--escape-key none` skips entry probes and local cleanup bytes, including
+parser cancellation, while still restoring the workstation's termios.
+
 The client uses a focused, vendored `vt100` 0.18.1 extension in
 `vendor/vt100` for read-only current/saved cursor and attribute snapshots,
 per-buffer origin/margins, insert mode, ASCII/DEC G0/G1 designations and SO/SI,
@@ -373,6 +389,8 @@ OSC 8 parameters are limited to 256 bytes and URIs to 2048 bytes; malformed
 links, other character sets and richer underline attributes defer painting.
 Cursor saves/restores with an active hyperlink also defer painting because
 their link semantics are not established across supported terminals.
+Cursor restores after changing the saved character-set designations also
+defer painting because emulator save semantics differ.
 Bursts of complete query/effect sequences are drained at each parsed frame,
 avoiding event-queue pressure. Advanced drawing/input state and content
 provenance remain pending.

@@ -453,6 +453,7 @@ impl Screen {
     }
 
     fn write_contents_diff(&self, contents: &mut String, prev: &Self) {
+        contents.push_str("\x1b]8;;\x1b\\");
         if self.hide_cursor() != prev.hide_cursor() {
             crate::term::HideCursor::new(self.hide_cursor())
                 .write_buf(contents);
@@ -463,6 +464,7 @@ impl Screen {
             prev.attrs,
         );
         self.attrs.write_escape_code_diff(contents, &prev_attrs);
+        contents.push_str(self.hyperlink.as_deref().unwrap_or("\x1b]8;;\x1b\\"));
     }
 
     /// Returns a sequence of strings containing escape sequences sufficient to

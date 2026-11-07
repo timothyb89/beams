@@ -222,10 +222,14 @@ impl Cell {
     }
 
     pub(crate) fn write_hyperlink(&self, out: &mut alloc::string::String) {
-        out.push_str(self.hyperlink().unwrap_or("\x1b]8;;\x1b\\"));
+        if let Some(link) = self.hyperlink() { out.push_str(link); }
     }
 
-    /// SGR commands establishing this cell's attributes from any attributes.
+    pub(crate) fn close_hyperlink(&self, out: &mut alloc::string::String) {
+        if self.hyperlink().is_some() { out.push_str("\x1b]8;;\x1b\\"); }
+    }
+
+    /// SGR and OSC 8 commands establishing this cell's drawing attributes.
     #[must_use]
     pub fn attributes_formatted(&self) -> alloc::string::String {
         let mut out = alloc::string::String::new();
@@ -234,7 +238,7 @@ impl Cell {
             &mut out,
             &crate::attrs::Attrs::default(),
         );
-        self.write_hyperlink(&mut out);
+        out.push_str(self.hyperlink().unwrap_or("\x1b]8;;\x1b\\"));
         out
     }
 }

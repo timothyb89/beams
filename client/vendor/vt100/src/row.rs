@@ -243,6 +243,7 @@ impl Row {
         prev_pos: Option<crate::grid::Pos>,
         prev_attrs: Option<crate::attrs::Attrs>,
     ) -> (crate::grid::Pos, crate::attrs::Attrs) {
+        contents.push_str("\x1b]8;;\x1b\\");
         let mut prev_was_wide = false;
 
         let mut prev_pos = prev_pos.unwrap_or_else(|| {
@@ -342,7 +343,7 @@ impl Row {
                     let cell_contents = cell.contents();
                     cell.write_hyperlink(contents);
                     contents.push_str(cell_contents);
-                    contents.push_str("\x1b]8;;\x1b\\");
+                    cell.close_hyperlink(contents);
                 } else if erase.is_none() {
                     erase = Some((pos.col, attrs));
                 }
@@ -380,6 +381,7 @@ impl Row {
         writer: &mut impl alloc::fmt::Write,
         current_attrs: &mut crate::attrs::Attrs,
     ) -> alloc::fmt::Result {
+        writer.write_str("\x1b]8;;\x1b\\")?;
         let mut prev_was_wide = false;
         let mut num_empty = 0;
 
@@ -402,9 +404,9 @@ impl Row {
             new_attrs.write_escape_code_diff_fmt(writer, current_attrs)?;
             *current_attrs = new_attrs;
             if cell.has_contents() {
-                writer.write_str(cell.hyperlink().unwrap_or("\x1b]8;;\x1b\\"))?;
+                if let Some(link) = cell.hyperlink() { writer.write_str(link)?; }
                 writer.write_str(cell.contents())?;
-                writer.write_str("\x1b]8;;\x1b\\")?;
+                if cell.hyperlink().is_some() { writer.write_str("\x1b]8;;\x1b\\")?; }
             } else {
                 writer.write_char(' ')?;
             }
@@ -427,6 +429,7 @@ impl Row {
         mut prev_pos: crate::grid::Pos,
         mut prev_attrs: crate::attrs::Attrs,
     ) -> (crate::grid::Pos, crate::attrs::Attrs) {
+        contents.push_str("\x1b]8;;\x1b\\");
         let mut prev_was_wide = false;
 
         let first_cell = &self.cells[usize::from(start)];
@@ -453,7 +456,7 @@ impl Row {
             };
             prev_first_cell.write_hyperlink(contents);
             contents.push_str(cell_contents);
-            contents.push_str("\x1b]8;;\x1b\\");
+            prev_first_cell.close_hyperlink(contents);
             crate::term::Backspace.write_buf(contents);
             if prev_first_cell.is_wide() {
                 crate::term::Backspace.write_buf(contents);
@@ -536,7 +539,7 @@ impl Row {
                     prev_pos.col += if cell.is_wide() { 2 } else { 1 };
                     cell.write_hyperlink(contents);
                     contents.push_str(cell.contents());
-                    contents.push_str("\x1b]8;;\x1b\\");
+                    cell.close_hyperlink(contents);
                 } else if erase.is_none() {
                     erase = Some((pos.col, attrs));
                 }
@@ -601,7 +604,7 @@ impl Row {
                 }
                 end_cell.write_hyperlink(contents);
                 contents.push_str(end_cell.contents());
-                contents.push_str("\x1b]8;;\x1b\\");
+                end_cell.close_hyperlink(contents);
                 prev_pos.col += if end_cell.is_wide() { 2 } else { 1 };
             }
         }

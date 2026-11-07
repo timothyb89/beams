@@ -931,8 +931,16 @@ bootstrap `Task`s.
     and render them in `beams fetch`/other waiting CLIs without changing approval
     status. Test custom/disabled prefixes, multiple frontends and old peers.
     This enhancement does not block the overlay fixes/default-readiness work.
-  - [ ] Session-entry/exit state ownership and advanced keyboard/mode cleanup,
-    including non-default outer-terminal state and partial-string termination.
+  - [x] Bounded session-entry probes and cleanup of observed outer modes, SGR,
+    margins/cursor style and keyboard flags, preserving ordinary startup input.
+    Non-default parent settings and normal/SIGTERM/partial-string exit have
+    controlling-PTY and independent xterm.js checks. Unknown settings are not
+    reset to defaults, and strict `--escape-key none` emits no probes/cleanup.
+    A child guard kills/reaps the PTY process on early setup errors, before
+    the driver owns it; a real-PTY regression covers this return path.
+  - [ ] Complete lifecycle ownership for unqueryable state and original/
+    unbalanced remote Kitty stack history; do not pop an unowned stack.
+    Unknown baseline modes can remain unbalanced after a remote crash.
   - [ ] Independent emulator comparison and recorded workstation matrix with
     Zellij, plain shell, pager/editor, fonts/reflow and lifecycle checks.
   - [ ] Separate default switch after all gates pass, retaining an explicit

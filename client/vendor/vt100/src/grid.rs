@@ -433,6 +433,7 @@ impl Grid {
         prev_pos: Option<Pos>,
         prev_attrs: Option<crate::attrs::Attrs>,
     ) {
+        contents.push_str("\x1b]8;;\x1b\\");
         let prev_attrs = prev_attrs.unwrap_or_default();
         // writing a character to the last column of a row doesn't wrap the
         // cursor immediately - it waits until the next character is actually
@@ -471,7 +472,7 @@ impl Grid {
                 cell.attrs().write_escape_code_diff(contents, &prev_attrs);
                 cell.write_hyperlink(contents);
                 contents.push_str(cell.contents());
-                contents.push_str("\x1b]8;;\x1b\\");
+                cell.close_hyperlink(contents);
                 prev_attrs.write_escape_code_diff(contents, cell.attrs());
             } else {
                 // if the cell doesn't have contents, we can't have gotten
@@ -520,7 +521,7 @@ impl Grid {
                                 );
                                 cell.write_hyperlink(contents);
                                 contents.push_str(cell.contents());
-                                contents.push_str("\x1b]8;;\x1b\\");
+                                cell.close_hyperlink(contents);
                                 prev_attrs.write_escape_code_diff(
                                     contents,
                                     cell.attrs(),
@@ -534,7 +535,7 @@ impl Grid {
                             );
                             cell.write_hyperlink(contents);
                             contents.push_str(cell.contents());
-                            contents.push_str("\x1b]8;;\x1b\\");
+                            cell.close_hyperlink(contents);
                             prev_attrs.write_escape_code_diff(
                                 contents,
                                 cell.attrs(),

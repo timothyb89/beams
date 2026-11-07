@@ -226,3 +226,24 @@ mapping, independent SGR attributes and OSC 8 URI/id metadata; the actual
 renderer comparison also passes. Toast tests cover restored hyperlinks and
 unlinked local text, plus continued printing in insert/graphics mode.
 Malformed color parameters no longer count as a complete SGR snapshot.
+
+Observed lifecycle pass (2026-11-07): 227 unit tests and 3 integration tests,
+client build, both managed-session modes and the protocol/PTY harness pass.
+Independent replay passes twelve restoration traces, the actual renderer and
+two live cleanup traces with non-default outer mouse, paste, keypad, insert,
+origin/margins, SGR, buffer and cursor visibility. PTY checks also cover
+retained startup input, keyboard-flag restoration without stack pops, cursor
+style, normal exit, SIGTERM during a partial string and byte-exact disabled
+prefix behavior with no probes or cleanup. A real-PTY unit test proves early
+setup returns kill/reap the supervised child. Negative setting replies are
+counted individually so one negative cannot finish three pending probes.
+
+The shell fixture now waits for the first remote frame before typing, rather
+than racing the bounded probe window. Native hyperlink serialization emits
+controls only around linked text, keeping unlinked restoration compact.
+Eligibility also rejects unsupported C0 controls, scrollback erasure, unknown
+status probes, malformed multi-mode reports and ambiguous changed-character-set
+restores before covered mutation. All original acceptance gates remain active.
+Unknown initialization/saved state, original keyboard-stack history, useful
+safe borrowing and physical resize/reflow remain unestablished; no workstation
+matrix was available in this Beam. The overlay remains opt-in.
