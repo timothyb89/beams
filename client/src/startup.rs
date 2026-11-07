@@ -1,62 +1,25 @@
-//! The workstation-owned startup manifest and its SSH key grant (see
-//! `docs/designs/SSH_AGENT_PROXY_DESIGN.md`, "Client-owned startup manifest").
+//! SSH key grants for launch tasks (a profile's `[ssh_grant]`; see
+//! `docs/development/launches.md`, "SSH key grants").
 //!
-//! `beamsd` submits `[startup] tasks` to each Beam once, the first time
-//! its bridge connects. If `[startup.ssh_grant]` is set, the clones that
-//! manifest runs may use the SSH key without a prompt, within limits the
-//! workstation enforces:
+//! Once a launch's covered phase can start, its SSH tasks may use the key
+//! without a prompt, within limits the workstation enforces:
 //!
 //! - only user-auth logins to a *verified* host named in `hosts`, as `user`;
 //! - at most `max_uses` signatures, within `window_secs`;
-//! - only until the manifest finishes, the bridge drops, or the user
+//! - only until the launch finishes, the bridge drops, or the user
 //!   revokes it;
-//! - only for requests the Beam attributes to that manifest's tasks
-//!   (`BEAMS_TASK_RUN`). That part is advisory: it keeps an agent's own
+//! - only for requests the Beam attributes to the covered tasks' exact
+//!   `BEAMS_TASK_RUN` tags. That part is advisory: it keeps an agent's own
 //!   `git clone` during the window from being silently approved, but it's
 //!   the host/user/count/time limits that bound what a compromised Beam
 //!   could do. Every use shows a passive toast.
+//!
+//! (The module name predates profiles: grants first came with the
+//! workstation's `[startup]` manifest, since removed.)
 
-use std::fs;
-use std::io::ErrorKind;
-use std::path::Path;
-use std::time::Duration;
-
-use anyhow::Context;
-use beams_protocol::{ManifestParam, ManifestTask};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentOperation, AgentPrompt, HostCheck};
-
-const DEFAULT_GRANT_WINDOW: Duration = Duration::from_secs(10 * 60);
-const MAX_GRANT_WINDOW: Duration = Duration::from_secs(60 * 60);
-/// Headroom over one signature per clone (a retry, a submodule).
-const GRANT_SPARE_USES: u32 = 2;
-
-/// `[startup]` in `config.toml`.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct StartupConfig {
-    /// Tasks for every new Beam, as `{ template = "...", params = {...} }`
-    /// (see `beam-bootstrap list-tasks`). Default: the Go and Rust
-    /// toolchains.
-    #[serde(default = "default_tasks")]
-    pub tasks: Vec<ManifestTask>,
-    #[serde(default)]
-    pub ssh_grant: Option<GrantConfig>,
-}
-
-impl Default for StartupConfig {
-    fn default() -> Self {
-        Self { tasks: default_tasks(), ssh_grant: None }
-    }
-}
-
-fn default_tasks() -> Vec<ManifestTask> {
-    ["install-toolchain-go", "install-toolchain-rust"]
-        .into_iter()
-        .map(|template| ManifestTask { template: template.to_string(), params: Default::default() })
-        .collect()
-}
 
 /// A launch's `[ssh_grant]` as compiled: `ssh-grant.json` in the
 /// workstation's launch directory, never sent to the Beam (the Beam can't
@@ -84,95 +47,7 @@ impl LaunchGrant {
     }
 }
 
-/// `[startup.ssh_grant]`.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct GrantConfig {
-    /// Host names as your `known_hosts` spells them (`github.com`,
-    /// `[host]:2222`).
-    pub hosts: Vec<String>,
-    #[serde(default = "default_user")]
-    pub user: String,
-    #[serde(default)]
-    pub window_secs: Option<u64>,
-    /// Default: one per ssh-style `clone-git-repo` task, plus two.
-    #[serde(default)]
-    pub max_uses: Option<u32>,
-}
-
-fn default_user() -> String {
-    "git".to_string()
-}
-
-impl GrantConfig {
-    pub fn window(&self) -> Duration {
-        self.window_secs.map(Duration::from_secs).unwrap_or(DEFAULT_GRANT_WINDOW).min(MAX_GRANT_WINDOW)
-    }
-
-    pub fn max_uses_for(&self, tasks: &[ManifestTask]) -> u32 {
-        self.max_uses.unwrap_or_else(|| {
-            let clones = tasks
-                .iter()
-                .filter(|task| task.template == "clone-git-repo")
-                .filter(|task| {
-                    matches!(task.params.get("repo"), Some(ManifestParam::Str(repo))
-                        if repo.starts_with("git@") || repo.starts_with("ssh://"))
-                })
-                .count() as u32;
-            clones + GRANT_SPARE_USES
-        })
-    }
-}
-
-impl StartupConfig {
-    /// The tasks to submit: `tasks`, plus a leading `wait-ssh-agent` when an
-    /// ssh-style clone needs the key and none was listed (`clone-git-repo`
-    /// requires what it provides).
-    pub fn manifest_tasks(&self) -> Vec<ManifestTask> {
-        let needs_key = self.tasks.iter().any(|task| {
-            task.template == "clone-git-repo"
-                && matches!(task.params.get("repo"), Some(ManifestParam::Str(repo))
-                    if repo.starts_with("git@") || repo.starts_with("ssh://"))
-        });
-        let has_wait = self
-            .tasks
-            .iter()
-            .any(|task| task.template == "wait-ssh-agent" || task.template == "wait-ssh-agent-unlock");
-        let mut tasks = Vec::with_capacity(self.tasks.len() + 1);
-        if needs_key && !has_wait {
-            tasks.push(ManifestTask { template: "wait-ssh-agent".to_string(), params: Default::default() });
-        }
-        tasks.extend(self.tasks.iter().cloned());
-        tasks
-    }
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct ConfigFile {
-    #[serde(default)]
-    startup: Option<StartupConfig>,
-}
-
-impl StartupConfig {
-    pub fn load() -> anyhow::Result<Self> {
-        Self::load_from(&crate::agent::Config::path()?)
-    }
-
-    pub fn load_from(path: &Path) -> anyhow::Result<Self> {
-        match fs::read_to_string(path) {
-            Ok(text) => Self::parse(&text).with_context(|| format!("parsing {}", path.display())),
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
-        }
-    }
-
-    pub fn parse(text: &str) -> anyhow::Result<Self> {
-        let file: ConfigFile = toml::from_str(text)?;
-        Ok(file.startup.unwrap_or_default())
-    }
-}
-
-/// A live (or just-ended) startup grant, as shown in the menu.
+/// A live (or just-ended) grant, as shown in the menu.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GrantRecord {
     pub grant_id: String,
@@ -212,8 +87,9 @@ impl GrantRecord {
         self.hosts.join(", ")
     }
 
-    /// A launch's grant (`manifest_id` is then the launch ID; startup
-    /// manifests are `manifest-N`).
+    /// A launch's grant (`manifest_id` is the launch ID). Grants named
+    /// `manifest-N` came from the removed `[startup]` manifest; the
+    /// wording for them goes once the session menu stops using it.
     pub fn is_launch(&self) -> bool {
         !self.manifest_id.starts_with("manifest-")
     }
@@ -311,38 +187,5 @@ mod tests {
         g.uses = 0;
         g.ended = Some("revoked".into());
         assert!(!g.usable(0));
-    }
-
-    #[test]
-    fn config_defaults_and_use_budget() {
-        let config = StartupConfig::parse("").unwrap();
-        assert_eq!(config, StartupConfig::default());
-        assert_eq!(config.tasks.len(), 2);
-
-        let config = StartupConfig::parse(
-            r#"
-            [startup]
-            tasks = [
-              { template = "clone-git-repo", params = { repo = "git@github.com:o/a.git", dest = "~/a" } },
-              { template = "clone-git-repo", params = { repo = "https://example.com/b.git", dest = "~/b" } },
-              { template = "checkout-pr-worktree", params = { base = "~/a", pr = 12, dest = "~/w" } },
-            ]
-            [startup.ssh_grant]
-            hosts = ["github.com"]
-            window_secs = 99999
-            "#,
-        )
-        .unwrap();
-        assert_eq!(config.tasks[2].params.get("pr"), Some(&ManifestParam::Int(12)));
-        let grant = config.ssh_grant.clone().unwrap();
-        assert_eq!(grant.user, "git");
-        assert_eq!(grant.window(), MAX_GRANT_WINDOW);
-        assert_eq!(grant.max_uses_for(&config.tasks), 1 + GRANT_SPARE_USES);
-        let submitted = config.manifest_tasks();
-        assert_eq!(submitted[0].template, "wait-ssh-agent", "added for the ssh clone");
-        assert_eq!(submitted.len(), 4);
-        assert_eq!(StartupConfig::default().manifest_tasks().len(), 2, "nothing added without ssh clones");
-        assert!(StartupConfig::parse("[startup]\ntask = []\n").is_err(), "typos are errors");
-        assert!(StartupConfig::parse("[startup]\ntasks = []\n").unwrap().tasks.is_empty());
     }
 }

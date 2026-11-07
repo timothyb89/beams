@@ -81,19 +81,23 @@ git -C "$W/repo.git" symbolic-ref HEAD refs/heads/main
 ME=$(id -un)
 SSHOPTS="-F /dev/null -o UserKnownHostsFile=$W/vm/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o IdentityFile=none -p $PORT"
 
-# Workstation config: the allowed key, and a startup manifest that clones
-# over ssh under a grant for the target sshd.
+# Workstation config: the allowed key. A profile whose clone runs over ssh
+# under a launch grant for the target sshd.
 cat >"$W/config/beams-client/config.toml" <<EOF
 [ssh_agent]
 allowed_keys = ["$ALLOWED_FP"]
 prompt_timeout = 20
+EOF
+mkdir -p "$W/profile"
+cat >"$W/profile/environment.toml" <<EOF
+schema_version = 1
+extends = ["builtin:core"]
 
-[startup]
-tasks = [
-  { template = "clone-git-repo", params = { repo = "ssh://$ME@127.0.0.1:$PORT$W/repo.git", dest = "$W/startup-clone" } },
-]
+[tasks.clone]
+template = "clone-git-repo"
+params = { repo = "ssh://$ME@127.0.0.1:$PORT$W/repo.git", dest = "$W/launch-clone" }
 
-[startup.ssh_grant]
+[ssh_grant]
 hosts = ["[127.0.0.1]:$PORT"]
 user = "$ME"
 EOF
@@ -102,7 +106,10 @@ EOF
 cat >"$W/bin/tsh" <<EOF
 #!/bin/sh
 case " \$* " in
-    *"beam-client-bridge"*) exec "$BOOTSTRAP" client-bridge --socket "$W/vm/daemon.sock" ;;
+    *" beams ls "*)
+        echo '[{"id": "smoke", "uuid": "smoke-uuid", "owner": "me", "expires": "2099-01-01T00:00:00Z"}]'
+        exit 0 ;;
+    *"beam-bootstrap client-bridge"*) exec "$BOOTSTRAP" client-bridge --socket "$W/vm/daemon.sock" ;;
 esac
 echo "fake tsh: unexpected \$*" >&2
 exit 1
@@ -140,7 +147,7 @@ for line in r:
 PY
 
 start_frontend() { # decision
-    python3 "$W/frontend.py" "$W/local.sock" "$1" "$W/local-agent.sock" "$W/prompts.log" >"$W/frontend-$1.out" 2>&1 &
+    python3 "$W/frontend.py" "$W/config/beams-client/daemon.sock" "$1" "$W/local-agent.sock" "$W/prompts.log" >"$W/frontend-$1.out" 2>&1 &
     FRONTEND_PID=$!
     pids+=("$FRONTEND_PID")
     for _ in $(seq 100); do grep -q connected "$W/frontend-$1.out" 2>/dev/null && break; sleep 0.1; done
@@ -148,14 +155,14 @@ start_frontend() { # decision
 }
 stop_frontend() { kill "$FRONTEND_PID" 2>/dev/null; wait "$FRONTEND_PID" 2>/dev/null; sleep 0.5; }
 
-# The startup clone's git inherits the Beam daemon's environment.
+# The launch clone's git inherits the Beam daemon's environment.
 GIT_SSH_COMMAND="ssh $SSHOPTS" "$BOOTSTRAP" daemon --socket "$W/vm/daemon.sock" >"$W/vm.log" 2>&1 &
 pids+=($!)
 for _ in $(seq 100); do [ -S "$W/vm/ssh-agent.sock" ] && break; sleep 0.1; done
 check "Beam daemon serves an agent socket" test -S "$W/vm/ssh-agent.sock"
 
-env PATH="$W/bin:$PATH" HOME="$W/home" XDG_CONFIG_HOME="$W/config" \
-    "$BEAMS" daemon --socket "$W/local.sock" >"$W/local.log" 2>&1 &
+env PATH="$W/bin:$PATH" HOME="$W/home" XDG_CONFIG_HOME="$W/config" XDG_RUNTIME_DIR= \
+    "$BEAMS" daemon --socket "$W/config/beams-client/daemon.sock" >"$W/local.log" 2>&1 &
 pids+=($!)
 
 # --- "on the Beam" ---------------------------------------------------------------
@@ -169,19 +176,21 @@ check "frontend attached: only the allowed key is listed" \
     bash -c "grep -qF '$ALLOWED_FP' <<<'$listed' && ! grep -qF '$HIDDEN_FP' <<<'$listed'"
 check "key management is refused" bash -c "! ssh-add -D 2>/dev/null"
 
-# The first connect sent the startup manifest; its clone runs under the grant.
-for _ in $(seq 100); do [ -d "$W/startup-clone/.git" ] && break; sleep 0.2; done
-check "startup clone over ssh succeeded" test -d "$W/startup-clone/.git"
-check "startup clone was signed by the grant" grep -q '"granted":"startup grant, 1 of 3"' "$W/prompts.log"
-check "startup clone never prompted" bash -c "! grep '\"status\":\"pending_approval\"' '$W/prompts.log' | grep -q 'manifest-'"
-for _ in $(seq 50); do grep -q 'ended: startup finished' "$W/local.log" && break; sleep 0.2; done
-check "grant ended when startup finished" grep -q 'ended: startup finished' "$W/local.log"
+# A headless launch: its clone runs under the launch's grant.
+env PATH="$W/bin:$PATH" HOME="$W/home" XDG_CONFIG_HOME="$W/config" XDG_RUNTIME_DIR= \
+    timeout 120 "$BEAMS" config launch --profile "$W/profile/environment.toml" --headless smoke >"$W/launch.log" 2>&1
+check "the launch succeeded" test $? -eq 0
+check "launch clone over ssh succeeded" test -d "$W/launch-clone/.git"
+check "launch clone was signed by the grant" grep -q '"granted":"launch grant, 1 of 3"' "$W/prompts.log"
+check "launch clone never prompted" bash -c "! grep '\"status\":\"pending_approval\"' '$W/prompts.log' | grep -q '/launch:'"
+for _ in $(seq 50); do grep -q 'ended: the launch finished' "$W/local.log" && break; sleep 0.2; done
+check "grant ended when the launch finished" grep -q 'ended: the launch finished' "$W/local.log"
 
 SSH_KEY_REASON="smoke: plain login" ssh $SSHOPTS "$ME@127.0.0.1" true
 check "approved ssh login succeeds" test $? -eq 0
 check "prompt named the verified host via hashed known_hosts" \
     grep -q '"host":{"status":"verified","name":"\[127.0.0.1\]:'"$PORT"'"}' "$W/prompts.log"
-check "a login outside startup still prompted" \
+check "a login outside the launch still prompted" \
     grep -q '"status":"pending_approval".*"reason":"smoke: plain login"' "$W/prompts.log"
 check "request ended signed" grep -q '"status":"running","request":null,"action":null,"message":"signed"' "$W/prompts.log"
 
@@ -221,7 +230,7 @@ AUDIT="$W/config/beams-client/ssh-agent-audit.jsonl"
 audit_has() { grep -q "\"event\":\"$1\"" "$AUDIT"; }
 check "audit log is private" test "$(stat -c %a "$AUDIT" 2>/dev/null)" = 600
 check "audit log records the grant's use and its task" \
-    bash -c "grep '\"event\":\"granted\"' '$AUDIT' | grep -q '\"task_run\":\"manifest-'"
+    bash -c "grep '\"event\":\"granted\"' '$AUDIT' | grep -q '\"task_run\":\"[0-9a-f-]*/launch:'"
 for event in asked signed rejected expired; do
     check "audit log records $event" audit_has "$event"
 done

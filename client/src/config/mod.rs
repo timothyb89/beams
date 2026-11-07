@@ -89,7 +89,7 @@ impl From<Codec> for Compression {
 struct LaunchConfig {
     /// Profile `beams ssh` launches new Beams with when `--profile` isn't
     /// given: `builtin:NAME`, or a path (relative to `config.toml`'s
-    /// directory). Unset: new Beams use the legacy repo-checkout startup.
+    /// directory). Unset: `DEFAULT_PROFILE`.
     profile: Option<String>,
 }
 
@@ -97,7 +97,12 @@ struct LaunchConfig {
 struct ConfigFile {
     #[serde(default)]
     launch: LaunchConfig,
+    /// The removed `[startup]` section, only to refuse it with directions.
+    startup: Option<toml::Value>,
 }
+
+/// The profile for `beams ssh` without `--profile` or `[launch] profile`.
+pub const DEFAULT_PROFILE: &str = "builtin:development";
 
 /// A profile argument as recorded and compiled: bundled names as given,
 /// paths made absolute against `base`.
@@ -109,18 +114,27 @@ pub fn resolve_profile(profile: &str, base: &std::path::Path) -> String {
     if path.is_absolute() { path } else { base.join(path) }.display().to_string()
 }
 
-/// The workstation's `[launch] profile`, resolved; `None` when unset.
-pub fn default_profile() -> anyhow::Result<Option<String>> {
+/// The workstation's `[launch] profile`, resolved, else `DEFAULT_PROFILE`.
+/// A leftover `[startup]` section is an error: it would otherwise be
+/// silently ignored.
+pub fn default_profile() -> anyhow::Result<String> {
     use anyhow::Context as _;
     let path = crate::agent::Config::path()?;
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(DEFAULT_PROFILE.to_string()),
         Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
     };
     let file: ConfigFile = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    if file.startup.is_some() {
+        anyhow::bail!(
+            "{}: [startup] is no longer supported; move its tasks (and [startup.ssh_grant], as \
+             [ssh_grant]) into a profile and set [launch] profile (see docs/development/launches.md)",
+            path.display()
+        );
+    }
     let base = path.parent().unwrap_or(std::path::Path::new("."));
-    Ok(file.launch.profile.map(|p| resolve_profile(&p, base)))
+    Ok(file.launch.profile.map_or_else(|| DEFAULT_PROFILE.to_string(), |p| resolve_profile(&p, base)))
 }
 
 /// Packs `profile` into a fresh launch directory under the local daemon's

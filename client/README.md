@@ -30,10 +30,8 @@ Beam, or a source checkout; built-in profiles/assets are embedded.
 
 `--json` includes workstation source metadata alongside a remote-facing
 `plan`; it is inspection output, not a daemon launch request yet. These
-commands do not install, upload, or execute anything. `beams ssh` still uses
-its existing startup path. Profile selection during SSH, archive upload,
-and `config init` are pending. An opt-in foreground execution command is
-available in bootstrap; daemon acceptance/readiness wiring remains pending.
+commands do not install, upload, or execute anything; `beams ssh` and
+`beams config launch` do (below). `config init` is pending.
 
 See the [developer guide](../docs/development/launches.md) for the supported
 schema, ordering rules, custom templates and a checked team example in
@@ -112,77 +110,46 @@ daemons with a fake `tsh`.
 ## `beams ssh`
 
 ```sh
-beams ssh [--repo ~/beams] [--purpose default] [--region REGION] [--login beams]
-          [--profile PROFILE [--push-repo]]
+beams ssh [--profile PROFILE] [--purpose default] [--region REGION] [--login beams]
+          [--repo ~/beams] [--push-repo]
 beams ssh --beam ID|UUID|PURPOSE [--profile PROFILE]
 ```
 
+Every Beam is launched from a profile: `--profile`, else `[launch]
+profile = "..."` in `config.toml` (a bundled `builtin:NAME` or a path
+relative to that file), else `builtin:development`.
+
 1. Looks up the beam tracked for `--purpose` (see "State" below). If it
-   exists and has more than 6 hours of TTL left (beams can't have their
-   TTL extended), reuses it - no file copy, straight to connecting.
-2. Otherwise spawns a new beam (`tsh beams add`), refusing if already at
-   the 5-concurrent-beam limit (`tsh beams rm` something first).
-3. Pushes `--repo`'s current branch onto the beam over git's `ext::`
-   transport, run through the same `tsh ssh` channel used everywhere
-   else here - no new credential, not the repo's own dedicated ssh
-   keypair (see `docs/designs/DESIGN.md`'s "Repo delivery onto a beam" for the full
-   design, including a real gotcha found verifying this against a live
-   beam: the beam-side repo's checked-out branch has to match what gets
-   pushed, or `receive.denyCurrentBranch=updateInstead` silently no-ops
-   instead of erroring). Only transfers committed history, like any git
-   push. Also points the beam's own `origin` remote at `--repo`'s real
-   `origin` (plain GitHub URL, not the `ext::` one used for this push,
-   which only works from this workstation) - without this the beam ends
-   up with no `origin` configured at all, since neither `git init` nor
-   a push over a bare URL creates one. Skipped entirely if `--repo`
-   itself has no `origin` configured.
-4. Separately `scp`s the required extra deliberately *not* tracked in git:
-   a prebuilt `beam-bootstrap` binary (**build this first**: beams run Linux, so if
-   you're on macOS (or just want a statically linked build) run
-   `../bootstrap/build-cross.sh`; on Linux, `cd ../bootstrap && cargo
-   build --release` also works. No Rust toolchain on a fresh beam, so the
-   binary has to be copied over either way - see `../bootstrap/README.md`.
-   `stage.rs` looks for a cross-compiled build first and falls back to a
-   native one, refusing to ship anything that isn't a Linux ELF binary.)
-5. Registers a random managed-session token with the local daemon's
-   per-Beam bridge, then connects with `tsh ssh -t <login>@<uuid> -- env
-   BEAMS_CLIENT_ID=... BEAMS_SESSION_TOKEN=... ~/beams/bin/beam-shell` -
-   bypassing the `tsh beams ssh` layer (which can't take a remote command)
-   in favor of plain `tsh ssh`, per project.md. Unlike the original direct
-   `exec` handoff, `beams` now supervises `tsh` under a local PTY: terminal
-   bytes, resize events, exit status, and signals still pass through, while
-   `Ctrl-]` can temporarily open a local menu over the remote session.
-   `beam-shell` starts the daemon's SSH agent relay, kicks off
-   `beam-bootstrap` in the background, and drops you into zellij with a
-   TUI and log pane - see `../bootstrap/README.md`.
-
-On reuse, steps 3-4 are skipped entirely - a reused beam is assumed to
-already be bootstrapped from a prior run.
-
-`--beam` skips the lookup: it connects to that existing Beam however
-little TTL it has left (only an expired one is refused), never creates
-one, and leaves purpose tracking alone. A Beam launched from a profile
-(recorded under any purpose) reattaches through `launch start`.
-
-### Profile launches (`--profile`, opt-in)
-
-```sh
-beams ssh --profile builtin:development [--push-repo] [--purpose NAME]
-```
-
-`--profile` (or `[launch] profile = "..."` in `config.toml`, a bundled
-`builtin:NAME` or a path relative to that file) replaces steps 3-5 for a
-*new* Beam:
-
-1. Packs the profile locally first (`beams config pack`), so a broken
-   profile fails before a Beam is created.
-2. No git push (unless `--push-repo`). One `tsh beams scp` copies
-   `~/.beams/`: the runtime (`beam-bootstrap`, the `beams-shell` wrapper
-   and Zellij layout, embedded in the client from `../shell/runtime/`)
-   and the launch's `launch.json` and pre bundle.
-3. Registers the launch with the local daemon *before* its bridge, then
-   connects with `~/.beams/runtime/bin/beam-bootstrap launch start
-   --launch-dir ~/.beams/launches/ID`. That starts the Beam daemon,
+   was launched from a profile and has more than 6 hours of TTL left
+   (beams can't have their TTL extended), reuses it - no file copy,
+   straight to connecting. It must have been launched with the same
+   profile; a different one is refused. A tracked Beam from before
+   profile launches is skipped (with a note) rather than reused.
+2. Otherwise packs the profile locally first (`beams config pack`), so a
+   broken profile fails before a Beam is created, then spawns a new beam
+   (`tsh beams add`), refusing if already at the 5-concurrent-beam limit
+   (`tsh beams rm` something first).
+3. One `tsh beams scp` copies `~/.beams/`: the runtime (`beam-bootstrap`,
+   the `beams-shell` wrapper and Zellij layout, embedded in the client
+   from `../shell/runtime/`) and the launch's `launch.json` and pre
+   bundle. **Build `beam-bootstrap` first**: beams run Linux, so on macOS
+   (or for a statically linked build) run `../bootstrap/build-cross.sh`;
+   on Linux `cd ../bootstrap && cargo build --release` also works.
+   `stage.rs` looks under `--repo` for a cross-compiled build first and
+   falls back to a native one, refusing anything that isn't a Linux ELF.
+   No Git checkout is pushed unless `--push-repo`, which pushes `--repo`'s
+   current branch to `~/beams` over git's `ext::` transport (see
+   `docs/designs/DESIGN.md`'s "Repo delivery onto a beam").
+4. Registers the launch with the local daemon (started if needed; a
+   launch needs it) *before* its bridge, then a random managed-session
+   token, and connects with `tsh ssh -t <login>@<uuid> -- env
+   BEAMS_CLIENT_ID=... BEAMS_SESSION_TOKEN=...
+   ~/.beams/runtime/bin/beam-bootstrap launch start --launch-dir
+   ~/.beams/launches/ID` - plain `tsh ssh` rather than `tsh beams ssh`
+   (which can't take a remote command), per project.md. `beams`
+   supervises `tsh` under a local PTY: terminal bytes, resize events,
+   exit status, and signals pass through, while `Ctrl-]` opens a local
+   menu over the remote session. `launch start` starts the Beam daemon,
    submits and stages the launch, installs Zellij while pre runs, prints
    pre progress, and replaces itself with a Zellij session named
    `beams-<first launch-ID group>` running the plan's shell and the TUI.
@@ -190,13 +157,14 @@ beams ssh --profile builtin:development [--push-repo] [--purpose NAME]
 
 The purpose entry records the launch (profile, ID, digest, local launch
 directory). Reconnecting reruns `launch start`, which attaches to the
-same session. A Beam launched with a different profile, or a legacy Beam
-given an explicit `--profile`, is refused with the profile it has. A
-launch-managed Beam never gets the `[startup]` manifest: put that work
-in the profile. The fixed startup (`claude-md-merge`, teleport/k3s,
-starship, kubectl) doesn't run on this path either. Needs the local
-daemon (no `--no-client-daemon`). See
-`../docs/development/launches.md`.
+same session.
+
+`--beam` skips the lookup: it reattaches that existing profile launch
+however little TTL it has left (only an expired one is refused), never
+creates one, and leaves purpose tracking alone. It reattaches whatever
+profile the Beam was launched with unless `--profile` names a different
+one. A Beam with no launch recorded on this workstation is refused
+(`tsh ssh` still reaches it). See `../docs/development/launches.md`.
 
 ## Managed SSH session and local menu
 
@@ -376,7 +344,7 @@ python3 client/tests/terminal-overlay-smoke.py
 `beams ssh` connects to a per-user workstation daemon and starts one in the
 background if no instance is listening. The foreground SSH process still owns
 the interactive PTY. The daemon owns one reconnecting
-`tsh ssh ... ~/beams/bin/beam-client-bridge` process per Beam, shares it across
+`tsh ssh ... ~/.beams/runtime/bin/beam-bootstrap client-bridge` process per Beam, shares it across
 local frontends, retains all managed-shell tokens when that bridge reconnects,
 and supervises approved `tsh ssh -N -L` processes plus one-shot `tsh scp`
 jobs independently of the interactive terminal.
@@ -396,8 +364,8 @@ beams daemon
 beams daemon --socket /tmp/beams-test.sock
 ```
 
-`--no-client-daemon` on `beams ssh` disables connection/auto-start without
-disabling the managed PTY itself.
+`beams ssh` needs the daemon: a launch's readiness and post work go over
+its bridge.
 
 ### Daemon lifecycle and updates
 
@@ -603,13 +571,13 @@ beams ide [target] [--ide vscode|cursor|zed]
 `rm` resolves every target before deleting anything, so a typo in one
 doesn't leave the others half-done. `tsh beams add` isn't wrapped:
 `beams ssh` (or `beams ssh --purpose <name>`) is the spawn path, since
-it also tracks the purpose and bootstraps the beam.
+it also tracks the purpose and launches the profile.
 
 ## Host keys: the Beam asks this workstation's known_hosts
 
 A Beam keeps no copy of your known_hosts. Its ssh config (a drop-in,
-`/etc/ssh/ssh_config.d/beams-known-hosts.conf`, written by `launch start`
-or `bin/beam-shell`) sets `KnownHostsCommand` to `beam-bootstrap client
+`/etc/ssh/ssh_config.d/beams-known-hosts.conf`, written by `launch start`)
+sets `KnownHostsCommand` to `beam-bootstrap client
 known-hosts %H`, which asks the connected workstation over the bridge
 (`KnownHostsQuery`). The daemon answers with `ssh-keygen -F HOST` over the
 known_hosts files `ssh -G HOST` resolves (hashed entries, `[host]:port`,
@@ -621,11 +589,7 @@ each lookup (`known-hosts: <beam>: <host>: N entries`).
 `BEAMS_KNOWN_HOSTS_FILES` (colon-separated, in the daemon's environment)
 replaces the files, e.g. for tests.
 
-## Configuration: SSH keys and startup tasks
-
-Client-side environment profiles, batched uploads/packages, and pre/post
-hooks are proposed in `../docs/designs/LAUNCH_CONFIGURATION_DESIGN.md`; they are not
-implemented yet. The configuration below is what works today.
+## Configuration: SSH keys and the launch profile
 
 `~/.config/beams-client/config.toml` (re-read on use; a missing file means
 the defaults below):
@@ -638,31 +602,20 @@ the defaults below):
 allowed_keys = ["SHA256:..."]
 prompt_timeout = 60        # seconds to approve a request (max 110)
 
-[startup]
-# Sent to each new Beam once, the first time `beams ssh` connects to it.
-# Default without this section: the Go and Rust toolchains.
-tasks = [
-  { template = "install-toolchain-go" },
-  { template = "install-toolchain-rust" },
-  { template = "clone-git-repo", params = { repo = "git@github.com:example-org/example-repo.git", dest = "~/projects/example-repo" } },
-  { template = "clone-git-repo", params = { repo = "git@github.com:timothyb89/teleport-harness.git", dest = "~/projects/teleport-harness" } },
-  { template = "clone-git-repo", params = { repo = "git@github.com:timothyb89/rdocker.git", dest = "~/projects/rdocker" } },
-]
-
-[startup.ssh_grant]
-# Lets those startup clones use the key without a prompt: logins to these
-# hosts (as your known_hosts names them, and verified against it) as
-# `user`, for at most `max_uses` signatures (default: one per ssh clone
-# plus two) within `window_secs` (default 600), ending early once startup
-# finishes. Each use shows a toast; revoke it from the menu.
-hosts = ["github.com"]
-user = "git"
+[launch]
+# The profile new Beams are launched with when `beams ssh` has no
+# `--profile`: `builtin:NAME` or a path relative to this file.
+# Default: builtin:development.
+profile = "profiles/personal.toml"
 ```
 
-A profile launch (`beams ssh --profile`) never gets `[startup]`; the
-profile declares the same grant as a top-level `[ssh_grant]` (same
-fields plus `tasks`), scoped to that launch's own SSH tasks. See
-`../docs/development/launches.md#ssh-key-grants`.
+Repo clones, toolchains and everything else a Beam starts with live in
+the profile (`../docs/development/launches.md`). So does the SSH key
+grant that lets a launch's own clones use the key without a prompt
+(`[ssh_grant]`, see
+`../docs/development/launches.md#ssh-key-grants`). The old `[startup]`
+section is gone; `beams ssh` refuses a `config.toml` that still has one
+and says where its contents go.
 
 There's no private key on a Beam: its `SSH_AUTH_SOCK` relays to the agent of
 the `beams ssh` terminal attached to it, and every other use of a key shows

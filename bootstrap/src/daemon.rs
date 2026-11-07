@@ -63,7 +63,7 @@
 //! `task_status` broadcast carries a `manifest_id` when the task ran as
 //! part of a manifest (`null` for a standalone `run_task`).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -77,7 +77,7 @@ use anyhow::Context;
 use beams_protocol::{
     ActionRequestProjection, BeamToClient, ClientToBeam, FetchSource, RequestProjection, RequestStatus,
     ServiceActionRequest, ServiceProjection, ServiceRequest, ServiceRequestKind, ServiceStatus,
-    CAPABILITY_FILE_FETCH, CAPABILITY_LAUNCH, CAPABILITY_SSH_AGENT, ManifestParam, ManifestTask, MAX_FETCH_SOURCES, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
+    CAPABILITY_FILE_FETCH, CAPABILITY_LAUNCH, CAPABILITY_SSH_AGENT, MAX_FETCH_SOURCES, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -105,7 +105,6 @@ struct Hub {
     /// Running workstation-submitted manifests: manifest id -> the
     /// `client_id` that submitted it. Routes its tasks' SSH key use
     /// (`route_agent`) while it runs.
-    manifest_owners: Mutex<HashMap<String, String>>,
     agent: AgentState,
     /// `known_hosts_query`s waiting for their workstation (`knownhosts`).
     known_hosts: Arc<crate::knownhosts::Pending>,
@@ -124,7 +123,6 @@ impl Default for Hub {
             client_requests: Mutex::new(BTreeMap::new()),
             client_action_requests: Mutex::new(BTreeMap::new()),
             client_services: Mutex::new(BTreeMap::new()),
-            manifest_owners: Mutex::new(HashMap::new()),
             agent: AgentState::default(),
             known_hosts: Arc::default(),
             launches: crate::launch::daemon::Launches::new(
@@ -191,10 +189,15 @@ impl Hub {
     /// The bridge (advertising `capability`) for a requester: see
     /// `route_agent`, which is this for `CAPABILITY_SSH_AGENT`.
     fn route_bridge(&self, capability: &str, session_token: Option<&str>, task_run: Option<&str>) -> Result<String, String> {
-        // A running manifest's or launch's owner (`<manifest or launch id>/<task>`).
-        let owner = task_run.and_then(|run| run.split_once('/').map(|(scope, _)| scope)).and_then(|scope| {
-            self.manifest_owners.lock().unwrap().get(scope).cloned().or_else(|| self.launches.running_owner(scope))
-        });
+        // A running launch's owner (`<launch id>/<task>`).
+        let owner = task_run
+            .and_then(|run| run.split_once('/').map(|(scope, _)| scope))
+            .and_then(|scope| self.launches.running_owner(scope));
+        self.pick_bridge(capability, session_token, owner.as_deref())
+    }
+
+    /// `route_bridge` once the task's owner (a client id) is known.
+    fn pick_bridge(&self, capability: &str, session_token: Option<&str>, owner: Option<&str>) -> Result<String, String> {
         let bridges = self.bridges.lock().unwrap();
         let capable: Vec<&BridgeRegistration> = bridges
             .values()
@@ -942,15 +945,6 @@ fn client_bridge_message(
         ClientToBeam::Ping { nonce } => {
             send_bridge_event(reply, &BeamToClient::Pong { nonce });
         }
-        ClientToBeam::RunManifest { request_id: manifest_request_id, tasks } => {
-            let client_id = hub.bridges.lock().unwrap().get(bridge_id).map(|bridge| bridge.client_id.clone());
-            let Some(client_id) = client_id else {
-                let _ = reply.send(error_reply(request_id, "bridge is no longer registered"));
-                return;
-            };
-            run_bridge_manifest(hub, &client_id, manifest_request_id, tasks, reply);
-            let _ = reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
-        }
         message @ (ClientToBeam::LaunchUploadBegin { .. }
         | ClientToBeam::LaunchUploadChunk { .. }
         | ClientToBeam::LaunchSubmit { .. }) => {
@@ -1422,60 +1416,6 @@ fn build_manifest(entries: Vec<ManifestEntry>) -> Result<Vec<Box<dyn Task>>, Str
         .collect()
 }
 
-/// `RunManifest` from a workstation bridge: the same as a local
-/// `run_manifest`, answered with typed bridge messages instead. While it
-/// runs, its tasks' SSH key use routes to `client_id` (`route_agent`).
-fn run_bridge_manifest(
-    hub: &Arc<Hub>,
-    client_id: &str,
-    request_id: String,
-    tasks: Vec<ManifestTask>,
-    reply: &Sender<String>,
-) {
-    let entries = tasks
-        .into_iter()
-        .map(|task| ManifestEntry {
-            template: task.template,
-            params: Value::Object(
-                task.params
-                    .into_iter()
-                    .map(|(name, param)| {
-                        let value = match param {
-                            ManifestParam::Bool(b) => Value::from(b),
-                            ManifestParam::Int(i) => Value::from(i),
-                            ManifestParam::Str(s) => Value::from(s),
-                        };
-                        (name, value)
-                    })
-                    .collect(),
-            ),
-        })
-        .collect();
-    let finished_reply = reply.clone();
-    let finished_hub = Arc::clone(hub);
-    let started = start_manifest(
-        hub,
-        entries,
-        |manifest_id, plan| {
-            eprintln!("daemon: workstation startup manifest accepted as {manifest_id}");
-            // Before the worker starts (`start_manifest` runs this first).
-            hub.manifest_owners.lock().unwrap().insert(manifest_id.to_string(), client_id.to_string());
-            send_bridge_event(reply, &BeamToClient::ManifestAccepted {
-                request_id: request_id.clone(),
-                manifest_id: manifest_id.to_string(),
-                task_ids: plan.iter().map(|planned| planned.task_id.clone()).collect(),
-            });
-        },
-        move |manifest_id, ok| {
-            finished_hub.manifest_owners.lock().unwrap().remove(manifest_id);
-            send_bridge_event(&finished_reply, &BeamToClient::ManifestFinished { manifest_id: manifest_id.to_string(), ok });
-        },
-    );
-    if let Err(message) = started {
-        send_bridge_event(reply, &BeamToClient::ManifestRejected { request_id, message });
-    }
-}
-
 fn run_manifest(hub: &Arc<Hub>, request_id: Option<&str>, tasks_value: Value, reply: &Sender<String>) {
     let entries: Vec<ManifestEntry> = match serde_json::from_value(tasks_value) {
         Ok(entries) => entries,
@@ -1672,7 +1612,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_requests_route_by_session_then_running_manifest_owner() {
+    fn agent_requests_route_by_session_then_task_owner() {
         let hub = Hub::default();
         agent_bridge(&hub, "client-a", "bridge-a", "token-a");
         // One client: everything goes to it, tagged or not.
@@ -1682,16 +1622,16 @@ mod tests {
         assert!(hub.route_agent(None, None).is_err(), "two clients and no hint is ambiguous");
         assert_eq!(hub.route_agent(Some("token-b"), None).unwrap(), "bridge-b");
 
-        let run = "manifest-4/clone-git-repo:dest=/home/beams/x";
-        assert!(hub.route_agent(None, Some(run)).is_err(), "not a running manifest");
-        hub.manifest_owners.lock().unwrap().insert("manifest-4".into(), "client-b".into());
-        assert_eq!(hub.route_agent(None, Some(run)).unwrap(), "bridge-b");
-        // A shell's own session still wins over a claimed run tag.
-        assert_eq!(hub.route_agent(Some("token-a"), Some(run)).unwrap(), "bridge-a");
+        let run = "launch-4/launch:launch-4:tasks:core";
+        assert!(hub.route_agent(None, Some(run)).is_err(), "not a running launch");
+        // A running launch's tasks go to its owner (`Launches::running_owner`).
+        assert_eq!(hub.pick_bridge(CAPABILITY_SSH_AGENT, None, Some("client-b")).unwrap(), "bridge-b");
+        // A shell's own session still wins over the task's owner.
+        assert_eq!(hub.pick_bridge(CAPABILITY_SSH_AGENT, Some("token-a"), Some("client-b")).unwrap(), "bridge-a");
 
         // The owner went away: fall back to the only remaining client.
         hub.bridges.lock().unwrap().remove("bridge-b");
-        assert_eq!(hub.route_agent(None, Some(run)).unwrap(), "bridge-a");
+        assert_eq!(hub.pick_bridge(CAPABILITY_SSH_AGENT, None, Some("client-b")).unwrap(), "bridge-a");
     }
 
     fn connect_to(hub: Arc<Hub>) -> (UnixStream, BufReader<UnixStream>, thread::JoinHandle<()>) {
@@ -1868,70 +1808,6 @@ mod tests {
         assert_eq!(done["status"], "ok");
         assert!(dest.join(".git").exists());
 
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn a_workstation_startup_manifest_runs_and_reports_back_over_the_bridge() {
-        let tmp = scratch_dir("bridge-manifest");
-        let source = tmp.join("source");
-        let dest = tmp.join("dest");
-        make_source_repo_with_pr(&source, 1);
-        let hub = Arc::new(Hub::default());
-        let (mut bridge, mut reader, _handle) = register_bridge(Arc::clone(&hub), "client-a", "bridge-a", "token-a");
-
-        let mut params = std::collections::BTreeMap::new();
-        params.insert("repo".to_string(), ManifestParam::Str(source.display().to_string()));
-        params.insert("dest".to_string(), ManifestParam::Str(dest.display().to_string()));
-        send(
-            &mut bridge,
-            &json!({
-                "request_id": "m1",
-                "op": "client_bridge_message",
-                "message": ClientToBeam::RunManifest {
-                    request_id: "startup-1".into(),
-                    tasks: vec![ManifestTask { template: "clone-git-repo".into(), params }],
-                },
-            })
-            .to_string(),
-        );
-        let bridge_message = |reader: &mut BufReader<UnixStream>| -> BeamToClient {
-            loop {
-                let value = recv(reader);
-                if value["type"] == "client_bridge_event" {
-                    return serde_json::from_value(value["message"].clone()).unwrap();
-                }
-            }
-        };
-        let BeamToClient::ManifestAccepted { request_id, manifest_id, task_ids } = bridge_message(&mut reader) else {
-            panic!("expected ManifestAccepted");
-        };
-        assert_eq!(request_id, "startup-1");
-        assert_eq!(task_ids.len(), 1);
-        assert!(task_ids[0].starts_with("clone-git-repo:"));
-        assert_eq!(
-            bridge_message(&mut reader),
-            BeamToClient::ManifestFinished { manifest_id, ok: true }
-        );
-        assert!(dest.join(".git").exists());
-
-        // An unknown template is rejected up front.
-        send(
-            &mut bridge,
-            &json!({
-                "request_id": "m2",
-                "op": "client_bridge_message",
-                "message": ClientToBeam::RunManifest {
-                    request_id: "startup-2".into(),
-                    tasks: vec![ManifestTask { template: "no-such-template".into(), params: Default::default() }],
-                },
-            })
-            .to_string(),
-        );
-        assert!(matches!(
-            bridge_message(&mut reader),
-            BeamToClient::ManifestRejected { request_id, .. } if request_id == "startup-2"
-        ));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

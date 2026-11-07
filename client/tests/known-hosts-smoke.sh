@@ -35,7 +35,7 @@ VM_SOCK="$T/vm/daemon.sock"
 WS_SOCK="$T/ws-run/daemon.sock"
 mkdir -p "$T/bin" "$T/vm" "$T/beam-home" "$T/ws-home/.ssh" "$T/ws-config/beams-client" "$T/ws-run"
 chmod 700 "$T/ws-run"
-printf '[startup]\ntasks = []\n' >"$T/ws-config/beams-client/config.toml"
+: >"$T/ws-config/beams-client/config.toml"
 
 for name in github example other; do
     ssh-keygen -q -t ed25519 -N '' -C '' -f "$T/$name" || exit 1
@@ -54,7 +54,7 @@ check "the hashed entry hides its name" sh -c "! grep -q hashed.example '$T/ws-h
 cat >"$T/bin/tsh" <<EOF
 #!/bin/sh
 case " \$* " in
-    *"beam-client-bridge"*) exec "$B" client-bridge --socket "$VM_SOCK" ;;
+    *"beam-bootstrap client-bridge"*) exec "$B" client-bridge --socket "$VM_SOCK" ;;
 esac
 echo "fake tsh: unexpected: \$*" >&2
 exit 1

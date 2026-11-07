@@ -4,7 +4,7 @@ Status: offline compiler, verified archive tooling and foreground execution
 foundation implemented, 2026-11-06. `beams config validate`
 and `beams config explain` resolve and validate profiles without contacting
 Teleport, reading client state, installing packages, or invoking hooks.
-`beams ssh` still uses the existing startup path. The opt-in headless runner
+Every `beams ssh` Beam is launched from a profile. The headless runner
 executes package/file/script graphs, and the daemon accepts launches, waits
 for their conditions and releases the interface from shell/TUI readiness.
 `beams config launch` drives a profile onto an existing Beam over its
@@ -45,9 +45,10 @@ The development starter selects fish, its configuration and starship (the
 `install-starship` template, downloaded while pre's apt batch runs) before
 the interface, so the first prompt is complete, with micro/less and
 Go/Rust afterward. It contains no SSH keys,
-cluster bot, Kubernetes settings, or maintainer project checkouts. The
-old startup's remaining optional installers will move into this profile
-as their generic execution primitives become available.
+cluster bot, Kubernetes settings, or maintainer project checkouts: those
+belong in a local profile that extends it (the old fixed startup's
+claude update, CLAUDE.md merge, kubectl, tbot and k3s steps are script
+tasks in the maintainer's gitignored `environments/local/` profile now).
 
 ## Profile schema v1
 
@@ -292,10 +293,8 @@ worker probes both phases when it starts.
   that need only pre artifacts proceed once the interface is ready, while
   post-bundle consumers still wait for their bundle.
 - **Who reports.** Both read `BEAMS_LAUNCH_ID`; without it neither does
-  anything, so the fixed startup is unaffected. The shell's report comes
-  from `shell/fish/conf.d/beams-launch.fish` at the first interactive
-  prompt (in the background, via `$BEAM_BOOTSTRAP_BIN` or `beam-bootstrap`
-  on `PATH`). The TUI reports after the first frame drawn with its launch's
+  anything. The shell's report comes from `beams-shell` (`launch shell`,
+  below), in the background, before it execs the plan's shell. The TUI reports after the first frame drawn with its launch's
   snapshot applied, unless that snapshot already has `tui` or a released
   interface. Getting `BEAMS_LAUNCH_ID` into the Zellij session is the
   launcher's job (the next slice); until then, export it yourself.
@@ -427,12 +426,12 @@ is). `client/tests/launch-bridge-smoke.sh` runs a headless and an
 interactive launch through the real workstation daemon, bridge adapter and
 Beam daemon with a fake `tsh`, including a multi-MiB post bundle.
 
-### Launch a new Beam: `beams ssh --profile`
+### Launch a new Beam: `beams ssh`
 
-`beams ssh --profile PROFILE` (or `[launch] profile` in the workstation's
-`config.toml`) creates a Beam for a launch instead of the legacy
-repo-checkout startup. It's opt-in; without a profile, `beams ssh` is
-unchanged.
+`beams ssh` creates every Beam for a launch of `--profile PROFILE`, else
+`[launch] profile` in the workstation's `config.toml`, else
+`builtin:development`. A `config.toml` that still has the removed
+`[startup]` section is refused with directions.
 
 ```text
 workstation                                   Beam
@@ -454,8 +453,7 @@ post packed and uploaded                      → … LaunchStatus{ok}
   `bin/beams-shell` and `zellij/beams-launch.kdl` (sources in
   `shell/runtime/`, embedded in the client). The launch itself is under
   `~/.beams/launches/<ID>/`. No `~/beams` checkout unless `--push-repo`.
-  The bridge runs the runtime's `client-bridge` when present, else the
-  legacy `~/beams/bin/beam-client-bridge`.
+  The bridge runs the runtime's `client-bridge`.
 - **Session.** One Zellij session per launch (`beams-` plus the first
   group of the launch ID), so an attach never reuses another launch's
   environment. Its environment is the plan's (`[env]`, `[shell] path`
@@ -472,12 +470,9 @@ post packed and uploaded                      → … LaunchStatus{ok}
 - **Reuse.** The purpose entry in `state.json` records the launch
   (profile, ID, digest, local launch directory). Reconnecting reruns
   `launch start`: the submission is `existing`, pre is already released,
-  and Zellij attaches to the same session. A different `--profile`, or an
-  explicit `--profile` for a legacy Beam, is refused.
-- **No legacy startup.** The workstation daemon doesn't send `[startup]`
-  tasks to a Beam that has a launch record, and the fixed startup
-  (`bin/beam-shell`'s background run) never starts. Work from either
-  belongs in the profile.
+  and Zellij attaches to the same session. A different `--profile` is
+  refused. A tracked Beam with no launch (from before profile launches)
+  isn't reused, and `--beam` refuses one.
 
 ### Package transactions and parallel work
 
@@ -487,7 +482,7 @@ edge to it; a task without package requirements can overlap apt. Each
 action probes requested names/architectures/versions in one `dpkg-query`
 call. An already-satisfied batch skips without apt.
 
-The shared package helper acquires the same kernel lock as legacy
+The shared package helper acquires the same kernel lock as
 `aptlock`: `~/.beam-bootstrap/apt.lock`. It probes again under the lock,
 fingerprints apt source/keyring contents, refreshes indexes on first use,
 changed inputs or missing index files, installs the batch noninteractively,

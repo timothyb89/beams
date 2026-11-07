@@ -881,16 +881,15 @@ mod tests {
         // An existing file keeps its comments and other sections.
         fs::write(
             &path,
-            "# my settings\n[startup]\ntasks = [] # none\n\n[ssh_agent]\nprompt_timeout = 30 # slow\nallowed_keys = [\"SHA256:old\"]\n",
+            "# my settings\n[launch]\nprofile = \"builtin:core\" # small\n\n[ssh_agent]\nprompt_timeout = 30 # slow\nallowed_keys = [\"SHA256:old\"]\n",
         )
         .unwrap();
         Config::write_allowed_keys_to(&path, &["SHA256:b".to_string(), "SHA256:c".to_string()]).unwrap();
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("# my settings") && text.contains("tasks = [] # none") && text.contains("# slow"), "{text}");
+        assert!(text.contains("# my settings") && text.contains("profile = \"builtin:core\" # small") && text.contains("# slow"), "{text}");
         let config = Config::load_from(&path).unwrap();
         assert_eq!(config.allowed_keys, vec!["SHA256:b".to_string(), "SHA256:c".to_string()]);
         assert_eq!(config.prompt_timeout, Some(30));
-        assert!(crate::startup::StartupConfig::load_from(&path).unwrap().tasks.is_empty());
 
         // An explicit empty list is "configured, sharing nothing".
         Config::write_allowed_keys_to(&path, &[]).unwrap();

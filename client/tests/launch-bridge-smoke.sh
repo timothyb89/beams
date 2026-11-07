@@ -39,10 +39,8 @@ VM_SOCK="$T/vm/daemon.sock"
 BEAM_HOME="$T/beam-home"
 mkdir -p "$T/bin" "$T/vm" "$BEAM_HOME" "$T/ws-home" "$T/ws-config" "$T/ws-run" "$T/profile/hooks" "$T/profile/data"
 chmod 700 "$T/ws-run"
-# No startup manifest: the default one installs toolchains into the scratch
-# Beam home (over the network). Launches are all this test exercises.
 mkdir -p "$T/ws-config/beams-client"
-printf '[startup]\ntasks = []\n' >"$T/ws-config/beams-client/config.toml"
+: >"$T/ws-config/beams-client/config.toml"
 
 cat >"$T/bin/tsh" <<EOF
 #!/bin/sh
@@ -50,7 +48,7 @@ case " \$* " in
     *" beams ls "*)
         echo '[{"id": "beam-a", "uuid": "beam-uuid", "owner": "me", "expires": "2099-01-01T00:00:00Z"}]'
         exit 0 ;;
-    *"beam-client-bridge"*)
+    *"beam-bootstrap client-bridge"*)
         exec "$B" client-bridge --socket "$VM_SOCK" ;;
 esac
 echo "fake tsh: unexpected: \$*" >&2
@@ -119,7 +117,6 @@ HOME="$BEAM_HOME" BEAMS_LAUNCH_ID="$ID2" "$B" launch ready --socket "$VM_SOCK" -
 wait "$follower"
 check "readiness released post, and the launch succeeded" test $? -eq 0
 check "post ran after the interface" test "$(events)" = "pre post "
-check "no startup manifest ran" test ! -e "$BEAM_HOME/.rustup" -a ! -e "$BEAM_HOME/.cargo"
 
 echo "$fails failure(s)"
 exit "$fails"

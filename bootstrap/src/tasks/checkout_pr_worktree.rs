@@ -58,7 +58,7 @@ impl Task for CheckoutPrWorktree {
         let mut fetch = Command::new("git");
         fetch.current_dir(&self.base).args(["fetch", "origin", &refspec]);
         // `origin` might be an ssh:// remote: use the relay, and tag the
-        // fetch so a startup manifest's PR checkout is covered by its
+        // fetch so a launch's PR checkout can be covered by its SSH
         // grant. An https:// or local one just ignores both, so this is
         // unconditional rather than probing the remote URL to decide.
         relay_command(&mut fetch);

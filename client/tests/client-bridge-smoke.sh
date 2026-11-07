@@ -37,7 +37,7 @@ mkdir -p "$TEST_DIR/bin" "$TEST_DIR/config-a" "$TEST_DIR/config-b"
 cat >"$TEST_DIR/bin/tsh" <<'EOF'
 #!/bin/sh
 case " $* " in
-    *"beam-client-bridge"*)
+    *"beam-bootstrap client-bridge"*)
         exec "$TEST_BOOTSTRAP_BIN" client-bridge --socket "$TEST_VM_SOCKET"
         ;;
 esac

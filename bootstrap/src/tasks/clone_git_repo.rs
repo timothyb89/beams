@@ -21,8 +21,8 @@ use crate::sshagent::relay_command;
 /// `SSH_AUTH_SOCK` (see `sshagent`: the daemon's own environment has
 /// none). An https:// or local filesystem `repo` has no such requirement.
 ///
-/// Each use of the key is approved on the workstation; a clone run by the
-/// workstation's startup manifest may be covered by its startup grant,
+/// Each use of the key is approved on the workstation; a launch's clone
+/// may be covered by the launch's `[ssh_grant]`,
 /// which is why `run()` also passes `BEAMS_TASK_RUN` (`relay_command`).
 pub struct CloneGitRepo {
     pub repo: String,

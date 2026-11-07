@@ -304,7 +304,7 @@ impl Hub {
             grant.user.clone(),
             std::time::Duration::from_secs(grant.window_secs),
             grant.max_uses,
-            Some(grant.task_runs(id).into_iter().collect()),
+            grant.task_runs(id).into_iter().collect(),
         );
     }
 

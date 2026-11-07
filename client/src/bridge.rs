@@ -140,11 +140,9 @@ fn supervise(
     }
 }
 
-/// The Beam-side bridge: a profile launch's runtime (`stage::RUNTIME_BIN`)
-/// when present, else a legacy repo checkout's wrapper. Wrapped in `sh -c`
-/// since the login shell may be fish.
-const BRIDGE_COMMAND: &str = "sh -c 'b=$HOME/.beams/runtime/bin/beam-bootstrap; \
-    if [ -x \"$b\" ]; then exec \"$b\" client-bridge; fi; exec $HOME/beams/bin/beam-client-bridge'";
+/// The Beam-side bridge, from the launch runtime (`stage::RUNTIME_BIN`).
+/// `~` expands in both sh and fish login shells.
+const BRIDGE_COMMAND: &str = "~/.beams/runtime/bin/beam-bootstrap client-bridge";
 
 fn start_child(
     program: &str,

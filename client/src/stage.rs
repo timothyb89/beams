@@ -4,27 +4,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 
-/// Builds a temp directory named `beams/` containing the one thing a
-/// fresh beam needs that git itself won't carry over: a prebuilt
-/// `beam-bootstrap` binary (no Rust toolchain on a fresh beam; see
-/// bootstrap/README.md). Everything else - every git-tracked file in
-/// `repo` - gets there via `tsh::push_repo` instead (see docs/designs/DESIGN.md's
-/// "Repo delivery onto a beam").
-///
-/// No SSH private key is ever copied: the beam's agent is a relay to the
-/// workstation's own agent (see docs/designs/SSH_AGENT_PROXY_DESIGN.md).
-pub fn build(repo: &Path) -> anyhow::Result<PathBuf> {
-    let tmp = std::env::temp_dir().join(format!("beams-client-stage-{}", std::process::id()));
-    let dest_root = tmp.join("beams");
-    fs::create_dir_all(&dest_root).with_context(|| format!("creating {}", dest_root.display()))?;
-
-    let bin = find_bootstrap_bin(repo)?;
-    let rel = bin.strip_prefix(repo).unwrap_or(&bin);
-    copy_preserving_mode(&bin, &dest_root.join(rel))?;
-
-    Ok(tmp)
-}
-
 /// Remote directory (under the Beam user's home) for a profile launch's
 /// runtime and launches; see `bootstrap/src/launch/session.rs`.
 pub const LAUNCH_ROOT: &str = ".beams";

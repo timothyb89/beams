@@ -23,10 +23,10 @@ use anyhow::{bail, Context};
 use beams_protocol::{
     ActionRequestProjection, BeamToClient, ClientToBeam, RequestProjection, RequestStatus,
     ServiceAction, ServiceActionRequest, ServiceProjection, ServiceRequest, ServiceRequestKind,
-    ServiceStatus, TransferProgress, CAPABILITY_SSH_AGENT, CAPABILITY_STARTUP_MANIFEST, MAX_FRAME_BYTES,
+    ServiceStatus, TransferProgress, CAPABILITY_SSH_AGENT, MAX_FRAME_BYTES,
     PROTOCOL, PROTOCOL_VERSION,
 };
-use crate::startup::{GrantConfig, GrantRecord, StartupConfig};
+use crate::startup::GrantRecord;
 
 mod launches;
 pub use launches::{LaunchRecord, LaunchStage};
@@ -197,7 +197,7 @@ enum ClientMessage {
         service_id: String,
         action: ServiceAction,
     },
-    /// End a startup SSH key grant now.
+    /// End a launch SSH key grant now.
     RevokeGrant {
         grant_id: String,
     },
@@ -238,7 +238,7 @@ pub enum ServerEvent {
         requests: Vec<RequestRecord>,
         services: Vec<ServiceRecord>,
         bridges: Vec<BridgeRecord>,
-        /// Usable startup SSH key grants.
+        /// Usable launch SSH key grants.
         #[serde(default)]
         grants: Vec<GrantRecord>,
         /// Configured launches this daemon drives.
@@ -291,11 +291,6 @@ struct PersistedState {
     requests: BTreeMap<String, RequestRecord>,
     #[serde(default)]
     services: BTreeMap<String, ServiceRecord>,
-    /// Beams that were already sent the startup manifest. Each Beam gets it
-    /// (and its SSH grant) at most once, however often its bridge or daemon
-    /// restarts.
-    #[serde(default)]
-    startup_submitted: BTreeSet<String>,
     /// Configured launches, by launch ID (see `launches`).
     #[serde(default)]
     launches: BTreeMap<String, LaunchRecord>,
@@ -308,7 +303,6 @@ impl Default for PersistedState {
             client_id: Uuid::new_v4().to_string(),
             requests: BTreeMap::new(),
             services: BTreeMap::new(),
-            startup_submitted: BTreeSet::new(),
             launches: BTreeMap::new(),
         }
     }
@@ -433,8 +427,6 @@ struct Hub {
     agent_known_hosts: Box<dyn Fn() -> String + Send + Sync>,
     agent: Mutex<AgentRuntime>,
     frontend_ids: AtomicU64,
-    /// `[startup]` config, read when a Beam first connects.
-    startup_config: Box<dyn Fn() -> StartupConfig + Send + Sync>,
     launch_runtime: Mutex<launches::Runtime>,
 }
 
@@ -450,13 +442,10 @@ struct AgentRuntime {
     pending: BTreeMap<String, PendingAgent>,
     /// Beams whose bridge advertised `CAPABILITY_SSH_AGENT`.
     capable: HashSet<String>,
-    /// Usable startup grants by id.
+    /// Usable launch SSH key grants by id.
     grants: BTreeMap<String, GrantRecord>,
-    /// Startup manifests sent but not yet accepted: request id ->
-    /// (Beam UUID, grant to issue once accepted, its use budget).
-    startup_requests: BTreeMap<String, (String, Option<GrantConfig>, u32)>,
-    /// Grants limited to exact `BEAMS_TASK_RUN` tags (launch grants), by
-    /// grant id; checked on top of `GrantRecord::covers`.
+    /// Each grant's exact `BEAMS_TASK_RUN` tags, by grant id; checked on
+    /// top of `GrantRecord::covers`.
     grant_scopes: BTreeMap<String, BTreeSet<String>>,
 }
 
@@ -469,13 +458,6 @@ struct PendingAgent {
 }
 
 use crate::agent::now_ms;
-
-fn load_startup_config() -> StartupConfig {
-    StartupConfig::load().unwrap_or_else(|err| {
-        eprintln!("startup: config ignored, using the default tasks: {err:#}");
-        StartupConfig::default()
-    })
-}
 
 fn load_agent_config() -> crate::agent::Config {
     crate::agent::Config::load().unwrap_or_else(|err| {
@@ -547,7 +529,6 @@ impl Hub {
         // Never the developer's real config or known_hosts.
         hub.agent_config = Box::new(crate::agent::Config::default);
         hub.agent_known_hosts = Box::new(String::new);
-        hub.startup_config = Box::new(|| StartupConfig { tasks: Vec::new(), ssh_grant: None });
         hub
     }
 
@@ -575,7 +556,6 @@ impl Hub {
             agent_known_hosts: Box::new(crate::agent::read_known_hosts),
             agent: Mutex::new(AgentRuntime::default()),
             frontend_ids: AtomicU64::new(1),
-            startup_config: Box::new(load_startup_config),
             launch_runtime: Mutex::default(),
         }
     }
@@ -834,10 +814,8 @@ impl Hub {
     /// has been failing for a while, retire it if its Beam no longer exists:
     /// drop the bridge (its supervisor exits when the command channel
     /// closes), stop that Beam's forwards and copies, and pause its syncs
-    /// (pausing is reversible), and forget that it was sent the startup
-    /// manifest. A later `beams ssh` to the same Beam simply creates a fresh
-    /// bridge, so a wrong call here heals itself, except that the Beam
-    /// would be sent `[startup]` (idempotent tasks, a fresh grant) again.
+    /// (pausing is reversible). A later `beams ssh` to the same Beam simply
+    /// creates a fresh bridge, so a wrong call here heals itself.
     fn retire_bridge_if_beam_gone(self: &Arc<Self>, beam_uuid: &str) {
         let Ok(existing) = (self.beam_lister)() else {
             return;
@@ -861,10 +839,6 @@ impl Hub {
             bridge.record
         };
         self.broadcast(ServerEvent::BridgeStatus { bridge: record });
-
-        if self.state.lock().unwrap().startup_submitted.remove(beam_uuid) {
-            let _ = self.save_state();
-        }
 
         let services = self
             .state
@@ -1999,68 +1973,8 @@ impl Hub {
         });
     }
 
-    /// Sends `[startup]` to a Beam that hasn't had it yet.
-    fn submit_startup(self: &Arc<Self>, beam_uuid: &str) {
-        let (first_time, launched) = {
-            let mut state = self.state.lock().unwrap();
-            let launched = state.launches.values().any(|l| l.beam_uuid == beam_uuid);
-            (state.startup_submitted.insert(beam_uuid.to_string()), launched)
-        };
-        if !first_time {
-            return;
-        }
-        // A launch-managed Beam (`beams ssh --profile`, `config launch`)
-        // takes its work from the launch plan only; the legacy manifest
-        // would be a second, competing configuration source.
-        if launched {
-            let _ = self.save_state();
-            eprintln!("startup: {beam_uuid}: launch-managed, not submitting [startup] tasks");
-            return;
-        }
-        let _ = self.save_state();
-        let config = (self.startup_config)();
-        if config.tasks.is_empty() {
-            return;
-        }
-        let Some(commands) = self
-            .bridges
-            .lock()
-            .unwrap()
-            .get(beam_uuid)
-            .map(|bridge| bridge.commands.clone())
-        else {
-            return;
-        };
-        let request_id = Uuid::new_v4().to_string();
-        let budget = config.ssh_grant.as_ref().map(|g| g.max_uses_for(&config.tasks)).unwrap_or(0);
-        self.agent.lock().unwrap().startup_requests.insert(
-            request_id.clone(),
-            (beam_uuid.to_string(), config.ssh_grant.clone().filter(|g| !g.hosts.is_empty()), budget),
-        );
-        let tasks = config.manifest_tasks();
-        eprintln!("startup: {beam_uuid}: submitting {} task(s)", tasks.len());
-        let _ = commands.try_send(ClientToBeam::RunManifest { request_id, tasks });
-    }
-
-    /// The Beam started our startup manifest: issue its grant, if any.
-    fn startup_accepted(self: &Arc<Self>, beam_uuid: &str, request_id: &str, manifest_id: &str, tasks: usize) {
-        let Some((owner, grant, max_uses)) = self.agent.lock().unwrap().startup_requests.remove(request_id) else {
-            return; // not one of ours
-        };
-        if owner != beam_uuid {
-            return;
-        }
-        eprintln!("startup: {beam_uuid}: {manifest_id} running {tasks} task(s)");
-        let Some(grant) = grant else {
-            return;
-        };
-        let window = grant.window();
-        self.issue_grant(beam_uuid, manifest_id, grant.hosts, grant.user, window, max_uses, None);
-    }
-
-    /// Issues a grant for `scope` (a manifest or launch ID) on `beam_uuid`,
-    /// usable for `window` or `max_uses` signatures; `task_runs` limits it
-    /// to those exact task tags (else any task of `scope`).
+    /// Issues a grant for launch `scope` on `beam_uuid`, usable for
+    /// `window` or `max_uses` signatures, by those exact task tags only.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn issue_grant(
         self: &Arc<Self>,
@@ -2070,7 +1984,7 @@ impl Hub {
         user: String,
         window: Duration,
         max_uses: u32,
-        task_runs: Option<BTreeSet<String>>,
+        task_runs: BTreeSet<String>,
     ) {
         let record = GrantRecord {
             grant_id: Uuid::new_v4().to_string(),
@@ -2083,14 +1997,12 @@ impl Hub {
             expires_at_ms: now_ms() + window.as_millis() as u64,
             ended: None,
         };
-        eprintln!("startup: {beam_uuid}: grant {} issued: {}", record.grant_id, record.summary());
+        eprintln!("grant: {beam_uuid}: {} issued: {}", record.grant_id, record.summary());
         let grant_id = record.grant_id.clone();
         {
             let mut agent = self.agent.lock().unwrap();
             agent.grants.insert(grant_id.clone(), record.clone());
-            if let Some(runs) = task_runs {
-                agent.grant_scopes.insert(grant_id.clone(), runs);
-            }
+            agent.grant_scopes.insert(grant_id.clone(), task_runs);
         }
         self.broadcast(ServerEvent::GrantChanged { grant: record });
         let weak = Arc::downgrade(self);
@@ -2120,7 +2032,7 @@ impl Hub {
             ids.iter().filter_map(|id| agent.grants.remove(id)).collect()
         };
         for mut grant in ended {
-            eprintln!("startup: {}: grant {} ended: {why}", grant.beam_uuid, grant.grant_id);
+            eprintln!("grant: {}: {} ended: {why}", grant.beam_uuid, grant.grant_id);
             grant.ended = Some(why.to_string());
             self.broadcast(ServerEvent::GrantChanged { grant });
         }
@@ -2132,7 +2044,7 @@ impl Hub {
         let mut agent = self.agent.lock().unwrap();
         let AgentRuntime { grants, grant_scopes, .. } = &mut *agent;
         let in_scope = |id: &str| {
-            grant_scopes.get(id).is_none_or(|runs| prompt.claimed.task_run.as_ref().is_some_and(|run| runs.contains(run)))
+            grant_scopes.get(id).is_some_and(|runs| prompt.claimed.task_run.as_ref().is_some_and(|run| runs.contains(run)))
         };
         let grant = grants
             .values_mut()
@@ -2150,7 +2062,7 @@ impl Hub {
         mut prompt: crate::agent::AgentPrompt,
         grant: GrantRecord,
     ) {
-        prompt.granted = Some(format!("startup grant, {} of {}", grant.uses, grant.max_uses));
+        prompt.granted = Some(format!("launch grant, {} of {}", grant.uses, grant.max_uses));
         let mut record = RequestRecord {
             request_id: Uuid::new_v4().to_string(),
             beam_uuid: beam_uuid.to_string(),
@@ -2158,7 +2070,7 @@ impl Hub {
             status: RequestStatus::Approved,
             request: None,
             action: None,
-            message: Some("approved by the startup grant".to_string()),
+            message: Some("approved by the launch grant".to_string()),
             local_path: None,
             agent: Some(prompt),
         };
@@ -2186,7 +2098,7 @@ impl Hub {
             match crate::agent::local_sign(&sock, &body) {
                 Ok(reply) => {
                     record.status = RequestStatus::Running;
-                    record.message = Some("signed (startup grant)".to_string());
+                    record.message = Some("signed (launch grant)".to_string());
                     hub.send_agent_response(&beam_uuid, &beam_request_id, &reply, None);
                 }
                 Err(err) => {
@@ -2699,8 +2611,8 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                     agent.capable.remove(&beam_uuid);
                 }
             }
-            // A reconnect means a new Beam-side daemon session; whatever
-            // manifest a grant belonged to may be gone.
+            // A reconnect means a new Beam-side daemon session; the launch
+            // a grant belonged to may be gone.
             hub.end_grants_for(&beam_uuid, "the Beam bridge reconnected");
             let (record, commands) = {
                 let mut bridges = hub.bridges.lock().unwrap();
@@ -2767,9 +2679,6 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
             let _ = commands.send(ClientToBeam::Ready);
             hub.broadcast(ServerEvent::BridgeStatus { bridge: record });
             hub.refresh_agent_identities(&beam_uuid);
-            if capabilities.iter().any(|c| c == CAPABILITY_STARTUP_MANIFEST) {
-                hub.submit_startup(&beam_uuid);
-            }
             hub.launch_bridge_connected(&beam_uuid, &capabilities);
         }
         crate::bridge::Event::Disconnected { beam_uuid, message } => {
@@ -2924,17 +2833,6 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                 message,
                 context,
             } => hub.handle_agent_sign(&beam_uuid, request_id, &conn_id, &message, &context),
-            BeamToClient::ManifestAccepted { request_id, manifest_id, task_ids } => {
-                hub.startup_accepted(&beam_uuid, &request_id, &manifest_id, task_ids.len())
-            }
-            BeamToClient::ManifestRejected { request_id, message } => {
-                hub.agent.lock().unwrap().startup_requests.remove(&request_id);
-                eprintln!("startup: {beam_uuid}: manifest rejected: {message}");
-            }
-            BeamToClient::ManifestFinished { manifest_id, ok } => {
-                eprintln!("startup: {beam_uuid}: {manifest_id} finished ({})", if ok { "ok" } else { "with errors" });
-                hub.end_grants_where(|g| g.beam_uuid == beam_uuid && g.manifest_id == manifest_id, "startup finished");
-            }
             message @ (BeamToClient::LaunchUploadOffset { .. }
             | BeamToClient::LaunchUploaded { .. }
             | BeamToClient::LaunchUploadFailed { .. }
@@ -4487,7 +4385,6 @@ mod tests {
     #[test]
     fn bridges_to_deleted_beams_are_retired_after_failing_for_a_while() {
         let (hub, command_rx) = failing_bridge("gone-uuid", vec!["other-uuid"]);
-        hub.state.lock().unwrap().startup_submitted.extend(["gone-uuid".to_string(), "other-uuid".to_string()]);
         handle_bridge_event(
             &hub,
             crate::bridge::Event::Disconnected {
@@ -4500,11 +4397,6 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(!hub.bridges.lock().unwrap().contains_key("gone-uuid"));
-        // Only the retired Beam is forgotten.
-        assert_eq!(
-            hub.state.lock().unwrap().startup_submitted.iter().collect::<Vec<_>>(),
-            ["other-uuid"]
-        );
         // Dropping the command sender is what stops the bridge supervisor.
         assert!(matches!(
             command_rx.recv_timeout(Duration::from_millis(100)),
@@ -4515,10 +4407,8 @@ mod tests {
     #[test]
     fn bridges_are_kept_when_the_beam_exists_or_existence_is_unknown() {
         let (hub, _rx) = failing_bridge("live-uuid", vec!["live-uuid"]);
-        hub.state.lock().unwrap().startup_submitted.insert("live-uuid".to_string());
         hub.retire_bridge_if_beam_gone("live-uuid");
         assert!(hub.bridges.lock().unwrap().contains_key("live-uuid"));
-        assert!(hub.state.lock().unwrap().startup_submitted.contains("live-uuid"));
 
         let (mut hub, _rx) = failing_bridge("unknown-uuid", vec![]);
         Arc::get_mut(&mut hub).unwrap().beam_lister = Box::new(|| anyhow::bail!("not logged in"));
@@ -4831,14 +4721,9 @@ mod tests {
         let _ = fs::remove_file(sock);
     }
 
-    /// A hub whose startup config clones one ssh repo under a github.com
-    /// grant, whose known_hosts names `host` as github.com, and whose
+    /// A hub whose known_hosts names `host` as github.com, and whose
     /// frontend 7 has a fake local agent holding `user`.
-    fn startup_hub(
-        user: &ssh_key::PrivateKey,
-        host: &ssh_key::PrivateKey,
-        max_uses: u32,
-    ) -> (Arc<Hub>, Receiver<ClientToBeam>, String) {
+    fn grant_hub(user: &ssh_key::PrivateKey, host: &ssh_key::PrivateKey) -> (Arc<Hub>, Receiver<ClientToBeam>, String) {
         let blob = user.public_key().to_bytes().unwrap();
         let fingerprint = beams_protocol::agent_crypto::fingerprint(&blob).unwrap();
         let mut hub = Hub::with_state_path_and_program(PersistedState::default(), None, "tsh".to_string());
@@ -4848,13 +4733,6 @@ mod tests {
         });
         let known_hosts = format!("github.com {}\n", host.public_key().to_openssh().unwrap());
         hub.agent_known_hosts = Box::new(move || known_hosts.clone());
-        hub.startup_config = Box::new(move || {
-            crate::startup::StartupConfig::parse(&format!(
-                "[startup]\ntasks = [{{ template = \"clone-git-repo\", params = {{ repo = \"git@github.com:o/r.git\", dest = \"~/r\" }} }}]\n\
-                 [startup.ssh_grant]\nhosts = [\"github.com\"]\nmax_uses = {max_uses}\n"
-            ))
-            .unwrap()
-        });
         let hub = Arc::new(hub);
         let (commands, command_rx) = mpsc::sync_channel(64);
         hub.bridges.lock().unwrap().insert(
@@ -4883,7 +4761,7 @@ mod tests {
             crate::bridge::Event::Connected {
                 beam_uuid: "beam-uuid".to_string(),
                 bridge_id: "bridge-1".to_string(),
-                capabilities: vec![CAPABILITY_SSH_AGENT.to_string(), CAPABILITY_STARTUP_MANIFEST.to_string()],
+                capabilities: vec![CAPABILITY_SSH_AGENT.to_string()],
             },
         );
     }
@@ -4928,102 +4806,6 @@ mod tests {
         );
     }
 
-    fn next_manifest(commands: &Receiver<ClientToBeam>) -> Option<(String, Vec<beams_protocol::ManifestTask>)> {
-        while let Ok(message) = commands.recv_timeout(Duration::from_millis(300)) {
-            if let ClientToBeam::RunManifest { request_id, tasks } = message {
-                return Some((request_id, tasks));
-            }
-        }
-        None
-    }
-
-    #[test]
-    fn startup_manifest_is_sent_once_and_its_grant_signs_only_its_own_clones() {
-        use beams_protocol::agent as wire;
-        use ssh_key::{rand_core::OsRng, Algorithm, PrivateKey};
-        let (user, host) = (
-            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
-            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
-        );
-        let (hub, commands, sock) = startup_hub(&user, &host, 2);
-
-        connect_capable(&hub);
-        let (request_id, tasks) = next_manifest(&commands).expect("startup manifest sent on first connect");
-        let templates: Vec<&str> = tasks.iter().map(|task| task.template.as_str()).collect();
-        assert_eq!(templates, vec!["wait-ssh-agent", "clone-git-repo"]);
-        connect_capable(&hub);
-        assert!(next_manifest(&commands).is_none(), "never resent to the same Beam");
-
-        let msg = |message| crate::bridge::Event::Message { beam_uuid: "beam-uuid".to_string(), message };
-        // A grant only comes from our own request id.
-        handle_bridge_event(&hub, msg(BeamToClient::ManifestAccepted {
-            request_id: "made-up".into(), manifest_id: "manifest-9".into(), task_ids: vec![],
-        }));
-        assert!(hub.agent.lock().unwrap().grants.is_empty());
-        handle_bridge_event(&hub, msg(BeamToClient::ManifestAccepted {
-            request_id, manifest_id: "manifest-1".into(), task_ids: vec!["clone-git-repo:dest=/r".into()],
-        }));
-        let ServerEvent::Snapshot { grants, .. } = hub.snapshot() else { panic!() };
-        assert_eq!(grants.len(), 1);
-        assert_eq!(grants[0].max_uses, 2);
-
-        // The manifest's own clone: signed without a prompt.
-        github_login(&hub, "c1", &user, &host, Some("manifest-1/clone-git-repo:dest=/r"));
-        assert!(pending_agent_ids(&hub).is_empty(), "no prompt for a granted request");
-        match next_agent_message(&commands) {
-            ClientToBeam::AgentResponse { request_id, message, .. } => {
-                assert_eq!(request_id, "c1");
-                assert!(wire::parse_sign_response(&wire::b64_decode(&message).unwrap()).unwrap().is_some());
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-        // Something else using the key during the window: asks as usual.
-        github_login(&hub, "c2", &user, &host, None);
-        assert_eq!(pending_agent_ids(&hub).len(), 1);
-        github_login(&hub, "c3", &user, &host, Some("manifest-10/x"));
-        assert_eq!(pending_agent_ids(&hub).len(), 2, "manifest ids are matched exactly");
-
-        // Last use, then the budget is spent.
-        github_login(&hub, "c4", &user, &host, Some("manifest-1/clone-git-repo:dest=/r"));
-        assert!(matches!(next_agent_message(&commands), ClientToBeam::AgentResponse { request_id, .. } if request_id == "c4"));
-        assert!(hub.agent.lock().unwrap().grants.is_empty(), "all uses spent");
-        github_login(&hub, "c5", &user, &host, Some("manifest-1/clone-git-repo:dest=/r"));
-        assert_eq!(pending_agent_ids(&hub).len(), 3);
-        let _ = fs::remove_file(sock);
-    }
-
-    #[test]
-    fn launch_managed_beams_get_no_startup_manifest() {
-        use ssh_key::{rand_core::OsRng, Algorithm, PrivateKey};
-        let (user, host) = (
-            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
-            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
-        );
-        let (hub, commands, sock) = startup_hub(&user, &host, 2);
-        hub.state.lock().unwrap().launches.insert(
-            "launch-1".into(),
-            LaunchRecord {
-                launch_id: "launch-1".into(),
-                plan_digest: "digest".into(),
-                beam_id: "beam".into(),
-                beam_uuid: "beam-uuid".into(),
-                login: "beams".into(),
-                launch_dir: std::env::temp_dir().join("no-such-launch-dir"),
-                gate: beams_protocol::launch::Gate::Interactive,
-                stage: LaunchStage::Submitting,
-                status: None,
-                released: Vec::new(),
-                grant_issued: false,
-                message: None,
-                upload: None,
-            },
-        );
-        connect_capable(&hub);
-        assert!(next_manifest(&commands).is_none(), "the launch plan is the only configuration source");
-        assert!(hub.state.lock().unwrap().startup_submitted.contains("beam-uuid"));
-        let _ = fs::remove_file(sock);
-    }
-
     #[test]
     fn launch_grants_open_at_their_phase_sign_only_their_tasks_and_are_issued_once() {
         use beams_protocol::launch::{LaunchStatus, Phase};
@@ -5032,7 +4814,7 @@ mod tests {
             PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
             PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
         );
-        let (hub, commands, sock) = startup_hub(&user, &host, 2);
+        let (hub, commands, sock) = grant_hub(&user, &host);
         let root = std::env::temp_dir().join(format!("beams-launch-grant-{}", Uuid::new_v4()));
         let add = |id: &str, phase: Phase| {
             let dir = root.join(id);
@@ -5114,34 +4896,27 @@ mod tests {
     }
 
     #[test]
-    fn startup_grants_end_when_the_manifest_finishes_or_are_revoked() {
+    fn revoked_grants_end() {
         use ssh_key::{rand_core::OsRng, Algorithm, PrivateKey};
         let (user, host) = (
             PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
             PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
         );
-        let (hub, commands, sock) = startup_hub(&user, &host, 5);
-        connect_capable(&hub);
-        let (request_id, _) = next_manifest(&commands).unwrap();
-        let msg = |message| crate::bridge::Event::Message { beam_uuid: "beam-uuid".to_string(), message };
-        handle_bridge_event(&hub, msg(BeamToClient::ManifestAccepted {
-            request_id, manifest_id: "manifest-1".into(), task_ids: vec![],
-        }));
-        assert_eq!(hub.agent.lock().unwrap().grants.len(), 1);
-        handle_bridge_event(&hub, msg(BeamToClient::ManifestFinished { manifest_id: "manifest-1".into(), ok: true }));
+        let (hub, _commands, sock) = grant_hub(&user, &host);
+        hub.issue_grant(
+            "beam-uuid",
+            "launch-1",
+            vec!["github.com".into()],
+            "git".into(),
+            Duration::from_secs(60),
+            3,
+            ["launch-1/launch:launch-1:tasks:core".to_string()].into(),
+        );
+        let id = hub.agent.lock().unwrap().grants.keys().next().cloned().unwrap();
+        hub.end_grants_where(|g| g.grant_id == id, "revoked by local user");
         assert!(hub.agent.lock().unwrap().grants.is_empty());
-        github_login(&hub, "c1", &user, &host, Some("manifest-1/clone-git-repo:dest=/r"));
-        assert_eq!(pending_agent_ids(&hub).len(), 1, "after startup, clones ask");
-
-        // Revoking (simulated: insert another grant, then revoke it).
-        let grant = crate::startup::GrantRecord {
-            grant_id: "g2".into(), beam_uuid: "beam-uuid".into(), manifest_id: "manifest-2".into(),
-            hosts: vec!["github.com".into()], user: "git".into(), uses: 0, max_uses: 3,
-            expires_at_ms: crate::agent::now_ms() + 60_000, ended: None,
-        };
-        hub.agent.lock().unwrap().grants.insert("g2".into(), grant);
-        hub.end_grants_where(|g| g.grant_id == "g2", "revoked by local user");
-        assert!(hub.agent.lock().unwrap().grants.is_empty());
+        github_login(&hub, "c1", &user, &host, Some("launch-1/launch:launch-1:tasks:core"));
+        assert_eq!(pending_agent_ids(&hub).len(), 1, "a revoked grant's task asks");
         let _ = fs::remove_file(sock);
     }
 
