@@ -8,8 +8,9 @@ Teleport, reading client state, installing packages, or invoking hooks.
 executes package/file/script graphs, and the daemon accepts launches, waits
 for their conditions and releases the interface from shell/TUI readiness.
 `beams config launch` drives a profile onto an existing Beam over its
-bridge (upload, submission, post after the interface). Using it from
-`beams ssh` (runtime delivery, shell preparation, Zellij) is pending. The full
+bridge (upload, submission, post after the interface), and
+`beams ssh --profile` creates a Beam for one (runtime delivery without a
+checkout, pre before the shell, a per-launch Zellij session). The full
 [launch design](../designs/LAUNCH_CONFIGURATION_DESIGN.md) records the
 proposal and migration.
 
@@ -35,8 +36,10 @@ falls back to the default.
 
 For a private starting point, copy `environments/examples/team/` to
 `environments/local/` (gitignored), then edit its profile and helpers.
-`config init`, workstation-wide `[launch].profile`, and `ssh --profile`
-are not implemented yet.
+`beams ssh --profile` and workstation-wide `[launch] profile` launch a new
+Beam with a profile (see
+[below](#launch-a-new-beam-beams-ssh---profile)); `config init` is not
+implemented yet.
 
 The development starter selects fish and its configuration before the
 interface, with micro/less and Go/Rust afterward. It contains no SSH keys,
@@ -397,7 +400,10 @@ LaunchUploadBegin{post, ...} ...              → ... LaunchUploaded
   Beam. A resubmission (same ID and digest) answers `existing: true` with
   the current status and released conditions, even after the declaration
   upload was consumed; that, and re-beginning uploads, is how a
-  reconnecting workstation recovers. A different digest is rejected.
+  reconnecting workstation recovers. A different digest is rejected. A
+  launch submitted on the Beam itself (no owner, as `launch start` does)
+  is adopted by the first bridge client that submits it, and that is
+  persisted.
 
 - **Throughput.** Uploads are bounded by the window: about
   256 KiB per bridge round trip (≈2.5 MiB/s at 100 ms), plus a third for
@@ -417,6 +423,57 @@ upload pre unless released; pack and upload post once `interface-ready`
 is). `client/tests/launch-bridge-smoke.sh` runs a headless and an
 interactive launch through the real workstation daemon, bridge adapter and
 Beam daemon with a fake `tsh`, including a multi-MiB post bundle.
+
+### Launch a new Beam: `beams ssh --profile`
+
+`beams ssh --profile PROFILE` (or `[launch] profile` in the workstation's
+`config.toml`) creates a Beam for a launch instead of the legacy
+repo-checkout startup. It's opt-in; without a profile, `beams ssh` is
+unchanged.
+
+```text
+workstation                                   Beam
+pack profile (fails before any Beam exists)
+tsh beams add, wait for SSH
+scp ~/.beams/ (runtime + launch.json + pre)   →
+StartLaunch to the local daemon, then bridge
+tsh ssh -- …/beam-bootstrap launch start      → beamctl start beam-bootstrapd (runtime binary)
+                                                launch_submit (local, no owner)
+                                                launch receive pre   ‖ install Zellij
+                                                pre progress printed in the terminal
+                                                exec zellij attach beams-<id> --create
+bridge: LaunchSubmit                          → existing: adopts the bridge client as owner
+                                              ← LaunchCondition{interface-ready} (shell + tui)
+post packed and uploaded                      → … LaunchStatus{ok}
+```
+
+- **Runtime.** `~/.beams/runtime/` holds `bin/beam-bootstrap`,
+  `bin/beams-shell` and `zellij/beams-launch.kdl` (sources in
+  `shell/runtime/`, embedded in the client). The launch itself is under
+  `~/.beams/launches/<ID>/`. No `~/beams` checkout unless `--push-repo`.
+  The bridge runs the runtime's `client-bridge` when present, else the
+  legacy `~/beams/bin/beam-client-bridge`.
+- **Session.** One Zellij session per launch (`beams-` plus the first
+  group of the launch ID), so an attach never reuses another launch's
+  environment. Its environment is the plan's (`[env]`, `[shell] path`
+  ahead of `PATH`), plus `BEAMS_LAUNCH_ID`, `BEAMS_SHELL` (the plan's
+  shell), `BEAM_BOOTSTRAP_BIN` and the relay's `SSH_AUTH_SOCK`. Zellij's
+  `default_shell` is `beams-shell` → `beam-bootstrap launch shell`, which
+  starts `launch ready --component shell` in the background and execs
+  `$BEAMS_SHELL`, so readiness doesn't depend on the shell (bash, fish).
+  The TUI pane reports `tui` as before.
+- **Pre failure.** `launch start` prints the failure and opens a plain
+  `bash -l` instead of the session, with the `launch status`/`launch
+  retry` commands to use.
+- **Reuse.** The purpose entry in `state.json` records the launch
+  (profile, ID, digest, local launch directory). Reconnecting reruns
+  `launch start`: the submission is `existing`, pre is already released,
+  and Zellij attaches to the same session. A different `--profile`, or an
+  explicit `--profile` for a legacy Beam, is refused.
+- **No legacy startup.** The workstation daemon doesn't send `[startup]`
+  tasks to a Beam that has a launch record, and the fixed startup
+  (`bin/beam-shell`'s background run) never starts. Work from either
+  belongs in the profile.
 
 ### Package transactions and parallel work
 

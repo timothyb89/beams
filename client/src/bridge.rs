@@ -140,13 +140,19 @@ fn supervise(
     }
 }
 
+/// The Beam-side bridge: a profile launch's runtime (`stage::RUNTIME_BIN`)
+/// when present, else a legacy repo checkout's wrapper. Wrapped in `sh -c`
+/// since the login shell may be fish.
+const BRIDGE_COMMAND: &str = "sh -c 'b=$HOME/.beams/runtime/bin/beam-bootstrap; \
+    if [ -x \"$b\" ]; then exec \"$b\" client-bridge; fi; exec $HOME/beams/bin/beam-client-bridge'";
+
 fn start_child(
     program: &str,
     target: &Target,
 ) -> anyhow::Result<(std::process::Child, ChildStdin)> {
     let ssh_target = format!("{}@{}", target.login, target.beam_uuid);
     let mut child = Command::new(program)
-        .args(["ssh", &ssh_target, "--", "~/beams/bin/beam-client-bridge"])
+        .args(["ssh", &ssh_target, "--", BRIDGE_COMMAND])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -15,6 +15,8 @@ mod teleport_bin;
 mod tool_paths;
 mod zellij;
 
+pub(crate) use zellij::InstallZellij;
+
 use std::path::{Path, PathBuf};
 
 use crate::events::{Emitter, Event, Status};

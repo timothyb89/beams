@@ -2,6 +2,7 @@
 pub mod daemon;
 mod files;
 mod runner;
+pub mod session;
 pub mod upload;
 #[cfg(test)]
 mod tests;
@@ -116,6 +117,24 @@ pub enum Command {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// Start (or reattach to) a launch copied onto this Beam by
+    /// `beams ssh --profile`: start the daemon, submit the launch, stage
+    /// and run pre (printing progress), then replace this process with the
+    /// launch's Zellij session. See `launch/session.rs`.
+    Start {
+        /// Directory holding `launch.json` and `pre/`.
+        #[arg(long)]
+        launch_dir: PathBuf,
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Report shell readiness for `$BEAMS_LAUNCH_ID` (in the background),
+    /// then exec `$BEAMS_SHELL` with these arguments. Zellij's
+    /// `default_shell` in a launch session (via `beams-shell`).
+    Shell {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Verify an archive and atomically publish staging, without installing it.
     Unpack {
         #[arg(long)]
@@ -195,6 +214,8 @@ pub fn run(command: Command) -> anyhow::Result<()> {
                 json!({"op": "launch_ready", "launch_id": launch_id, "component": component}),
             )?;
         }
+        Command::Start { launch_dir, socket } => session::start(&launch_dir, socket)?,
+        Command::Shell { args } => session::shell(&args)?,
         Command::Receive { launch_id, phase, archive, descriptor, socket } => {
             receive(socket, &launch_id, phase.into(), &archive, &descriptor)?;
         }

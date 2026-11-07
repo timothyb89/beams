@@ -296,6 +296,17 @@ events and snapshot `seq` boundary are documented in
 `docs/development/launches.md` ("Run a launch through the daemon"); the
 end-to-end check is `tests/launch-daemon-smoke.sh`.
 
+`launch start --launch-dir DIR [--socket PATH]` is the interactive
+command `beams ssh --profile` runs (from `~/.beams/runtime/bin/`, no repo
+checkout): it starts the daemon under `beamctl` unless it answers,
+submits `DIR/launch.json` (interactive gate), receives `DIR/pre/`,
+installs Zellij alongside pre, prints pre progress, and then execs
+`zellij attach beams-<id> --create` with the plan's environment. A pre
+failure opens `bash -l` instead. Rerunning it reattaches. `launch shell
+[-- ARGS]` is that session's `default_shell` (via `beams-shell`): it
+reports `shell` readiness in the background and execs `$BEAMS_SHELL`.
+See `src/launch/session.rs` and the guide's "`beams ssh --profile`".
+
 ### Shared package transactions
 
 Package actions batch one install per phase and skip when a batched

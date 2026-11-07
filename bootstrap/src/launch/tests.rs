@@ -1247,6 +1247,36 @@ mod daemon_launches {
     }
 
     #[test]
+    fn a_launch_submitted_on_the_beam_is_adopted_by_its_workstation_bridge() {
+        // `beams ssh --profile`: `launch start` submits locally (no owner),
+        // then the workstation's bridge submits the same launch.
+        let f = Fixture::new();
+        let launch = pre_post_launch(&f);
+        let id = launch.launch_id.clone();
+        f.stage(&launch, Phase::Pre, &hooks(&f));
+        f.stage(&launch, Phase::Post, &hooks(&f));
+        let host = host(&f);
+        submit(&f, &host, &launch, "interactive");
+        wait_until(&host, &id, "the interface wait", |s| node_status(s, "interface-ready") == NodeStatus::Waiting);
+        let adopted = submit_over_bridge(&host, &launch, Gate::Interactive);
+        assert!(matches!(adopted, BeamToClient::LaunchAccepted { existing: true, .. }), "{adopted:?}");
+
+        ready(&host, &id, "shell");
+        ready(&host, &id, "tui");
+        let done = wait_until(&host, &id, "completion", finished);
+        assert_eq!(done.status, LaunchStatus::Ok, "{done:#?}");
+        let notified = host.notified.lock().unwrap().clone();
+        assert!(notified.iter().all(|(client, _)| client == "client-a"), "{notified:?}");
+        assert!(
+            notified.iter().any(|(_, m)| matches!(m, BeamToClient::LaunchCondition { condition, released: true, .. } if condition == "interface-ready")),
+            "the adopting workstation hears interface-ready: {notified:?}"
+        );
+        let accepted: serde_json::Value =
+            beams_artifacts::read_json(&f.state.join(&id).join("accepted.json")).unwrap();
+        assert_eq!(accepted["owner_client_id"], "client-a", "adoption survives a daemon restart");
+    }
+
+    #[test]
     fn a_bridge_upload_is_accepted_staged_and_released_without_signals() {
         let f = Fixture::new();
         let launch = pre_post_launch(&f);

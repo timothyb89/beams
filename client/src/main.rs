@@ -16,7 +16,7 @@ mod terminal_paint;
 mod terminal_stream;
 mod tsh;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{bail, Context};
@@ -83,6 +83,16 @@ enum Commands {
         /// menu over the captured remote screen instead of a blank takeover.
         #[arg(long)]
         terminal_overlay: bool,
+        /// Launch a new Beam with this profile (`builtin:NAME` or a TOML
+        /// path) instead of the legacy repo-checkout startup. Default:
+        /// `[launch] profile` in config.toml. A reused Beam must have been
+        /// launched with the same profile.
+        #[arg(long)]
+        profile: Option<String>,
+        /// With a profile, also push the repo checkout to `~/beams` as the
+        /// legacy path does (the launch itself doesn't need it).
+        #[arg(long)]
+        push_repo: bool,
     },
     /// Run the workstation-side service daemon in the foreground. Normal
     /// `beams ssh` invocations start it automatically as needed.
@@ -276,13 +286,19 @@ fn main() -> anyhow::Result<ExitCode> {
             escape_key,
             no_client_daemon,
             terminal_overlay,
+            profile,
+            push_repo,
         } => ssh(
-            &expand_tilde(&repo),
-            &purpose,
-            region.as_deref(),
-            &login,
+            &SshOptions {
+                repo: expand_tilde(&repo),
+                purpose,
+                region,
+                login,
+                no_client_daemon,
+                profile,
+                push_repo,
+            },
             escape_key,
-            no_client_daemon,
             session::DisplayOptions {
                 overlay: terminal_overlay,
             },
@@ -517,30 +533,67 @@ fn copy_file(
     bail!("local daemon disconnected before the file-copy job completed")
 }
 
-fn ssh(
-    repo: &Path,
-    purpose: &str,
-    region: Option<&str>,
-    login: &str,
-    escape_key: session::EscapeKey,
+struct SshOptions {
+    repo: PathBuf,
+    purpose: String,
+    region: Option<String>,
+    login: String,
     no_client_daemon: bool,
+    profile: Option<String>,
+    push_repo: bool,
+}
+
+fn ssh(
+    options: &SshOptions,
+    escape_key: session::EscapeKey,
     display: session::DisplayOptions,
 ) -> anyhow::Result<u8> {
+    let SshOptions { repo, purpose, region, login, .. } = options;
+    let (purpose, login) = (purpose.as_str(), login.as_str());
+    let profile = match &options.profile {
+        Some(profile) => Some(config::resolve_profile(profile, &std::env::current_dir()?)),
+        None => config::default_profile()?,
+    };
+    if profile.is_some() && options.no_client_daemon {
+        bail!(
+            "a profile launch needs the client daemon (readiness and post work go over its bridge); \
+             drop --no-client-daemon or launch without a profile"
+        );
+    }
     let mut state = state::State::load()?;
     let beams = tsh::list_beams()?;
 
     let existing = state
         .purposes
         .get(purpose)
-        .and_then(|entry| beams.iter().find(|b| b.uuid == entry.uuid));
+        .and_then(|entry| beams.iter().find(|b| b.uuid == entry.uuid).map(|beam| (beam, entry.launch.clone())))
+        .filter(|(beam, _)| has_ttl_remaining(beam, MIN_TTL_HOURS));
 
-    let beam = match existing.filter(|b| has_ttl_remaining(b, MIN_TTL_HOURS)) {
-        Some(beam) => {
+    let (beam, launch) = match existing {
+        Some((beam, launch)) => {
+            match (&profile, &launch) {
+                (Some(wanted), Some(launch)) if &launch.profile != wanted => bail!(
+                    "beam {} (purpose {purpose:?}) was launched with profile {}, not {wanted}; use \
+                     --purpose NAME for a new Beam, or remove this one with `tsh beams rm {}`",
+                    beam.id,
+                    launch.profile,
+                    beam.id
+                ),
+                (Some(wanted), None) if options.profile.is_some() => bail!(
+                    "beam {} (purpose {purpose:?}) uses the legacy startup, not profile {wanted}; use \
+                     --purpose NAME for a new Beam, or remove this one with `tsh beams rm {}`",
+                    beam.id,
+                    beam.id
+                ),
+                _ => {}
+            }
             eprintln!(
-                "beams: reusing beam {} ({}) for purpose {purpose:?}",
-                beam.id, beam.uuid
+                "beams: reusing beam {} ({}) for purpose {purpose:?}{}",
+                beam.id,
+                beam.uuid,
+                launch.as_ref().map(|l| format!(", launch {} ({})", l.launch_id, l.profile)).unwrap_or_default()
             );
-            beam.clone()
+            (beam.clone(), launch)
         }
         None => {
             if beams.len() >= MAX_CONCURRENT_BEAMS {
@@ -551,8 +604,29 @@ fn ssh(
                 );
             }
 
+            // Pack before creating anything: a broken profile fails here.
+            let packed = match &profile {
+                Some(profile) => {
+                    let (launch_dir, declaration) = config::pack_for_ssh(profile)?;
+                    eprintln!("beams: packed launch {} ({profile})", declaration.launch_id);
+                    Some(state::PurposeLaunch {
+                        launch_id: declaration.launch_id,
+                        profile: profile.clone(),
+                        plan_digest: declaration.plan_digest,
+                        launch_dir,
+                    })
+                }
+                None => None,
+            };
+            if packed.is_some() && legacy_startup_configured() {
+                eprintln!(
+                    "beams: note: [startup] tasks in config.toml are not run on profile launches; \
+                     move them into the profile"
+                );
+            }
+
             eprintln!("beams: no usable beam for purpose {purpose:?}, spawning a new one...");
-            let fresh = tsh::add_beam(region)?;
+            let fresh = tsh::add_beam(region.as_deref())?;
 
             eprintln!(
                 "beams: waiting for {} to accept SSH connections...",
@@ -560,24 +634,33 @@ fn ssh(
             );
             tsh::wait_until_ready(&fresh.id, login, READY_TIMEOUT)?;
 
-            eprintln!("beams: pushing {} to {}...", repo.display(), fresh.id);
-            let branch = tsh::current_branch(repo)?;
-            let origin_url = tsh::origin_url(repo)?;
-            tsh::prepare_git_target(
-                login,
-                &fresh.uuid,
-                REMOTE_REPO_PATH,
-                &branch,
-                origin_url.as_deref(),
-            )?;
-            tsh::push_repo(repo, login, &fresh.uuid, REMOTE_REPO_PATH, &branch)?;
+            if packed.is_none() || options.push_repo {
+                eprintln!("beams: pushing {} to {}...", repo.display(), fresh.id);
+                let branch = tsh::current_branch(repo)?;
+                let origin_url = tsh::origin_url(repo)?;
+                tsh::prepare_git_target(
+                    login,
+                    &fresh.uuid,
+                    REMOTE_REPO_PATH,
+                    &branch,
+                    origin_url.as_deref(),
+                )?;
+                tsh::push_repo(repo, login, &fresh.uuid, REMOTE_REPO_PATH, &branch)?;
+            }
 
-            eprintln!(
-                "beams: copying the bootstrap binary to {}...",
-                fresh.id
-            );
-            let staging = stage::build(repo)?;
-            let result = tsh::scp_dir(&staging.join("beams"), &fresh.id);
+            let (staging, copied) = match &packed {
+                Some(launch) => {
+                    eprintln!("beams: copying the runtime and launch {} to {}...", launch.launch_id, fresh.id);
+                    let staging = stage::build_launch(repo, &launch.launch_dir, &launch.launch_id)?;
+                    (staging.clone(), staging.join(stage::LAUNCH_ROOT))
+                }
+                None => {
+                    eprintln!("beams: copying the bootstrap binary to {}...", fresh.id);
+                    let staging = stage::build(repo)?;
+                    (staging.clone(), staging.join("beams"))
+                }
+            };
+            let result = tsh::scp_dir(&copied, &fresh.id);
             let _ = std::fs::remove_dir_all(&staging);
             result?;
 
@@ -592,55 +675,60 @@ fn ssh(
                     beam_id: fresh.id.clone(),
                     uuid: fresh.uuid.clone(),
                     created_at: Utc::now().to_rfc3339(),
+                    launch: packed.clone(),
                 },
             );
             state.save()?;
 
-            fresh
+            (fresh, packed)
         }
     };
 
+    let shell_command = match &launch {
+        Some(launch) => format!(
+            "{} launch start --launch-dir ~/{}/launches/{}",
+            stage::RUNTIME_BIN,
+            stage::LAUNCH_ROOT,
+            launch.launch_id
+        ),
+        None => "~/beams/bin/beam-shell".to_string(),
+    };
     eprintln!("beams: connecting to {} ({})...", beam.id, beam.uuid);
-    let (local_daemon, remote_command) = if no_client_daemon {
+    let (local_daemon, remote_command) = if options.no_client_daemon {
         (
             session::LocalDaemon::unavailable("disabled by --no-client-daemon"),
-            "~/beams/bin/beam-shell".to_string(),
+            shell_command,
         )
     } else {
-        match clientd::connect_or_start() {
-            Ok(mut frontend) => {
-                let session_token = Uuid::new_v4().to_string();
-                let target = bridge::Target {
-                    beam_id: beam.id.clone(),
-                    beam_uuid: beam.uuid.clone(),
-                    login: login.to_string(),
-                };
-                match frontend.ensure_bridge(&target, &session_token) {
-                    Ok(()) => {
-                        let command = format!(
-                            "env BEAMS_CLIENT_ID={} BEAMS_SESSION_TOKEN={} ~/beams/bin/beam-shell",
-                            frontend.client_id, session_token
-                        );
-                        (
-                            session::LocalDaemon::connected(frontend, target, session_token),
-                            command,
-                        )
-                    }
-                    Err(err) => {
-                        eprintln!("beams: could not register managed session: {err:#}");
-                        (
-                            session::LocalDaemon::unavailable(err.to_string()),
-                            "~/beams/bin/beam-shell".to_string(),
-                        )
-                    }
-                }
+        let connected = clientd::connect_or_start().and_then(|mut frontend| {
+            let session_token = Uuid::new_v4().to_string();
+            let target = bridge::Target {
+                beam_id: beam.id.clone(),
+                beam_uuid: beam.uuid.clone(),
+                login: login.to_string(),
+            };
+            // Before the bridge: the daemon then knows this Beam is a
+            // launch (no legacy startup manifest) by the time it connects.
+            if let Some(launch) = &launch {
+                frontend.start_launch(&target, &launch.launch_dir, beams_protocol::launch::Gate::Interactive)?;
+            }
+            frontend.ensure_bridge(&target, &session_token)?;
+            Ok((frontend, target, session_token))
+        });
+        match connected {
+            Ok((frontend, target, session_token)) => {
+                let command = format!(
+                    "env BEAMS_CLIENT_ID={} BEAMS_SESSION_TOKEN={} {shell_command}",
+                    frontend.client_id, session_token
+                );
+                (session::LocalDaemon::connected(frontend, target, session_token), command)
+            }
+            Err(err) if launch.is_some() => {
+                return Err(err.context("the local service daemon is needed for a profile launch"));
             }
             Err(err) => {
                 eprintln!("beams: local service daemon unavailable: {err:#}");
-                (
-                    session::LocalDaemon::unavailable(err.to_string()),
-                    "~/beams/bin/beam-shell".to_string(),
-                )
+                (session::LocalDaemon::unavailable(err.to_string()), shell_command)
             }
         }
     };
@@ -655,6 +743,15 @@ fn ssh(
     )
 }
 
+/// Whether config.toml lists `[startup] tasks` (which profile launches
+/// don't run).
+fn legacy_startup_configured() -> bool {
+    std::fs::read_to_string(agent::Config::path().unwrap_or_default())
+        .ok()
+        .and_then(|text| startup::StartupConfig::parse(&text).ok())
+        .is_some_and(|config| config.tasks != startup::StartupConfig::default().tasks)
+}
+
 /// Does `beam` have more than `hours` of TTL left? Beams can't have their
 /// TTL extended (project.md), so this is the only "is it still worth
 /// reusing" signal available.
@@ -665,7 +762,7 @@ fn has_ttl_remaining(beam: &tsh::BeamInfo, hours: i64) -> bool {
     }
 }
 
-fn expand_tilde(path: &str) -> PathBuf {
+pub(crate) fn expand_tilde(path: &str) -> PathBuf {
     match path.strip_prefix("~/") {
         Some(rest) => {
             let home = std::env::var("HOME").unwrap_or_default();

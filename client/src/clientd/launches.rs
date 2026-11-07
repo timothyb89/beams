@@ -212,6 +212,8 @@ impl Hub {
             let mut runtime = self.launch_runtime.lock().unwrap();
             if !capabilities.iter().any(|c| c == CAPABILITY_LAUNCH) {
                 runtime.capable.remove(beam_uuid);
+                drop(runtime);
+                self.report_incapable(beam_uuid);
                 return;
             }
             runtime.capable.insert(beam_uuid.to_string());
@@ -228,6 +230,28 @@ impl Hub {
         for id in ids {
             self.launch_runtime.lock().unwrap().failures.remove(&id);
             self.drive_launch(&id);
+        }
+    }
+
+    /// The bridge connected without `CAPABILITY_LAUNCH`: its `beam-bootstrap`
+    /// predates launches. Say so instead of "waiting for the Beam bridge".
+    fn report_incapable(&self, beam_uuid: &str) {
+        let ids: Vec<String> = self
+            .state
+            .lock()
+            .unwrap()
+            .launches
+            .values()
+            .filter(|l| l.beam_uuid == beam_uuid && l.stage != LaunchStage::Finished)
+            .map(|l| l.launch_id.clone())
+            .collect();
+        for id in ids {
+            self.update_launch(&id, |l| {
+                l.message = Some(
+                    "the Beam's beam-bootstrap has no launch support (too old); update its runtime or use a new Beam"
+                        .into(),
+                )
+            });
         }
     }
 

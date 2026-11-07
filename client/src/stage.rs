@@ -25,6 +25,49 @@ pub fn build(repo: &Path) -> anyhow::Result<PathBuf> {
     Ok(tmp)
 }
 
+/// Remote directory (under the Beam user's home) for a profile launch's
+/// runtime and launches; see `bootstrap/src/launch/session.rs`.
+pub const LAUNCH_ROOT: &str = ".beams";
+/// The runtime's `beam-bootstrap`, as a remote shell path.
+pub const RUNTIME_BIN: &str = "~/.beams/runtime/bin/beam-bootstrap";
+
+const RUNTIME_SHELL: &str = include_str!("../../shell/runtime/bin/beams-shell");
+const RUNTIME_LAYOUT: &str = include_str!("../../shell/runtime/zellij/beams-launch.kdl");
+
+/// Stages everything a `beams ssh --profile` Beam needs, for one recursive
+/// copy into its home: the runtime (`beam-bootstrap`, the shell wrapper and
+/// layout) and the packed launch's declaration and pre bundle. No repo
+/// checkout, no post content (that goes over the bridge after the
+/// interface is ready). Returns the temp directory holding `.beams/`.
+pub fn build_launch(repo: &Path, launch_dir: &Path, launch_id: &str) -> anyhow::Result<PathBuf> {
+    let tmp = std::env::temp_dir().join(format!("beams-client-launch-{}-{launch_id}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let root = tmp.join(LAUNCH_ROOT);
+    let runtime = root.join("runtime");
+    copy_preserving_mode(&find_bootstrap_bin(repo)?, &runtime.join("bin/beam-bootstrap"))?;
+    write_file(&runtime.join("bin/beams-shell"), RUNTIME_SHELL, 0o755)?;
+    write_file(&runtime.join("zellij/beams-launch.kdl"), RUNTIME_LAYOUT, 0o644)?;
+
+    let launch = root.join("launches").join(launch_id);
+    copy_preserving_mode(&launch_dir.join("launch.json"), &launch.join("launch.json"))?;
+    for entry in fs::read_dir(launch_dir.join("pre")).with_context(|| format!("reading {}/pre", launch_dir.display()))? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            copy_preserving_mode(&entry.path(), &launch.join("pre").join(entry.file_name()))?;
+        }
+    }
+    Ok(tmp)
+}
+
+fn write_file(path: &Path, contents: &str, mode: u32) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("setting permissions on {}", path.display()))
+}
+
 /// Candidate paths under `bootstrap/target/`, most to least preferred. Beams
 /// run Linux, so a cross-compiled target (built with `cargo zigbuild`, see
 /// `bootstrap/build-cross.sh`) comes first - that's the only thing that can

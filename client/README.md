@@ -113,6 +113,7 @@ daemons with a fake `tsh`.
 
 ```sh
 beams ssh [--repo ~/beams] [--purpose default] [--region REGION] [--login beams]
+          [--profile PROFILE [--push-repo]]
 ```
 
 1. Looks up the beam tracked for `--purpose` (see "State" below). If it
@@ -156,6 +157,40 @@ beams ssh [--repo ~/beams] [--purpose default] [--region REGION] [--login beams]
 
 On reuse, steps 3-4 are skipped entirely - a reused beam is assumed to
 already be bootstrapped from a prior run.
+
+### Profile launches (`--profile`, opt-in)
+
+```sh
+beams ssh --profile builtin:development [--push-repo] [--purpose NAME]
+```
+
+`--profile` (or `[launch] profile = "..."` in `config.toml`, a bundled
+`builtin:NAME` or a path relative to that file) replaces steps 3-5 for a
+*new* Beam:
+
+1. Packs the profile locally first (`beams config pack`), so a broken
+   profile fails before a Beam is created.
+2. No git push (unless `--push-repo`). One `tsh beams scp` copies
+   `~/.beams/`: the runtime (`beam-bootstrap`, the `beams-shell` wrapper
+   and Zellij layout, embedded in the client from `../shell/runtime/`)
+   and the launch's `launch.json` and pre bundle.
+3. Registers the launch with the local daemon *before* its bridge, then
+   connects with `~/.beams/runtime/bin/beam-bootstrap launch start
+   --launch-dir ~/.beams/launches/ID`. That starts the Beam daemon,
+   submits and stages the launch, installs Zellij while pre runs, prints
+   pre progress, and replaces itself with a Zellij session named
+   `beams-<first launch-ID group>` running the plan's shell and the TUI.
+   Post work is uploaded over the bridge once both report ready.
+
+The purpose entry records the launch (profile, ID, digest, local launch
+directory). Reconnecting reruns `launch start`, which attaches to the
+same session. A Beam launched with a different profile, or a legacy Beam
+given an explicit `--profile`, is refused with the profile it has. A
+launch-managed Beam never gets the `[startup]` manifest: put that work
+in the profile. The fixed startup (`claude-md-merge`, teleport/k3s,
+starship, kubectl) doesn't run on this path either. Needs the local
+daemon (no `--no-client-daemon`). See
+`../docs/development/launches.md`.
 
 ## Managed SSH session and local menu
 

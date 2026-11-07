@@ -54,18 +54,22 @@ path (runtime delivery, shell preparation, Zellij/TUI with
   link to the repo's), so `git push` failed host key verification. Git
   also had no `user.name`/`user.email`. Since the repo's `.ssh`
   (which carried known_hosts) was dropped in `06060b5`/`651fc1c`, nothing
-  seeds them. Likely consequence, not yet checked on a fresh Beam: a
-  startup manifest's `git@github.com:` clones fail ("Host key verification
-  failed", no TTY to ask) before the agent relay is ever asked to sign.
-  - known_hosts: a launch-profile-driven, idempotent line merge (a native
-    task, not a leaf file copy: a Beam-provided `known_hosts` would
-    conflict with the file adapter's deny/backup/replace). Sources: pinned
-    GitHub keys in the core profile (from `https://api.github.com/meta`,
-    with fingerprints recorded), and/or entries for named hosts taken from
-    the workstation's own `known_hosts`, which is already the relay's
-    trust root. Never `ssh-keyscan`/`accept-new` alone. Hashed workstation
-    entries can only be matched for named hosts, not listed (see the SSH
-    agent design's gotchas).
+  seeds them. Confirmed on a fresh Beam 2026-11-07: every startup
+  manifest `git@github.com:` clone fails "Host key verification failed"
+  (no TTY to ask) before the agent relay is ever asked to sign.
+  - known_hosts (decided 2026-11-07): live lookup instead of seeding.
+    The Beam's ssh config sets `KnownHostsCommand` (OpenSSH >= 8.5) to a
+    `beam-bootstrap client known-hosts %H`-style helper that asks the
+    workstation over the bridge; the workstation answers with
+    `ssh-keygen -F <host>` against its own `known_hosts` (already the
+    relay's trust root, and this matches hashed entries). Nothing personal
+    is copied into the VM wholesale and nothing goes stale. SSH clones
+    already need the bridge for the agent relay, so it adds no new
+    dependency. Check `ssh -V` on the Beam image; without a bridge (headless)
+    fall back to pinned GitHub keys in the core profile (from
+    `https://api.github.com/meta`, fingerprints recorded). Never
+    `ssh-keyscan`/`accept-new`. Applied by a native ssh-config task
+    (idempotent, `Include`-style), not a leaf file copy.
   - git config: `user.name`/`user.email` defaulted from the workstation's
     `git config` at compile time, overridable per profile, applied with
     `git config --global` (idempotent; leaves other Beam settings alone).
@@ -173,10 +177,31 @@ path (runtime delivery, shell preparation, Zellij/TUI with
   restart, and fixture tests cover resource serialization, but no committed
   cross-binary test yet runs fake apt with an independent hook completing
   while apt waits.
-- [ ] Phase 3: ship a small runtime/pre archive independently of a Git
+- [x] Phase 3: ship a small runtime/pre archive independently of a Git
   checkout; run pre tasks through the daemon, prepare the shell before
   spawning it, and gate post tasks on shell startup + first TUI frame.
-  Remove the new path's competing background fixed bootstrap.
+  Remove the new path's competing background fixed bootstrap. Landed
+  2026-11-07 as opt-in `beams ssh --profile` / `[launch] profile`
+  (`~/.beams/` runtime, `launch start`, per-launch Zellij session,
+  `launch shell` readiness wrapper); validated on disposable Beams.
+- [ ] Remove the legacy startup once the profile path is the default
+  (maintainer decision 2026-11-07: no long-term legacy support, single
+  user): the `[startup]` manifest submission (`clientd::submit_startup`,
+  `startup.rs`, `RunManifest` startup grants unless launch tasks reuse
+  them), `bin/beam-shell`'s fixed background run and the Git-push
+  delivery, the `~/beams/bin/beam-client-bridge` fallback, and the
+  implicit Go/Rust defaults. Move the maintainer's clones/toolchains into
+  a local profile first (clones need `KnownHostsCommand` below and grant
+  routing for launch tasks).
+- [ ] `beams ssh` never reuses a Beam on identities whose Beams get <= 12h
+  TTL: `MIN_TTL_HOURS = 12` vs. ~11h observed for this sandbox's bot
+  identity 2026-11-07 (a second `beams ssh --purpose X` created a new
+  Beam). Make the threshold relative to the Beam's total TTL, or smaller.
+- [ ] Profile-launch follow-ups: a reattached Beam keeps the runtime it
+  was launched with (no runtime upgrade path); `launch start`'s pre
+  progress repeats `pending` lines; measure scp vs. bridge upload for
+  the runtime; `--no-client-daemon` is refused rather than running
+  local-only work.
 - [ ] Phase 4: projected upload progress in the session overlay/Beam TUI,
   bounded task concurrency and retry/recovery. Background uploads and
   receive-driven release of artifact-ready landed 2026-11-06 (`beams config

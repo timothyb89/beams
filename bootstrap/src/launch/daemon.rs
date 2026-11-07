@@ -266,12 +266,16 @@ fn accept<H: Host>(
     let id = declaration.launch_id.clone();
     {
         let mut table = launches.table.lock().unwrap();
-        if let Some(entry) = table.entries.get(&id) {
+        let Table { seq, entries, .. } = &mut *table;
+        if let Some(entry) = entries.get_mut(&id) {
             if entry.accepted.declaration.plan_digest != declaration.plan_digest {
                 bail!("launch {id} was already accepted with a different plan digest");
             }
+            if let Some(owner) = owner_client_id {
+                adopt(&launches, &id, entry, &owner)?;
+            }
             // An identical retry of the submission refers to the same launch.
-            reply(true, table.seq, &entry.snapshot);
+            reply(true, *seq, &entry.snapshot);
             return Ok(());
         }
         let accepted = Accepted { declaration, staging, gate, accepted_at_ms: now_ms(), owner_client_id };
@@ -1042,12 +1046,14 @@ fn bridge_submit<H: Host>(
     upload::check_id(id)?;
     let launches = host.launches();
     {
-        let table = launches.table.lock().unwrap();
-        if let Some(entry) = table.entries.get(id) {
+        let mut table = launches.table.lock().unwrap();
+        let Table { seq, entries, .. } = &mut *table;
+        if let Some(entry) = entries.get_mut(id) {
             if entry.accepted.declaration.plan_digest != plan_digest {
                 bail!("launch {id} was already accepted with a different plan digest");
             }
-            reply(true, table.seq, &entry.snapshot);
+            adopt(&launches, id, entry, client_id)?;
+            reply(true, *seq, &entry.snapshot);
             return Ok(());
         }
     }
@@ -1063,6 +1069,18 @@ fn bridge_submit<H: Host>(
     accept(host, declaration, staging, gate, Some(client_id.to_string()), reply)?;
     // accepted.json holds it now.
     launches.uploads.remove(id, Blob::Declaration);
+    Ok(())
+}
+
+/// A launch submitted on the Beam itself (`launch start`, from `beams ssh
+/// --profile`) has no owner until its workstation's bridge submits it too;
+/// that client then gets the owner notifications (conditions, status).
+/// The first owner stays.
+fn adopt(launches: &Launches, id: &str, entry: &mut Entry, owner: &str) -> anyhow::Result<()> {
+    if entry.accepted.owner_client_id.is_none() {
+        entry.accepted.owner_client_id = Some(owner.to_string());
+        beams_artifacts::write_json(&launches.dir(id).join("accepted.json"), &entry.accepted)?;
+    }
     Ok(())
 }
 

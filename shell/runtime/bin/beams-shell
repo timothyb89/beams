@@ -1,0 +1,5 @@
+#!/bin/sh
+# Zellij's default_shell in a `beams ssh --profile` launch session (see
+# bootstrap/src/launch/session.rs). Reports shell readiness for
+# $BEAMS_LAUNCH_ID, then execs the launch plan's shell ($BEAMS_SHELL).
+exec "$(dirname "$0")/beam-bootstrap" launch shell -- "$@"

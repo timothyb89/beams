@@ -1981,8 +1981,20 @@ impl Hub {
 
     /// Sends `[startup]` to a Beam that hasn't had it yet.
     fn submit_startup(self: &Arc<Self>, beam_uuid: &str) {
-        let first_time = self.state.lock().unwrap().startup_submitted.insert(beam_uuid.to_string());
+        let (first_time, launched) = {
+            let mut state = self.state.lock().unwrap();
+            let launched = state.launches.values().any(|l| l.beam_uuid == beam_uuid);
+            (state.startup_submitted.insert(beam_uuid.to_string()), launched)
+        };
         if !first_time {
+            return;
+        }
+        // A launch-managed Beam (`beams ssh --profile`, `config launch`)
+        // takes its work from the launch plan only; the legacy manifest
+        // would be a second, competing configuration source.
+        if launched {
+            let _ = self.save_state();
+            eprintln!("startup: {beam_uuid}: launch-managed, not submitting [startup] tasks");
             return;
         }
         let _ = self.save_state();
@@ -4927,6 +4939,37 @@ mod tests {
     }
 
     #[test]
+    fn launch_managed_beams_get_no_startup_manifest() {
+        use ssh_key::{rand_core::OsRng, Algorithm, PrivateKey};
+        let (user, host) = (
+            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
+            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
+        );
+        let (hub, commands, sock) = startup_hub(&user, &host, 2);
+        hub.state.lock().unwrap().launches.insert(
+            "launch-1".into(),
+            LaunchRecord {
+                launch_id: "launch-1".into(),
+                plan_digest: "digest".into(),
+                beam_id: "beam".into(),
+                beam_uuid: "beam-uuid".into(),
+                login: "beams".into(),
+                launch_dir: std::env::temp_dir().join("no-such-launch-dir"),
+                gate: beams_protocol::launch::Gate::Interactive,
+                stage: LaunchStage::Submitting,
+                status: None,
+                released: Vec::new(),
+                message: None,
+                upload: None,
+            },
+        );
+        connect_capable(&hub);
+        assert!(next_manifest(&commands).is_none(), "the launch plan is the only configuration source");
+        assert!(hub.state.lock().unwrap().startup_submitted.contains("beam-uuid"));
+        let _ = fs::remove_file(sock);
+    }
+
+    #[test]
     fn startup_grants_end_when_the_manifest_finishes_or_are_revoked() {
         use ssh_key::{rand_core::OsRng, Algorithm, PrivateKey};
         let (user, host) = (
@@ -5134,6 +5177,10 @@ mod tests {
         // Recorded at once; nothing is sent until the bridge says it can.
         hub.start_launch(&target, &launch_dir, Gate::Interactive).unwrap();
         assert_eq!(record().stage, LaunchStage::Submitting);
+        assert!(rx.try_recv().is_err());
+        // A Beam whose runtime predates launches is named as the problem.
+        hub.launch_bridge_connected("beam-uuid", &[]);
+        assert!(record().message.unwrap().contains("no launch support"), "{:?}", record().message);
         assert!(rx.try_recv().is_err());
         hub.launch_bridge_connected("beam-uuid", &[beams_protocol::CAPABILITY_LAUNCH.to_string()]);
 

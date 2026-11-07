@@ -1,5 +1,6 @@
-//! Offline launch configuration tools. Live `ssh` retains the existing startup
-//! path until the execution/transport milestones are implemented.
+//! Launch configuration: offline tools (`validate`/`explain`/`pack`),
+//! `config launch` onto an existing Beam, and the profile selection
+//! `beams ssh --profile` uses (`[launch] profile` in `config.toml`).
 
 pub(crate) mod pack;
 mod plan;
@@ -80,6 +81,55 @@ impl From<Codec> for Compression {
             Codec::Gzip => Compression::Gzip,
         }
     }
+}
+
+/// `[launch]` in `config.toml`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchConfig {
+    /// Profile `beams ssh` launches new Beams with when `--profile` isn't
+    /// given: `builtin:NAME`, or a path (relative to `config.toml`'s
+    /// directory). Unset: new Beams use the legacy repo-checkout startup.
+    profile: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ConfigFile {
+    #[serde(default)]
+    launch: LaunchConfig,
+}
+
+/// A profile argument as recorded and compiled: bundled names as given,
+/// paths made absolute against `base`.
+pub fn resolve_profile(profile: &str, base: &std::path::Path) -> String {
+    if profile.starts_with("builtin:") {
+        return profile.to_string();
+    }
+    let path = crate::expand_tilde(profile);
+    if path.is_absolute() { path } else { base.join(path) }.display().to_string()
+}
+
+/// The workstation's `[launch] profile`, resolved; `None` when unset.
+pub fn default_profile() -> anyhow::Result<Option<String>> {
+    use anyhow::Context as _;
+    let path = crate::agent::Config::path()?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
+    let file: ConfigFile = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let base = path.parent().unwrap_or(std::path::Path::new("."));
+    Ok(file.launch.profile.map(|p| resolve_profile(&p, base)))
+}
+
+/// Packs `profile` into a fresh launch directory under the local daemon's
+/// launches dir, for `beams ssh`.
+pub fn pack_for_ssh(profile: &str) -> anyhow::Result<(PathBuf, beams_protocol::launch::Declaration)> {
+    let output = crate::clientd::launches_dir()?.join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(output.parent().expect("has a parent"))?;
+    let declaration = pack::prepare(profile, &output, Compression::Gzip)?;
+    Ok((output, declaration))
 }
 
 fn launch(

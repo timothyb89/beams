@@ -447,39 +447,30 @@ impl Context {
             .with_context(|| format!("artifact {id} has not been verified"))
     }
     fn environment(&self) -> BTreeMap<String, String> {
-        let mut env: BTreeMap<_, _> = self
-            .declaration
-            .plan
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), self.expand(v)))
-            .collect();
-        let configured = self
-            .declaration
-            .plan
-            .shell
-            .path
-            .as_ref()
-            .into_iter()
-            .flatten()
-            .map(|p| self.expand(p))
-            .collect::<Vec<_>>();
-        let inherited = env
-            .get("PATH")
-            .cloned()
-            .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
-        env.insert(
-            "PATH".into(),
-            configured
-                .into_iter()
-                .chain([inherited])
-                .collect::<Vec<_>>()
-                .join(":"),
-        );
-        env.entry("HOME".into())
-            .or_insert_with(|| self.options.home.display().to_string());
-        env
+        plan_environment(&self.declaration, &self.options.home, &std::env::var("PATH").unwrap_or_default())
     }
+}
+
+/// The plan's environment for its tasks and its session: `[env]` with
+/// `${beam.*}` expanded, `PATH` led by `[shell] path` (remote `~`
+/// expanded) before the plan's own or the inherited `PATH`, and `HOME`.
+pub(super) fn plan_environment(declaration: &Declaration, home: &Path, inherited_path: &str) -> BTreeMap<String, String> {
+    let home_str = home.display().to_string();
+    let expand = |value: &str| {
+        value
+            .replace("${beam.home}", &home_str)
+            .replace("${beam.launch_id}", &declaration.launch_id)
+    };
+    let mut env: BTreeMap<_, _> = declaration.plan.env.iter().map(|(k, v)| (k.clone(), expand(v))).collect();
+    let configured = declaration.plan.shell.path.iter().flatten().map(|p| match p.as_str() {
+        "~" => home_str.clone(),
+        p => p.strip_prefix("~/").map_or_else(|| expand(p), |tail| home.join(tail).display().to_string()),
+    });
+    let inherited = env.get("PATH").cloned().unwrap_or_else(|| inherited_path.to_string());
+    let path = configured.chain([inherited]).filter(|p| !p.is_empty()).collect::<Vec<_>>().join(":");
+    env.insert("PATH".into(), path);
+    env.entry("HOME".into()).or_insert(home_str);
+    env
 }
 struct LaunchTask {
     node: Node,

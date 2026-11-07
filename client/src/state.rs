@@ -21,6 +21,21 @@ pub struct PurposeEntry {
     pub beam_id: String,
     pub uuid: String,
     pub created_at: String,
+    /// Set for a Beam created by `beams ssh --profile`: the launch it runs.
+    /// Absent for a legacy (repo checkout, `beam-shell`) Beam.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<PurposeLaunch>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PurposeLaunch {
+    pub launch_id: String,
+    /// The profile as given (`builtin:development`, an absolute path).
+    pub profile: String,
+    pub plan_digest: String,
+    /// The packed launch on this workstation (the local daemon's driver
+    /// reads post sources and blobs from it).
+    pub launch_dir: PathBuf,
 }
 
 impl State {

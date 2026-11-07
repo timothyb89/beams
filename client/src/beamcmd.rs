@@ -242,7 +242,7 @@ mod tests {
         for (purpose, id, uuid) in entries {
             state.purposes.insert(
                 purpose.to_string(),
-                PurposeEntry { beam_id: id.to_string(), uuid: uuid.to_string(), created_at: String::new() },
+                PurposeEntry { beam_id: id.to_string(), uuid: uuid.to_string(), created_at: String::new(), launch: None },
             );
         }
         state
