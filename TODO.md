@@ -962,6 +962,15 @@ bootstrap `Task`s.
     ownership, close/replay before output overflow or a remote buffer switch,
     and deliver queries/effects exactly once. Never nest over a remote-owned
     alternate buffer or switch screens for ordinary toasts.
+    First scoped path: an observed RIS followed by no remote alternate use
+    establishes an unused scratch buffer. Require known primary current/save/
+    tab geometry after resize, origin off/full margins/no pending wrap, and
+    retain at most 256 KiB of drawing output. Close/replay before a query,
+    effect, non-ASCII/unsupported frame, buffer switch or exhaustion. Preserve
+    primary cells/save slots and keep the snapshot/replay with error cleanup.
+    Implemented (2026-11-07), with independent and live PTY replay; close
+    re-selects the scratch after a partially written setup selector.
+    Ordinary inherited-buffer ownership and covered reflow remain separate.
   - [ ] Optional richer inline approval guidance for uncertain terminal states,
     skippable if high effort. Correlate the request's originating session with
     frontend prefix/UI availability; add capability-negotiated advisory notices

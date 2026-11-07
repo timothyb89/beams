@@ -107,6 +107,9 @@ pub struct Evidence {
     // Full-width rows established by EL 2. Never infer inherited cells from
     // the backend's default blanks. Storage is bounded by terminal height.
     known_rows: [Vec<bool>; 2],
+    // An observed RIS, with no subsequent remote alternate use. Entry mode
+    // reports and primary initialization cannot establish scratch ownership.
+    unused_alternate: bool,
 }
 
 impl Default for Evidence {
@@ -116,6 +119,7 @@ impl Default for Evidence {
             shared: 0,
             buffers: [BufferEvidence::default(); 2],
             known_rows: [Vec::new(), Vec::new()],
+            unused_alternate: false,
         }
     }
 }
@@ -143,7 +147,15 @@ impl Evidence {
                 normal_rows: NormalRows::Known,
             }; 2];
             self.known_rows.iter_mut().for_each(Vec::clear);
+            self.unused_alternate = true;
             return;
+        }
+        if before_alternate
+            || private_modes(frame).is_some_and(|(set, modes)| {
+                mode_numbers(modes).any(|m| m == Some(1049) || set && m == Some(47))
+            })
+        {
+            self.unused_alternate = false;
         }
         // An explicit baseline cannot recover loss from an arbitrary protocol.
         if matches!(
@@ -378,6 +390,7 @@ impl Evidence {
         self.shared = 0;
         self.buffers = [BufferEvidence::default(); 2];
         self.known_rows.iter_mut().for_each(Vec::clear);
+        self.unused_alternate = false;
     }
 
     pub fn resize(&mut self) {
@@ -422,6 +435,17 @@ impl Evidence {
     pub fn can_paint(&self, alternate: bool) -> bool {
         let index = usize::from(alternate);
         self.shared_known() && self.buffers[index].complete() && self.buffers[index].cells
+    }
+
+    pub fn can_borrow(&self, screen: &vt100::Screen) -> bool {
+        let state = screen.drawing_state();
+        self.unused_alternate
+            && self.shared_known()
+            && !state.alternate_screen
+            && self.buffers[0].complete()
+            && !state.primary.cursor.origin_mode
+            && state.primary.scroll_region == (0, screen.size().0.get() - 1)
+            && state.primary.cursor.col < screen.size().1.get()
     }
 
     /// Toasts do not use the application's saved cursor or tab stops. They
@@ -571,6 +595,72 @@ fn text_fits_row(frame: &[u8], columns: usize) -> bool {
                 .sum::<usize>()
                 <= columns
         })
+}
+
+/// Borrowed menus retain only drawing. Everything else closes before replay
+/// so replies/effects come once from the real primary after earlier drawing.
+pub fn borrowed_drawing(frame: &[u8]) -> bool {
+    if !frame.starts_with(b"\x1b") {
+        return frame.iter().all(|b| b.is_ascii() && *b != 7);
+    }
+    if let Some(body) = frame.strip_prefix(b"\x1b[") {
+        let Some((&action, args)) = body.split_last() else {
+            return false;
+        };
+        if let Some(modes) = args.strip_prefix(b"?") {
+            return matches!(action, b'h' | b'l')
+                && !mode_numbers(modes).any(|m| matches!(m, Some(47 | 1049)));
+        }
+        return matches!(
+            action,
+            b'@' | b'A'
+                | b'B'
+                | b'C'
+                | b'D'
+                | b'E'
+                | b'F'
+                | b'G'
+                | b'H'
+                | b'J'
+                | b'K'
+                | b'L'
+                | b'M'
+                | b'P'
+                | b'S'
+                | b'T'
+                | b'X'
+                | b'`'
+                | b'd'
+                | b'f'
+                | b'r'
+                | b'm'
+                | b's'
+                | b'u'
+                | b'h'
+                | b'l'
+                | b'g'
+                | b'q'
+        ) && !args.starts_with(b">")
+            && !args.starts_with(b"=");
+    }
+    // OSC 8 changes drawing state; other OSCs have physical effects.
+    frame.starts_with(b"\x1b]8;")
+        || matches!(
+            frame,
+            b"\x1b7"
+                | b"\x1b8"
+                | b"\x1bM"
+                | b"\x1b(B"
+                | b"\x1b(0"
+                | b"\x1b)B"
+                | b"\x1b)0"
+                | b"\x1b="
+                | b"\x1b>"
+                | b"\x1b#5"
+                | b"\x1b<"
+                | b"\x1b%G"
+                | b"\x1b\\"
+        )
 }
 
 /// This is a support policy, not a second cursor/mode emulator. The backend

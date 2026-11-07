@@ -390,6 +390,18 @@ reset or explicit initialization never opens the menu automatically; retry
 the prefix to reopen a preserved form. The client refuses to borrow an
 alternate buffer whose ownership, content or saved state is unknown.
 
+One narrow menu fallback borrows the alternate buffer: after an observed full
+reset (`ESC c`) with no later remote alternate-buffer use, the inactive
+alternate is a known-blank scratch buffer. If the primary buffer's content is
+uncertain (for example after a resize) but its origin, margins, cursor and
+save slot are known, a menu opens there via `CSI ?47h`, leaving primary cells
+and save slots untouched. Remote drawing is retained (at most 256 KiB) and
+replayed exactly once after the menu clears the scratch buffer and returns to
+the primary. Queries, terminal effects, non-ASCII or unsupported output, buffer
+switches and retention exhaustion close the menu first, so the real terminal
+answers them once in order. Toasts never borrow, and a shell that never
+observed a reset still defers.
+
 If unsupported output arrives during a menu, the client restores the last
 represented state before forwarding the complete original sequence and its
 continuation. Forms survive for reopening. Every buffer touched while hidden

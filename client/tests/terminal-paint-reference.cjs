@@ -7,16 +7,17 @@ function write(terminal, bytes) {
   return new Promise(resolve => terminal.write(Uint8Array.from(bytes), resolve));
 }
 
-function snapshot(terminal) {
-  const buffer = terminal.buffer.active;
+function snapshot(terminal, buffer = terminal.buffer.active,
+                  rawBuffer = terminal._core._bufferService.buffer, saved = false) {
   const lines = [];
   for (let y = 0; y < terminal.rows; y++) {
     const line = buffer.getLine(buffer.baseY + y);
+    if (!line) { lines.push(null); continue; }
     const cells = [];
     for (let x = 0; x < terminal.cols; x++) {
       const cell = line.getCell(x);
       // Pinned 5.5 internals: compare URI/id, not allocated numeric ids.
-      const raw = terminal._core._bufferService.buffer.lines.get(buffer.baseY + y).loadCell(x,
+      const raw = rawBuffer.lines.get(buffer.baseY + y).loadCell(x,
         terminal._core._inputHandler._workCell);
       const link = cell.getWidth() === 0 || !raw.hasExtendedAttrs() ? null :
         terminal._core._oscLinkService.getLinkData(raw.extended.urlId) || null;
@@ -31,8 +32,11 @@ function snapshot(terminal) {
     }
     lines.push(cells);
   }
-  return { lines, x: buffer.cursorX, y: buffer.cursorY, type: buffer.type,
+  const state = { lines, x: buffer.cursorX, y: buffer.cursorY, type: buffer.type,
     origin: terminal.modes.originMode };
+  if (saved) state.saved = [rawBuffer.savedX, rawBuffer.savedY,
+    rawBuffer.savedCurAttrData.fg, rawBuffer.savedCurAttrData.bg, rawBuffer.savedCharset];
+  return state;
 }
 
 async function main() {
@@ -71,6 +75,15 @@ async function main() {
       await write(actual, trace.physical ||
         [...trace.before, ...trace.paint, ...trace.restore, ...trace.after]);
       assert.deepEqual(snapshot(actual), snapshot(expected), trace.name);
+      if (trace.checkInactive) {
+        for (const name of ['normal', 'alternate']) {
+          const rawName = name === 'normal' ? 'normal' : 'alt';
+          assert.deepEqual(
+            snapshot(actual, actual.buffer[name], actual._core._bufferService.buffers[rawName], true),
+            snapshot(expected, expected.buffer[name], expected._core._bufferService.buffers[rawName], true),
+            `${trace.name}: ${name} including saved cursor`);
+        }
+      }
     } finally {
       expected.dispose();
       actual.dispose();

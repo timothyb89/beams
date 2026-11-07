@@ -329,3 +329,25 @@ semantics and covered reflow still need work. Knowing the primary buffer is
 active does not establish ownership of an unknown inactive alternate buffer.
 Borrowing remains gated pending ownership and independent switching/replay
 tests, and the overlay remains opt-in.
+
+Owned-scratch borrowing pass (2026-11-07): **254 unit tests and 3 integration
+tests pass, none ignored**. An observed RIS with no later remote alternate use
+establishes an unused scratch alternate; any 47/1049 selection, unsupported
+output or budget loss revokes it, and resize keeps ownership while requiring
+fresh primary geometry/save/tab evidence. Menus borrow it only when direct
+painting is unavailable, at an output boundary, on the primary with origin off,
+full margins and no pending wrap. Retention is bounded to 256 KiB of drawing
+output; queries, effects, non-ASCII/unsupported frames, buffer switches and
+exhaustion close and replay first. Close starts with CAN/ST and an explicit 47
+selection, so cleanup after a partially written selector never clears the
+primary.
+
+Model, eligibility and `session/borrowed.rs` regressions cover ownership and
+revocation, missing geometry, split/rejected frames, retention limits, partial
+close writes and partial setup selectors. Two independent xterm.js traces and
+the live PTY renderer (normal exit and SIGTERM while borrowing) match an
+unpainted session for primary cells, saved cursors and the unused alternate,
+with ordered query/effect replay, relinquishment and resize. Twenty-one model
+and seven live independent comparisons pass. Both managed-session smokes and
+the protocol/PTY harness pass. Ordinary inherited-shell borrowing without an
+observed reset, covered reflow and the workstation matrix remain open.

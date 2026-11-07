@@ -626,6 +626,162 @@ def run_inherited_initialization(root, binary):
         session.close()
 
 
+def run_owned_borrowing(root, binary, outcome):
+    session = Session(root, binary, initialized=False)
+    try:
+        before_resize = b"\x1bcPRIMARY SENTINEL\x1b[2;2H\x1b[31m\x1b7"
+        session.emit(before_resize)
+        session.wait(lambda: before_resize in session.output, "reset owns unused alternate")
+        fcntl.ioctl(session.master, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 80, 0, 0))
+        session.wait(lambda: "12 80\n" in (root / "sizes").read_text(), "unknown primary after resize")
+        partial = b"\x1b[?6l\x1b[r\x1b[2;3H"
+        session.emit(partial)
+        session.wait(lambda: partial in session.output, "partial primary geometry")
+        baseline = session.remote_input()
+        session.send(b"\x1dyUNKNOWN GEOMETRY INPUT")
+        session.wait(lambda: session.remote_input() == baseline + b"yUNKNOWN GEOMETRY INPUT",
+                     "borrow requires saved geometry too")
+
+        offset = len(session.output)
+        before = partial + b"\x1b7\x1b[32mKNOWN CURSOR"
+        session.emit(before)
+        session.wait(lambda: before in session.output[offset:], "geometry without primary clear")
+        session.open()
+        assert b"\x1b[?47h" in session.output[offset:], "menu must select owned scratch"
+        session.send(b"f8080")
+        session.wait(lambda: b"Forward a Beam port" in session.output[offset:], "borrowed form")
+        hidden = (b"\x1b[3;4H\x1b[35mRETAINED DRAWING\x1b7"
+                  b"\x1b]8;id=remote;https://example.test/borrowed\x1b\\LINK\x1b]8;;\x1b\\")
+        mark = len(session.output)
+        session.emit(hidden)
+        session.wait(lambda: b"\x1b[?2026l" in session.output[mark:], "borrowed output tick")
+        assert hidden not in session.output[mark:], "drawing must remain off both physical buffers"
+        baseline = session.remote_input()
+        session.send(b"\x1dAFTER BORROWED INPUT")
+        session.wait(lambda: session.remote_input() == baseline + b"\x1dAFTER BORROWED INPUT",
+                     "manual borrowed close restores ordinary input")
+        session.wait(lambda: hidden in session.output[mark:], "retained drawing replay")
+        assert session.output[mark:].count(hidden) == 1
+        after = b"\x1b8!\x1b[0mAFTER BORROWED MENU"
+        session.emit(after)
+        session.wait(lambda: after in session.output[offset:], "saved cursor after borrowed close")
+        if module := os.environ.get("BEAMS_TEST_XTERM_MODULE"):
+            trace = dict(name="live owned borrowed menu", rows=12, cols=80,
+                         initialRows=24, initialCols=100, beforeResize=list(before_resize),
+                         before=list(before), hidden=list(hidden), after=list(after),
+                         physical=list(session.output[offset:]), checkInactive=True)
+            subprocess.run(["node", str(Path(__file__).with_name("terminal-paint-reference.cjs")), module],
+                           input=json.dumps([trace]), text=True, check=True)
+
+        session.open(b"Forward a Beam port")
+        session.wait(lambda: b"8080" in session.output[mark:], "borrowed form survives close")
+        if outcome == "normal":
+            session.command += 1
+            (root / f"command-{session.command}").write_bytes(b"EXIT")
+            session.wait(lambda: session.status is not None, "remote exit while borrowing")
+            assert session.status == 17
+            session.assert_termios_restored()
+            return
+
+        # A query closes before it is answered by the real primary terminal.
+        mark = len(session.output)
+        baseline = session.remote_input()
+        drawing = b"\x1b[5;7HQUERY DRAWN"
+        query = b"\x1b[6n"
+        title = b"\x1b]2;BORROWED TITLE\x1b\\"
+        clipboard = b"\x1b]52;c;QQ==\x1b\\"
+        session.emit(drawing + query + title + clipboard)
+        session.wait(lambda: drawing + query + title + clipboard in session.output[mark:],
+                     "query closes and runs after retained drawing")
+        assert session.remote_input() == baseline, "borrowed query must not also receive a model reply"
+        assert session.output[mark:].count(query) == 1
+        assert session.output[mark:].count(title) == 1
+        assert session.output[mark:].count(clipboard) == 1
+        session.send(b"\x1b[5;18R")
+        session.wait(lambda: session.remote_input() == baseline + b"\x1b[5;18R",
+                     "one physical query reply reaches the child")
+
+        session.open(b"Forward a Beam port")
+        mark = len(session.output)
+        effect = b"\x1b]2;SPLIT BORROWED TITLE\x1b\\"
+        session.emit(effect[:9])
+        session.emit(effect[9:])
+        session.wait(lambda: effect in session.output[mark:], "split effect closes before raw delivery")
+        assert session.output[mark:].count(effect) == 1
+
+        session.open(b"Forward a Beam port")
+        mark = len(session.output)
+        prefix = b"\x1b[38;2;"
+        session.emit(prefix)
+        session.wait(lambda: b"\x1b[?2026l" in session.output[mark:], "partial drawing retained")
+        baseline = session.remote_input()
+        session.send(b"\x1dAFTER PARTIAL INPUT")
+        session.wait(lambda: session.remote_input() == baseline + b"\x1dAFTER PARTIAL INPUT",
+                     "manual close during partial control")
+        continuation = b"1;2;3mCOLOR AFTER BORROW\x1b[0m"
+        session.emit(continuation)
+        session.wait(lambda: prefix + continuation in session.output[mark:], "partial control resumes once")
+        assert session.output[mark:].count(prefix + continuation) == 1
+
+        session.open(b"Forward a Beam port")
+        mark = len(session.output)
+        burst = b"\x1b[H" + b"#" * (256 * 1024 + 8192) + b"BORROWED BUDGET COMPLETE"
+        session.emit(burst)
+        session.wait(lambda: burst in session.output[mark:], "borrowed retention budget closes without loss")
+        assert session.output[mark:].count(b"#") == 256 * 1024 + 8192
+        baseline = session.remote_input()
+        session.send(b"AFTER BUDGET INPUT")
+        session.wait(lambda: session.remote_input() == baseline + b"AFTER BUDGET INPUT",
+                     "retention exhaustion returns to passthrough")
+
+        session.emit(before)
+        session.wait(lambda: before in session.output[mark:], "reset cursor after retained burst")
+        session.open(b"Forward a Beam port")
+        mark = len(session.output)
+        transition = b"\x1b[?00047hREMOTE OWNS ALTERNATE"
+        session.emit(transition[:8])
+        session.emit(transition[8:])
+        session.wait(lambda: transition in session.output[mark:], "borrow relinquished before remote selection")
+        assert session.output[mark:].count(transition) == 1
+        session.emit(b"\x1b[?47l" + before)
+        session.wait(lambda: b"\x1b[?47l" + before in session.output[mark:], "remote returns to primary")
+        baseline = session.remote_input()
+        session.send(b"\x1dyNO SCRATCH INPUT")
+        session.wait(lambda: session.remote_input() == baseline + b"yNO SCRATCH INPUT",
+                     "alternate ownership cannot be guessed after remote use")
+
+        # A new RIS establishes a new scratch lifetime. Controlled covered
+        # resize closes; this is not a workstation reflow guarantee.
+        session.emit(before_resize)
+        fcntl.ioctl(session.master, termios.TIOCSWINSZ, struct.pack("HHHH", 13, 80, 0, 0))
+        session.wait(lambda: "13 80\n" in (root / "sizes").read_text(), "new scratch resize")
+        session.emit(before)
+        session.wait(lambda: before in session.output[mark:], "new scratch geometry")
+        session.open(b"Forward a Beam port")
+        mark = len(session.output)
+        resize_drawing = b"\x1b[4;3HBEFORE BORROWED RESIZE"
+        session.emit(resize_drawing)
+        fcntl.ioctl(session.master, termios.TIOCSWINSZ, struct.pack("HHHH", 14, 80, 0, 0))
+        session.wait(lambda: "14 80\n" in (root / "sizes").read_text(), "covered borrowed resize")
+        session.wait(lambda: resize_drawing in session.output[mark:], "resize relinquishes and replays")
+        assert session.output[mark:].count(resize_drawing) == 1
+        session.emit(before)
+        session.wait(lambda: before in session.output[mark:], "geometry after covered resize")
+        session.open(b"Forward a Beam port")
+        mark = len(session.output)
+        signal_drawing = b"\x1b[6;2HBEFORE BORROWED SIGNAL"
+        session.emit(signal_drawing)
+        session.wait(lambda: b"\x1b[?2026l" in session.output[mark:], "drawing retained before signal")
+        os.kill(session.pid, signal.SIGTERM)
+        session.wait(lambda: session.status is not None, "SIGTERM while borrowing")
+        assert signal_drawing in session.output[mark:]
+        assert session.output[mark:].count(signal_drawing) == 1
+        assert session.status == 143
+        session.assert_termios_restored()
+    finally:
+        session.close()
+
+
 def run_lifecycle(root, binary, outcome):
     disabled = outcome == "disabled"
     settings = {25: False, 47: True, 66: True, 1: True, 4: True, 6: True,
@@ -703,6 +859,10 @@ def main():
         inherited = root / "inherited"
         inherited.mkdir()
         run_inherited_initialization(inherited, binary)
+        for outcome in ["signal", "normal"]:
+            borrowed = root / f"borrowed-{outcome}"
+            borrowed.mkdir()
+            run_owned_borrowing(borrowed, binary, outcome)
         for outcome in ["normal", "signal", "disabled"]:
             lifecycle = root / f"lifecycle-{outcome}"
             lifecycle.mkdir()

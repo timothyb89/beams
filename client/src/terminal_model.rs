@@ -480,11 +480,34 @@ impl TerminalModel {
         mut event: impl FnMut(TerminalEvent) -> Result<(), E>,
         drain: bool,
     ) -> Result<(usize, Option<Vec<u8>>), E> {
+        self.process_guarded(bytes, covered, false, &mut event, drain)
+    }
+
+    pub fn process_borrowed(&mut self, bytes: &[u8]) -> (usize, Option<Vec<u8>>) {
+        self.process_guarded(
+            bytes,
+            true,
+            true,
+            |_| Ok::<(), std::convert::Infallible>(()),
+            true,
+        )
+        .unwrap()
+    }
+
+    fn process_guarded<E>(
+        &mut self,
+        bytes: &[u8],
+        covered: bool,
+        borrowed: bool,
+        mut event: impl FnMut(TerminalEvent) -> Result<(), E>,
+        drain: bool,
+    ) -> Result<(usize, Option<Vec<u8>>), E> {
         self.stream.advance_guarded(bytes, |frame, original| {
             let supported = self.evidence.supported(original, self.parser.screen());
             if covered
                 && (!supported
                     || original == b"\x1bc"
+                    || borrowed && !crate::terminal_eligibility::borrowed_drawing(original)
                     || self
                         .evidence
                         .enters_unknown_buffer(original, self.parser.screen().alternate_screen()))
@@ -538,6 +561,10 @@ impl TerminalModel {
 
     pub fn can_paint_buffer(&self, alternate: bool) -> bool {
         !self.integrity_lost && self.evidence.can_paint(alternate)
+    }
+
+    pub fn can_borrow(&self) -> bool {
+        !self.integrity_lost && self.evidence.can_borrow(self.screen())
     }
 
     /// Current-state restoration never uses a save slot. The entire requested
@@ -817,6 +844,82 @@ mod tests {
             b"\x1b[2;1H\x1b[2K\x1b[3;1H\x1b[2K\x1b[H",
         ]
         .concat()
+    }
+
+    #[test]
+    fn borrowed_menu_requires_reset_owned_unused_alternate_and_known_primary_geometry() {
+        let mut model = TerminalModel::new(size());
+        assert!(
+            !model.can_borrow(),
+            "an initial primary default is not ownership"
+        );
+        model.process(&inherited_initialization(false));
+        assert!(
+            !model.can_borrow(),
+            "observing primary state cannot reveal inactive content"
+        );
+        model.process(b"\x1bcPRIMARY");
+        assert!(model.can_borrow());
+        model.resize(size());
+        assert!(!model.can_borrow());
+        model.process(b"\x1b[?6l\x1b[r\x1b[H\x1b7");
+        assert!(
+            model.can_borrow(),
+            "geometry can recover while primary cells stay uncertain"
+        );
+        assert!(!model.can_paint());
+        assert!(
+            !model.can_paint_area(Rect::new(0, 0, 12, 4)),
+            "toasts never borrow"
+        );
+        for selection in [
+            b"\x1b[?47h".as_slice(),
+            b"\x1b[?00047h",
+            b"\x1b[?1049h",
+            b"\x1b[?1049l",
+        ] {
+            model.process(b"\x1bc");
+            model.process(selection);
+            model.process(b"\x1b[?47l\x1b[?6l\x1b[r\x1b[H\x1b7");
+            assert!(
+                !model.can_borrow(),
+                "remote alternate use revokes ownership: {selection:?}"
+            );
+            model.resize(size());
+            model.process(b"\x1b[?6l\x1b[r\x1b[H\x1b7");
+            assert!(!model.can_borrow(), "resize cannot reclaim a remote buffer");
+        }
+        for unavailable in [
+            b"\x1b[?6h".as_slice(),
+            b"\x1b[2;3r",
+            b"abcdefghijkl",
+            b"\x1b[7777h",
+        ] {
+            model.process(b"\x1bc");
+            model.resize(size());
+            model.process(b"\x1b[?6l\x1b[r\x1b[H\x1b7");
+            model.process(unavailable);
+            assert!(
+                !model.can_borrow(),
+                "unsupported borrowing geometry: {unavailable:?}"
+            );
+        }
+        for missing in [b"\x1b[?6l".as_slice(), b"\x1b[r", b"\x1b[H", b"\x1b7"] {
+            model.process(b"\x1bc");
+            model.resize(size());
+            for component in [b"\x1b[?6l".as_slice(), b"\x1b[r", b"\x1b[H", b"\x1b7"] {
+                if component != missing {
+                    model.process(component);
+                }
+            }
+            assert!(!model.can_borrow(), "missing {missing:?}");
+        }
+        model.process(b"\x1bc");
+        model.discard_oversized_sequence();
+        model.process(b"\x18\x1b[?6l\x1b[r\x1b[H\x1b7");
+        assert!(!model.can_borrow(), "budget loss revokes scratch ownership");
+        model.process(b"\x1bc");
+        assert!(model.can_borrow());
     }
 
     #[test]

@@ -39,6 +39,7 @@ use crate::clientd::{BridgeRecord, Frontend, RequestRecord, ServerEvent, Service
 use crate::terminal_model::{TerminalEvent, TerminalModel};
 
 mod baseline;
+mod borrowed;
 mod child;
 mod form;
 mod input;
@@ -296,7 +297,7 @@ pub fn run(
             .baseline
             .observed_final_screen(&terminal_model)
             .cloned();
-        if overlay_enabled && terminal_state.palette_open {
+        if overlay_enabled && terminal_state.palette_open && terminal_state.borrowed.is_none() {
             let _ = restore_terminal_model(&terminal_model, terminal_state.covered_alternate);
             terminal_state.palette_open = false;
         }
@@ -373,7 +374,7 @@ fn drive(
                 escape_key,
                 &daemon_view,
                 terminal_model,
-                overlay_enabled,
+                overlay_enabled && terminal_state.borrowed.is_none(),
             )?
         };
     }
@@ -415,6 +416,7 @@ fn drive(
             &mut terminal_state.output,
             Some(writer),
             &mut painter,
+            &mut terminal_state.borrowed,
         )?;
         let output_changed = output.changed;
         if let Some(resume) = output.resume {
@@ -514,7 +516,8 @@ fn drive(
         }
 
         let now = Instant::now();
-        input_router.palette_available = !overlay_enabled || terminal_model.can_paint();
+        input_router.palette_available = !overlay_enabled || terminal_model.can_paint()
+            || terminal_model.can_borrow() && terminal_state.output.at_boundary(now);
         if input_router.mode == InputMode::Passthrough {
             input_router.mouse_utf8 = terminal_model.screen().mouse_protocol_encoding()
                 == vt100::MouseProtocolEncoding::Utf8;
@@ -581,10 +584,12 @@ fn drive(
                 }
                 InputAction::OpenPalette => {
                     painter.forget();
-                    if overlay_enabled {
+                    let borrow = overlay_enabled && !terminal_model.can_paint()
+                        && terminal_model.can_borrow();
+                    if overlay_enabled && !borrow {
                         terminal_model.begin_overlay();
                     }
-                    terminal_state.open_palette(terminal_model.screen())?;
+                    terminal_state.open_palette(terminal_model.screen(), borrow)?;
                     palette_terminal = Some(new_palette_terminal()?);
                     // The prefix while a request's toast is up goes straight
                     // to that request.
@@ -2720,6 +2725,7 @@ fn drain_output(
     tracker: &mut toast::OutputTracker,
     remote_writer: Option<&ChildInput>,
     painter: &mut toast::ToastPainter,
+    borrowed: &mut Option<borrowed::BorrowedMenu>,
 ) -> anyhow::Result<OutputUpdate> {
     let mut stdout = io::stdout().lock();
     let mut wrote = false;
@@ -2728,6 +2734,19 @@ fn drain_output(
         match rx.try_recv() {
             Ok(OutputEvent::Data(bytes)) => {
                 changed = true;
+                if let Some(borrowed) = borrowed.as_mut() {
+                    let update = borrowed.process(terminal_model, &bytes);
+                    tracker.feed(&bytes[..update.consumed], Instant::now());
+                    if let Some(resume) = update.resume {
+                        stdout.flush().context("flushing before borrowed-menu replay")?;
+                        return Ok(OutputUpdate {
+                            changed,
+                            resume: Some(resume),
+                            replay_pending: update.replay_pending,
+                        });
+                    }
+                    continue;
+                }
                 if mode == InputMode::Passthrough {
                     // Remove a toast using the last represented state before
                     // new output can invalidate it. Raw output then stays raw.
@@ -2831,6 +2850,7 @@ fn finish_output(
             &mut toast::OutputTracker::default(),
             None,
             &mut toast::ToastPainter::default(),
+            &mut None,
         )?;
         if !*finished {
             thread::sleep(Duration::from_millis(5));
@@ -2851,8 +2871,13 @@ fn close_palette(
 ) -> anyhow::Result<()> {
     if terminal_state.palette_open {
         palette_terminal.take();
-        terminal_state.close_palette(overlay_enabled)?;
-        if overlay_enabled {
+        if let Some(borrowed) = terminal_state.borrowed.as_mut() {
+            borrowed.close(&mut io::stdout().lock())
+                .context("restoring primary and replaying borrowed-menu output")?;
+            terminal_state.borrowed = None;
+            terminal_state.palette_open = false;
+        } else if overlay_enabled {
+            terminal_state.close_palette(overlay_enabled)?;
             deferred.clear();
             restore_terminal_model(terminal_model, terminal_state.covered_alternate)?;
             let mut stdout = io::stdout().lock();
@@ -2868,6 +2893,7 @@ fn close_palette(
                 .flush()
                 .context("flushing unfinished remote sequence")?;
         } else {
+            terminal_state.close_palette(overlay_enabled)?;
             let mut stdout = io::stdout().lock();
             let mut restore = Vec::new();
             if let Some(snapshot) = &terminal_state.menu_snapshot {
@@ -3001,6 +3027,7 @@ struct TerminalState {
     final_screen: Option<vt100::Screen>,
     initial_input: Vec<u8>,
     palette_open: bool,
+    borrowed: Option<borrowed::BorrowedMenu>,
     /// Remote sequence state (including hidden overlay output), so toasts
     /// paint between sequences and menu close can resume an unfinished one.
     output: toast::OutputTracker,
@@ -3020,6 +3047,7 @@ impl TerminalState {
             final_screen: None,
             initial_input: Vec::new(),
             palette_open: false,
+            borrowed: None,
             output: toast::OutputTracker::default(),
             menu_prefix: Vec::new(),
             menu_snapshot: None,
@@ -3053,22 +3081,24 @@ impl TerminalState {
         Ok(())
     }
 
-    fn open_palette(&mut self, screen: &vt100::Screen) -> io::Result<()> {
-        // Do not enter the terminal's alternate screen here. The remote zellij
-        // application normally already owns it, and alternate-screen state is
-        // not safely nestable. The overlay restores its model; takeover
-        // relies on the SIGWINCH redraw in `close_palette`.
+    fn open_palette(&mut self, screen: &vt100::Screen, borrow: bool) -> io::Result<()> {
         let mut stdout = io::stdout();
         self.menu_prefix = self.output.pending().to_vec();
         self.covered_alternate = screen.alternate_screen();
         self.menu_snapshot = Some(screen.clone());
+        self.palette_open = true;
+        if borrow {
+            self.borrowed = Some(borrowed::BorrowedMenu::new(screen));
+            // No implicit cursor saving; ordinary overlay/takeover stay in
+            // the remote buffer. Ownership was proved before this call.
+            stdout.write_all(b"\x1b[?47h")?;
+        }
         // A menu can open between chunks of a CSI, OSC/DCS or UTF-8
         // character. Cancel only the physical parser; the model and tracker
         // retain the remote prefix, which close replays before passthrough.
         stdout.write_all(crate::terminal_paint::BEGIN)?;
         stdout.write_all(b"\x1b[?2004h")?;
         execute!(stdout, Hide, Clear(ClearType::All), MoveTo(0, 0))?;
-        self.palette_open = true;
         Ok(())
     }
 
@@ -3091,7 +3121,10 @@ impl TerminalState {
             // Cancel an unfinished parser and restore only settings observed
             // before the first child output. Never clear an inherited buffer,
             // pop an unowned keyboard stack or invent unknown shell defaults.
-            if self.palette_open {
+            if let Some(mut borrowed) = self.borrowed.take() {
+                let _ = borrowed.close(&mut io::stdout().lock());
+                self.palette_open = false;
+            } else if self.palette_open {
                 if let Some(snapshot) = &self.menu_snapshot {
                     let mut restore = crate::terminal_paint::BEGIN.to_vec();
                     crate::terminal_paint::restore(snapshot, false, &mut restore);

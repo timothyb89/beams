@@ -500,6 +500,39 @@ buffer, preserve its relevant contents/state, and independently test selection
 and ordered bounded replay before enabling a fallback. Keep ordinary inherited
 primary sessions deferred when those preconditions are absent.
 
+Owned-scratch borrowing is implemented (2026-11-07): establish an unused
+scratch alternate only from an observed RIS, and revoke it on any remote alternate selection or
+unsupported/budget loss. Preserve that ownership through resize while requiring
+fresh primary geometry/save/tab evidence. Use the fallback only on the primary,
+with origin off, full margins and no pending wrap; never infer ownership from
+entry probes or explicit primary initialization alone. Prefer direct overlay
+when complete content is available.
+
+Select 47 without implicit saving, paint only in the unused alternate, and
+restore its blank default state before returning to the primary. Restore entry
+current state without touching primary cells or save slots, then replay retained
+remote drawing bytes exactly once. Bound retention to 256 KiB. For this first
+path, close before queries, terminal effects, non-ASCII output, buffer changes,
+unsupported controls or retention exhaustion rather than synthesizing answers
+from uncertain cells. Their original bytes run after earlier retained drawing,
+so the real primary terminal supplies replies/effects once. Preserve forms for
+explicit reopening. Store the entry snapshot and retained bytes with terminal
+cleanup so error paths can relinquish the borrowed buffer too.
+
+Close output begins with CAN/ST and an explicit 47 selection, so cleanup after
+a partially written selector clears only the scratch buffer, never the primary.
+Borrowing is offered only at an output boundary and only when direct painting
+is unavailable. 1047/1048 remain outside the supported inventory, so they
+close and replay like any unsupported frame. Model tests cover ownership,
+revocation by every alternate selection, resize recovery and missing geometry
+components; `session/borrowed.rs` tests cover retention limits, split and
+rejected frames, partial close writes and partial setup selectors. Two
+independent xterm.js traces and the live PTY renderer (normal exit and SIGTERM
+while borrowing) verify primary cells, saved cursors, the unused alternate,
+ordered query/effect replay, buffer relinquishment and resize. This narrowly
+owned path does not establish ordinary inherited-shell borrowing, covered
+reflow fidelity or default readiness.
+
 Explicit inherited initialization is implemented (2026-11-07): observe a supported
 initialization of the state used by painting instead of requiring RIS.
 Track shared attribute/character-set/input-mode evidence separately from
@@ -703,11 +736,11 @@ Next work, in separately reviewable changes:
    all three gates; none should be ignored.
 2. Query-policy coverage above is implemented. Any new probes must extend the
    explicit inventory and preserve exactly-once replies.
-3. Establish inactive-buffer ownership and safe borrowing.
+3. Extend inactive-buffer ownership beyond the RIS-owned scratch path.
    Explicit inherited initialization, post-resize geometry, common drawing
-   state, conservative recovery and row-level toast evidence are implemented. Safe
-   borrowing still needs stronger ownership evidence and independent switching
-   tests; covered resize fidelity remains open.
+   state, conservative recovery, row-level toast evidence and owned-scratch
+   borrowing are implemented. Ordinary inherited shells (no observed RIS)
+   still defer; covered resize fidelity remains open.
 4. Update READMEs, audit and TODO with each slice. Run the client suite/build
    and all three smoke paths. Rerun independent replay when painting changes.
    Keep the default switch separate.
@@ -726,12 +759,13 @@ fixture stall that made a fairness assertion depend on output throughput.
 This failure policy bounds memory; it does not promise continued service for
 a peer that never drains its input.
 
-Current validation: **246 client unit tests and 3 integration tests pass, with
+Current validation: **254 client unit tests and 3 integration tests pass, with
 zero ignored tests**. The client build, takeover and overlay managed-session
 smokes, and expanded protocol/PTY harness pass. Pinned xterm.js 5.5 replay again
 passes twelve restoration traces, two resize traces, three inherited-state
-traces, two regional toast traces, three live renderer traces and two live
-non-default lifecycle traces.
+traces, two regional toast traces, two borrowed-menu traces, five live
+renderer traces (including owned borrowing in its normal-exit and SIGTERM
+runs) and two live non-default lifecycle traces.
 The harness also covers explicit initialization without any RIS, deferred recovery and
 strict disabled-prefix partial-string termination. No real
 workstation font/reflow or graphical-terminal validation has been recorded.
@@ -762,9 +796,9 @@ Retain these decisions and remaining gates:
 - Prefer deferring unsafe painting, with explicit best-effort takeover available.
   Unknown inherited primary cells cannot be recovered from a cursor report.
   Zellij helps but does not establish safety when users bypass it.
-- A borrowed alternate buffer is a planned, guarded menu fallback, not current
-  behavior. Establish ownership and safe replay first; never nest it over a
-  remote-owned alternate screen or use it for ordinary toasts.
+- A borrowed alternate buffer is implemented only for a RIS-owned, unused
+  scratch alternate. Ordinary inherited ownership remains unestablished; never
+  nest over a remote-owned alternate screen or use it for ordinary toasts.
 - Durable inline request logging is implemented in all accepted-fetch cases.
   Session-specific prefix/uncertainty notices remain optional, skippable work;
   generic menu guidance uses the existing return path today.
