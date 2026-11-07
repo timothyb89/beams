@@ -140,6 +140,137 @@ directories; it kills fixture children and removes files on completion.
 The existing smoke test also checks daemon-connected forms and path completion
 in both display modes.
 
+> **Known breakage (2026-11-07):** `main` at `94be084` removed
+> `beams ssh --no-client-daemon` (every launch now needs the client daemon),
+> but `managed-session-smoke.sh` and `terminal-overlay-smoke.py` still pass it,
+> so both fail at argument parsing on `main` and on this branch. They passed on
+> the same overlay code before the rebase. Fixing them needs a
+> daemon-connected fake launch, which belongs to the launch workstream.
+
+## Adding terminal recordings
+
+Recordings of real sessions keep overlay eligibility honest: the gate must
+become eligible for what supported multiplexers and terminals actually send,
+and painting over that output must match an unpainted terminal. Zellij adapts
+to reported terminal capabilities (it uses synchronized frames under iTerm2
+and none without a terminal answering), so record each supported terminal.
+Prioritize terminals that differ: one without synchronized output (e.g.
+Terminal.app) and one with the Kitty keyboard protocol (Ghostty, kitty or
+WezTerm).
+
+Each recording has four parts. Keep raw files under `overlay-traces/` (git
+ignored) until trimmed and reviewed.
+
+1. **Terminal identity and size.** In the terminal under test, outside any
+   multiplexer, and without resizing the window afterwards:
+
+   ```sh
+   mkdir -p overlay-traces/<terminal> && cd overlay-traces/<terminal>
+   echo "$TERM_PROGRAM $TERM_PROGRAM_VERSION $TERM $(stty size)" > terminal.txt
+   ```
+
+2. **Entry-probe replies.** Strict passthrough sends no probes, so record the
+   terminal's answers separately, outside beams, ssh, tmux and zellij, without
+   typing while it runs:
+
+   ```sh
+   python3 <repo>/client/tests/terminal-probe-replies.py replies.bin
+   ```
+
+   It sends exactly `Baseline::probes()` (a unit test keeps the two in sync),
+   saves the raw replies and reports when the last one arrived. Replies later
+   than the client's 200 ms window are themselves a finding: that terminal
+   gets no evidence for them.
+
+3. **Session output in strict passthrough.** `--escape-key none` makes the
+   client a pure pipe, so the file is exactly what the remote sent (plus the
+   terminal's own echo). Use a scratch Beam and a harmless prompt: everything
+   on screen is recorded.
+
+   ```sh
+   # macOS (BSD script): output only, keystrokes are not logged.
+   script -q zellij-claude.trace beams ssh --purpose overlay-trace --escape-key none
+   # Linux (util-linux script):
+   script -q -c 'beams ssh --purpose overlay-trace --escape-key none' zellij-claude.trace
+   ```
+
+   Inside: let Zellij start, run `claude` in a scratch directory, type in its
+   input box and let a reply stream for 10–20 seconds (frequent status/input
+   redraws matter), then exit. For an attach redraw, reconnect with the same
+   command in a second recording and exit after a few seconds. Do not resize:
+   macOS `script` does not forward window-size changes; the PTY harness covers
+   resize instead. Afterwards, `beams rm overlay-trace`.
+
+4. **Line-size behavior.** In the terminal under test (outside multiplexers),
+   both commands must print normal-width text; record the result in the
+   workstation matrix. The overlay assumes this for `CSI 2J` and `?1049h`:
+
+   ```sh
+   printf '\e#6WIDE\e[2Jnormal?\n'
+   printf '\e[?1049h\e#6WIDE\e[?1049l\e[?1049hnormal?'; sleep 2; printf '\e[?1049l'
+   ```
+
+Copy the files to a Beam checkout if recorded elsewhere, e.g. `beams copy-to
+--purpose <purpose> zellij-claude.trace <checkout>/overlay-traces/<terminal>/zellij-claude.trace`.
+
+### Trim, review and add
+
+Trim to the multiplexer's lifetime: from its alternate-screen entry through
+its exit line. Recordings made with clients before `9b51919` also end with the
+client's own cleanup (starting `CAN ST ESC[?2026l`); drop it.
+
+```sh
+python3 -I - overlay-traces/<terminal>/zellij-claude.trace \
+    client/tests/fixtures/zellij-<terminal>-<scenario>.bin <<'PY'
+import sys
+data = open(sys.argv[1], "rb").read()
+cleanup = data.rfind(b"\x18\x1b\\\x1b[?2026l\x1b[?9l")
+if cleanup != -1:
+    data = data[:cleanup]
+start = data.index(b"\x1b[?1049h")
+exit_ = data.rindex(b"\x1b[?1049l")
+end = data.find(b"\n", exit_) + 1 or len(data)
+open(sys.argv[2], "wb").write(data[start:end])
+print(len(data[start:end]), "bytes")
+PY
+```
+
+Review the trimmed text before committing (paths, hostnames, Beam names,
+tokens, prompt contents). Prefer a short attach redraw over a long session;
+the committed reattach fixture is 23 KB. Copy `replies.bin` next to it as
+`zellij-<terminal>-<scenario>.replies` when recorded.
+
+Add an entry to `RECORDINGS` in `client/src/session/baseline.rs` with the
+rows/cols from `terminal.txt`, and `replies: Some(include_bytes!(...))` when
+recorded (otherwise `None`, which replays representative and no-DECRQSS reply
+sets). Two tests then run for every recording:
+
+- `recordings_are_paintable_from_observed_entry_state`: eligible after the
+  first full frame (exactly, when synchronized frames are present), never
+  lost before the multiplexer exits, unavailable afterwards, and never
+  eligible without reported settings. Every recorded reply must be
+  recognized; an unrecognized reply would reach the remote as input.
+- `painting_over_recordings_matches_an_unpainted_terminal`: a toast at the
+  first eligible boundary and a menu covering later output leave the terminal
+  identical to an unpainted run, including an unseen workstation primary, in
+  the model and (with `BEAMS_TEST_XTERM_MODULE`) in xterm.js.
+
+When the eligibility test fails it prints the reason and the distinct frames
+outside the supported inventory:
+
+- `UnsupportedSequence`: classify each listed frame in
+  `terminal_eligibility::supported`, with its protocol reference and why it
+  cannot change represented cells or state. If it is a query or effect, make
+  sure it is relayed once while hidden and that its reply routes to the remote
+  (`is_terminal_reply`). Add a look-alike that must stay unsupported. Never
+  accept a frame just because a recording contains it.
+- `InheritedState` with no unsupported frames: entry replies or the redraw do
+  not establish something (often a mode the terminal does not answer). Decide
+  explicitly whether it can be observed, safely reset at entry, or must defer.
+
+Record the terminal, versions, results and any new policy in the design doc
+and this audit, alongside the fixture.
+
 Recorded results in this Linux Beam environment: 188 client unit tests and
 3 integration tests passed; the takeover smoke, overlay smoke and new overlay
 protocol/PTY harness passed. The three acceptance gates were also run
@@ -357,7 +488,7 @@ pass, none ignored**. Strict-passthrough recordings of Zellij 0.45.1 with
 claude under iTerm2 3.6.10 showed the gate never became eligible: Zellij sends
 no RIS or explicit initialization, several unclassified controls, and on
 reattach repaints every row without clearing. UTF-8 characters split across
-reads were also misclassified (fixed separately in `4200572`).
+reads were also misclassified (fixed separately in `24be6a9`).
 
 Overlay sessions now seed evidence from entry probe replies and write one
 set of unqueryable resets before remote output; Zellij's controls are

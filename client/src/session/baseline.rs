@@ -430,141 +430,217 @@ mod tests {
     use super::*;
     use crate::terminal_eligibility::Unavailable;
 
-    /// Zellij's reattach redraw, recorded from iTerm2 3.6.10 in strict
-    /// passthrough: its own setup, synchronized frames and claude rendering.
-    const ZELLIJ_ITERM2: &[u8] = include_bytes!("../../tests/fixtures/zellij-iterm2-reattach.bin");
+    /// Strict-passthrough terminal recordings (see "Adding terminal
+    /// recordings" in docs/development/terminal-overlay.md). Each fixture is
+    /// the remote output from the multiplexer's alternate-screen entry up to,
+    /// and including, its exit; `replies` are that terminal's recorded
+    /// answers to `Baseline::probes`, when captured.
+    struct Recording {
+        name: &'static str,
+        bytes: &'static [u8],
+        rows: u16,
+        cols: u16,
+        replies: Option<&'static [u8]>,
+    }
 
-    fn replies(settings: bool) -> Vec<u8> {
+    const RECORDINGS: &[Recording] = &[Recording {
+        name: "zellij 0.45.1 + claude, iTerm2 3.6.10, reattach",
+        bytes: include_bytes!("../../tests/fixtures/zellij-iterm2-reattach.bin"),
+        rows: 65,
+        cols: 208,
+        replies: None,
+    }];
+
+    /// Representative replies for a terminal that answers every probe with
+    /// defaults (autowrap and cursor visible). `settings: false` answers no
+    /// DECRQSS request.
+    fn replies(settings: bool, rows: u16) -> Vec<u8> {
         let mut replies = Vec::new();
         for mode in MODES {
             let value = if matches!(mode, 7 | 25) { 1 } else { 2 };
             replies.extend_from_slice(format!("\x1b[?{mode};{value}$y").as_bytes());
         }
         replies.extend_from_slice(b"\x1b[4;2$y\x1b[20;2$y\x1b[?0u\x1b[>4;0m");
-        replies.extend_from_slice(if settings {
-            b"\x1bP1$r0m\x1b\\\x1bP1$r1;65r\x1b\\\x1bP1$r0 q\x1b\\".as_slice()
+        if settings {
+            replies.extend_from_slice(b"\x1bP1$r0m\x1b\\");
+            replies.extend_from_slice(format!("\x1bP1$r1;{rows}r\x1b\\").as_bytes());
+            replies.extend_from_slice(b"\x1bP1$r0 q\x1b\\");
         } else {
-            b"\x1bP0$r\x1b\\\x1bP0$r\x1b\\\x1bP0$r\x1b\\"
-        });
+            replies.extend_from_slice(b"\x1bP0$r\x1b\\\x1bP0$r\x1b\\\x1bP0$r\x1b\\");
+        }
         replies
     }
 
-    fn entry_model(replies: &[u8]) -> crate::terminal_model::TerminalModel {
+    fn entry_model(replies: &[u8], rows: u16, cols: u16) -> crate::terminal_model::TerminalModel {
         let mut capture = Capture::default();
         capture.feed(replies);
         let (baseline, input) = capture.finish();
-        assert!(input.is_empty());
+        assert!(input.is_empty(), "every recorded reply is recognized");
         let mut model = crate::terminal_model::TerminalModel::new(portable_pty::PtySize {
-            rows: 65,
-            cols: 208,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         });
         model.process(ENTRY_RESETS);
-        model.process(&baseline.entry_evidence(65));
+        model.process(&baseline.entry_evidence(rows));
         model
     }
 
-    /// Paint a toast after zellij's first frame, and a menu covering its
-    /// second; replay the rest. An unpainted terminal must end identical,
-    /// including the workstation primary that the model never saw.
-    #[test]
-    fn painting_over_recorded_zellij_session_matches_an_unpainted_terminal() {
-        use super::super::toast::{OutputTracker, Toast, ToastPainter, Tone};
-        let frame_ends: Vec<usize> = ZELLIJ_ITERM2
-            .windows(8)
-            .enumerate()
-            .filter(|(_, w)| *w == b"\x1b[?2026l")
-            .map(|(i, _)| i + 8)
-            .collect();
-        let (first, second) = (frame_ends[0], frame_ends[1]);
-        let exit = ZELLIJ_ITERM2.windows(8).rposition(|w| w == b"\x1b[?1049l").unwrap();
-        let inherited =
-            [b"\x1b[5;1H\x1b[1;31mUNSEEN WORKSTATION PRIMARY\x1b[7;9H\x1b7".as_slice(), ENTRY_RESETS].concat();
-        let parser = |chunks: &[&[u8]]| {
-            let mut parser = vt100::Parser::new(
-                std::num::NonZeroU16::new(65).unwrap(),
-                std::num::NonZeroU16::new(208).unwrap(),
-                0,
-            );
-            for chunk in chunks {
-                parser.process(chunk);
+    /// Reply sets to replay a recording with: the recorded replies when
+    /// present, otherwise both representative sets.
+    fn reply_sets(recording: &Recording) -> Vec<(&'static str, Vec<u8>)> {
+        match recording.replies {
+            Some(replies) => vec![("recorded replies", replies.to_vec())],
+            None => vec![
+                ("representative replies", replies(true, recording.rows)),
+                ("no DECRQSS replies", replies(false, recording.rows)),
+            ],
+        }
+    }
+
+    /// Distinct frames outside the supported inventory, for failure
+    /// messages: these are what a new recording needs classified.
+    fn unsupported_frames(bytes: &[u8], rows: u16, cols: u16) -> Vec<String> {
+        let mut parser = vt100::Parser::new(
+            std::num::NonZeroU16::new(rows).unwrap(),
+            std::num::NonZeroU16::new(cols).unwrap(),
+            0,
+        );
+        let mut stream = crate::terminal_stream::TerminalStream::default();
+        let mut found = BTreeMap::<String, usize>::new();
+        let _ = stream.advance_guarded(bytes, |frame, original| {
+            if !crate::terminal_eligibility::supported(original, parser.screen()) {
+                let shown: String = original
+                    .iter()
+                    .take(48)
+                    .flat_map(|b| std::ascii::escape_default(*b))
+                    .map(char::from)
+                    .collect();
+                *found.entry(shown).or_default() += 1;
             }
-            parser
-        };
+            parser.process(frame);
+            Ok::<_, ()>(true)
+        });
+        found.into_iter().map(|(frame, count)| format!("{frame} x{count}")).collect()
+    }
 
-        let mut model = entry_model(&replies(true));
-        model.process(&ZELLIJ_ITERM2[..first]);
-        let notice = Toast {
-            tone: Tone::Info,
-            title: "Beams".to_string(),
-            lines: vec![ratatui::text::Line::from("request pending approval")],
-        };
-        let mut painter = ToastPainter::default();
-        let paint = painter.sync(
-            Some(&notice),
-            &model,
-            &mut OutputTracker::default(),
-            std::time::Instant::now(),
-        );
-        assert!(!paint.is_empty(), "toast paints over the recorded session");
-        let restore = painter.clear(&model);
+    /// Where the multiplexer leaves the alternate screen (its last `?1049l`).
+    fn exit_offset(bytes: &[u8]) -> usize {
+        bytes.windows(8).rposition(|w| w == b"\x1b[?1049l").expect("recording includes the exit")
+    }
 
-        // A menu covers the second frame, which the model consumes hidden.
-        model.begin_overlay();
-        let mut menu = crate::terminal_paint::BEGIN.to_vec();
-        menu.extend_from_slice(b"\x1b[2J\x1b[HLOCAL MENU");
-        menu.extend_from_slice(crate::terminal_paint::END);
-        let hidden = &ZELLIJ_ITERM2[first..second];
-        let (consumed, rejected) = model
-            .process_guarded_with_events(hidden, true, |_| Ok::<(), ()>(()), true)
-            .unwrap();
-        assert_eq!((consumed, rejected), (hidden.len(), None));
-        assert!(model.can_paint());
-        let close = model.restore_bytes(true);
-        model.end_overlay();
-        let after = &ZELLIJ_ITERM2[second..];
+    /// Offsets just before an ESC: every earlier sequence and character is
+    /// complete, as a real paint boundary requires.
+    fn boundaries(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
+        (1..bytes.len()).filter(|&i| bytes[i] == 0x1b)
+    }
 
-        let expected = parser(&[&inherited, ZELLIJ_ITERM2]);
-        let actual = parser(&[
-            &inherited,
-            &ZELLIJ_ITERM2[..first],
-            &paint,
-            &restore,
-            &menu,
-            &close,
-            after,
-        ]);
-        assert_eq!(actual.screen().contents(), expected.screen().contents());
-        assert_eq!(actual.screen().drawing_state(), expected.screen().drawing_state());
-        // Zellij's exit returns to the workstation primary, which the model
-        // never saw and painting never touched (one line scrolled by "Bye").
-        assert!(expected.screen().contents().contains("UNSEEN WORKSTATION PRIMARY"));
-        assert!(!expected.screen().alternate_screen());
-        let at_exit = |chunks: &[&[u8]]| parser(chunks).screen().contents();
-        assert_eq!(
-            at_exit(&[&inherited, &ZELLIJ_ITERM2[..first], &paint, &restore, &menu, &close,
-                &ZELLIJ_ITERM2[second..exit]]),
-            at_exit(&[&inherited, &ZELLIJ_ITERM2[..exit]]),
-            "zellij's alternate screen before exit"
-        );
+    /// Paint a toast at the first eligible boundary and a menu covering
+    /// output from there to a later boundary; replay the rest. An unpainted
+    /// terminal must end identical, including the workstation primary that
+    /// the model never saw.
+    #[test]
+    fn painting_over_recordings_matches_an_unpainted_terminal() {
+        use super::super::toast::{OutputTracker, Toast, ToastPainter, Tone};
+        let mut traces = Vec::new();
+        for recording in RECORDINGS {
+            let bytes = recording.bytes;
+            let exit = exit_offset(bytes);
+            let inherited = [
+                b"\x1b[5;1H\x1b[1;31mUNSEEN WORKSTATION PRIMARY\x1b[7;9H\x1b7".as_slice(),
+                ENTRY_RESETS,
+            ]
+            .concat();
+            let parser = |chunks: &[&[u8]]| {
+                let mut parser = vt100::Parser::new(
+                    std::num::NonZeroU16::new(recording.rows).unwrap(),
+                    std::num::NonZeroU16::new(recording.cols).unwrap(),
+                    0,
+                );
+                for chunk in chunks {
+                    parser.process(chunk);
+                }
+                parser
+            };
+            let (_, replies) = &reply_sets(recording)[0];
+            // The first boundary where painting is allowed.
+            let mut probe = entry_model(replies, recording.rows, recording.cols);
+            let mut processed = 0;
+            let first = boundaries(&bytes[..exit])
+                .find(|&offset| {
+                    probe.process(&bytes[processed..offset]);
+                    processed = offset;
+                    probe.can_paint()
+                })
+                .unwrap_or_else(|| panic!("{}: never eligible", recording.name));
+            let second = boundaries(&bytes[..exit])
+                .find(|&offset| offset > first + (exit - first) / 2)
+                .unwrap();
+            let name = recording.name;
 
+            let mut model = entry_model(replies, recording.rows, recording.cols);
+            model.process(&bytes[..first]);
+            let notice = Toast {
+                tone: Tone::Info,
+                title: "Beams".to_string(),
+                lines: vec![ratatui::text::Line::from("request pending approval")],
+            };
+            let mut painter = ToastPainter::default();
+            let paint = painter.sync(
+                Some(&notice),
+                &model,
+                &mut OutputTracker::default(),
+                std::time::Instant::now(),
+            );
+            assert!(!paint.is_empty(), "{name}: toast paints");
+            let restore = painter.clear(&model);
+
+            model.begin_overlay();
+            let mut menu = crate::terminal_paint::BEGIN.to_vec();
+            menu.extend_from_slice(b"\x1b[2J\x1b[HLOCAL MENU");
+            menu.extend_from_slice(crate::terminal_paint::END);
+            let hidden = &bytes[first..second];
+            let (consumed, rejected) = model
+                .process_guarded_with_events(hidden, true, |_| Ok::<(), ()>(()), true)
+                .unwrap();
+            assert_eq!((consumed, rejected), (hidden.len(), None), "{name}: hidden output");
+            assert!(model.can_paint(), "{name}");
+            let close = model.restore_bytes(model.screen().alternate_screen());
+            model.end_overlay();
+            let after = &bytes[second..];
+
+            let painted = |end: usize| {
+                parser(&[&inherited, &bytes[..first], &paint, &restore, &menu, &close,
+                    &bytes[second..end]])
+            };
+            let unpainted = |end: usize| parser(&[&inherited, &bytes[..end]]);
+            for end in [exit, bytes.len()] {
+                let (actual, expected) = (painted(end), unpainted(end));
+                assert_eq!(actual.screen().contents(), expected.screen().contents(), "{name}");
+                assert_eq!(
+                    actual.screen().drawing_state(),
+                    expected.screen().drawing_state(),
+                    "{name}"
+                );
+            }
+            // After the exit: the workstation primary, never seen or touched.
+            assert!(unpainted(bytes.len()).screen().contents().contains("UNSEEN WORKSTATION PRIMARY"));
+            traces.push(serde_json::json!({
+                "name": format!("toast over {name}"),
+                "rows": recording.rows, "cols": recording.cols, "inherited": inherited,
+                "before": &bytes[..first], "hidden": [],
+                "paint": paint, "restore": restore, "after": &bytes[first..],
+            }));
+            traces.push(serde_json::json!({
+                "name": format!("menu over {name}"),
+                "rows": recording.rows, "cols": recording.cols, "inherited": inherited,
+                "before": &bytes[..first], "hidden": hidden,
+                "paint": menu, "restore": close, "after": after,
+            }));
+        }
         if let Some(module) = std::env::var_os("BEAMS_TEST_XTERM_MODULE") {
             use std::io::Write as _;
-            let traces = serde_json::json!([
-                {
-                    "name": "toast over recorded zellij (iTerm2)",
-                    "rows": 65, "cols": 208, "inherited": inherited,
-                    "before": &ZELLIJ_ITERM2[..first], "hidden": [],
-                    "paint": paint, "restore": restore, "after": &ZELLIJ_ITERM2[first..],
-                },
-                {
-                    "name": "menu over recorded zellij (iTerm2)",
-                    "rows": 65, "cols": 208, "inherited": inherited,
-                    "before": &ZELLIJ_ITERM2[..first], "hidden": hidden,
-                    "paint": menu, "restore": close, "after": after,
-                },
-            ]);
             let mut reference = std::process::Command::new("node")
                 .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/terminal-paint-reference.cjs"))
                 .arg(module)
@@ -584,14 +660,14 @@ mod tests {
     #[test]
     fn entry_evidence_seeds_only_reported_representable_settings() {
         let shared_known = |replies: &[u8]| {
-            let mut model = entry_model(replies);
+            let mut model = entry_model(replies, 65, 208);
             // A RIS-free explicit buffer initialization isolates shared state.
             model.process(b"\x1b[?6l\x1b[r\x1b[H\x1b[2J");
             model.can_paint()
         };
-        assert!(shared_known(&replies(true)));
+        assert!(shared_known(&replies(true, 65)));
         // Modes a terminal does not recognize cannot be active.
-        let unrecognized: Vec<u8> = String::from_utf8(replies(true))
+        let unrecognized: Vec<u8> = String::from_utf8(replies(true, 65))
             .unwrap()
             .replace("\x1b[?2026;2$y", "\x1b[?2026;0$y")
             .replace("\x1b[?1016;2$y", "\x1b[?1016;0$y")
@@ -601,7 +677,7 @@ mod tests {
         assert!(shared_known(&unrecognized));
         // Autowrap off is unrepresented; unanswered autowrap is unknown.
         for autowrap in ["\x1b[?7;2$y", "\x1b[?7;0$y", ""] {
-            let replies = String::from_utf8(replies(true))
+            let replies = String::from_utf8(replies(true, 65))
                 .unwrap()
                 .replace("\x1b[?7;1$y", autowrap)
                 .into_bytes();
@@ -609,24 +685,24 @@ mod tests {
         }
         // An exotic attribute stays unknown instead of invalidating the
         // session; a later observed SGR reset establishes it.
-        let exotic = String::from_utf8(replies(true))
+        let exotic = String::from_utf8(replies(true, 65))
             .unwrap()
             .replace("\x1bP1$r0m", "\x1bP1$r0;58;5;1m")
             .into_bytes();
-        let mut model = entry_model(&exotic);
+        let mut model = entry_model(&exotic, 65, 208);
         model.process(b"\x1b[?6l\x1b[r\x1b[H\x1b[2J");
         assert!(!model.can_paint());
         assert_eq!(model.unavailable_reason(), Some(Unavailable::InheritedState));
         model.process(b"\x1b[m\x1b[H\x1b[2J");
         assert!(model.can_paint());
         // Non-default represented values are seeded as reported.
-        let custom = String::from_utf8(replies(true))
+        let custom = String::from_utf8(replies(true, 65))
             .unwrap()
             .replace("\x1b[?1;2$y", "\x1b[?1;1$y")
             .replace("\x1b[?2004;2$y", "\x1b[?2004;1$y")
             .replace("\x1bP1$r0m", "\x1bP1$r0;1;31m")
             .into_bytes();
-        let mut model = entry_model(&custom);
+        let mut model = entry_model(&custom, 65, 208);
         assert!(model.screen().application_cursor());
         assert!(model.screen().bracketed_paste());
         let (row, col) = model.screen().cursor_position();
@@ -636,52 +712,86 @@ mod tests {
         assert_eq!(cell.fgcolor(), vt100::Color::Idx(1));
     }
 
+    /// `client/tests/terminal-probe-replies.py` must send exactly the probes
+    /// a session sends, or recorded replies would not match real sessions.
     #[test]
-    fn recorded_zellij_session_is_paintable_from_observed_entry_state() {
-        let exit = ZELLIJ_ITERM2
-            .windows(8)
-            .rposition(|w| w == b"\x1b[?1049l")
-            .unwrap();
-        for settings in [true, false] {
-            // Without DECRQSS answers, zellij's own SGR reset and full
-            // margins establish what the setting reports would have.
-            let mut model = entry_model(&replies(settings));
-            assert!(!model.can_paint(), "the inherited primary stays unknown");
-            let mut first = None;
-            for (index, chunk) in ZELLIJ_ITERM2[..exit].chunks(512).enumerate() {
-                let (consumed, rejected) = model
-                    .process_guarded_with_events(chunk, false, |_| Ok::<(), ()>(()), true)
-                    .unwrap();
-                assert_eq!((consumed, rejected), (chunk.len(), None));
-                if model.can_paint() {
-                    first.get_or_insert(index);
-                } else {
-                    assert!(
-                        first.is_none(),
-                        "settings {settings}: eligibility lost at chunk {index}: {:?}",
-                        model.unavailable_reason()
-                    );
-                }
-            }
-            let first = first.unwrap_or_else(|| {
-                panic!("settings {settings}: never eligible: {:?}", model.unavailable_reason())
-            });
-            // Zellij's first synchronized frame repaints every row; the
-            // first read boundary after it completes is the first chance.
-            let frame_end = ZELLIJ_ITERM2
+    fn probe_reply_script_sends_the_session_probes() {
+        let script = include_str!("../../tests/terminal-probe-replies.py");
+        let modes: Vec<String> = MODES.iter().map(u16::to_string).collect();
+        assert!(script.contains(&format!("MODES = [{}]", modes.join(", "))));
+        let mode_probes: Vec<u8> = MODES
+            .iter()
+            .flat_map(|mode| format!("\x1b[?{mode}$p").into_bytes())
+            .collect();
+        let probes = Baseline::probes();
+        let extra = probes.strip_prefix(mode_probes.as_slice()).unwrap();
+        let literal: String = extra
+            .iter()
+            .map(|b| match b {
+                0x1b => "\\x1b".to_string(),
+                b'\\' => "\\\\".to_string(),
+                b => char::from(*b).to_string(),
+            })
+            .collect();
+        assert!(script.contains(&format!("EXTRA = b\"{literal}\"")), "{literal}");
+    }
+
+    #[test]
+    fn recordings_are_paintable_from_observed_entry_state() {
+        for recording in RECORDINGS {
+            let bytes = recording.bytes;
+            let exit = exit_offset(bytes);
+            // Synchronized frames, when the terminal supports them, give an
+            // exact expectation: eligible right after the first full frame.
+            let first_frame = bytes
                 .windows(8)
                 .position(|w| w == b"\x1b[?2026l")
-                .unwrap()
-                + 8;
-            assert_eq!(first, frame_end / 512, "eligible right after the first full frame");
-            assert!(model.screen().alternate_screen());
-            assert!(model.can_paint_area(ratatui::layout::Rect::new(150, 1, 56, 6)));
-            model.process(&ZELLIJ_ITERM2[exit..]);
-            assert!(!model.can_paint(), "returning to the inherited primary");
+                .filter(|end| *end < exit)
+                .map(|end| end + 8);
+            for (replies_name, replies) in reply_sets(recording) {
+                let context = format!("{}, {replies_name}", recording.name);
+                let mut model = entry_model(&replies, recording.rows, recording.cols);
+                assert!(!model.can_paint(), "{context}: the inherited primary stays unknown");
+                let mut first = None;
+                for (index, chunk) in bytes[..exit].chunks(512).enumerate() {
+                    let (consumed, rejected) = model
+                        .process_guarded_with_events(chunk, false, |_| Ok::<(), ()>(()), true)
+                        .unwrap();
+                    assert_eq!((consumed, rejected), (chunk.len(), None), "{context}");
+                    if model.can_paint() {
+                        first.get_or_insert(index);
+                    } else {
+                        assert!(
+                            first.is_none(),
+                            "{context}: eligibility lost at chunk {index}: {:?}; unsupported: {:#?}",
+                            model.unavailable_reason(),
+                            unsupported_frames(&bytes[..exit], recording.rows, recording.cols)
+                        );
+                    }
+                }
+                let first = first.unwrap_or_else(|| {
+                    // UnsupportedSequence: classify the frames listed here.
+                    // InheritedState: entry replies or redraw evidence lack
+                    // something (see "Adding terminal recordings").
+                    panic!(
+                        "{context}: never eligible: {:?}; unsupported: {:#?}",
+                        model.unavailable_reason(),
+                        unsupported_frames(&bytes[..exit], recording.rows, recording.cols)
+                    )
+                });
+                if let Some(frame_end) = first_frame {
+                    assert_eq!(first, frame_end / 512, "{context}: eligible after the first frame");
+                }
+                assert!(model.screen().alternate_screen(), "{context}");
+                let toast = ratatui::layout::Rect::new(recording.cols - 58, 1, 56, 6);
+                assert!(model.can_paint_area(toast), "{context}");
+                model.process(&bytes[exit..]);
+                assert!(!model.can_paint(), "{context}: returning to the inherited primary");
+            }
+            let mut model = entry_model(b"", recording.rows, recording.cols);
+            model.process(bytes);
+            assert!(!model.can_paint(), "{}: no reported settings, nothing assumed", recording.name);
         }
-        let mut model = entry_model(b"");
-        model.process(ZELLIJ_ITERM2);
-        assert!(!model.can_paint(), "no reported settings: nothing is assumed");
     }
 
     #[test]

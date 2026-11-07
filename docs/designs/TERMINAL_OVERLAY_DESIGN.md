@@ -479,7 +479,7 @@ holds the reattach redraw) showed why: Zellij never sends RIS or the explicit
 initialization, uses several unclassified controls, and on reattach never
 clears; it relies on `?1049h` and repaints every row. A read split inside a
 UTF-8 character was also misclassified as unsupported; text frames now carry
-whole characters across reads (`4200572`).
+whole characters across reads (`24be6a9`).
 
 Decisions (agreed with the user):
 
@@ -768,7 +768,8 @@ the default.** All three original release gates pass unignored, including
 `overlay_acceptance_dcs_query`. Compatibility and content provenance remain
 incomplete; passing these three fixtures does not establish default readiness.
 
-Completed work is preserved in these commits:
+Completed work is preserved in these commits. Those up to `28eb7a8` are on
+`main`; the rest are on the `terminal-overlay-readiness` branch:
 
 | Commit | Result |
 | --- | --- |
@@ -777,13 +778,28 @@ Completed work is preserved in these commits:
 | `e6dee81` | Durable `beams fetch` acknowledgement with generic workstation-menu guidance |
 | `cb5cc47` | Bounded stream framing, model snapshots, streaming DCS callbacks and conservative overflow recovery |
 | `28eb7a8` | Shared saved/current cursor, SGR, origin/margin restoration; toast and takeover fixes; independent replay fixtures |
-| `db11c79` | ST-aware remote-state DECRQSS replies, negative replies for unmodeled settings/XTGETTCAP and unignored DCS gate |
+| `33424d3` | ST-aware remote-state DECRQSS replies, negative replies for unmodeled settings/XTGETTCAP and unignored DCS gate |
+| `1b9c006`, `cc98a25` | Child-input backpressure worker; the supported query policy |
+| `0a45b94`, `1111022`, `223fba8` | Deferred unsafe painting with recovery; insert/charset/SGR/link state; bell acknowledgement |
+| `9b51919` | Observed outer-terminal baseline and cleanup; child ownership on setup errors |
+| `45ed059`, `5712b93`, `f9d1eec` | Post-resize and explicit inherited initialization; regional toast evidence |
+| `fefca31` | Borrowed RIS-owned scratch alternate for menus over uncertain primaries |
+| `24be6a9` | Whole UTF-8 characters across read splits |
+| `71566c4` | Zellij eligibility: classified controls, entry evidence and resets, lazy save/tabs, row overwrites |
 
-The overlay work and its handoff commit (`271f2ca`) have been merged into local
-`main`, preserving the launch work already present at `355058d`. They have not
-been pushed. Start by reading `AGENTS.md`, this section, `TODO.md` and `git log`,
-and checking `git status` before changing anything. Push only when requested.
-Do not depend on previous conversation history or `/tmp` files surviving.
+**Branch state for resuming (2026-11-07).** Work happens on the local branch
+`terminal-overlay-readiness` (worktree `~/.codex/worktrees/851a/beams`),
+rebased onto `main` at `94be084`; it is not merged into `main` and not pushed,
+by choice. `terminal-overlay-readiness-pre-rebase` keeps the pre-rebase
+history and can be deleted once the rebased branch is accepted. `main` keeps
+moving in another worktree (`~/beams`): rebase again before merging. Raw
+recordings live in the ignored `overlay-traces/`; only trimmed fixtures are
+committed.
+
+Start by reading `AGENTS.md`, this section, `TODO.md` and `git log main..`,
+and check `git status` before changing anything. Push or merge only when
+requested. Do not depend on previous conversation history or `/tmp` files
+surviving (recreate the xterm.js module from the audit's instructions).
 
 Implementation entry points:
 
@@ -799,24 +815,38 @@ Implementation entry points:
 | `client/src/session/toast.rs` | Physical-output tracker and toast paint/removal |
 | `client/vendor/vt100/BEAMS.md`, `client/vendor/vt100/src/state.rs` | Vendored changes, provenance and read-only drawing snapshots |
 | `client/tests/terminal-overlay-smoke.py`, `client/tests/terminal-paint-reference.cjs` | Live controlling-PTY coverage and optional independent replay |
+| `client/src/session/borrowed.rs` | Borrowed scratch-alternate menus: bounded retention, ordered close/replay |
+| `client/tests/fixtures/`, `RECORDINGS` in `baseline.rs` | Trimmed real-terminal recordings and the tests run over each |
+| `client/tests/terminal-probe-replies.py` | Records a terminal's answers to the entry probes |
 | `bootstrap/src/fetch.rs` | Persistent request acknowledgement; no new notice protocol |
 
 Next work, in separately reviewable changes:
 
-1. Establish the baseline using the
-   [repeatable validation commands](../development/terminal-overlay.md#repeatable-validation).
-   `cargo test --manifest-path client/Cargo.toml overlay_acceptance` now runs
-   all three gates; none should be ignored.
-2. Query-policy coverage above is implemented. Any new probes must extend the
-   explicit inventory and preserve exactly-once replies.
-3. Extend inactive-buffer ownership beyond the RIS-owned scratch path.
-   Explicit inherited initialization, post-resize geometry, common drawing
-   state, conservative recovery, row-level toast evidence and owned-scratch
-   borrowing are implemented. Ordinary inherited shells (no observed RIS)
-   still defer; covered resize fidelity remains open.
-4. Update READMEs, audit and TODO with each slice. Run the client suite/build
-   and all three smoke paths. Rerun independent replay when painting changes.
-   Keep the default switch separate.
+1. **Restore the smoke tests.** `main`'s `fe7556c` removed
+   `--no-client-daemon`; `managed-session-smoke.sh` and
+   `terminal-overlay-smoke.py` still pass it and fail at argument parsing
+   (also on `main`). They need a daemon-connected fake launch; coordinate with
+   the launch workstream rather than reintroducing the flag. Until then,
+   validate with the unit suite and run the harness on a pre-`fe7556c` base if
+   painting changes.
+2. **Toast flicker** over frequently redrawn rows (claude's input/status
+   lines under Zellij). Today a toast is erased before each output chunk and
+   repainted after 30 ms of quiet output. Erase, pass through and repaint in
+   one synchronized update when a chunk ends at a boundary (not inside a
+   remote synchronized block or partial sequence); otherwise keep the
+   delayed repaint. Zellij emits its own synchronized frames under iTerm2.
+3. **Terminal coverage.** Add recordings per
+   [Adding terminal recordings](../development/terminal-overlay.md#adding-terminal-recordings):
+   iTerm2's real entry-probe replies, a terminal without synchronized output
+   and one with the Kitty keyboard protocol, plus the line-size checks.
+4. **Diagnostics (optional).** An opt-in file recording entry replies and
+   availability reasons would make workstation results self-explanatory.
+5. Extend inactive-buffer ownership beyond the RIS-owned scratch path and
+   settle covered resize fidelity; then the workstation matrix and, last and
+   separately, the default switch.
+
+Update READMEs, audit and TODO with each slice; rerun independent replay when
+painting changes.
 
 Child-input backpressure is resolved by one ordered worker queue for user input
 and query replies. Its 256 KiB limit includes in-flight writes. Only the worker
@@ -832,9 +862,13 @@ fixture stall that made a fairness assertion depend on output throughput.
 This failure policy bounds memory; it does not promise continued service for
 a peer that never drains its input.
 
-Current validation: **262 client unit tests and 3 integration tests pass, with
-zero ignored tests** (see the Zellij eligibility section above). The client build, takeover and overlay managed-session
-smokes, and expanded protocol/PTY harness pass. Pinned xterm.js 5.5 replay again
+Current validation (rebased onto `main` at `94be084`): **266 client unit
+tests and 3 integration tests pass, with zero ignored tests**, and the client
+builds (one dead-code warning from `main`'s daemon-flag removal). The
+managed-session smokes and PTY harness fail on `main` and here for the
+reason in step 1. Before the rebase the same overlay code also passed the
+takeover and overlay managed-session smokes and the expanded protocol/PTY
+harness. Pinned xterm.js 5.5 replay again
 passes twelve restoration traces, two resize traces, three inherited-state
 traces, two regional toast traces, two borrowed-menu traces, five live
 renderer traces (including owned borrowing in its normal-exit and SIGTERM

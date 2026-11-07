@@ -964,8 +964,14 @@ bootstrap `Task`s.
     iTerm2 reattach fixture is eligible after Zellij's first frame.
   - [ ] Zellij/terminal coverage: record strict-passthrough Zellij sessions from
     the other supported terminals (at least one without synchronized output
-    and one with the Kitty keyboard protocol), record real entry-probe replies,
-    and check the line-size assumption per terminal (see the design doc).
+    and one with the Kitty keyboard protocol), record real entry-probe replies
+    (including iTerm2's), and check the line-size assumption per terminal.
+    Procedure: "Adding terminal recordings" in docs/development/terminal-overlay.md
+    (`client/tests/terminal-probe-replies.py`, `RECORDINGS` in baseline.rs).
+  - [ ] Restore the managed-session and overlay PTY smokes: `fe7556c` removed
+    `beams ssh --no-client-daemon`, which both still pass, so they fail at
+    argument parsing (on `main` too). Needs a daemon-connected fake launch,
+    coordinated with the launch workstream.
   - [ ] Toast flicker over frequently redrawn rows (e.g. claude's input/status
     lines): erase, pass through and repaint in one synchronized update when a
     chunk ends at a boundary, instead of repainting after 30 ms of quiet.

@@ -9,3 +9,5 @@
 /environments/local/
 /artifacts/target/
 /artifacts/Cargo.lock
+# Raw terminal recordings; trim and review into client/tests/fixtures/.
+/overlay-traces/
