@@ -53,6 +53,13 @@ pub fn start(launch_dir: &Path, socket: Option<String>) -> anyhow::Result<()> {
         .to_path_buf();
     let home = PathBuf::from(std::env::var("HOME").context("HOME is not set")?);
     eprintln!("beams: launch {id}");
+    // The runtime's bin/ goes on every pane's PATH: `beams fetch` (this
+    // binary under the name `beams`), `beam-bootstrap launch status`.
+    let bin = runtime.join("bin");
+    if let Err(err) = link_beams_cli(&bin) {
+        eprintln!("beams: the `beams` command is unavailable: {err:#}");
+    }
+    let inherited_path = with_runtime_bin(&std::env::var("PATH").unwrap_or_default(), &bin);
 
     // Zellij (a pinned, verified download) doesn't depend on pre; fetch it
     // while pre runs.
@@ -96,14 +103,21 @@ pub fn start(launch_dir: &Path, socket: Option<String>) -> anyhow::Result<()> {
     if let Err(err) = pre.and(zellij.map(|_| ()).map_err(|err| anyhow::anyhow!("installing Zellij: {err}"))) {
         eprintln!("beams: {err:#}");
         eprintln!(
-            "beams: opening a plain shell instead; `beam-bootstrap launch status --launch-id {id}` shows \
-             details and `beam-bootstrap launch retry --launch-id {id}` retries"
+            "beams: opening a plain shell instead; `{exe} launch status --launch-id {id}` shows \
+             details and `{exe} launch retry --launch-id {id}` retries",
+            // A login bash's /etc/profile resets PATH, so the full path.
+            exe = exe.display()
         );
-        let err = Command::new("/bin/bash").arg("-l").env_remove("BEAMS_LAUNCH_ID").exec();
+        let err = Command::new("/bin/bash").arg("-l").env_remove("BEAMS_LAUNCH_ID").env("PATH", &inherited_path).exec();
         bail!("starting bash: {err}");
     }
 
-    let env = super::runner::plan_environment(&declaration, &home, &std::env::var("PATH").unwrap_or_default());
+    let mut env = super::runner::plan_environment(&declaration, &home, &inherited_path);
+    // A profile's own `[env] PATH` replaces the inherited one; keep the
+    // runtime reachable regardless.
+    if let Some(path) = env.get_mut("PATH") {
+        *path = with_runtime_bin(path, &bin);
+    }
     let shell = declaration.plan.shell.program.clone().unwrap_or_else(|| "/bin/bash".into());
     let config = write_zellij_config(&home, &runtime, &id)?;
     let mut zellij = Command::new("zellij");
@@ -122,6 +136,28 @@ pub fn start(launch_dir: &Path, socket: Option<String>) -> anyhow::Result<()> {
     }
     let err = zellij.exec();
     bail!("starting zellij: {err}")
+}
+
+/// `bin/beams` -> `beam-bootstrap`: invoked as `beams`, the binary runs
+/// its Beam-side CLI (`beams fetch`).
+fn link_beams_cli(bin: &Path) -> anyhow::Result<()> {
+    let link = bin.join("beams");
+    if std::fs::read_link(&link).is_ok_and(|target| target == Path::new("beam-bootstrap")) {
+        return Ok(());
+    }
+    let tmp = bin.join(".beams.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink("beam-bootstrap", &tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    std::fs::rename(&tmp, &link).with_context(|| format!("creating {}", link.display()))
+}
+
+/// `path` with `bin` appended, unless it's already there.
+fn with_runtime_bin(path: &str, bin: &Path) -> String {
+    let bin = bin.display().to_string();
+    if path.split(':').any(|p| p == bin) {
+        return path.to_string();
+    }
+    if path.is_empty() { bin } else { format!("{path}:{bin}") }
 }
 
 /// Starts the daemon under beamctl (from this runtime) unless its socket
@@ -299,6 +335,25 @@ mod tests {
         assert!(matches!(pre_outcome(&failed), Some(Err(_))));
         let stopped = launch(vec![], &[], LaunchStatus::Interrupted);
         assert!(matches!(pre_outcome(&stopped), Some(Err(_))));
+    }
+
+    #[test]
+    fn the_runtime_bin_is_appended_once() {
+        let bin = Path::new("/h/.beams/runtime/bin");
+        assert_eq!(with_runtime_bin("/usr/bin:/bin", bin), "/usr/bin:/bin:/h/.beams/runtime/bin");
+        assert_eq!(with_runtime_bin("/h/.beams/runtime/bin:/bin", bin), "/h/.beams/runtime/bin:/bin");
+        assert_eq!(with_runtime_bin("", bin), "/h/.beams/runtime/bin");
+    }
+
+    #[test]
+    fn the_beams_link_names_the_runtime_binary_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("beams-runtime-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        link_beams_cli(&dir).unwrap();
+        link_beams_cli(&dir).unwrap();
+        assert_eq!(std::fs::read_link(dir.join("beams")).unwrap(), Path::new("beam-bootstrap"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

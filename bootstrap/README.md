@@ -415,7 +415,8 @@ Approval creates a workstation-owned `tsh ssh -N -L` process bound only to
 daemon; the Beam never receives a privileged command that can start it
 directly. Every remotely submitted request begins as `pending_approval`.
 
-`beams fetch PATH... [DEST]` (installed as `~/beams/bin/beams`, which runs
+`beams fetch PATH... [DEST]` (installed as `~/beams/bin/beams`, or for a
+`beams ssh --profile` launch `~/.beams/runtime/bin/beams`, which runs
 this binary under the name `beams`; `beam-bootstrap fetch` is the same command)
 proposes a multi-file `file_fetch` request: absolute Beam paths with their
 sizes (directory totals included) and an optional destination suggestion. It

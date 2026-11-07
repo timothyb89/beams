@@ -459,7 +459,8 @@ post packed and uploaded                      → … LaunchStatus{ok}
 - **Session.** One Zellij session per launch (`beams-` plus the first
   group of the launch ID), so an attach never reuses another launch's
   environment. Its environment is the plan's (`[env]`, `[shell] path`
-  ahead of `PATH`), plus `BEAMS_LAUNCH_ID`, `BEAMS_SHELL` (the plan's
+  ahead of `PATH`, the runtime's `bin/` after it, which also holds
+  `beams`, a link to `beam-bootstrap` for `beams fetch`), plus `BEAMS_LAUNCH_ID`, `BEAMS_SHELL` (the plan's
   shell), `BEAM_BOOTSTRAP_BIN` and the relay's `SSH_AUTH_SOCK`. Zellij's
   `default_shell` is `beams-shell` → `beam-bootstrap launch shell`, which
   starts `launch ready --component shell` in the background and execs
