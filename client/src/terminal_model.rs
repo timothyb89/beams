@@ -227,11 +227,16 @@ impl Callbacks for EventCallbacks {
                 return;
             }
         }
-        if i1 == Some(b'?') && i2 == Some(b'$') && final_byte == 'p' && params.len() == 1 {
+        if final_byte == 'p'
+            && ((i1 == Some(b'?') && i2 == Some(b'$')) || (i1 == Some(b'$') && i2.is_none()))
+            && params.len() == 1
+            && params[0].len() == 1
+        {
             let mode = params[0].first().copied().unwrap_or(0);
-            let enabled = match mode {
-                1 => Some(screen.application_cursor()),
-                6 => {
+            let private = i1 == Some(b'?');
+            let enabled = match (private, mode) {
+                (true, 1) => Some(screen.application_cursor()),
+                (true, 6) => {
                     let state = screen.drawing_state();
                     Some(if state.alternate_screen {
                         state.alternate.cursor.origin_mode
@@ -239,16 +244,37 @@ impl Callbacks for EventCallbacks {
                         state.primary.cursor.origin_mode
                     })
                 }
-                25 => Some(!screen.hide_cursor()),
-                2004 => Some(screen.bracketed_paste()),
+                (true, 25) => Some(!screen.hide_cursor()),
+                (true, 47 | 1049) => Some(screen.alternate_screen()),
+                (true, 66) => Some(screen.application_keypad()),
+                (true, 9) => Some(screen.mouse_protocol_mode() == vt100::MouseProtocolMode::Press),
+                (true, 1000) => {
+                    Some(screen.mouse_protocol_mode() == vt100::MouseProtocolMode::PressRelease)
+                }
+                (true, 1002) => {
+                    Some(screen.mouse_protocol_mode() == vt100::MouseProtocolMode::ButtonMotion)
+                }
+                (true, 1003) => {
+                    Some(screen.mouse_protocol_mode() == vt100::MouseProtocolMode::AnyMotion)
+                }
+                (true, 1005) => {
+                    Some(screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Utf8)
+                }
+                (true, 1006) => {
+                    Some(screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr)
+                }
+                (true, 2004) => Some(screen.bracketed_paste()),
                 _ => None,
             };
-            if let Some(enabled) = enabled {
-                self.push(TerminalEvent::Reply(
-                    format!("\x1b[?{mode};{}$y", if enabled { 1 } else { 2 }).into_bytes(),
-                ));
-                return;
-            }
+            self.push(TerminalEvent::Reply(
+                format!(
+                    "\x1b[{}{mode};{}$y",
+                    if private { "?" } else { "" },
+                    enabled.map_or(0, |enabled| if enabled { 1 } else { 2 })
+                )
+                .into_bytes(),
+            ));
+            return;
         }
         let window_report = final_byte == 't'
             && params
@@ -257,7 +283,9 @@ impl Callbacks for EventCallbacks {
                 .is_some_and(|p| (11..=21).contains(p));
         if matches!(final_byte, 'c' | 'n')
             || window_report
-            || (final_byte == 'u' && i1 == Some(b'?'))
+            || (final_byte == 'u' && i1 == Some(b'?') && i2.is_none())
+            || (final_byte == 'm' && i1 == Some(b'?') && i2.is_none())
+            || (final_byte == 'q' && i1 == Some(b'>') && i2.is_none() && params == [&[0][..]])
         {
             self.push(TerminalEvent::Query(csi(i1, i2, params, final_byte)));
             return;
@@ -377,6 +405,8 @@ fn process_frame(parser: &mut Parser<EventCallbacks>, frame: &[u8]) {
         // XTGETTCAP includes dynamically adjusted key capabilities. Local UI
         // changes input modes; do not relay probes against those settings.
         TerminalEvent::Reply(b"\x1bP0+r\x1b\\".to_vec())
+    } else if dcs.starts_with(b"\x1bP+Q") {
+        TerminalEvent::Reply(b"\x1bP0+R\x1b\\".to_vec())
     } else {
         dcs.extend_from_slice(b"\x1b\\");
         TerminalEvent::UnhandledDcs(dcs)
@@ -706,6 +736,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mode_queries_use_remote_mouse_keypad_and_buffer_state_or_report_unknown() {
+        let trace = b"\x1b[?1049h\x1b=\x1b[?1002h\x1b[?1006h\x1b[?1002$p\x1b[?1000$p\x1b[?1006$p\x1b[?1005$p\x1b[?66$p\x1b[?47$p\x1b[?1049$p\x1b[?9999$p\x1b[4$p";
+        for split in 0..=trace.len() {
+            let mut model = TerminalModel::new(size());
+            model.process(&trace[..split]);
+            model.process(&trace[split..]);
+            assert_eq!(
+                model.take_events(),
+                vec![
+                    TerminalEvent::Reply(b"\x1b[?1002;1$y".to_vec()),
+                    TerminalEvent::Reply(b"\x1b[?1000;2$y".to_vec()),
+                    TerminalEvent::Reply(b"\x1b[?1006;1$y".to_vec()),
+                    TerminalEvent::Reply(b"\x1b[?1005;2$y".to_vec()),
+                    TerminalEvent::Reply(b"\x1b[?66;1$y".to_vec()),
+                    TerminalEvent::Reply(b"\x1b[?47;1$y".to_vec()),
+                    TerminalEvent::Reply(b"\x1b[?1049;1$y".to_vec()),
+                    TerminalEvent::Reply(b"\x1b[?9999;0$y".to_vec()),
+                    TerminalEvent::Reply(b"\x1b[4;0$y".to_vec()),
+                ],
+                "split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyboard_and_version_queries_are_physical_but_window_mutations_are_not_queries() {
+        let mut model = TerminalModel::new(size());
+        model.process(b"\x1b[?4m\x1b[?u\x1b[>0q\x1b[18t\x1b[22t\x1b[8;8;30t");
+        assert_eq!(
+            model.take_events(),
+            vec![
+                TerminalEvent::Query(b"\x1b[?4m".to_vec()),
+                TerminalEvent::Query(b"\x1b[?0u".to_vec()),
+                TerminalEvent::Query(b"\x1b[>0q".to_vec()),
+                TerminalEvent::Query(b"\x1b[18t".to_vec()),
+                TerminalEvent::UnhandledCsi('t'),
+                TerminalEvent::ResizeRequest { rows: 8, cols: 30 },
+            ]
+        );
+        model.process(b"\x1bP+Q666f6e74\x1b\\");
+        assert_eq!(
+            model.take_events(),
+            vec![TerminalEvent::Reply(b"\x1bP0+R\x1b\\".to_vec())]
+        );
+    }
     #[test]
     fn complete_osc_effects_are_relayed_once_at_every_chunk_boundary() {
         for input in [

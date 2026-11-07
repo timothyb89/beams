@@ -2463,6 +2463,7 @@ fn is_terminal_reply(encoded: &[u8]) -> bool {
             && !encoded.starts_with(b"\x1b[M")
             && (matches!(encoded.last(), Some(b'R' | b'c' | b'n' | b't' | b'y'))
                 || (encoded.starts_with(b"\x1b[?") && encoded.ends_with(b"u"))))
+        || (encoded.starts_with(b"\x1b[>") && encoded.ends_with(b"m"))
 }
 
 fn is_string_sequence(encoded: &[u8]) -> bool {

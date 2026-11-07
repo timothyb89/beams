@@ -472,6 +472,24 @@ write. Painting bytes did not change; workstation gates remain pending.
 
 ## Implementation status and next-session handoff
 
+The additional query-policy slice is implemented (2026-11-07). DEC mode reports
+cover application cursor/keypad, origin, visibility, alternate buffers, modeled
+mouse tracking/encoding and paste. Unmodeled ANSI/DEC modes receive DECRQM
+status 0 (not recognized), rather than waiting for a reply. XTGETXRES receives
+its negative resource response while hidden. Physical Kitty flags, xterm key
+modifier options and terminal version probes are relayed because local drawing
+does not change those settings; split replies remain opaque to menu actions.
+Window operations 11–21 are reports; resizing/title-stack mutations are effects
+or unsupported operations, never read-only queries.
+
+The supported inventory is deliberately explicit. Other DCS/CSI requests with
+no defined negative reply need the eligibility/recovery path below; they must
+not be guessed from a local UI cursor or silently declared compositable.
+Protocol references: xterm's control-sequence specification (DECRQM,
+XTQMODKEYS, XTVERSION, XTGETXRES) and Kitty's keyboard-protocol specification
+("Progressive enhancement"). Client validation: 217 unit tests and 3 integration
+tests, build and protocol/PTY smoke pass; all acceptance gates remain unignored.
+
 As of 2026-11-07, represented-state painting, remote setting queries and bounded
 child-input writes are implemented. **Keep the overlay opt-in; takeover remains
 the default.** All three original release gates pass unignored, including
@@ -515,9 +533,8 @@ Next work, in separately reviewable changes:
    [repeatable validation commands](../development/terminal-overlay.md#repeatable-validation).
    `cargo test --manifest-path client/Cargo.toml overlay_acceptance` now runs
    all three gates; none should be ignored.
-2. Inventory additional DECRQM, physical probes and advanced keyboard queries.
-   Extend represented state or return explicit unsupported results; only relay
-   a physical query when temporary painting leaves its answer unchanged.
+2. Query-policy coverage above is implemented. Any new probes must extend the
+   explicit inventory and preserve exactly-once replies.
 3. Implement content provenance and common drawing state, including guarded
    fallback and mid-dialog recovery. The remaining gates below still apply.
 4. Update READMEs, audit and TODO with each slice. Run the client suite/build

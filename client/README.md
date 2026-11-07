@@ -325,6 +325,13 @@ modes. Other DCS commands remain unsupported while hidden. In passthrough,
 original probes and physical replies remain byte-exact and the model sends
 no extra replies.
 
+Mode reports also cover modeled mouse tracking/encoding, alternate buffers
+and application keypad. Unmodeled ANSI/DEC modes receive status 0 (not
+recognized). Hidden XTGETXRES receives a negative resource response. Kitty
+keyboard flags, xterm key-modifier options and terminal version probes reach
+the physical terminal; local painting does not change those settings. Their
+replies bypass menu shortcuts, including when split across reads.
+
 The model and physical-output tracker share a bounded stream framer. It holds
 at most 64 KiB of an unfinished control sequence and feeds complete sequences
 to the allocating emulator only when they fit that budget. If hidden output

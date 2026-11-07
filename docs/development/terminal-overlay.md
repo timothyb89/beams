@@ -202,3 +202,9 @@ behavior after closing the menu and after the SSH process exits.
 
 Enable the overlay by default only after the acceptance gates pass, unsupported
 state has a tested compatibility policy, and this workstation pass succeeds.
+
+Additional query-policy pass (2026-11-07): 217 unit tests and 3 integration
+tests, client build and protocol/PTY smoke pass. DECRQM mouse/keypad/buffer
+reports use remote state; unmodeled ANSI/DEC modes receive status 0. XTGETXRES
+receives a negative response while hidden. Kitty flags, xterm modifier options
+and version probes are physical, and split replies bypass menu actions.

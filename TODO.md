@@ -888,12 +888,15 @@ bootstrap `Task`s.
     traces and the actual menu renderer, but saved-wrap/origin semantics differ
     from the model. Establish the supported terminal behavior or defer painting
     on those variants before changing the default.
-  - [ ] Ordered remote/physical query dispatch, starting with DECRQSS and
+  - [x] Ordered remote/physical query dispatch for the explicit supported inventory:
+    DECRQM mouse/keypad/buffer state, unmodeled ANSI/DEC status 0, physical
+    Kitty flags/xterm modifier/version probes and negative XTGETXRES replies,
+    alongside DECRQSS and
     origin-relative CPR. Both are implemented and all three acceptance gates
     are unignored. Split/cancelled DCS and exactly-once replies have model/PTY
     regressions. Unsupported DECRQSS settings and hidden XTGETTCAP receive
-    negative replies; unknown DCS remains unsupported. Complete the probe
-    inventory and additional mode/advanced-keyboard query policy.
+    negative replies; unknown DCS remains unsupported and must use the
+    eligibility/recovery path. New probes must extend the explicit policy.
   - [x] Child-input backpressure: user bytes and query replies share a 256 KiB
     ordered worker queue, including in-flight bytes. A stalled child cannot
     block the session driver; exhaustion is an explicit session error.
