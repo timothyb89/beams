@@ -1,10 +1,10 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{bail, Context};
 
 use super::{cap, resource, Step};
 use crate::aptlock;
+use crate::releaseutil::run;
 use crate::graph::Capability;
 
 /// kubectl isn't in Debian's default repos, so we add the official
@@ -66,17 +66,4 @@ impl Step for InstallKubectl {
 
         Ok(Some(format!("installed kubectl ({K8S_MINOR} repo)")))
     }
-}
-
-fn run(cmd: &mut Command) -> anyhow::Result<()> {
-    let output = cmd.output().with_context(|| format!("running {cmd:?}"))?;
-    if !output.status.success() {
-        bail!(
-            "{:?} failed ({}): {}",
-            cmd,
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
 }
