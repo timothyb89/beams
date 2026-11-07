@@ -39,6 +39,7 @@ use crate::clientd::{BridgeRecord, Frontend, RequestRecord, ServerEvent, Service
 use crate::terminal_model::{TerminalEvent, TerminalModel};
 
 mod form;
+mod input;
 mod keys;
 mod notices;
 mod picker;
@@ -47,6 +48,7 @@ mod toast;
 mod ui;
 
 use form::{ChoiceOption, Completion, Field, Form, FormEvent};
+use input::ChildInput;
 use keys::{Decoded, Key};
 
 const LOOP_TICK: Duration = Duration::from_millis(25);
@@ -245,7 +247,8 @@ pub fn run(
     let mut reader = master
         .try_clone_reader()
         .context("cloning local PTY reader")?;
-    let mut writer = master.take_writer().context("opening local PTY writer")?;
+    let writer = ChildInput::new(master.take_writer().context("opening local PTY writer")?)
+        .context("starting local PTY input worker")?;
 
     let (output_tx, output_rx) = mpsc::sync_channel(OUTPUT_QUEUE_CHUNKS);
     let output_thread = thread::spawn(move || read_pty_output(&mut reader, output_tx));
@@ -265,7 +268,7 @@ pub fn run(
     let mut terminal_model = TerminalModel::new(initial_size);
     let drive_result = drive(
         &*master,
-        &mut *writer,
+        &writer,
         &mut *child,
         &output_rx,
         &signal_rx,
@@ -285,7 +288,7 @@ pub fn run(
     if drive_result.is_err() {
         let _ = child.kill();
     }
-    drop(writer); // sends EOF if the child is somehow still reading
+    drop(writer);
     let _ = child.wait();
 
     // Closing the signal handle wakes its blocking iterator. Dropping a
@@ -302,7 +305,7 @@ pub fn run(
 #[allow(clippy::too_many_arguments)]
 fn drive(
     master: &dyn MasterPty,
-    writer: &mut dyn Write,
+    writer: &ChildInput,
     child: &mut dyn portable_pty::Child,
     output_rx: &Receiver<OutputEvent>,
     signal_rx: &Receiver<i32>,
@@ -393,7 +396,7 @@ fn drive(
             terminal_model,
             overlay_enabled,
             &mut terminal_state.output,
-            writer,
+            Some(writer),
         )?;
         let output_changed = output.changed;
         if let Some(resume) = output.resume {
@@ -465,6 +468,7 @@ fn drive(
             finish_output(output_rx, &mut output_finished, terminal_model)?;
             return Ok(exit_code(&status));
         }
+        writer.check().context("writing to local PTY")?;
 
         if let Ok(size) = current_size() {
             if size != last_size {
@@ -537,8 +541,7 @@ fn drive(
         for action in actions {
             match action {
                 InputAction::Remote(bytes) => {
-                    writer.write_all(&bytes).context("writing to local PTY")?;
-                    writer.flush().context("flushing local PTY")?;
+                    writer.enqueue(&bytes).context("queueing local PTY input")?;
                 }
                 InputAction::OpenPalette => {
                     painter.forget();
@@ -2662,7 +2665,7 @@ fn drain_output(
     terminal_model: &mut TerminalModel,
     overlay_enabled: bool,
     tracker: &mut toast::OutputTracker,
-    remote_writer: &mut dyn Write,
+    remote_writer: Option<&ChildInput>,
 ) -> anyhow::Result<OutputUpdate> {
     let mut stdout = io::stdout().lock();
     let mut wrote = false;
@@ -2678,9 +2681,9 @@ fn drain_output(
                             if mode == InputMode::Palette && overlay_enabled {
                                 if let TerminalEvent::Reply(reply) = event {
                                     remote_writer
-                                        .write_all(&reply)
-                                        .context("answering remote terminal query")?;
-                                    remote_writer.flush().context("flushing terminal reply")?;
+                                        .expect("overlay query dispatch has a child input queue")
+                                        .enqueue(&reply)
+                                        .context("queueing remote terminal reply")?;
                                 } else if let Some(bytes) = event.terminal_bytes() {
                                     stdout
                                         .write_all(&bytes)
@@ -2751,7 +2754,7 @@ fn finish_output(
             terminal_model,
             false,
             &mut toast::OutputTracker::default(),
-            &mut io::sink(),
+            None,
         )?;
         if !*finished {
             thread::sleep(Duration::from_millis(5));

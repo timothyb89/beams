@@ -50,19 +50,38 @@ def fake_tsh(args):
     os.write(1, b"\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?2004hREMOTE READY")
     (root / "ready").touch()
     command = 1
+    pending = b""
+    written = 0
+    exiting = False
+    os.set_blocking(1, False)
     with (root / "input").open("ab", buffering=0) as log:
         while True:
             path = root / f"command-{command}"
-            if path.exists():
+            if not pending and path.exists():
                 payload = path.read_bytes()
                 if payload == b"EXIT":
                     # Ordinary programs leave their terminal modes on exit.
-                    os.write(1, b"\x1b[?1002l\x1b[?1006l\x1b[?2004l\x1b[?1049l")
-                    return 17
-                os.write(1, payload)
-                (root / "ack").write_text(str(command))
-                command += 1
-            if select.select([0], [], [], 0.01)[0]:
+                    payload = b"\x1b[?1002l\x1b[?1006l\x1b[?2004l\x1b[?1049l"
+                    exiting = True
+                pending = payload
+                written = 0
+            # A synchronous 4 MiB write would prevent this fixture from
+            # reading input, measuring throughput instead of client fairness.
+            readable, writable, _ = select.select(
+                [] if (root / "pause-input").exists() else [0],
+                [1] if pending else [], [], 0.01)
+            if writable:
+                try:
+                    written += os.write(1, pending[written:written + 65536])
+                except BlockingIOError:
+                    pass
+                if written == len(pending):
+                    if exiting:
+                        return 17
+                    (root / "ack").write_text(str(command))
+                    command += 1
+                    pending = b""
+            if readable:
                 data = os.read(0, 65536)
                 if not data:
                     return 0
@@ -330,6 +349,51 @@ def run_checks(root, binary):
         session.close()
 
 
+def run_input_pressure(root, binary, outcome):
+    session = Session(root, binary)
+    try:
+        session.open()
+        paused = root / "pause-input"
+        paused.touch()
+        # More than the OS PTY can accept, but below the client's byte budget.
+        queries = 8192
+        session.emit(b"\x1b[5n" * queries + b"\x1b]2;PRESSURE DRAINED\x07")
+        session.wait(lambda: b"PRESSURE DRAINED" in session.output,
+                     "output and query dispatch while the child stops reading")
+        if outcome == "resume":
+            session.send(b"qTYPED UNDER PRESSURE")
+            fcntl.ioctl(session.master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 90, 0, 0))
+            session.wait(lambda: "30 90\n" in (root / "sizes").read_text(),
+                         "menu input and resize while the child stops reading", timeout=2)
+            session.emit(b"OUTPUT UNDER PRESSURE")
+            session.wait(lambda: b"OUTPUT UNDER PRESSURE" in session.output,
+                         "remote output stays responsive with blocked input", timeout=2)
+            paused.unlink()
+            expected = b"\x1b[0n" * queries + b"TYPED UNDER PRESSURE"
+            session.wait(lambda: session.remote_input() == expected,
+                         "queued query replies precede subsequent user input", timeout=10)
+            session.command += 1
+            (root / f"command-{session.command}").write_bytes(b"EXIT")
+            session.wait(lambda: session.status is not None, "exit after input drain")
+            assert session.status == 17
+        elif outcome == "signal":
+            os.kill(session.pid, signal.SIGTERM)
+            session.wait(lambda: session.status is not None,
+                         "SIGTERM remains responsive under input backpressure", timeout=2)
+            assert session.status == 143
+        elif outcome == "overflow":
+            # Don't wait for fixture acknowledgement: the client terminates
+            # the child before it can finish emitting an over-budget storm.
+            session.command += 1
+            (root / f"command-{session.command}").write_bytes(b"\x1b[5n" * (256 * 1024 // 4))
+            session.wait(lambda: session.status is not None, "input budget exhaustion", timeout=10)
+            assert session.status == 1
+            assert b"child PTY input exceeded 256 KiB" in session.output
+        session.assert_termios_restored()
+    finally:
+        session.close()
+
+
 def main():
     client = Path(__file__).resolve().parent.parent
     binary = str(client / "target/debug/beams")
@@ -338,6 +402,10 @@ def main():
         normal = root / "normal"
         normal.mkdir()
         run_checks(normal, binary)
+        for outcome in ["resume", "signal", "overflow"]:
+            pressure = root / f"pressure-{outcome}"
+            pressure.mkdir()
+            run_input_pressure(pressure, binary, outcome)
         interrupted = root / "interrupted"
         interrupted.mkdir()
         session = Session(interrupted, binary)

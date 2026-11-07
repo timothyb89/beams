@@ -391,9 +391,10 @@ content provenance or availability UX. The borrowed-buffer fallback is pending.
 Event storage has count/byte budgets. The live relay drains events at each frame
 so supported query/effect bursts do not hit those budgets; offline consumers
 get an explicit overflow diagnostic. Origin-relative CPR now uses the exposed
-remote margins. Query-phase work must also audit synchronous reply-write
-backpressure; the current 512-query PTY check does not prove a peer that stops
-reading its input cannot stall the driver.
+remote margins. At this foundation stage, synchronous reply-write backpressure
+was still unaudited; the 512-query PTY check did not prove a peer that stops
+reading its input could not stall the driver. The later input slice below
+resolves that gap.
 
 Validation: the client suite passes (201 unit tests and 3 integration tests),
 as do both managed-session display modes and the expanded controlling-PTY
@@ -464,16 +465,16 @@ Validation: all 212 client unit tests and 3 integration tests pass, with all
 three acceptance gates unignored. The client build, both managed-session modes
 and expanded controlling-PTY harness pass. Fixtures cover every request split,
 cancellation, overflow, immediate state changes, unsupported responses,
-split physical DCS replies and exactly-once passthrough. The existing burst
-responsiveness assertion missed its two-second deadline once and passed on
-rerun; retain this timing sensitivity in future validation. Painting bytes did
-not change; independent replay and workstation gates remain as recorded below.
+split physical DCS replies and exactly-once passthrough. At this slice, the
+existing burst responsiveness assertion missed its two-second deadline once
+and passed on rerun; the later input slice corrects its synchronous fixture
+write. Painting bytes did not change; workstation gates remain pending.
 
 ## Implementation status and next-session handoff
 
-As of 2026-11-07, the represented-state painting and remote setting query
-slices are implemented. **Keep the overlay opt-in; takeover remains the
-default.** All three original release gates pass unignored, including
+As of 2026-11-07, represented-state painting, remote setting queries and bounded
+child-input writes are implemented. **Keep the overlay opt-in; takeover remains
+the default.** All three original release gates pass unignored, including
 `overlay_acceptance_dcs_query`. Compatibility and content provenance remain
 incomplete; passing these three fixtures does not establish default readiness.
 
@@ -486,6 +487,7 @@ Completed work is preserved in these commits:
 | `e6dee81` | Durable `beams fetch` acknowledgement with generic workstation-menu guidance |
 | `cb5cc47` | Bounded stream framing, model snapshots, streaming DCS callbacks and conservative overflow recovery |
 | `28eb7a8` | Shared saved/current cursor, SGR, origin/margin restoration; toast and takeover fixes; independent replay fixtures |
+| `db11c79` | ST-aware remote-state DECRQSS replies, negative replies for unmodeled settings/XTGETTCAP and unignored DCS gate |
 
 The overlay work and its handoff commit (`271f2ca`) have been merged into local
 `main`, preserving the launch work already present at `355058d`. They have not
@@ -501,6 +503,7 @@ Implementation entry points:
 | `client/src/terminal_model.rs` | Remote shadow state, ordered events and remote-state CPR/DECRQSS replies |
 | `client/src/terminal_paint.rs` | Shared local drawing setup and represented-state restoration |
 | `client/src/session.rs` | `drain_output`, hidden-output dispatch, raw replay, menu snapshots and child-input writes |
+| `client/src/session/input.rs` | Ordered 256 KiB input/reply queue and blocking-write worker, with asynchronous error reporting |
 | `client/src/session/toast.rs` | Physical-output tracker and toast paint/removal |
 | `client/vendor/vt100/BEAMS.md`, `client/vendor/vt100/src/state.rs` | Vendored changes, provenance and read-only drawing snapshots |
 | `client/tests/terminal-overlay-smoke.py`, `client/tests/terminal-paint-reference.cjs` | Live controlling-PTY coverage and optional independent replay |
@@ -512,20 +515,37 @@ Next work, in separately reviewable changes:
    [repeatable validation commands](../development/terminal-overlay.md#repeatable-validation).
    `cargo test --manifest-path client/Cargo.toml overlay_acceptance` now runs
    all three gates; none should be ignored.
-2. Address child-input backpressure. Replies still use synchronous
-   `write_all`/flush; the passing 512-query test does not establish behavior when
-   the peer stops reading. Use a bounded, ordered write path and exercise input,
-   signal, resize and output responsiveness under that pressure.
-3. Inventory additional DECRQM, physical probes and advanced keyboard queries.
+2. Inventory additional DECRQM, physical probes and advanced keyboard queries.
    Extend represented state or return explicit unsupported results; only relay
    a physical query when temporary painting leaves its answer unchanged.
-4. Implement content provenance and common drawing state, including guarded
+3. Implement content provenance and common drawing state, including guarded
    fallback and mid-dialog recovery. The remaining gates below still apply.
-5. Update READMEs, audit and TODO with each slice. Run the client suite/build
+4. Update READMEs, audit and TODO with each slice. Run the client suite/build
    and all three smoke paths. Rerun independent replay when painting changes.
    Keep the default switch separate.
 
-The overlay slice's recorded validation is **206 passing client unit tests, one ignored
+Child-input backpressure is resolved by one ordered worker queue for user input
+and query replies. Its 256 KiB limit includes in-flight writes. Only the worker
+can block in an OS write; the session driver never waits for queue capacity or
+joins a blocked writer. A full queue produces an explicit session error and
+restores the terminal rather than dropping input or replies. Asynchronous write
+errors reach the driver. The controlling-PTY fixture can now stop reading while
+continuing to emit output: it proves menu-close, output, resize and SIGTERM
+responsiveness, exact reply/user-input order after reads resume, and cleanup
+when a query storm exhausts the budget. The normal burst fixture now uses
+nonblocking output so it reads input during the 4 MiB burst, correcting a
+fixture stall that made a fairness assertion depend on output throughput.
+This failure policy bounds memory; it does not promise continued service for
+a peer that never drains its input.
+
+Current validation: **215 client unit tests and 3 integration tests pass, with
+zero ignored tests**. The client build, takeover and overlay managed-session
+smokes, and expanded protocol/PTY harness pass. Pinned xterm.js 5.5 replay again
+passes all nine restoration traces and the actual renderer trace. The corrected
+burst fixture passes both with and without the independent module. No real
+workstation font/reflow or graphical-terminal validation has been recorded.
+
+The earlier painting slice's recorded validation was **206 passing client unit tests, one ignored
 DCS gate, and 3 passing integration tests**. The client build, takeover smoke,
 overlay smoke and protocol/PTY harness passed. Optional xterm.js 5.5 replay
 passed nine restoration traces and one actual menu-renderer trace; fetch's four
@@ -534,7 +554,7 @@ contains the commands and historical results. One forward-diagnostics test
 missed captured stderr once and passed its isolated/full reruns; TODO tracks
 that unresolved flake.
 
-Validation of the combined `main` merge passed: **209 client unit tests and
+Validation of the earlier combined `main` merge passed: **209 client unit tests and
 3 integration tests**, with the DCS gate still ignored, plus the four targeted
 bootstrap fetch tests. Both managed-session display modes, the overlay
 protocol/PTY harness and the launch bridge smoke test passed. Optional xterm.js

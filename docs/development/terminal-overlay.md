@@ -9,8 +9,9 @@ The proposed [resolution plan](../designs/TERMINAL_OVERLAY_DESIGN.md) sequences
 bounded parsing and state snapshots, reversible painting, query dispatch,
 compatibility/lifecycle behavior, independent validation and the final default
 switch. The model/backend foundation and represented cursor/margin painting
-are implemented. Saved-cursor, origin/margins and DCS queries pass; input
-backpressure and later compatibility/lifecycle milestones remain pending.
+are implemented. Saved-cursor, origin/margins and DCS queries pass, and child
+input is bounded without blocking the driver. Later compatibility/lifecycle
+milestones remain pending.
 The [next-session handoff](../designs/TERMINAL_OVERLAY_DESIGN.md#implementation-status-and-next-session-handoff)
 records the current commits, code entry points and concrete next steps.
 
@@ -24,8 +25,8 @@ records the current commits, code entry points and concrete next steps.
 | Alternate screens | Emulator fixtures cover entering, leaving and round trips while the menu is open, selecting the final buffer and removing the menu from the buffer it covered. An ordinary alternate-screen overlay preserves the workstation main screen that the shadow model never observed. Updates to inactive buffers across more complex transitions remain a gap. |
 | Wide/combining text | Fixtures cover double-width cells, combining accents, Nerd Font private-use glyphs, RGB, inverse video with default colors, and pending right-margin wrap. Toast removal restores wide glyphs bisected by either edge. Actual font/emoji width differences still require visual testing. |
 | Resize | The controlling-PTY harness resizes an open dialog through ordinary and small sizes, checks the child sees each size and verifies overlay close does not inject the takeover mode's one-column pulse. |
-| Input/query replies | Fixtures and the PTY harness cover ordinary/private CPR, DSR, device queries, OSC clipboard replies and opaque DCS input replies. CPR is answered from the remote model at the query's position, even if later bytes move its cursor; origin-relative CPR now uses exposed remote margins. Application-cursor, cursor-visibility and bracketed-paste DECRQM reports use remote state. Kitty prefix repeats/releases cannot toggle the menu. The PTY harness verifies 512 replies to 512 status queries without queue loss. Additional mode queries and DCS query answers remain gaps. |
-| Sustained output/lifecycle | A bounded 32-chunk output channel and a 16-chunk drain budget give input, resize, signals and daemon events turns during output bursts. The PTY harness checks a 4 MiB burst, child exit status, SIGTERM, terminal termios restoration, and cleanup sequences for mouse/paste/alternate-screen modes. |
+| Input/query replies | Model/PTY fixtures cover ordinary/private CPR, DSR, device queries, OSC clipboard replies and opaque DCS input replies. CPR, common DECRQM reports and complete DECRQSS SGR/margin requests use remote state at the request. Cancelled/oversized DCS never synthesize replies; unmodeled settings and hidden XTGETTCAP receive negative responses. Passthrough adds no model reply. Additional mode/advanced-keyboard probes remain gaps. |
+| Sustained output/lifecycle | A bounded 32-chunk output channel and 16-chunk drain budget give input, resize, signals and daemon events turns during output bursts. User input and replies share a 256 KiB worker queue including in-flight bytes; only the worker blocks on child writes. The PTY harness checks a 4 MiB burst, 8192 replies with child reads paused, exact subsequent input order, menu close, output/resize/SIGTERM responsiveness, explicit queue-exhaustion errors, exit status and termios cleanup. The burst fixture now reads input during nonblocking output. |
 | Chunk boundaries | The remote prefix is tracked across reads. Opening a menu cancels an unfinished sequence only in the physical terminal; closing replays the latest unfinished prefix before passthrough resumes. Fixtures cover CSI, OSC and split UTF-8. |
 
 The ordinary emulator fixtures use `vt100` as the physical-terminal reference.
@@ -170,6 +171,25 @@ The four targeted bootstrap fetch tests, both managed-session display modes,
 the overlay protocol/PTY harness and the launch bridge smoke test pass.
 Independent replay again passes all nine restoration traces and the live menu
 renderer trace.
+
+After remote setting queries and bounded child-input writes (2026-11-07):
+**215 client unit tests and 3 integration tests pass, with none ignored**.
+The client build, both managed-session display modes and the expanded
+protocol/PTY harness pass. The harness verifies split/cancelled DCS,
+remote-state DECRQSS, negative replies and exactly-once passthrough, then
+pauses child reads to exercise ordered reply/input delivery, local menu
+close, output, resize and signals. An over-budget storm produces an explicit
+error and restores termios. Three input-worker unit tests cover short writes,
+in-flight accounting, asynchronous errors and teardown without joining a
+blocked writer. Independent xterm.js replay passes the nine restoration
+traces and actual renderer trace.
+
+The old burst check twice missed its two-second deadline. Its fake SSH process
+used a synchronous 4 MiB output write, preventing that fixture from reading
+input during the burst. The fixture now multiplexes nonblocking output and
+input; the corrected harness passes both with and without independent replay.
+This fixes the fixture's fairness measurement. The separately tracked forward
+diagnostic flake and real workstation validation remain unresolved.
 
 For the final workstation pass, use the actual supported outer terminals with
 Zellij, a plain shell, `less`, and an editor. Open/close the menu during a

@@ -306,6 +306,14 @@ model (including origin-relative cursor reports), and device/window queries
 reach the physical terminal. The output queue is bounded and yields to
 input/resize handling during long bursts.
 
+User input and terminal replies share one ordered worker queue, bounded to
+256 KiB including an in-flight write. A child that stops reading can block the
+worker, while the session continues handling output, menu keys, resize and
+signals. Exhausting that budget ends the session with an explicit error and
+restores the local terminal; input is never silently discarded to keep running.
+Worker write errors also reach the driver, and teardown never waits for a
+blocked writer.
+
 Complete, bounded DECRQSS requests for SGR (`m`) and vertical margins (`r`)
 also receive remote-state replies at the request's terminator, before later
 output changes those settings. Cancelled or oversized DCS strings receive no

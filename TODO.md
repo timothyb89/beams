@@ -852,9 +852,10 @@ bootstrap `Task`s.
   Also resolve unknown initial/inactive screen state,
   unsupported drawing/input protocols, and independent
   workstation font/reflow/lifecycle validation before changing the default.
-  The [2026-11-06 handoff](docs/designs/TERMINAL_OVERLAY_DESIGN.md#implementation-status-and-next-session-handoff)
+  The [2026-11-07 handoff](docs/designs/TERMINAL_OVERLAY_DESIGN.md#implementation-status-and-next-session-handoff)
   records completed commits, validation and implementation entry points.
-  DECRQSS SGR/margin replies now use remote state. Next: child-input backpressure;
+  DECRQSS SGR/margin replies use remote state, and child-input writes now use a
+  bounded worker queue. Next: remaining probe inventory and content provenance;
   the saved-cursor and origin/margins fixes do not complete compatibility work.
   Follow the [resolution plan](docs/designs/TERMINAL_OVERLAY_DESIGN.md) in
   separately reviewable milestones:
@@ -892,7 +893,16 @@ bootstrap `Task`s.
     are unignored. Split/cancelled DCS and exactly-once replies have model/PTY
     regressions. Unsupported DECRQSS settings and hidden XTGETTCAP receive
     negative replies; unknown DCS remains unsupported. Complete the probe
-    inventory and audit child-input backpressure (writes are still synchronous).
+    inventory and additional mode/advanced-keyboard query policy.
+  - [x] Child-input backpressure: user bytes and query replies share a 256 KiB
+    ordered worker queue, including in-flight bytes. A stalled child cannot
+    block the session driver; exhaustion is an explicit session error.
+    Unit/PTY checks cover short writes, byte bounds, asynchronous failures,
+    nonblocking teardown, exact reply/input order after resuming reads, menu
+    close, output/resize/SIGTERM responsiveness and termios on overflow.
+    The 4 MiB burst fixture now reads input while emitting output, correcting
+    a synchronous fixture write that made its responsiveness check depend
+    on output throughput. The separately tracked forward diagnostic flake remains.
   - [ ] Content provenance and unsupported-feature policy; settle compatibility
     UX before integrating it. Proposed default: defer unsafe painting, retain
     explicit best-effort takeover. Cover unknown inherited screens, common
