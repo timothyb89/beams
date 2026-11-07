@@ -957,6 +957,18 @@ bootstrap `Task`s.
     output. Common drawing state is covered. Deferred menus acknowledge with
     a bell only at a safe boundary; recovery needs an explicit retry and keeps
     forms. Complete richer eligibility and covered-resize fidelity.
+    Zellij eligibility (2026-11-07): Zellij's controls are classified, overlay
+    sessions derive shared state from entry probe replies plus one-time
+    unqueryable resets, saved slot/tabs are lazy, full-row overwrites prove
+    rows, and `?1049h`/`CSI 2J` are assumed to reset line sizes. A recorded
+    iTerm2 reattach fixture is eligible after Zellij's first frame.
+  - [ ] Zellij/terminal coverage: record strict-passthrough Zellij sessions from
+    the other supported terminals (at least one without synchronized output
+    and one with the Kitty keyboard protocol), record real entry-probe replies,
+    and check the line-size assumption per terminal (see the design doc).
+  - [ ] Toast flicker over frequently redrawn rows (e.g. claude's input/status
+    lines): erase, pass through and repaint in one synchronized update when a
+    chunk ends at a boundary, instead of repainting after 30 ms of quiet.
   - [ ] Guarded alternate-buffer menu fallback for unknown primary screens:
     preserve primary content and cursor/mode state, establish inactive-buffer
     ownership, close/replay before output overflow or a remote buffer switch,

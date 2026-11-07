@@ -190,7 +190,9 @@ impl Callbacks for EventCallbacks {
         params: &[&[u16]],
         final_byte: char,
     ) {
-        if i1.is_none() && i2.is_none() && final_byte == 'm' {
+        if i1.is_none() && i2.is_none() && final_byte == 'm' && params != [&[59][..]] {
+            // SGR 59 resets an unrepresented underline color that SGR 58
+            // could never have set; it leaves represented attributes complete.
             // The backend rejected an attribute. Do not report a partial SGR
             // state as complete; a full reset reestablishes confidence.
             self.attributes_unknown = true;
@@ -357,6 +359,11 @@ impl TerminalEvent {
             Self::CopyToClipboard { target, data } => osc(&[b"52", target, data]),
             Self::PasteFromClipboard { target } => osc(&[b"52", target, b"?"]),
             Self::UnhandledOsc(bytes) | Self::Query(bytes) => bytes.clone(),
+            // The only accepted unhandled DCS; the outer terminal (or an
+            // outer multiplexer) receives it exactly once, as without a menu.
+            Self::UnhandledDcs(bytes) if crate::terminal_eligibility::zellij_identity(bytes) => {
+                bytes.clone()
+            }
             Self::ResizeRequest { rows, cols } => format!("\x1b[8;{rows};{cols}t").into_bytes(),
             _ => return None,
         })
@@ -510,6 +517,9 @@ impl TerminalModel {
                     || borrowed && !crate::terminal_eligibility::borrowed_drawing(original)
                     || self
                         .evidence
+                        .depends_on_unknown(original, self.parser.screen().alternate_screen())
+                    || self
+                        .evidence
                         .enters_unknown_buffer(original, self.parser.screen().alternate_screen()))
             {
                 return Ok(false);
@@ -523,6 +533,13 @@ impl TerminalModel {
                 buffers[usize::from(before_alternate)] = true;
             }
             process_frame(&mut self.parser, frame);
+            if crate::terminal_eligibility::kitty_graphics_query(original) {
+                // The backend ignores APC. Relay the capability query while
+                // hidden so the physical terminal still answers it once.
+                self.parser
+                    .callbacks_mut()
+                    .push(TerminalEvent::Query(original.to_vec()));
+            }
             if std::mem::take(&mut self.parser.callbacks_mut().reset_observed) {
                 self.integrity_lost = false;
                 self.evidence
@@ -649,7 +666,13 @@ impl TerminalModel {
             bytes.extend_from_slice(select);
             bytes.extend_from_slice(crate::terminal_paint::BEGIN);
             bytes.extend_from_slice(copy.screen().contents_formatted().as_bytes());
-            crate::terminal_paint::restore(copy.screen(), true, &mut bytes);
+            // Never write an unobserved saved slot: painting did not use it
+            // and covered output that would change it closes first.
+            crate::terminal_paint::restore(
+                copy.screen(),
+                self.evidence.saved_known(alternate),
+                &mut bytes,
+            );
         }
         bytes.extend_from_slice(b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l");
         bytes.extend_from_slice(screen.input_mode_formatted().as_bytes());
@@ -820,6 +843,19 @@ mod tests {
         b"\x1b[?1016l",
     ];
 
+    /// Covered output that depends on unobserved tabs or a saved slot must
+    /// close the menu before mutation and replay exactly.
+    fn assert_covered_rejects(model: &mut TerminalModel, frame: &[u8], context: &str) {
+        model.begin_overlay();
+        let snapshot = model.drawing_state();
+        let (_, rejected) = model
+            .process_guarded_with_events(frame, true, |_| Ok::<(), ()>(()), true)
+            .unwrap();
+        assert_eq!(rejected.as_deref(), Some(frame), "{context}");
+        assert_eq!(model.drawing_state(), snapshot, "{context}");
+        model.end_overlay();
+    }
+
     fn inherited_initialization(alternate: bool) -> Vec<u8> {
         [
             INHERITED_SHARED.concat().as_slice(),
@@ -984,9 +1020,10 @@ mod tests {
         model.process(b"\x1b[H\x1b[2K\x1b[4;1H\x1b[2K\x1b[H");
         assert!(model.can_paint_area(Rect::new(0, 0, 12, 4)));
         assert!(
-            !model.can_paint(),
-            "a menu also needs tabs and its save slot"
+            model.can_paint(),
+            "a menu needs no tab stops or save slot to paint"
         );
+        assert_covered_rejects(&mut model, b"\x1b8", "a menu cannot restore an unknown slot");
         model.process(b"\x1b[3g\x1b7");
         assert!(
             model.can_paint(),
@@ -1061,16 +1098,61 @@ mod tests {
     }
 
     #[test]
+    fn complete_row_overwrites_establish_rows_only_without_movement_or_scroll() {
+        let row4 = Rect::new(0, 3, 12, 1);
+        // Interleaved attributes, links and read splits keep the run; every
+        // cell of the row is still written left to right from column one.
+        let full = "\x1b[4;1H\x1b[31mab\x1b]8;;https://x.test\x1b\\cd\x1b]8;;\x1b\\\x1b[m─┐╰efg界".as_bytes();
+        for split in 0..=full.len() {
+            let mut model = TerminalModel::new(size());
+            model.process(&regional_initialization());
+            assert!(!model.can_paint_area(row4));
+            model.process(&full[..split]);
+            model.process(&full[split..]);
+            assert_eq!(model.screen().cursor_position(), (3, 12), "split {split}");
+            assert!(model.can_paint_area(row4), "split {split}");
+        }
+        for (name, trace) in [
+            ("starts mid-row", b"\x1b[4;2Habcdefghijk".as_slice()),
+            ("cursor moves within the run", b"\x1b[4;1Habc\x1b[4;5Hefghijkl"),
+            ("erase inside the run", b"\x1b[4;1Habcdef\x1b[Kghijkl"),
+            ("tab inside the run", b"\x1b[4;1Habc\tdefghijkl"),
+            ("backspace inside the run", b"\x1b[4;1Habcd\x08efghijkl"),
+            // The wide glyph cannot fit in the last column and wraps.
+            ("wide glyph at the edge", "\x1b[4;1Habcdefghijk界".as_bytes()),
+            // Past the edge on the bottom row: wraps and scrolls.
+            ("writes past the edge", b"\x1b[4;1Habcdefghijklm"),
+        ] {
+            let mut model = TerminalModel::new(size());
+            model.process(&regional_initialization());
+            model.process(trace);
+            assert!(!model.can_paint_area(row4), "{name}");
+        }
+        // Every row overwritten: whole-buffer content, as after ED 2.
+        let mut model = TerminalModel::new(size());
+        model.process(&regional_initialization());
+        for row in 1..=4 {
+            model.process(format!("\x1b[{row};1H{row}bcdefghijkl").as_bytes());
+        }
+        assert!(model.can_paint_area(Rect::new(0, 0, 12, 4)));
+        assert!(model.can_paint());
+    }
+
+    #[test]
     fn regional_restore_requires_known_cells_for_pending_wrap_outside_the_area() {
         let mut model = TerminalModel::new(size());
         let area = Rect::new(2, 1, 8, 2);
         model.process(&regional_initialization());
-        model.process(b"\x1b[4;1Habcdefghijkl");
+        // A write from column five leaves the row's first cells unknown.
+        model.process(b"\x1b[4;5Hefghijkl");
         assert_eq!(model.screen().cursor_position(), (3, 12));
         assert!(
             !model.can_paint_area(area),
-            "restoring wrap reprints an unknown glyph"
+            "restoring wrap reprints a glyph on a partly unknown row"
         );
+        // Writing the whole row from column one establishes every cell.
+        model.process(b"\x1b[4;1Habcdefghijkl");
+        assert!(model.can_paint_area(area), "a complete overwrite is observed");
         model.process(b"\x1b[4;1H\x1b[2Kabcdefghijkl");
         assert!(
             model.can_paint_area(area),
@@ -1121,6 +1203,8 @@ mod tests {
                 INHERITED_SHARED[missing]
             );
         }
+        // Tab stops and the save slot are not needed to paint; hidden output
+        // that depends on either closes the menu first instead.
         for missing in [
             b"\x1b[?47l".as_slice(),
             b"\x1b[3g",
@@ -1145,7 +1229,22 @@ mod tests {
                     model.process(component);
                 }
             }
-            assert!(!model.can_paint(), "missing {missing:?}");
+            match missing {
+                b"\x1b[3g" => {
+                    assert!(model.can_paint(), "unknown tabs do not block painting");
+                    assert_covered_rejects(&mut model, b"\t", "tab at unknown stops");
+                }
+                b"\x1b7" => {
+                    assert!(model.can_paint(), "an unknown save slot does not block painting");
+                    assert!(!model.evidence.saved_known(false));
+                    assert_covered_rejects(&mut model, b"\x1b8", "restore of an unknown slot");
+                    assert!(
+                        !model.restore_bytes(false).windows(2).any(|w| w == b"\x1b7"),
+                        "restoration never writes an unknown saved slot"
+                    );
+                }
+                _ => assert!(!model.can_paint(), "missing {missing:?}"),
+            }
         }
     }
 
@@ -1206,12 +1305,9 @@ mod tests {
         model.process(b"\x1b[?6l\x1b[r");
         model.process(REINITIALIZE);
         assert!(
-            !model.can_paint(),
-            "line resets before selection do not prove the target"
+            model.can_paint(),
+            "ED 2 after the selection resets the target's line sizes"
         );
-        model.process(NORMAL_ROWS);
-        model.process(REINITIALIZE);
-        assert!(model.can_paint());
     }
 
     #[test]
@@ -1289,21 +1385,22 @@ mod tests {
                 model.process(frame);
                 assert!(!model.can_paint());
                 model.process(REINITIALIZE);
-                assert!(!model.can_paint(), "target tabs are unknown");
-                model.process(b"\x1b[3g");
-                model.process(NORMAL_ROWS);
-                model.process(REINITIALIZE);
                 if frame == b"\x1b[?1049l" {
                     assert!(
                         !model.can_paint(),
                         "1049 also restores an inherited primary slot"
                     );
                     model.process(&inherited_initialization(false));
+                    assert!(model.can_paint());
+                } else {
+                    assert!(
+                        model.can_paint(),
+                        "target coordinates/cells now explicitly initialized"
+                    );
+                    let alternate = model.screen().alternate_screen();
+                    assert_covered_rejects(&mut model, b"\t", "target tabs are unknown");
+                    assert!(model.evidence.depends_on_unknown(b"\t", alternate));
                 }
-                assert!(
-                    model.can_paint(),
-                    "target coordinates/cells now explicitly initialized"
-                );
             }
         }
     }
@@ -1316,9 +1413,11 @@ mod tests {
         assert_eq!(model.screen().cell(0, 11).unwrap().contents(), "B");
         model.resize(PtySize { cols: 16, ..size() });
         model.process(REINITIALIZE);
-        assert!(
-            !model.can_paint(),
-            "resize may create stops on the outer terminal"
+        assert!(model.can_paint(), "painting never uses tab stops");
+        assert_covered_rejects(
+            &mut model,
+            b"\t",
+            "resize may create stops on the outer terminal",
         );
         model.process(b"\x1b[3gA\tB");
         assert!(model.can_paint());
@@ -1366,17 +1465,19 @@ mod tests {
         model.process(&INHERITED_SHARED.concat());
         model.process(b"\x1b[?47l\x1b[3g\x1b[?6l\x1b[r\x1b[H\x1b#5\x1b#5\x1b#5\x1b#5");
         model.process(b"\x1b7\x1b[2J");
+        assert!(model.can_paint(), "ED 2 resets every row's line size");
         assert!(
-            !model.can_paint(),
-            "repeated resets of one row are not full-screen evidence"
+            !model.evidence.saved_known(false),
+            "a save before line sizes were known stays unknown"
         );
         model.process(NORMAL_ROWS);
         assert!(
-            !model.can_paint(),
-            "normalizing later cannot prove an earlier save or clear"
+            !model.evidence.saved_known(false),
+            "normalizing later cannot prove an earlier save"
         );
         model.process(b"\x1b[H\x1b7\x1b[2J");
         assert!(model.can_paint());
+        assert!(model.evidence.saved_known(false));
 
         let mut model = TerminalModel::new(size());
         model.process(&inherited_initialization(false)[3..]);
@@ -1487,8 +1588,14 @@ mod tests {
                     model.process(component);
                 }
             }
-            assert!(!model.can_paint(), "missing component {missing}");
-            assert_eq!(model.unavailable_reason(), Some(Unavailable::Resize));
+            if components[missing] == b"\x1b7" {
+                assert!(model.can_paint(), "the save slot is not needed to paint");
+                assert!(!model.evidence.saved_known(true));
+                assert_covered_rejects(&mut model, b"\x1b8", "restore of an unknown slot");
+            } else {
+                assert!(!model.can_paint(), "missing component {missing}");
+                assert_eq!(model.unavailable_reason(), Some(Unavailable::Resize));
+            }
         }
         for alternate in [false, true] {
             for split in 0..=REINITIALIZE.len() {
@@ -1524,10 +1631,12 @@ mod tests {
         model.process(b"\x1bc");
         model.resize(size());
         model.process(b"\x1b7\x1b[?6l\x1b[r\x1b[H\x1b[2J");
+        assert!(model.can_paint());
         assert!(
-            !model.can_paint(),
+            !model.evidence.saved_known(false),
             "a later CUP cannot prove an earlier save"
         );
+        assert_covered_rejects(&mut model, b"\x1b8", "restore of an unproven save");
         model.process(b"\x1b8\x1b7");
         assert!(
             !model.can_paint(),
@@ -1697,7 +1806,8 @@ mod tests {
     #[test]
     fn covered_unsupported_frames_stop_before_mutation_and_replay_exactly_at_every_split() {
         for unsafe_frame in [
-            b"\x1b_Ga=q;opaque qy\x1b\\".as_slice(),
+            // A graphics query (a=q) is accepted; transmit-and-display is not.
+            b"\x1b_Ga=T,f=24;opaque qy\x1b\\".as_slice(),
             b"\x1b[7777h",
             b"\x1b]50;unmodeled-font\x1b\\",
             b"\x1b[3J",
@@ -1920,6 +2030,74 @@ mod tests {
     }
 
     #[test]
+    fn zellij_controls_keep_eligibility_and_relay_hidden_queries_once() {
+        let identity = b"\x1bP26661nCgkKBGJlYW0SAQE=\x1b\\".as_slice();
+        let graphics = b"\x1b_Ga=q,i=31,s=1,v=1,t=d,f=24;AAAA\x1b\\".as_slice();
+        let trace = [
+            b"\x1b[?12l\x1b[>1u\x1b[?2031h\x1b[?1004h\x1b[?1015h\x1b[59m".as_slice(),
+            b"\x1b[?996n",
+            identity,
+            graphics,
+            b"\x1b[<1u\x1b[?2031l\x1b[?1004l\x1b[?1015l\x1bP$qm\x1b\\",
+        ]
+        .concat();
+        for split in 0..=trace.len() {
+            let mut model = TerminalModel::new(size());
+            model.process(b"\x1bc");
+            model.begin_overlay();
+            let mut relayed = Vec::new();
+            for chunk in [&trace[..split], &trace[split..]] {
+                let (consumed, rejected) = model
+                    .process_guarded_with_events(
+                        chunk,
+                        true,
+                        |event| {
+                            relayed.push(event);
+                            Ok::<(), ()>(())
+                        },
+                        true,
+                    )
+                    .unwrap();
+                assert_eq!((consumed, rejected), (chunk.len(), None), "split {split}");
+            }
+            model.end_overlay();
+            assert!(model.can_paint(), "split {split}");
+            let effects: Vec<_> = relayed.iter().filter_map(TerminalEvent::terminal_bytes).collect();
+            assert_eq!(
+                effects,
+                vec![b"\x1b[?996n".to_vec(), identity.to_vec(), graphics.to_vec()],
+                "split {split}"
+            );
+            // SGR 59 leaves the represented attributes complete.
+            assert!(relayed.contains(&TerminalEvent::Reply(b"\x1bP1$r0m\x1b\\".to_vec())));
+        }
+        // Look-alikes stay unsupported: other DCS, other graphics commands,
+        // an oversized or malformed identity, underline colors.
+        for frame in [
+            b"\x1bP26661nnot base64!\x1b\\".as_slice(),
+            b"\x1bPq#0;2;0;0;0\x1b\\",
+            b"\x1b_Ga=T,f=24;AAAA\x1b\\",
+            b"\x1b_Ga=q\x07\x1b\\",
+            b"\x1b[58;5;1m",
+            b"\x1b[>1;2u",
+        ] {
+            let mut model = TerminalModel::new(size());
+            model.process(b"\x1bc");
+            model.process(frame);
+            assert_eq!(
+                model.unavailable_reason(),
+                Some(Unavailable::UnsupportedSequence),
+                "{frame:?}"
+            );
+        }
+        let mut model = TerminalModel::new(size());
+        model.process(b"\x1bc");
+        let oversized = [b"\x1bP26661n".as_slice(), &[b'A'; 2000], b"\x1b\\"].concat();
+        model.process(&oversized);
+        assert_eq!(model.unavailable_reason(), Some(Unavailable::UnsupportedSequence));
+    }
+
+    #[test]
     fn mode_queries_use_remote_mouse_keypad_and_buffer_state_or_report_unknown() {
         let trace = b"\x1b[?1049h\x1b=\x1b[?1002h\x1b[?1006h\x1b[?1002$p\x1b[?1000$p\x1b[?1006$p\x1b[?1005$p\x1b[?66$p\x1b[?47$p\x1b[?1049$p\x1b[?9999$p\x1b[4$p";
         for split in 0..=trace.len() {
@@ -2105,7 +2283,7 @@ mod tests {
     fn overlay_acceptance_saved_cursor() {
         let mut model = TerminalModel::new(size());
         let mut physical = Parser::new(nonzero(4), nonzero(12), 0);
-        let before = b"\x1b[2;3H\x1b7";
+        let before = b"\x1bc\x1b[2;3H\x1b7";
         model.process(before);
         physical.process(before);
         physical.process(b"\x1b[2J\x1b[HLOCAL MENU");
@@ -2212,6 +2390,9 @@ mod tests {
         ];
         let mut traces = Vec::new();
         for (name, before, hidden, after) in cases {
+            // Start from an eligible state, as painting requires. Without
+            // evidence a saved slot is unknown and is never rewritten.
+            let before = &format!("\x1bc{before}");
             let mut model = TerminalModel::new(size());
             let mut physical = Parser::new(nonzero(4), nonzero(12), 0);
             model.process(before.as_bytes());

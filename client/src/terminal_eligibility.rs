@@ -104,9 +104,13 @@ pub struct Evidence {
     reason: Option<Unavailable>,
     shared: u64,
     buffers: [BufferEvidence; 2],
-    // Full-width rows established by EL 2. Never infer inherited cells from
-    // the backend's default blanks. Storage is bounded by terminal height.
+    // Full-width rows established by EL 2 or a complete overwrite. Never
+    // infer inherited cells from the backend's default blanks. Storage is
+    // bounded by terminal height.
     known_rows: [Vec<bool>; 2],
+    // A row being rewritten left to right from column one: (buffer, row,
+    // next column). Reaching the right edge writes every cell of the row.
+    overwrite: Option<(bool, u16, u16)>,
     // An observed RIS, with no subsequent remote alternate use. Entry mode
     // reports and primary initialization cannot establish scratch ownership.
     unused_alternate: bool,
@@ -119,6 +123,7 @@ impl Default for Evidence {
             shared: 0,
             buffers: [BufferEvidence::default(); 2],
             known_rows: [Vec::new(), Vec::new()],
+            overwrite: None,
             unused_alternate: false,
         }
     }
@@ -126,6 +131,73 @@ impl Default for Evidence {
 
 impl Evidence {
     pub fn observe(
+        &mut self,
+        frame: &[u8],
+        before_alternate: bool,
+        before_cursor: (u16, u16),
+        screen: &vt100::Screen,
+    ) {
+        // Any early return (reset, boundary, buffer switch) ends a run.
+        let run = self.overwrite.take();
+        self.observe_frame(frame, before_alternate, before_cursor, screen);
+        self.track_overwrite(run, frame, before_alternate, before_cursor, screen);
+    }
+
+    /// Contiguous text from column one to the right edge, with only
+    /// non-moving, non-mutating controls (SGR, links, modes) in between,
+    /// writes every cell of that row with known state: the row is known.
+    /// This needs no clear, so a redraw such as zellij's attach (which
+    /// relies on its own full repaint) establishes content.
+    fn track_overwrite(
+        &mut self,
+        run: Option<(bool, u16, u16)>,
+        frame: &[u8],
+        before_alternate: bool,
+        before_cursor: (u16, u16),
+        screen: &vt100::Screen,
+    ) {
+        let alternate = screen.alternate_screen();
+        let index = usize::from(alternate);
+        if alternate != before_alternate
+            || !(self.shared_known() && self.buffers[index].drawing_known())
+            || self.buffers[index].cells
+        {
+            return;
+        }
+        let after = screen.cursor_position();
+        let (rows, cols) = (screen.size().0.get(), screen.size().1.get());
+        let text = !frame.is_empty()
+            && !frame.starts_with(b"\x1b")
+            && frame.iter().all(|b| *b >= 0x20 && *b != 0x7f);
+        if let Some((buffer, row, col)) = run {
+            if buffer == alternate && before_cursor == (row, col) {
+                if text && after.0 == row && after.1 > col {
+                    if after.1 < cols {
+                        self.overwrite = Some((buffer, row, after.1));
+                        return;
+                    }
+                    // Pending wrap at the right edge: every cell written.
+                    let known = &mut self.known_rows[index];
+                    known.resize(usize::from(rows), false);
+                    known[usize::from(row)] = true;
+                    if known.iter().all(|k| *k) {
+                        self.buffers[index].cells = true;
+                        known.clear();
+                    }
+                    return;
+                }
+                if !text && !mutates_cells(frame) && after == before_cursor {
+                    self.overwrite = run;
+                    return;
+                }
+            }
+        }
+        if !text && !mutates_cells(frame) && after.1 == 0 {
+            self.overwrite = Some((alternate, after.0, 0));
+        }
+    }
+
+    fn observe_frame(
         &mut self,
         frame: &[u8],
         before_alternate: bool,
@@ -237,6 +309,19 @@ impl Evidence {
                 ..BufferEvidence::default()
             };
             self.known_rows[usize::from(alternate)].clear();
+            // Emulators keep DECOM/DECSTBM either globally (xterm) or per
+            // buffer with defaults (reset origin, full margins). When the
+            // departing buffer's values are known defaults and the model
+            // reports defaults for both buffers, every semantics agrees.
+            let departing = self.buffers[usize::from(before_alternate)];
+            let state = screen.drawing_state();
+            let full = (0, screen.size().0.get() - 1);
+            let default_origin = !state.primary.cursor.origin_mode
+                && !state.alternate.cursor.origin_mode;
+            let default_margins =
+                state.primary.scroll_region == full && state.alternate.scroll_region == full;
+            let carried_origin = departing.origin && default_origin;
+            let carried_margins = departing.margins && default_margins;
             if before_alternate {
                 let tabs = self.buffers[1].tabs;
                 let normal_rows = self.buffers[1].normal_rows;
@@ -255,7 +340,21 @@ impl Evidence {
                 };
                 self.known_rows[1].clear();
             }
-            self.buffers[usize::from(alternate)].selected = true;
+            let target = &mut self.buffers[usize::from(alternate)];
+            target.selected = true;
+            target.origin = carried_origin;
+            target.margins = carried_margins;
+            if alternate
+                && private_modes(frame).is_some_and(|(set, modes)| {
+                    set && mode_numbers(modes).any(|m| m == Some(1049))
+                })
+            {
+                // Entering with 1049 clears the alternate buffer, which also
+                // resets DEC line sizes (xterm `ClearBufRows`). Like ED 2,
+                // an explicit assumption verified per terminal. Cells are
+                // not assumed: they need erasure or a complete overwrite.
+                target.normal_rows = NormalRows::Known;
+            }
             return;
         }
 
@@ -284,7 +383,11 @@ impl Evidence {
         let rows = &mut self.known_rows[usize::from(alternate)];
         let positioned = shared_known && buffer.drawing_known();
         if frame == b"\x1b[2J" {
-            buffer.cells = shared_known && buffer.normal_rows == NormalRows::Known;
+            // Erasing whole rows resets DEC double-width/height line sizes
+            // (xterm `ClearBufRows`). This is an explicit cross-terminal
+            // assumption, verified per terminal in the workstation matrix.
+            buffer.normal_rows = NormalRows::Known;
+            buffer.cells = shared_known;
             rows.clear();
         } else if frame == b"\x1b[2K" && positioned && !buffer.cells {
             rows.resize(usize::from(screen.size().0.get()), false);
@@ -432,9 +535,29 @@ impl Evidence {
                 .is_some_and(|rows| !rows.is_empty() && rows.iter().all(|known| *known))
     }
 
+    /// A saved slot or tab stops may remain unknown: painting never uses
+    /// them. Covered output that depends on one closes first (`depends_on_unknown`)
+    /// and restoration never writes an unknown saved slot.
     pub fn can_paint(&self, alternate: bool) -> bool {
         let index = usize::from(alternate);
-        self.shared_known() && self.buffers[index].complete() && self.buffers[index].cells
+        self.shared_known() && self.buffers[index].drawing_known() && self.buffers[index].cells
+    }
+
+    pub fn saved_known(&self, alternate: bool) -> bool {
+        self.buffers[usize::from(alternate)].saved
+    }
+
+    /// Hidden output whose effect depends on state that was never observed:
+    /// restoring an unknown saved cursor, or a tab with unknown stops. The
+    /// caller closes the menu and replays it raw instead of guessing.
+    pub fn depends_on_unknown(&self, frame: &[u8], alternate: bool) -> bool {
+        let buffer = self.buffers[usize::from(alternate)];
+        (matches!(frame, b"\x1b8" | b"\x1b[u" | b"\x1b[0u") && !buffer.saved)
+            || (frame == b"\t" && buffer.tabs == Tabs::Unknown)
+            // A save the evidence cannot certify would change the remote's
+            // slot in the model without a faithful physical restoration.
+            || (matches!(frame, b"\x1b7" | b"\x1b[s" | b"\x1b[0s")
+                && !(self.shared_known() && buffer.drawing_known()))
     }
 
     pub fn can_borrow(&self, screen: &vt100::Screen) -> bool {
@@ -587,13 +710,19 @@ fn mutates_cells(frame: &[u8]) -> bool {
 }
 
 fn text_fits_row(frame: &[u8], columns: usize) -> bool {
+    use unicode_width::UnicodeWidthChar as _;
     // Bytes are already an upper bound; only inspect UTF-8 near the edge.
+    // Otherwise use the backend's own per-character width (the same
+    // unicode-width crate). Anything wider than two stays conservative.
     frame.len() <= columns
         || std::str::from_utf8(frame).is_ok_and(|text| {
             text.chars()
-                .map(|c| if c.is_ascii() { 1 } else { 2 })
-                .sum::<usize>()
-                <= columns
+                .map(|c| match c.width() {
+                    Some(width @ 0..=2) => width,
+                    _ => columns + 1,
+                })
+                .try_fold(0usize, |sum, width| sum.checked_add(width))
+                .is_some_and(|sum| sum <= columns)
         })
 }
 
@@ -661,6 +790,35 @@ pub fn borrowed_drawing(frame: &[u8]) -> bool {
                 | b"\x1b%G"
                 | b"\x1b\\"
         )
+}
+
+/// Zellij announces its session to the outer terminal with a private DCS
+/// (`DCS 26661 n <base64> ST`). Terminals ignore it; it never draws cells.
+/// Accept only that exact shape, bounded, so other DCS stay unsupported.
+pub fn zellij_identity(frame: &[u8]) -> bool {
+    frame
+        .strip_prefix(b"\x1bP26661n")
+        .and_then(|rest| rest.strip_suffix(b"\x1b\\"))
+        .is_some_and(|payload| {
+            payload.len() <= 1024
+                && payload
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+        })
+}
+
+/// A Kitty graphics `a=q` query asks whether the protocol is supported and
+/// stores or draws nothing. Every other graphics command stays unsupported.
+pub fn kitty_graphics_query(frame: &[u8]) -> bool {
+    frame
+        .strip_prefix(b"\x1b_G")
+        .and_then(|rest| rest.strip_suffix(b"\x1b\\"))
+        .is_some_and(|body| {
+            let control = body.split(|b| *b == b';').next().unwrap_or_default();
+            body.len() <= 4096
+                && control.split(|b| *b == b',').any(|kv| kv == b"a=q")
+                && !body.iter().any(|b| *b < 0x20)
+        })
 }
 
 /// This is a support policy, not a second cursor/mode emulator. The backend
@@ -735,12 +893,18 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
                                     | 2004
                                     | 2026
                             ) || action == b'h' && m == 7
-                                || action == b'l' && matches!(m, 5 | 45 | 69 | 1001 | 1015 | 1016)
+                                || action == b'l' && matches!(m, 5 | 45 | 69 | 1001 | 1016)
+                                // Cursor blink, focus/theme reports and urxvt
+                                // mouse encoding affect input or cursor style,
+                                // never cells. Local menus decode none of their
+                                // reports; replies route to the remote.
+                                || matches!(m, 12 | 1004 | 1015 | 2031)
                         })
                 });
             }
             return action == b'c'
-                || (action == b'n' && modes == b"6")
+                // CPR, or the terminal's color-scheme (theme) report.
+                || (action == b'n' && matches!(modes, b"6" | b"996"))
                 || (action == b'u' && matches!(modes, b"" | b"0"))
                 || (action == b'm' && matches!(modes, b"" | b"0" | b"1" | b"2" | b"3" | b"4"))
                 || (action == b'p'
@@ -757,6 +921,11 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
                 .and_then(|s| s.parse::<u16>().ok())
                 .is_some();
         }
+        if action == b'u' && (args.starts_with(b">") || args.starts_with(b"<")) {
+            // Kitty keyboard push/pop changes key encoding only; the menu
+            // decodes CSI-u keys and cleanup never pops an unowned stack.
+            return args[1..].iter().all(u8::is_ascii_digit);
+        }
         if args.starts_with(b">") || args.starts_with(b"=") {
             return action == b'c' || (action == b'q' && args == b">0");
         }
@@ -767,6 +936,11 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
                 .and_then(|s| std::str::from_utf8(s).ok())
                 .and_then(|s| s.parse::<u16>().ok())
                 .is_some_and(|op| (11..=21).contains(&op));
+        }
+        if frame == b"\x1b[59m" {
+            // Reset underline color. Setting one (SGR 58) stays unsupported,
+            // so the represented underline color is already the default.
+            return true;
         }
         if action == b'm' {
             // Preview SGR using the same backend to catch unrepresented
@@ -896,7 +1070,11 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
     if frame.starts_with(b"\x1bP") {
         return frame.starts_with(b"\x1bP$q")
             || frame.starts_with(b"\x1bP+q")
-            || frame.starts_with(b"\x1bP+Q");
+            || frame.starts_with(b"\x1bP+Q")
+            || zellij_identity(frame);
+    }
+    if frame.starts_with(b"\x1b_") {
+        return kitty_graphics_query(frame);
     }
     if matches!(frame, b"\x1b(B" | b"\x1b(0" | b"\x1b)B" | b"\x1b)0") {
         return true;

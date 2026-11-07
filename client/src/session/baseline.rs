@@ -4,8 +4,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 const MODES: &[u16] = &[
-    1, 6, 9, 25, 47, 66, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 2004, 2026,
+    1, 5, 6, 7, 9, 25, 45, 47, 66, 69, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1015, 1016,
+    2004, 2026,
 ];
+const MOUSE_MODES: &[u16] = &[9, 1000, 1001, 1002, 1003, 1005, 1006, 1015, 1016];
+
+/// Overlay sessions write these once, before any remote output: state no
+/// terminal can report, reset to the defaults an ordinary shell already has.
+/// Parser boundary, UTF-8, ASCII in G0/G1 with G0 active, unprotected
+/// characters and no open hyperlink. Queryable settings are observed instead.
+pub const ENTRY_RESETS: &[u8] = b"\x18\x1b\\\x1b%G\x1b(B\x1b)B\x0f\x1b[0\"q\x1b]8;;\x1b\\";
 const REPLY_LIMIT: usize = 4096;
 const MOUSE_GROUPS: &[&[u16]] = &[&[9, 1000, 1001, 1002, 1003], &[1005, 1006, 1015, 1016]];
 
@@ -14,6 +22,7 @@ pub struct Baseline {
     modes: BTreeMap<u16, bool>,
     unrecognized: BTreeSet<u16>,
     insert: Option<bool>,
+    linefeed: Option<bool>,
     attributes: Option<Vec<u8>>,
     margins: Option<(u16, u16)>,
     cursor_style: Option<u8>,
@@ -37,8 +46,75 @@ impl Baseline {
             bytes.extend_from_slice(format!("\x1b[?{mode}$p").as_bytes());
         }
         bytes.extend_from_slice(
-            b"\x1b[4$p\x1bP$qm\x1b\\\x1bP$qr\x1b\\\x1bP$q q\x1b\\\x1b[?u\x1b[?4m",
+            b"\x1b[4$p\x1b[20$p\x1bP$qm\x1b\\\x1bP$qr\x1b\\\x1bP$q q\x1b\\\x1b[?u\x1b[?4m",
         );
+        bytes
+    }
+
+    /// A synthesized initialization equal to what the terminal reported
+    /// before any remote output. The model processes it as observed
+    /// evidence; none of it is written. A mode the terminal does not
+    /// recognize counts as off: that feature cannot be active. Values the
+    /// model cannot represent, or that went unanswered, stay unknown.
+    pub fn entry_evidence(&self, rows: u16) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if self.modes.is_empty() {
+            // No ANSI reply at all: not even the parser mode is known.
+            return bytes;
+        }
+        // Answering CSI reports proves ANSI (not VT52) mode.
+        bytes.extend_from_slice(b"\x1b<");
+        let off = |mode: u16| {
+            self.modes.get(&mode) == Some(&false) || self.unrecognized.contains(&mode)
+        };
+        let mut set = |mode: u16, enabled: bool| {
+            bytes.extend_from_slice(
+                format!("\x1b[?{mode}{}", if enabled { 'h' } else { 'l' }).as_bytes(),
+            );
+        };
+        // Select first: a first selection discards earlier buffer evidence.
+        if self.modes.get(&47) == Some(&false) {
+            set(47, false);
+        }
+        if self.modes.get(&7) == Some(&true) {
+            set(7, true);
+        }
+        for mode in [5, 45, 69, 2026].into_iter().chain(MOUSE_MODES.iter().copied()) {
+            if off(mode) {
+                set(mode, false);
+            }
+        }
+        for mode in [1, 25, 2004] {
+            if let Some(enabled) = self.modes.get(&mode) {
+                set(mode, *enabled);
+            }
+        }
+        if self.modes.get(&47) == Some(&false) && self.modes.get(&6) == Some(&false) {
+            set(6, false);
+        }
+        if let Some(keypad) = self.modes.get(&66) {
+            bytes.extend_from_slice(if *keypad { b"\x1b=" } else { b"\x1b>" });
+        }
+        if let Some(insert) = self.insert {
+            bytes.extend_from_slice(if insert { b"\x1b[4h" } else { b"\x1b[4l" });
+        }
+        if self.linefeed == Some(false) {
+            bytes.extend_from_slice(b"\x1b[20l");
+        }
+        if let Some(attributes) = self.attributes.as_ref().filter(|sgr| {
+            // An attribute the model cannot represent stays unknown rather
+            // than invalidating eligibility for the whole session.
+            let probe = vt100::Parser::new(std::num::NonZeroU16::MIN, std::num::NonZeroU16::MIN, 0);
+            crate::terminal_eligibility::supported(sgr, probe.screen())
+        }) {
+            bytes.extend_from_slice(b"\x1b[0m");
+            bytes.extend_from_slice(attributes);
+        }
+        if self.modes.get(&47) == Some(&false)
+            && self.margins == Some((0, rows.saturating_sub(1)))
+        {
+            bytes.extend_from_slice(b"\x1b[r");
+        }
         bytes
     }
 
@@ -132,6 +208,9 @@ impl Baseline {
         if let Some(insert) = self.insert {
             bytes.extend_from_slice(if insert { b"\x1b[4h" } else { b"\x1b[4l" });
         }
+        if let Some(linefeed) = self.linefeed {
+            bytes.extend_from_slice(if linefeed { b"\x1b[20h" } else { b"\x1b[20l" });
+        }
         if let Some(attributes) = &self.attributes {
             bytes.extend_from_slice(attributes);
         }
@@ -164,6 +243,7 @@ pub struct Capture {
     pub input: Vec<u8>,
     seen_modes: BTreeSet<u16>,
     seen_insert: bool,
+    seen_linefeed: bool,
     seen_attributes: bool,
     seen_margins: bool,
     seen_style: bool,
@@ -176,6 +256,7 @@ impl Capture {
     pub fn complete(&self) -> bool {
         self.seen_modes.len() == MODES.len()
             && self.seen_insert
+            && self.seen_linefeed
             && (u8::from(self.seen_attributes)
                 + u8::from(self.seen_margins)
                 + u8::from(self.seen_style)
@@ -254,6 +335,12 @@ impl Capture {
             if !private && mode == 4 {
                 self.seen_insert = true;
                 self.baseline.insert = enabled;
+                return true;
+            }
+            if !private && mode == 20 {
+                self.seen_linefeed = true;
+                // Unrecognized LNM cannot be set: newline does not imply CR.
+                self.baseline.linefeed = enabled.or(Some(false).filter(|_| value == 0));
                 return true;
             }
         }
@@ -341,6 +428,261 @@ fn numbers(bytes: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_eligibility::Unavailable;
+
+    /// Zellij's reattach redraw, recorded from iTerm2 3.6.10 in strict
+    /// passthrough: its own setup, synchronized frames and claude rendering.
+    const ZELLIJ_ITERM2: &[u8] = include_bytes!("../../tests/fixtures/zellij-iterm2-reattach.bin");
+
+    fn replies(settings: bool) -> Vec<u8> {
+        let mut replies = Vec::new();
+        for mode in MODES {
+            let value = if matches!(mode, 7 | 25) { 1 } else { 2 };
+            replies.extend_from_slice(format!("\x1b[?{mode};{value}$y").as_bytes());
+        }
+        replies.extend_from_slice(b"\x1b[4;2$y\x1b[20;2$y\x1b[?0u\x1b[>4;0m");
+        replies.extend_from_slice(if settings {
+            b"\x1bP1$r0m\x1b\\\x1bP1$r1;65r\x1b\\\x1bP1$r0 q\x1b\\".as_slice()
+        } else {
+            b"\x1bP0$r\x1b\\\x1bP0$r\x1b\\\x1bP0$r\x1b\\"
+        });
+        replies
+    }
+
+    fn entry_model(replies: &[u8]) -> crate::terminal_model::TerminalModel {
+        let mut capture = Capture::default();
+        capture.feed(replies);
+        let (baseline, input) = capture.finish();
+        assert!(input.is_empty());
+        let mut model = crate::terminal_model::TerminalModel::new(portable_pty::PtySize {
+            rows: 65,
+            cols: 208,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+        model.process(ENTRY_RESETS);
+        model.process(&baseline.entry_evidence(65));
+        model
+    }
+
+    /// Paint a toast after zellij's first frame, and a menu covering its
+    /// second; replay the rest. An unpainted terminal must end identical,
+    /// including the workstation primary that the model never saw.
+    #[test]
+    fn painting_over_recorded_zellij_session_matches_an_unpainted_terminal() {
+        use super::super::toast::{OutputTracker, Toast, ToastPainter, Tone};
+        let frame_ends: Vec<usize> = ZELLIJ_ITERM2
+            .windows(8)
+            .enumerate()
+            .filter(|(_, w)| *w == b"\x1b[?2026l")
+            .map(|(i, _)| i + 8)
+            .collect();
+        let (first, second) = (frame_ends[0], frame_ends[1]);
+        let exit = ZELLIJ_ITERM2.windows(8).rposition(|w| w == b"\x1b[?1049l").unwrap();
+        let inherited =
+            [b"\x1b[5;1H\x1b[1;31mUNSEEN WORKSTATION PRIMARY\x1b[7;9H\x1b7".as_slice(), ENTRY_RESETS].concat();
+        let parser = |chunks: &[&[u8]]| {
+            let mut parser = vt100::Parser::new(
+                std::num::NonZeroU16::new(65).unwrap(),
+                std::num::NonZeroU16::new(208).unwrap(),
+                0,
+            );
+            for chunk in chunks {
+                parser.process(chunk);
+            }
+            parser
+        };
+
+        let mut model = entry_model(&replies(true));
+        model.process(&ZELLIJ_ITERM2[..first]);
+        let notice = Toast {
+            tone: Tone::Info,
+            title: "Beams".to_string(),
+            lines: vec![ratatui::text::Line::from("request pending approval")],
+        };
+        let mut painter = ToastPainter::default();
+        let paint = painter.sync(
+            Some(&notice),
+            &model,
+            &mut OutputTracker::default(),
+            std::time::Instant::now(),
+        );
+        assert!(!paint.is_empty(), "toast paints over the recorded session");
+        let restore = painter.clear(&model);
+
+        // A menu covers the second frame, which the model consumes hidden.
+        model.begin_overlay();
+        let mut menu = crate::terminal_paint::BEGIN.to_vec();
+        menu.extend_from_slice(b"\x1b[2J\x1b[HLOCAL MENU");
+        menu.extend_from_slice(crate::terminal_paint::END);
+        let hidden = &ZELLIJ_ITERM2[first..second];
+        let (consumed, rejected) = model
+            .process_guarded_with_events(hidden, true, |_| Ok::<(), ()>(()), true)
+            .unwrap();
+        assert_eq!((consumed, rejected), (hidden.len(), None));
+        assert!(model.can_paint());
+        let close = model.restore_bytes(true);
+        model.end_overlay();
+        let after = &ZELLIJ_ITERM2[second..];
+
+        let expected = parser(&[&inherited, ZELLIJ_ITERM2]);
+        let actual = parser(&[
+            &inherited,
+            &ZELLIJ_ITERM2[..first],
+            &paint,
+            &restore,
+            &menu,
+            &close,
+            after,
+        ]);
+        assert_eq!(actual.screen().contents(), expected.screen().contents());
+        assert_eq!(actual.screen().drawing_state(), expected.screen().drawing_state());
+        // Zellij's exit returns to the workstation primary, which the model
+        // never saw and painting never touched (one line scrolled by "Bye").
+        assert!(expected.screen().contents().contains("UNSEEN WORKSTATION PRIMARY"));
+        assert!(!expected.screen().alternate_screen());
+        let at_exit = |chunks: &[&[u8]]| parser(chunks).screen().contents();
+        assert_eq!(
+            at_exit(&[&inherited, &ZELLIJ_ITERM2[..first], &paint, &restore, &menu, &close,
+                &ZELLIJ_ITERM2[second..exit]]),
+            at_exit(&[&inherited, &ZELLIJ_ITERM2[..exit]]),
+            "zellij's alternate screen before exit"
+        );
+
+        if let Some(module) = std::env::var_os("BEAMS_TEST_XTERM_MODULE") {
+            use std::io::Write as _;
+            let traces = serde_json::json!([
+                {
+                    "name": "toast over recorded zellij (iTerm2)",
+                    "rows": 65, "cols": 208, "inherited": inherited,
+                    "before": &ZELLIJ_ITERM2[..first], "hidden": [],
+                    "paint": paint, "restore": restore, "after": &ZELLIJ_ITERM2[first..],
+                },
+                {
+                    "name": "menu over recorded zellij (iTerm2)",
+                    "rows": 65, "cols": 208, "inherited": inherited,
+                    "before": &ZELLIJ_ITERM2[..first], "hidden": hidden,
+                    "paint": menu, "restore": close, "after": after,
+                },
+            ]);
+            let mut reference = std::process::Command::new("node")
+                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/terminal-paint-reference.cjs"))
+                .arg(module)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            reference
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&serde_json::to_vec(&traces).unwrap())
+                .unwrap();
+            assert!(reference.wait().unwrap().success());
+        }
+    }
+
+    #[test]
+    fn entry_evidence_seeds_only_reported_representable_settings() {
+        let shared_known = |replies: &[u8]| {
+            let mut model = entry_model(replies);
+            // A RIS-free explicit buffer initialization isolates shared state.
+            model.process(b"\x1b[?6l\x1b[r\x1b[H\x1b[2J");
+            model.can_paint()
+        };
+        assert!(shared_known(&replies(true)));
+        // Modes a terminal does not recognize cannot be active.
+        let unrecognized: Vec<u8> = String::from_utf8(replies(true))
+            .unwrap()
+            .replace("\x1b[?2026;2$y", "\x1b[?2026;0$y")
+            .replace("\x1b[?1016;2$y", "\x1b[?1016;0$y")
+            .replace("\x1b[?69;2$y", "\x1b[?69;0$y")
+            .replace("\x1b[20;2$y", "\x1b[20;0$y")
+            .into_bytes();
+        assert!(shared_known(&unrecognized));
+        // Autowrap off is unrepresented; unanswered autowrap is unknown.
+        for autowrap in ["\x1b[?7;2$y", "\x1b[?7;0$y", ""] {
+            let replies = String::from_utf8(replies(true))
+                .unwrap()
+                .replace("\x1b[?7;1$y", autowrap)
+                .into_bytes();
+            assert!(!shared_known(&replies), "autowrap reply {autowrap:?}");
+        }
+        // An exotic attribute stays unknown instead of invalidating the
+        // session; a later observed SGR reset establishes it.
+        let exotic = String::from_utf8(replies(true))
+            .unwrap()
+            .replace("\x1bP1$r0m", "\x1bP1$r0;58;5;1m")
+            .into_bytes();
+        let mut model = entry_model(&exotic);
+        model.process(b"\x1b[?6l\x1b[r\x1b[H\x1b[2J");
+        assert!(!model.can_paint());
+        assert_eq!(model.unavailable_reason(), Some(Unavailable::InheritedState));
+        model.process(b"\x1b[m\x1b[H\x1b[2J");
+        assert!(model.can_paint());
+        // Non-default represented values are seeded as reported.
+        let custom = String::from_utf8(replies(true))
+            .unwrap()
+            .replace("\x1b[?1;2$y", "\x1b[?1;1$y")
+            .replace("\x1b[?2004;2$y", "\x1b[?2004;1$y")
+            .replace("\x1bP1$r0m", "\x1bP1$r0;1;31m")
+            .into_bytes();
+        let mut model = entry_model(&custom);
+        assert!(model.screen().application_cursor());
+        assert!(model.screen().bracketed_paste());
+        let (row, col) = model.screen().cursor_position();
+        model.process(b"X");
+        let cell = model.screen().cell(row, col).unwrap();
+        assert!(cell.bold());
+        assert_eq!(cell.fgcolor(), vt100::Color::Idx(1));
+    }
+
+    #[test]
+    fn recorded_zellij_session_is_paintable_from_observed_entry_state() {
+        let exit = ZELLIJ_ITERM2
+            .windows(8)
+            .rposition(|w| w == b"\x1b[?1049l")
+            .unwrap();
+        for settings in [true, false] {
+            // Without DECRQSS answers, zellij's own SGR reset and full
+            // margins establish what the setting reports would have.
+            let mut model = entry_model(&replies(settings));
+            assert!(!model.can_paint(), "the inherited primary stays unknown");
+            let mut first = None;
+            for (index, chunk) in ZELLIJ_ITERM2[..exit].chunks(512).enumerate() {
+                let (consumed, rejected) = model
+                    .process_guarded_with_events(chunk, false, |_| Ok::<(), ()>(()), true)
+                    .unwrap();
+                assert_eq!((consumed, rejected), (chunk.len(), None));
+                if model.can_paint() {
+                    first.get_or_insert(index);
+                } else {
+                    assert!(
+                        first.is_none(),
+                        "settings {settings}: eligibility lost at chunk {index}: {:?}",
+                        model.unavailable_reason()
+                    );
+                }
+            }
+            let first = first.unwrap_or_else(|| {
+                panic!("settings {settings}: never eligible: {:?}", model.unavailable_reason())
+            });
+            // Zellij's first synchronized frame repaints every row; the
+            // first read boundary after it completes is the first chance.
+            let frame_end = ZELLIJ_ITERM2
+                .windows(8)
+                .position(|w| w == b"\x1b[?2026l")
+                .unwrap()
+                + 8;
+            assert_eq!(first, frame_end / 512, "eligible right after the first full frame");
+            assert!(model.screen().alternate_screen());
+            assert!(model.can_paint_area(ratatui::layout::Rect::new(150, 1, 56, 6)));
+            model.process(&ZELLIJ_ITERM2[exit..]);
+            assert!(!model.can_paint(), "returning to the inherited primary");
+        }
+        let mut model = entry_model(b"");
+        model.process(ZELLIJ_ITERM2);
+        assert!(!model.can_paint(), "no reported settings: nothing is assumed");
+    }
 
     #[test]
     fn split_reports_preserve_user_input_and_nondefault_settings() {
@@ -384,7 +726,7 @@ mod tests {
         for mode in MODES {
             capture.feed(format!("\x1b[?{mode};0$y").as_bytes());
         }
-        capture.feed(b"\x1b[4;0$y\x1b[?0u\x1b[>4;0m\x1bP0$r\x1b\\");
+        capture.feed(b"\x1b[4;0$y\x1b[20;0$y\x1b[?0u\x1b[>4;0m\x1bP0$r\x1b\\");
         assert!(!capture.complete());
         capture.feed(b"\x1bP1$r1;24r\x1b\\");
         assert!(!capture.complete());

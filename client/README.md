@@ -354,9 +354,38 @@ attributes/link closure, character sets, supported wrap/linefeed behavior,
 input modes, coupled mouse resets, tab clearing, normal size on every row,
 coordinates and a new save
 slot. The [initialization inventory](../docs/designs/TERMINAL_OVERLAY_DESIGN.md#implementation-status-and-next-session-handoff)
-records the required controls. The client observes these controls from remote
-output; it never sends initialization itself. An ordinary TUI clear or soft
-reset is insufficient, and the inactive buffer remains unknown.
+records the required controls. An ordinary TUI clear or soft reset is
+insufficient, and the inactive buffer remains unknown.
+
+With `--terminal-overlay`, the client also establishes this shared state at
+session entry, before forwarding any remote output. Settings a terminal can
+report (modes, insert/linefeed, SGR, margins) come from the replies to its
+startup queries; a mode the terminal does not recognize counts as off.
+Settings no terminal can report are reset once to the defaults an ordinary
+shell already has: `CAN ST`, UTF-8 (`ESC % G`), ASCII in G0/G1 with `SI`,
+unprotected characters (`CSI 0 " q`) and a closed OSC 8 link. Nothing else is
+written, takeover sessions send none of it, and `--escape-key none` stays
+strict passthrough. A setting that goes unanswered, or that the model cannot
+represent (for example autowrap reported off), stays unknown.
+
+Content can then be established without a clear: rewriting a whole row from
+column one to the right edge, with only attribute/link/mode changes in
+between, proves every cell in that row. Zellij's attach redraw does exactly
+this. Entering the alternate screen with `1049` and `CSI 2J` are assumed to
+reset DEC double-width/height line sizes, as xterm does; this assumption is
+checked per terminal in the workstation matrix. Menus no longer need a known
+saved cursor slot or tab stops: painting uses neither, hidden output that
+would restore an unknown slot, save from uncertain state or tab at unknown
+stops closes the menu and is replayed raw, and restoration never writes an
+unknown slot.
+
+Zellij's own setup controls are classified explicitly rather than ignored:
+cursor blink (`?12`), focus and theme reports (`?1004`, `?2031`), urxvt mouse
+encoding (`?1015`), Kitty keyboard push/pop, `SGR 59`, its private session
+DCS (`DCS 26661 n … ST`) and a Kitty graphics `a=q` query. While a menu is
+open, the theme query, graphics query and Zellij DCS reach the real terminal
+once, and their replies and focus reports go to the remote rather than the
+menu. Other graphics commands and DCS strings remain unsupported.
 
 Toasts can use less content evidence than menus. With shared drawing settings,
 buffer selection, normal line sizes and current cursor/origin/margins known,

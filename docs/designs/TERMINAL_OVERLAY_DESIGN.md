@@ -470,6 +470,73 @@ existing burst responsiveness assertion missed its two-second deadline once
 and passed on rerun; the later input slice corrects its synchronous fixture
 write. Painting bytes did not change; workstation gates remain pending.
 
+## Observed entry state and Zellij eligibility (2026-11-07)
+
+Dogfooding over iTerm2 3.6.10 showed the conservative gate made the overlay
+unusable under Zellij 0.45, the main supported workflow. Two strict-passthrough
+recordings (startup and reattach, `client/tests/fixtures/zellij-iterm2-reattach.bin`
+holds the reattach redraw) showed why: Zellij never sends RIS or the explicit
+initialization, uses several unclassified controls, and on reattach never
+clears; it relies on `?1049h` and repaints every row. A read split inside a
+UTF-8 character was also misclassified as unsupported; text frames now carry
+whole characters across reads (`4200572`).
+
+Decisions (agreed with the user):
+
+- **Classify Zellij's controls explicitly.** `?12`, `?1004`, `?2031`, `?1015`
+  (h/l), Kitty `CSI > N u` / `CSI < N u`, `SGR 59`, `CSI ? 996 n` and the
+  exact bounded `DCS 26661 n <base64> ST` are accepted; a Kitty graphics
+  `a=q` query is accepted but other graphics commands are not. While hidden,
+  the theme query, graphics query and Zellij DCS are relayed once; replies and
+  focus reports route to the remote. Recordings from other terminals may add
+  entries: Zellij adapts to reported capabilities (it used 316 synchronized
+  frames under iTerm2 and none without a terminal answering).
+- **Observe what a terminal can report; reset only what none can.** The entry
+  probes now include `?5`, `?7`, `?45`, `?69` and ANSI `20`. The model processes
+  a synthesized initialization equal to the replies (unrecognized modes count
+  as off; unrepresentable or unanswered values stay unknown; ANSI mode is
+  proved by the replies). Overlay sessions then write `ENTRY_RESETS` once,
+  before any remote output: `CAN ST`, `ESC % G`, `ESC ( B`, `ESC ) B`, `SI`,
+  `CSI 0 " q` and an OSC 8 close. This is the single exception to "observe,
+  never inject": no terminal can report these, and they equal an ordinary
+  shell's state. Takeover and `--escape-key none` send none of it.
+- **Lazy saved slot and tab stops.** Painting uses neither. A menu no longer
+  requires them; covered `DECRC` of an unknown slot, `DECSC` from uncertain
+  state, or a tab at unknown stops closes the menu and replays raw, and
+  restoration never writes an unknown saved slot.
+- **Buffer switches carry default origin/margins.** When the departing buffer's
+  values are known defaults and the model reports defaults for both buffers,
+  global (xterm) and per-buffer semantics agree.
+- **Line sizes are assumed normal after `?1049h` entry or `CSI 2J`** (xterm's
+  `ClearBufRows` resets DEC double-size lines). Line size cannot be queried and
+  every painted row depends on it, so it cannot be lazy. This is an explicit
+  assumption to verify per terminal in the workstation matrix, e.g.
+  `printf '\e#6WIDE\e[2Jnormal?\n'` and
+  `printf '\e[?1049h\e#6WIDE\e[?1049l\e[?1049hnormal?'; sleep 2; printf '\e[?1049l'`.
+- **A complete row overwrite establishes that row.** Contiguous text from
+  column one to the right edge, with only non-moving, non-mutating controls in
+  between, writes every cell. Cursor movement, erases, tabs, backspace, a wide
+  glyph that cannot fit or writing past the edge end the run. The in-row text
+  bound now uses the backend's own `unicode-width` widths; widths above two
+  remain conservative.
+
+Validation: 262 client unit tests and 3 integration tests pass with none
+ignored; build, both managed-session smokes and the PTY harness (whose fake
+terminal now answers every probe) pass. The reattach fixture becomes eligible
+at the first read boundary after Zellij's first full frame, stays eligible
+until Zellij leaves the alternate screen, and is never eligible without
+reported settings. A toast after the first frame and a menu covering the
+second leave the terminal identical to an unpainted one, including the
+unseen workstation primary, in both the model and xterm.js. The uncommitted
+startup recording behaves the same at 64-byte, 512-byte and 4 KiB reads.
+Independent replay passes 23 model traces and 7 live traces.
+
+Limits: the iTerm2 replies to the entry probes have not been recorded (strict
+passthrough sends none), so fixtures use representative replies; a terminal
+without DECRQM gets no entry evidence. The line-size assumption, real
+terminal widths and other terminals' Zellij output remain workstation gates.
+The overlay stays opt-in.
+
 ## Implementation status and next-session handoff
 
 Row-level content evidence is implemented (2026-11-07). Separate the cells and
@@ -572,6 +639,12 @@ client observes these controls and never injects initialization:
 | Selected buffer | Explicit 47 selection; a first selection invalidates earlier buffer-local evidence |
 | Buffer state | TBC 3, DECOM reset, full margins, CUP, a fresh DECSC and ED 2 |
 | Line size | CUP to column one and `ESC # 5` for every row, in order, before saving/clearing |
+
+Superseded in part by the Zellij eligibility section: overlay sessions also
+derive shared state from entry probe replies plus `ENTRY_RESETS`; TBC and a
+fresh DECSC are no longer required to paint (dependent hidden output closes
+instead); `?1049h` entry or `CSI 2J` establishes normal line sizes; and a
+complete row overwrite establishes that row's cells.
 
 Shared and normal-line evidence must be complete before saving/clearing;
 printing before modes and
@@ -759,8 +832,8 @@ fixture stall that made a fairness assertion depend on output throughput.
 This failure policy bounds memory; it does not promise continued service for
 a peer that never drains its input.
 
-Current validation: **254 client unit tests and 3 integration tests pass, with
-zero ignored tests**. The client build, takeover and overlay managed-session
+Current validation: **262 client unit tests and 3 integration tests pass, with
+zero ignored tests** (see the Zellij eligibility section above). The client build, takeover and overlay managed-session
 smokes, and expanded protocol/PTY harness pass. Pinned xterm.js 5.5 replay again
 passes twelve restoration traces, two resize traces, three inherited-state
 traces, two regional toast traces, two borrowed-menu traces, five live
@@ -795,7 +868,8 @@ Retain these decisions and remaining gates:
 
 - Prefer deferring unsafe painting, with explicit best-effort takeover available.
   Unknown inherited primary cells cannot be recovered from a cursor report.
-  Zellij helps but does not establish safety when users bypass it.
+  Zellij is eligible from observed entry state and its own full redraw, not
+  from its name; a session that bypasses it gets no such evidence.
 - A borrowed alternate buffer is implemented only for a RIS-owned, unused
   scratch alternate. Ordinary inherited ownership remains unestablished; never
   nest over a remote-owned alternate screen or use it for ordinary toasts.

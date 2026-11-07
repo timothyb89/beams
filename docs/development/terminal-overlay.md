@@ -351,3 +351,23 @@ with ordered query/effect replay, relinquishment and resize. Twenty-one model
 and seven live independent comparisons pass. Both managed-session smokes and
 the protocol/PTY harness pass. Ordinary inherited-shell borrowing without an
 observed reset, covered reflow and the workstation matrix remain open.
+
+Zellij eligibility pass (2026-11-07): **262 unit tests and 3 integration tests
+pass, none ignored**. Strict-passthrough recordings of Zellij 0.45.1 with
+claude under iTerm2 3.6.10 showed the gate never became eligible: Zellij sends
+no RIS or explicit initialization, several unclassified controls, and on
+reattach repaints every row without clearing. UTF-8 characters split across
+reads were also misclassified (fixed separately in `4200572`).
+
+Overlay sessions now seed evidence from entry probe replies and write one
+set of unqueryable resets before remote output; Zellij's controls are
+classified with hidden relays; saved slots and tab stops are lazy; full-row
+overwrites establish rows; and `?1049h`/`CSI 2J` are assumed to reset line
+sizes (to be verified per terminal). The committed reattach fixture is
+eligible from the first read boundary after Zellij's first full frame until
+Zellij exits. A toast and a covering menu over it match an unpainted terminal
+in the model and xterm.js, including the unseen workstation primary.
+Twenty-three model and seven live independent comparisons pass; both
+managed-session smokes and the PTY harness pass. Real entry-probe replies,
+other terminals' Zellij output, line-size behavior and the workstation matrix
+remain open; the overlay stays opt-in.

@@ -272,6 +272,22 @@ pub fn run(
     let drive_result = (|| {
         if terminal_state.managed {
             terminal_state.capture_baseline()?;
+            if overlay_enabled {
+                // Before any remote output: reset the few settings no
+                // terminal can report, then let the model observe both
+                // those resets and the reported settings as evidence.
+                let mut stdout = io::stdout().lock();
+                stdout
+                    .write_all(baseline::ENTRY_RESETS)
+                    .context("writing overlay entry resets")?;
+                stdout.flush().context("flushing overlay entry resets")?;
+                drop(stdout);
+                terminal_model.process(baseline::ENTRY_RESETS);
+                terminal_model.process(
+                    &terminal_state.baseline.entry_evidence(initial_size.rows),
+                );
+                terminal_model.take_events();
+            }
         }
         drive(
             &*master,
@@ -2518,6 +2534,8 @@ fn is_terminal_reply(encoded: &[u8]) -> bool {
         || (encoded.starts_with(b"\x1b[")
             && !encoded.starts_with(b"\x1b[M")
             && (matches!(encoded.last(), Some(b'R' | b'c' | b'n' | b't' | b'y'))
+                // Focus in/out reports (mode 1004) belong to the remote.
+                || matches!(encoded, b"\x1b[I" | b"\x1b[O")
                 || (encoded.starts_with(b"\x1b[?") && encoded.ends_with(b"u"))))
         || (encoded.starts_with(b"\x1b[>") && encoded.ends_with(b"m"))
 }
@@ -3404,6 +3422,12 @@ mod tests {
             b"\x1b[?2004;1$y".as_slice(),
             b"\x1b]52;c;cXk=\x1b\\".as_slice(),
             b"\x1bP1$r0m\x1b\\".as_slice(),
+            // Focus reports, the theme report and a Kitty graphics reply,
+            // all requested by zellij, belong to the remote.
+            b"\x1b[I".as_slice(),
+            b"\x1b[O".as_slice(),
+            b"\x1b[?997;1n".as_slice(),
+            b"\x1b_Gi=31;OK\x1b\\".as_slice(),
         ] {
             let mut router = InputRouter {
                 mode: InputMode::Palette,

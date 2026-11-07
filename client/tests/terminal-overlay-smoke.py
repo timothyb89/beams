@@ -155,13 +155,15 @@ class Session:
                 self.status = os.waitstatus_to_exitcode(status)
         if (not self.disabled and not self.baseline_replied and b"\x1b[?4m" in self.output
                 and (self.root / "ready").exists()):
-            modes = [1, 6, 9, 25, 47, 66, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 2004, 2026]
+            modes = [1, 5, 6, 7, 9, 25, 45, 47, 66, 69, 1000, 1001, 1002, 1003, 1004, 1005, 1006,
+                     1015, 1016, 2004, 2026]
             reports = b""
             for mode in modes:
-                enabled = self.baseline.get(mode, mode == 25)
+                enabled = self.baseline.get(mode, mode in (7, 25))
                 value = 0 if enabled is None else 1 if enabled else 2
                 reports += f"\x1b[?{mode};{value}$y".encode()
             reports += f"\x1b[4;{1 if self.baseline.get(4, False) else 2}$y".encode()
+            reports += f"\x1b[20;{1 if self.baseline.get(20, False) else 2}$y".encode()
             reports += b"\x1bP1$r" + self.baseline.get("sgr", b"0") + b"m\x1b\\"
             reports += b"\x1bP1$r" + self.baseline.get("margins", b"1;24") + b"r\x1b\\"
             reports += f"\x1bP1$r{self.baseline.get('style', 0)} q\x1b\\".encode()
@@ -452,7 +454,7 @@ def run_unknown_and_recovery(root, binary):
         session.send(b"f8080")
         session.wait(lambda: b"Forward a Beam port" in session.output, "form before recovery")
         offset = len(session.output)
-        unsafe = b"\x1b_Ga=q;opaque qy\x1b\\AFTER UNSUPPORTED"
+        unsafe = b"\x1b_Ga=T,f=24;opaque qy\x1b\\AFTER UNSUPPORTED"
         session.emit(unsafe[:8])
         session.emit(unsafe[8:])
         session.wait(lambda: unsafe in session.output[offset:], "unsupported sequence replay after close")
@@ -485,8 +487,9 @@ def run_resize_reinitialization(root, binary):
         fcntl.ioctl(session.master, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 60, 0, 0))
         session.wait(lambda: "12 60\n" in (root / "sizes").read_text(), "uncovered PTY resize")
 
-        # A clear and explicit coordinates still lack a known saved slot.
-        session.emit(b"\x1b[?6l\x1b[r\x1b[H\x1b[2JPARTIAL INITIALIZATION")
+        # Margins, coordinates and a clear still lack known origin mode
+        # after resize. (A saved slot may stay unknown; painting never uses it.)
+        session.emit(b"\x1b[r\x1b[H\x1b[2JPARTIAL INITIALIZATION")
         session.wait(lambda: b"PARTIAL INITIALIZATION" in session.output, "partial initialization")
         baseline = session.remote_input()
         offset = len(session.output)
@@ -559,12 +562,15 @@ def inherited_initialization(alternate=True):
 
 
 def run_inherited_initialization(root, binary):
-    session = Session(root, binary, initialized=False)
+    # The terminal does not recognize autowrap, so entry evidence cannot
+    # supply it; the client never invents it. (Links, character sets and
+    # the parser boundary are reset by the client at entry.)
+    session = Session(root, binary, initialized=False, baseline={7: None})
     try:
-        partial = inherited_initialization().replace(b"\x1b]8;;\x1b\\", b"")
+        partial = inherited_initialization().replace(b"\x1b[?7h", b"")
         session.emit(partial + b"PARTIAL INHERITED INITIALIZATION")
         session.wait(lambda: b"PARTIAL INHERITED INITIALIZATION" in session.output,
-                     "initialization with an unknown link")
+                     "initialization with unknown autowrap")
         baseline = session.remote_input()
         session.send(b"\x1dyINHERITED INPUT")
         session.wait(lambda: session.remote_input() == baseline + b"yINHERITED INPUT",
