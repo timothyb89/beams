@@ -1979,6 +1979,23 @@ impl Hub {
         });
     }
 
+    /// Answers a Beam's `KnownHostsQuery` from this workstation's
+    /// known_hosts, on its own thread (`ssh -G`/`ssh-keygen` are
+    /// subprocesses; the bridge event thread must not wait on them).
+    fn answer_known_hosts(self: &Arc<Self>, beam_uuid: &str, request_id: String, host: String) {
+        let commands = self.bridges.lock().unwrap().get(beam_uuid).map(|bridge| bridge.commands.clone());
+        let Some(commands) = commands else { return };
+        let beam_uuid = beam_uuid.to_string();
+        thread::spawn(move || {
+            let lines = crate::knownhosts::lookup(&host).unwrap_or_else(|err| {
+                eprintln!("known-hosts: {beam_uuid}: {host:?}: {err:#}");
+                Vec::new()
+            });
+            eprintln!("known-hosts: {beam_uuid}: {host}: {} entr{}", lines.len(), if lines.len() == 1 { "y" } else { "ies" });
+            let _ = commands.send(ClientToBeam::KnownHostsAnswer { request_id, lines });
+        });
+    }
+
     /// Sends `[startup]` to a Beam that hasn't had it yet.
     fn submit_startup(self: &Arc<Self>, beam_uuid: &str) {
         let (first_time, launched) = {
@@ -2864,6 +2881,7 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
             BeamToClient::AgentConnClosed { conn_id } => {
                 hub.agent.lock().unwrap().binds.close(&beam_uuid, &conn_id);
             }
+            BeamToClient::KnownHostsQuery { request_id, host } => hub.answer_known_hosts(&beam_uuid, request_id, host),
             BeamToClient::AgentSignRequest {
                 request_id,
                 conn_id,

@@ -1,6 +1,7 @@
 mod agent;
 mod beamcmd;
 mod startup;
+mod knownhosts;
 mod bridge;
 mod clientd;
 mod copy;

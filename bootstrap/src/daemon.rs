@@ -107,6 +107,8 @@ struct Hub {
     /// (`route_agent`) while it runs.
     manifest_owners: Mutex<HashMap<String, String>>,
     agent: AgentState,
+    /// `known_hosts_query`s waiting for their workstation (`knownhosts`).
+    known_hosts: Arc<crate::knownhosts::Pending>,
     /// Accepted launches (`launch::daemon`).
     launches: crate::launch::daemon::Launches,
 }
@@ -124,6 +126,7 @@ impl Default for Hub {
             client_services: Mutex::new(BTreeMap::new()),
             manifest_owners: Mutex::new(HashMap::new()),
             agent: AgentState::default(),
+            known_hosts: Arc::default(),
             launches: crate::launch::daemon::Launches::new(
                 crate::pathutil::expand_tilde("~/.beam-bootstrap/launch-state"),
                 home_dir(),
@@ -175,13 +178,26 @@ impl AgentBridges for Hub {
     /// the last rule doesn't: the chosen workstation still evaluates and
     /// approves the request itself.
     fn route_agent(&self, session_token: Option<&str>, task_run: Option<&str>) -> Result<String, String> {
+        self.route_bridge(CAPABILITY_SSH_AGENT, session_token, task_run)
+    }
+
+    fn send_agent(&self, bridge_id: &str, message: &BeamToClient) -> bool {
+        let sender = self.bridges.lock().unwrap().get(bridge_id).map(|bridge| bridge.sender.clone());
+        sender.is_some_and(|sender| send_bridge_event(&sender, message))
+    }
+}
+
+impl Hub {
+    /// The bridge (advertising `capability`) for a requester: see
+    /// `route_agent`, which is this for `CAPABILITY_SSH_AGENT`.
+    fn route_bridge(&self, capability: &str, session_token: Option<&str>, task_run: Option<&str>) -> Result<String, String> {
         let owner = task_run
             .and_then(|run| run.split_once('/').map(|(manifest, _)| manifest))
             .and_then(|manifest| self.manifest_owners.lock().unwrap().get(manifest).cloned());
         let bridges = self.bridges.lock().unwrap();
         let capable: Vec<&BridgeRegistration> = bridges
             .values()
-            .filter(|bridge| bridge.ready && bridge.capabilities.contains(CAPABILITY_SSH_AGENT))
+            .filter(|bridge| bridge.ready && bridge.capabilities.contains(capability))
             .collect();
         let only = |keep: &dyn Fn(&BridgeRegistration) -> bool| match capable
             .iter()
@@ -207,11 +223,6 @@ impl AgentBridges for Hub {
             [] => Err("no managed beams client is connected".to_string()),
             _ => Err("several beams clients are connected and none owns this shell's session or task".to_string()),
         }
-    }
-
-    fn send_agent(&self, bridge_id: &str, message: &BeamToClient) -> bool {
-        let sender = self.bridges.lock().unwrap().get(bridge_id).map(|bridge| bridge.sender.clone());
-        sender.is_some_and(|sender| send_bridge_event(&sender, message))
     }
 }
 
@@ -334,6 +345,7 @@ impl Hub {
     fn unregister_bridge(&self, bridge_id: &str) {
         self.agent.forget_bridge(bridge_id);
         let removed = self.bridges.lock().unwrap().remove(bridge_id);
+        crate::knownhosts::bridge_gone(&self.known_hosts, bridge_id);
         if let Some(registration) = removed {
             let changed = {
                 let mut services = self.client_services.lock().unwrap();
@@ -510,6 +522,19 @@ fn handle_line(hub: &Arc<Hub>, line: &str, reply: &Sender<String>, context: &mut
         }
         "client_bridge_message" => {
             client_bridge_message(hub, request_id, &request, reply, context);
+        }
+        "known_hosts_query" => {
+            crate::knownhosts::query(
+                &hub.known_hosts,
+                |capability, token, run| hub.route_bridge(capability, token, run),
+                |bridge_id, message| {
+                    let sender = hub.bridges.lock().unwrap().get(bridge_id).map(|bridge| bridge.sender.clone());
+                    sender.is_some_and(|sender| send_bridge_event(&sender, message))
+                },
+                request_id,
+                &request,
+                reply,
+            );
         }
         "list_clients" => {
             list_clients(hub, request_id, reply);
@@ -909,6 +934,9 @@ fn client_bridge_message(
                 .to_string(),
             );
             let _ = reply.send(json!({"request_id": request_id, "type": "bridge_message_accepted"}).to_string());
+        }
+        ClientToBeam::KnownHostsAnswer { request_id: query_id, lines } => {
+            crate::knownhosts::answer(&hub.known_hosts, bridge_id, &query_id, lines);
         }
         ClientToBeam::Ping { nonce } => {
             send_bridge_event(reply, &BeamToClient::Pong { nonce });

@@ -63,6 +63,10 @@ if [ -x "$BOOTSTRAP_BIN" ]; then
     # not relying on that race resolving in our favor, not a strict
     # requirement for it to work at all.)
     "$BOOTSTRAP_BIN" --repo "$REPO" --only start-bootstrap-daemon
+    # Before the workstation's startup clones can start: their host keys
+    # are checked against the workstation's known_hosts over the bridge
+    # (ssh KnownHostsCommand; see bootstrap/src/knownhosts.rs).
+    "$BOOTSTRAP_BIN" --repo "$REPO" --only known-hosts-command || true
 else
     echo "beam-shell: beam-bootstrap binary not found under $REPO/bootstrap/target - skipping" >>"$LOG"
 fi

@@ -57,19 +57,15 @@ path (runtime delivery, shell preparation, Zellij/TUI with
   seeds them. Confirmed on a fresh Beam 2026-11-07: every startup
   manifest `git@github.com:` clone fails "Host key verification failed"
   (no TTY to ask) before the agent relay is ever asked to sign.
-  - known_hosts (decided 2026-11-07): live lookup instead of seeding.
-    The Beam's ssh config sets `KnownHostsCommand` (OpenSSH >= 8.5) to a
-    `beam-bootstrap client known-hosts %H`-style helper that asks the
-    workstation over the bridge; the workstation answers with
-    `ssh-keygen -F <host>` against its own `known_hosts` (already the
-    relay's trust root, and this matches hashed entries). Nothing personal
-    is copied into the VM wholesale and nothing goes stale. SSH clones
-    already need the bridge for the agent relay, so it adds no new
-    dependency. Check `ssh -V` on the Beam image; without a bridge (headless)
-    fall back to pinned GitHub keys in the core profile (from
-    `https://api.github.com/meta`, fingerprints recorded). Never
-    `ssh-keyscan`/`accept-new`. Applied by a native ssh-config task
-    (idempotent, `Include`-style), not a leaf file copy.
+  - [x] known_hosts: live lookup instead of seeding, landed 2026-11-07.
+    `/etc/ssh/ssh_config.d/beams-known-hosts.conf` sets
+    `KnownHostsCommand beam-bootstrap client known-hosts %H`; the daemon
+    routes a `KnownHostsQuery` to the workstation (agent routing rules),
+    which answers with `ssh-keygen -F` over the files `ssh -G` names.
+    Verified on a disposable Beam: github.com reaches authentication,
+    an unknown host still fails, `~/.ssh` untouched. Remaining: pinned
+    GitHub keys in the core profile for headless launches without a
+    bridge; ssh queries twice per connection (harmless).
   - git config: `user.name`/`user.email` defaulted from the workstation's
     `git config` at compile time, overridable per profile, applied with
     `git config --global` (idempotent; leaves other Beam settings alone).

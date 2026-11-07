@@ -296,6 +296,14 @@ events and snapshot `seq` boundary are documented in
 `docs/development/launches.md` ("Run a launch through the daemon"); the
 end-to-end check is `tests/launch-daemon-smoke.sh`.
 
+`client known-hosts HOST [--socket PATH]` is ssh's `KnownHostsCommand`
+here: it prints the connected workstation's known_hosts entries for `HOST`
+(routed like an agent request, 10 s timeout), always exiting 0 with any
+failure on one stderr line. The `known-hosts-command` step (run
+synchronously by `bin/beam-shell`, and by `launch start`) installs
+`/etc/ssh/ssh_config.d/beams-known-hosts.conf` pointing at this binary.
+See `src/knownhosts.rs`.
+
 `launch start --launch-dir DIR [--socket PATH]` is the interactive
 command `beams ssh --profile` runs (from `~/.beams/runtime/bin/`, no repo
 checkout): it starts the daemon under `beamctl` unless it answers,

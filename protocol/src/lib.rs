@@ -36,9 +36,41 @@ pub const CAPABILITY_STARTUP_MANIFEST: &str = "startup_manifest";
 /// status and conditions to the submitting workstation.
 pub const CAPABILITY_LAUNCH: &str = "launch";
 
+/// The workstation answers host key lookups (`KnownHostsQuery`) from its
+/// own `known_hosts`, for the Beam's ssh `KnownHostsCommand`.
+pub const CAPABILITY_KNOWN_HOSTS: &str = "known_hosts";
+
 /// Every capability this build implements.
-pub const CAPABILITIES: &[&str] =
-    &[CAPABILITY_FILE_FETCH, CAPABILITY_SSH_AGENT, CAPABILITY_STARTUP_MANIFEST, CAPABILITY_LAUNCH];
+pub const CAPABILITIES: &[&str] = &[
+    CAPABILITY_FILE_FETCH,
+    CAPABILITY_SSH_AGENT,
+    CAPABILITY_STARTUP_MANIFEST,
+    CAPABILITY_LAUNCH,
+    CAPABILITY_KNOWN_HOSTS,
+];
+
+/// Longest host name a `KnownHostsQuery` may carry (`[name]:port`).
+pub const MAX_KNOWN_HOST_NAME: usize = 260;
+/// Most lines, and bytes in total, a `KnownHostsAnswer` may carry.
+pub const MAX_KNOWN_HOSTS_LINES: usize = 64;
+pub const MAX_KNOWN_HOSTS_BYTES: usize = 32 * 1024;
+
+/// Whether `host` is a plain `KnownHostsQuery` name: a host name or
+/// address, optionally `[host]:port`, with no known_hosts pattern
+/// characters and no leading `-` (it ends up on a command line).
+pub fn valid_known_host_name(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => match rest.split_once("]:") {
+            Some((name, port)) if !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit()) => name,
+            _ => return false,
+        },
+        None => host,
+    };
+    !name.is_empty()
+        && host.len() <= MAX_KNOWN_HOST_NAME
+        && !name.starts_with('-')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_:".contains(&b))
+}
 
 /// Bounds on the advisory process context attached to an agent request, so
 /// a request always fits in `MAX_FRAME_BYTES`.
@@ -393,6 +425,14 @@ pub enum ClientToBeam {
         #[serde(default)]
         gate: launch::Gate,
     },
+    /// The reply to a `KnownHostsQuery`: matching known_hosts lines (hashed
+    /// entries and `@cert-authority`/`@revoked` markers as written), none
+    /// when the workstation doesn't know the host. Bounded by
+    /// `MAX_KNOWN_HOSTS_LINES`/`MAX_KNOWN_HOSTS_BYTES`.
+    KnownHostsAnswer {
+        request_id: String,
+        lines: Vec<String>,
+    },
     /// The reply to an `AgentSignRequest`: a raw agent message body
     /// (`SSH_AGENT_SIGN_RESPONSE` or `SSH_AGENT_FAILURE`), base64.
     AgentResponse {
@@ -530,6 +570,13 @@ pub enum BeamToClient {
         message: String,
         #[serde(default)]
         context: AgentContext,
+    },
+    /// ssh on the Beam is checking `host` (`%H`: a name or `[name]:port`)
+    /// and asks for the workstation's known_hosts entries for it. Answered
+    /// with `KnownHostsAnswer`. Requires `CAPABILITY_KNOWN_HOSTS`.
+    KnownHostsQuery {
+        request_id: String,
+        host: String,
     },
     /// Agent connection `conn_id` closed; forget its session binds.
     AgentConnClosed {
@@ -779,6 +826,16 @@ mod tests {
     }
 
     #[test]
+    fn known_host_names_are_plain_names_or_bracketed_ports() {
+        for ok in ["github.com", "10.0.0.1", "[git.example.com]:2222", "fe80::1", "host_1"] {
+            assert!(valid_known_host_name(ok), "{ok}");
+        }
+        for bad in ["", "-oProxyCommand=x", "*.example.com", "a,b", "!host", "[host]", "[host]:", "[host]:x", "a b", "h\n"] {
+            assert!(!valid_known_host_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn file_fetch_request_has_a_stable_tagged_shape() {
         let request = ServiceRequest {
             request_id: "request-9".to_string(),
@@ -808,7 +865,7 @@ mod tests {
     #[test]
     fn hello_capabilities_are_optional_both_ways() {
         let hello = serde_json::to_value(ClientToBeam::hello("c", "b", Vec::new())).unwrap();
-        assert_eq!(hello["capabilities"], json!(["file_fetch", "ssh_agent", "startup_manifest", "launch"]));
+        assert_eq!(hello["capabilities"], json!(["file_fetch", "ssh_agent", "startup_manifest", "launch", "known_hosts"]));
         // A hello from a workstation that predates capabilities.
         let old: ClientToBeam = serde_json::from_value(json!({
             "type": "hello",

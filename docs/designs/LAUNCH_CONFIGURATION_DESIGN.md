@@ -77,12 +77,15 @@ flags.
 
 1. **Visibility.** Launch status and upload progress in the session
    overlay (`ServerEvent::LaunchChanged`), retry over the bridge.
-2. **Maintainer profile and legacy removal.** A local profile carrying
-   the current `[startup]` clones and toolchains plus the optional fixed
-   steps worth keeping (starship install, claude update/guidance,
-   kubectl); `KnownHostsCommand` (see `TODO.md`) and grant routing for
-   launch tasks so SSH clones work; then remove the `[startup]` manifest,
-   `bin/beam-shell`'s fixed run and Git-push delivery.
+2. **Maintainer profile and legacy removal.** `KnownHostsCommand` landed
+   (`bootstrap/src/knownhosts.rs`, `client/src/knownhosts.rs`,
+   `client/tests/known-hosts-smoke.sh`). Next: SSH grants for launch
+   tasks (a profile's clones signing without a prompt, like
+   `[startup.ssh_grant]`), then a local profile carrying the current
+   `[startup]` clones and toolchains plus the optional fixed steps worth
+   keeping (starship install, claude update/guidance, kubectl); then
+   remove the `[startup]` manifest, `bin/beam-shell`'s fixed run and
+   Git-push delivery.
 3. Then timing/transport baselines (bridge upload vs scp), `config init`,
    native parameterization, sanitized default migration, git config
    seeding and optional ControlMaster.

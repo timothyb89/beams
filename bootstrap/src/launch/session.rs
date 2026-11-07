@@ -61,6 +61,10 @@ pub fn start(launch_dir: &Path, socket: Option<String>) -> anyhow::Result<()> {
         crate::steps::InstallZellij.run(Path::new("")).map_err(|err| format!("{err:#}"))
     });
 
+    // Before pre: profile hooks and post clones may use ssh.
+    if let Err(err) = crate::knownhosts::install_ssh_config(&exe) {
+        eprintln!("beams: known_hosts lookups through the workstation are unavailable: {err:#}");
+    }
     ensure_daemon(&exe, socket.clone())?;
     let mut conn = super::connect(socket.clone())?;
     let reply = super::request(

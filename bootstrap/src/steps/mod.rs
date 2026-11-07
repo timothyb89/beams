@@ -5,6 +5,7 @@ mod daemon_service;
 mod default_shell;
 mod k3s_bot;
 mod kubeconfig;
+mod known_hosts_command;
 mod kubectl;
 mod link;
 mod linkutil;
@@ -47,6 +48,7 @@ pub mod cap {
     pub const CLAUDE_UPDATED: &str = "claude-updated";
     pub const BOOTSTRAP_DAEMON_RUNNING: &str = "bootstrap-daemon-running";
     pub const TOOL_PATHS_LINKED: &str = "tool-paths-linked";
+    pub const KNOWN_HOSTS_COMMAND: &str = "known-hosts-command";
 }
 
 /// Named resources a step's `run()` holds exclusively while running - see
@@ -182,6 +184,7 @@ fn all() -> Vec<Box<dyn Step>> {
         Box::new(kubeconfig::LinkKubeconfig),
         Box::new(claude::UpdateClaude),
         Box::new(daemon_service::StartBootstrapDaemon),
+        Box::new(known_hosts_command::InstallKnownHostsCommand),
     ]
 }
 

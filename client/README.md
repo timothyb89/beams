@@ -605,6 +605,22 @@ doesn't leave the others half-done. `tsh beams add` isn't wrapped:
 `beams ssh` (or `beams ssh --purpose <name>`) is the spawn path, since
 it also tracks the purpose and bootstraps the beam.
 
+## Host keys: the Beam asks this workstation's known_hosts
+
+A Beam keeps no copy of your known_hosts. Its ssh config (a drop-in,
+`/etc/ssh/ssh_config.d/beams-known-hosts.conf`, written by `launch start`
+or `bin/beam-shell`) sets `KnownHostsCommand` to `beam-bootstrap client
+known-hosts %H`, which asks the connected workstation over the bridge
+(`KnownHostsQuery`). The daemon answers with `ssh-keygen -F HOST` over the
+known_hosts files `ssh -G HOST` resolves (hashed entries, `[host]:port`,
+`@cert-authority`/`@revoked` all work), so `git@github.com:` clones on the
+Beam verify GitHub's key against yours. Only the entries for the one host
+being checked travel, and only to a Beam you're bridged to; an unknown
+host still fails (nothing is ever accepted automatically). The daemon logs
+each lookup (`known-hosts: <beam>: <host>: N entries`).
+`BEAMS_KNOWN_HOSTS_FILES` (colon-separated, in the daemon's environment)
+replaces the files, e.g. for tests.
+
 ## Configuration: SSH keys and startup tasks
 
 Client-side environment profiles, batched uploads/packages, and pre/post

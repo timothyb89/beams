@@ -8,6 +8,7 @@ mod events;
 mod executor;
 mod fetch;
 mod graph;
+mod knownhosts;
 mod launch;
 mod pathutil;
 mod packages;
@@ -148,6 +149,16 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ClientCommand {
+    /// Print the connected workstation's known_hosts entries for HOST
+    /// (`name` or `[name]:port`): ssh's `KnownHostsCommand` on this Beam
+    /// (see `knownhosts.rs`). Always exits 0; failures go to stderr.
+    KnownHosts {
+        /// Taken as given (even with a leading `-`) and validated.
+        #[arg(allow_hyphen_values = true)]
+        host: String,
+        #[arg(long)]
+        socket: Option<String>,
+    },
     /// List workstation clients with live bridges to this Beam.
     List {
         #[arg(long)]
@@ -375,6 +386,13 @@ fn run_client_bridge(socket: Option<String>) {
 
 fn run_client_command(command: ClientCommand) -> i32 {
     match command {
+        ClientCommand::KnownHosts { host, socket } => match knownhosts::run_cli(&host, socket) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("beams known-hosts: {err:#}");
+                0
+            }
+        },
         ClientCommand::List { socket } => client_list(socket),
         ClientCommand::Request { socket, service } => client_request(socket, service),
     }
