@@ -22,8 +22,9 @@ template definitions, package batches, artifact selections and graph validation.
 
 ## Implementation status and next-session handoff
 
-Updated 2026-11-07 after the `beams ssh --profile` slice (phase 3 of the
-sequence below). A new Beam can now be created for a launch: the
+Updated 2026-11-07 after the legacy-startup removal (`a7f32d2`), which
+followed the `beams ssh --profile` slice (phase 3 of the sequence below).
+A new Beam can now be created for a launch: the
 workstation packs the profile first, copies a small runtime and the pre
 bundle (no Git checkout), and the Beam runs pre, opens a per-launch Zellij
 session and reports readiness; post goes over the bridge as with `beams
@@ -45,7 +46,7 @@ Beam is a launch: `--profile`, `[launch] profile`, else
 | (2026-11-07) | `beams ssh --profile`/`--push-repo`, `[launch] profile`; `~/.beams/` runtime staging; `launch start`/`launch shell`; per-launch Zellij session; bridge adopts a Beam-submitted launch; launch Beams skip `[startup]`; plan PATH `~` expansion | `client/src/main.rs`, `stage.rs`, `bridge.rs`, `clientd.rs`, `bootstrap/src/launch/session.rs`, `launch/daemon.rs`, `shell/runtime/` |
 | `52c0363`, `c75b48c` | `KnownHostsCommand` through the workstation; launch `[ssh_grant]` | `bootstrap/src/knownhosts.rs`, `client/src/knownhosts.rs`, `client/src/config/plan.rs`, `client/src/clientd/launches.rs` |
 | `1c9f0e7`, `a967019` | starship as a pre template in `builtin:development`; `beams` on the session `PATH` | `bootstrap/src/tasks/install_starship.rs`, `launch/session.rs` |
-| `fe7556c` + Beam-side commit | Legacy removal: profile always, no `[startup]`/`RunManifest`, no fixed steps, `bin/`, `shell/fish`, `shell/zellij` | `client/src/main.rs`, `clientd.rs`, `protocol/src/lib.rs`, `bootstrap/src/main.rs`, `bootstrap/src/install/` |
+| `fe7556c`, `a7f32d2` | Legacy removal: profile always, no `[startup]`/`RunManifest`, no fixed steps, `bin/`, `shell/fish`, `shell/zellij` | `client/src/main.rs`, `clientd.rs`, `protocol/src/lib.rs`, `bootstrap/src/main.rs`, `bootstrap/src/install/` |
 
 Available commands are `beams config validate/explain/pack/pack-post/launch`,
 `beams ssh --profile`, and `beam-bootstrap launch
@@ -86,11 +87,16 @@ flags.
 1. **Visibility.** Launch status and upload progress in the session
    overlay (`ServerEvent::LaunchChanged`), retry over the bridge.
 2. **Legacy-removal follow-ups.** Done: maintainer profile, real-key
-   grant clones, removal. Left (blocked on the overlay work in
+   grant clones (3 of 5 uses on `radiant-rocket`), removal. First, on the
+   workstation: move any `[startup]` out of `config.toml` (now refused),
+   install the maintainer profile (below) and set `[launch] profile`, and
+   rebuild the client and the musl `beam-bootstrap`. Left (blocked on the overlay work in
    `client/src/session.rs`): drop `LocalDaemon::unavailable` and the
    "Startup" grant wording, rename `client/src/startup.rs` to
    `grants.rs`. Validate the ported personal tasks (tbot, claude update,
-   kubectl) on a disposable Beam.
+   kubectl: never run on a real Beam yet) on a disposable Beam. Give
+   `config launch`'s interactive gate a shell reporter again (the fish
+   conf.d hook went with `shell/fish`; `--headless` works).
 3. Then timing/transport baselines (bridge upload vs scp), `config init`,
    native parameterization, sanitized default migration, git config
    seeding and optional ControlMaster.
@@ -138,6 +144,17 @@ flags.
 - **Shell environment on this Beam.** Non-interactive shells may lack
   `~/.cargo/bin` on `PATH`; a filtered build command can then look clean
   while nothing compiled. Check the exit status or export the path first.
+- **Maintainer profile is not in Git.** `environments/local/personal.toml`
+  and `environments/local/personal/` (hooks: `claude-md/` with a copy of
+  `.claude/CLAUDE.md`, `claude-update.sh`, `kubectl.sh`, `teleport.sh`
+  trying `cdn.teleport.dev` then the staging `cdn.cloud.gravitational.io`,
+  `tbot.sh`) are gitignored. The workstation's copy under
+  `~/.config/beams-client/profiles/` is the durable one; a session Beam
+  only has whatever was copied onto it.
+- **Where the launch runtime lives.** `bootstrap/src/launch/session.rs`
+  (`launch start`/`launch shell`, `beams` link, session PATH),
+  `bootstrap/src/install/` (Zellij, starship), `client/src/stage.rs`
+  (`~/.beams/` staging), `shell/runtime/` (embedded wrapper and layout).
 - **Pre-profile Beams.** A Beam from before the removal (e.g. the one an
   earlier session ran in) has no `~/.beams/runtime`; the new bridge
   command needs it. Link `~/.beams/runtime/bin/beam-bootstrap` to that

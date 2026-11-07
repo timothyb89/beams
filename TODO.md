@@ -205,6 +205,12 @@ path (runtime delivery, shell preparation, Zellij/TUI with
   CLAUDE.md merge, kubectl, tbot/tctl from the staging CDN, k3s bot and
   kubeconfig) are script tasks in gitignored
   `environments/local/personal.toml` + `personal/`.
+- [ ] Workstation migration (maintainer): drop `[startup]` from
+  `config.toml` (now refused), copy the gitignored
+  `environments/local/personal.toml` + `personal/` into
+  `~/.config/beams-client/profiles/`, set `[launch] profile`, rebuild the
+  client and musl `beam-bootstrap`; then a disposable-Beam run to validate
+  the ported tbot/claude-update/kubectl tasks.
 - [ ] Legacy-removal follow-ups: `client/src/session.rs` still has
   `LocalDaemon::unavailable` (now unused, a build warning) and
   "Startup" grant wording/tests (`GrantRecord::is_launch`, menu title);
