@@ -58,6 +58,32 @@ fn default_tasks() -> Vec<ManifestTask> {
         .collect()
 }
 
+/// A launch's `[ssh_grant]` as compiled: `ssh-grant.json` in the
+/// workstation's launch directory, never sent to the Beam (the Beam can't
+/// widen it, and nothing regenerates it from Beam state).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LaunchGrant {
+    pub hosts: Vec<String>,
+    pub user: String,
+    pub window_secs: u64,
+    pub max_uses: u32,
+    /// Plan node IDs it covers (`tasks:<id>`).
+    pub nodes: Vec<String>,
+    /// The earliest phase of a covered node: the window opens when that
+    /// phase can start (acceptance for pre, `interface-ready` for post).
+    pub phase: beams_protocol::launch::Phase,
+}
+
+impl LaunchGrant {
+    pub const FILE: &'static str = "ssh-grant.json";
+
+    /// The `BEAMS_TASK_RUN` tags of the covered tasks in launch `launch_id`
+    /// (`bootstrap/src/launch/runner.rs`: `<launch>/launch:<launch>:<node>`).
+    pub fn task_runs(&self, launch_id: &str) -> Vec<String> {
+        self.nodes.iter().map(|node| format!("{launch_id}/launch:{launch_id}:{node}")).collect()
+    }
+}
+
 /// `[startup.ssh_grant]`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -186,16 +212,28 @@ impl GrantRecord {
         self.hosts.join(", ")
     }
 
+    /// A launch's grant (`manifest_id` is then the launch ID; startup
+    /// manifests are `manifest-N`).
+    pub fn is_launch(&self) -> bool {
+        !self.manifest_id.starts_with("manifest-")
+    }
+
     pub fn summary(&self) -> String {
-        format!("Startup: {} as {} · {} of {} used", self.hosts_label(), self.user, self.uses, self.max_uses)
+        let kind = if self.is_launch() { "Launch" } else { "Startup" };
+        format!("{kind}: {} as {} · {} of {} used", self.hosts_label(), self.user, self.uses, self.max_uses)
     }
 
     pub fn describe(&self, now_ms: u64) -> Vec<(String, bool)> {
         let left = self.expires_at_ms.saturating_sub(now_ms) / 1000;
+        let (tasks, finishes, scope) = if self.is_launch() {
+            ("launch's SSH tasks", "the launch finishes", "Launch")
+        } else {
+            ("startup tasks", "startup finishes", "Startup manifest")
+        };
         vec![
             (
                 format!(
-                    "This Beam's startup tasks may sign in to {} as {} without asking.",
+                    "This Beam's {tasks} may sign in to {} as {} without asking.",
                     self.hosts_label(),
                     self.user
                 ),
@@ -203,7 +241,7 @@ impl GrantRecord {
             ),
             (
                 format!(
-                    "Used {} of {} times; ends in {}m{:02}s or when startup finishes.",
+                    "Used {} of {} times; ends in {}m{:02}s or when {finishes}.",
                     self.uses,
                     self.max_uses,
                     left / 60,
@@ -211,7 +249,7 @@ impl GrantRecord {
                 ),
                 false,
             ),
-            (format!("Startup manifest: {}.", self.manifest_id), false),
+            (format!("{scope}: {}.", self.manifest_id), false),
         ]
     }
 }

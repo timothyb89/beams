@@ -475,3 +475,47 @@ target = "~/data"
     assert!(compiled.notes.iter().any(|n| n.contains("staged in pre")));
     assert!(depends(&compiled, "tasks:z-post", "artifact-ready:pre"));
 }
+
+#[test]
+fn ssh_grants_cover_ssh_clones_or_named_tasks_and_stay_off_the_remote_plan() {
+    let f = Fixture::new();
+    let clones = "[tasks.core]\ntemplate='clone-git-repo'\nparams={repo='git@github.com:o/core.git', dest='~/core'}\n\
+                  [tasks.web]\ntemplate='clone-git-repo'\nparams={repo='https://github.com/o/web', dest='~/web'}\n";
+    let compiled = f.compile(&format!("{clones}[ssh_grant]\nhosts=['github.com']")).unwrap();
+    let grant = compiled.ssh_grant.clone().unwrap();
+    assert_eq!(grant.nodes, ["tasks:core"], "only the SSH clone");
+    assert_eq!((grant.user.as_str(), grant.max_uses, grant.window_secs), ("git", 3, 600));
+    assert_eq!(grant.phase, Phase::Post);
+    assert_eq!(
+        grant.task_runs("L"),
+        ["L/launch:L:tasks:core"],
+        "the tag bootstrap/src/launch/runner.rs gives the task"
+    );
+    let plan = serde_json::to_string(&compiled.plan).unwrap();
+    assert!(!plan.contains("github.com\"]") && !plan.contains("ssh_grant"), "not in the Beam's plan");
+    assert!(explain(&compiled).contains("SSH grant: github.com as git, 3 uses within 600s from interface-ready; covers tasks:core"));
+
+    f.write("sync.sh", "git fetch\n");
+    let named = f
+        .compile(&format!(
+            "{clones}[tasks.sync]\nscript='./sync.sh'\nphase='pre'\n[ssh_grant]\nhosts=['github.com']\ntasks=['sync','core']\nmax_uses=5\nwindow_secs=60"
+        ))
+        .unwrap()
+        .ssh_grant
+        .unwrap();
+    assert_eq!(named.nodes, ["tasks:sync", "tasks:core"]);
+    assert_eq!((named.max_uses, named.window_secs, named.phase), (5, 60, Phase::Pre), "a pre task opens it at acceptance");
+
+    assert!(f.error(&format!("{clones}[ssh_grant]\nhosts=['github.com']\ntasks=['nope']")).contains("isn't an enabled task"));
+    assert!(f.error("[ssh_grant]\nhosts=['github.com']").contains("covers no tasks"));
+    assert!(f.error(&format!("{clones}[ssh_grant]\nhosts=['github.com']\nwindow_secs=7200")).contains("window_secs"));
+    assert!(f.error(&format!("{clones}[ssh_grant]\nhosts=['github.com']\ntypo=1")).contains("unknown field"));
+
+    // A child replaces an inherited grant whole; hosts = [] removes it.
+    let base = f.write("base.toml", &format!("schema_version = 1\n{clones}[ssh_grant]\nhosts=['github.com']\n"));
+    let child = |grant: &str| format!("extends=['{}']\n{grant}", base.display());
+    assert!(f.compile(&child("")).unwrap().ssh_grant.is_some(), "inherited");
+    assert!(f.compile(&child("[ssh_grant]\nhosts=[]")).unwrap().ssh_grant.is_none(), "removed");
+    let replaced = f.compile(&child("[ssh_grant]\nhosts=['gitlab.com']\nuser='me'")).unwrap().ssh_grant.unwrap();
+    assert_eq!((replaced.hosts, replaced.user), (vec!["gitlab.com".to_string()], "me".to_string()));
+}

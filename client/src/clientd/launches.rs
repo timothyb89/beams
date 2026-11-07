@@ -69,6 +69,10 @@ pub struct LaunchRecord {
     /// Conditions the Beam reported released.
     #[serde(default)]
     pub released: Vec<String>,
+    /// The launch's `[ssh_grant]` was issued (at most once per launch, so a
+    /// forced reconnect can't refill its budget).
+    #[serde(default)]
+    pub grant_issued: bool,
     #[serde(default)]
     pub message: Option<String>,
     #[serde(default)]
@@ -189,6 +193,7 @@ impl Hub {
                         stage: LaunchStage::Submitting,
                         status: None,
                         released: Vec::new(),
+                        grant_issued: false,
                         message: Some("waiting for the Beam bridge".into()),
                         upload: None,
                     };
@@ -265,6 +270,42 @@ impl Hub {
 
     fn drive_launch(self: &Arc<Self>, id: &str) {
         self.begin_upload(id, Blob::Declaration);
+    }
+
+    /// Issues launch `id`'s `[ssh_grant]` (from its workstation-side
+    /// `ssh-grant.json`) once the covered tasks' phase can start: at
+    /// acceptance for pre, at `interface-ready` for post. At most once.
+    fn issue_launch_grant(self: &Arc<Self>, id: &str) {
+        let Some(record) = self.launch_record(id) else { return };
+        if record.grant_issued || record.stage == LaunchStage::Finished {
+            return;
+        }
+        let path = record.launch_dir.join(crate::startup::LaunchGrant::FILE);
+        if !path.exists() {
+            return;
+        }
+        let grant: crate::startup::LaunchGrant = match beams_artifacts::read_json(&path) {
+            Ok(grant) => grant,
+            Err(err) => {
+                eprintln!("launch {id}: reading {}: {err:#}", path.display());
+                return;
+            }
+        };
+        let open = grant.phase == beams_protocol::launch::Phase::Pre
+            || record.released.iter().any(|c| c == "interface-ready");
+        if !open {
+            return;
+        }
+        self.update_launch(id, |l| l.grant_issued = true);
+        self.issue_grant(
+            &record.beam_uuid,
+            id,
+            grant.hosts.clone(),
+            grant.user.clone(),
+            std::time::Duration::from_secs(grant.window_secs),
+            grant.max_uses,
+            Some(grant.task_runs(id).into_iter().collect()),
+        );
     }
 
     fn launch_record(&self, id: &str) -> Option<LaunchRecord> {
@@ -485,6 +526,11 @@ impl Hub {
                     l.released = released;
                     l.message = Some(if existing { "the Beam already has this launch" } else { "accepted by the Beam" }.into());
                 });
+                if finished {
+                    self.end_grants_for_scope(&launch_id, "the launch finished");
+                } else {
+                    self.issue_launch_grant(&launch_id);
+                }
                 self.continue_launch(&launch_id);
             }
             BeamToClient::LaunchRejected { launch_id, message, .. } if owned(&launch_id) => {
@@ -495,6 +541,9 @@ impl Hub {
                 });
             }
             BeamToClient::LaunchStatus { launch_id, status, message } if owned(&launch_id) => {
+                if status.finished() {
+                    self.end_grants_for_scope(&launch_id, "the launch finished");
+                }
                 self.update_launch(&launch_id, |l| {
                     if status.finished() {
                         l.stage = LaunchStage::Finished;
@@ -518,6 +567,7 @@ impl Hub {
                     }
                 });
                 if released && condition == "interface-ready" {
+                    self.issue_launch_grant(&launch_id);
                     self.continue_launch(&launch_id);
                 }
             }

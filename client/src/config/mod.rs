@@ -255,6 +255,19 @@ fn explain(compilation: &Compilation) -> String {
     for (key, value) in &compilation.plan.env {
         writeln!(out, "Environment: {key}={value}").unwrap();
     }
+    if let Some(grant) = &compilation.ssh_grant {
+        writeln!(
+            out,
+            "SSH grant: {} as {}, {} uses within {}s from {}; covers {}",
+            grant.hosts.join(", "),
+            grant.user,
+            grant.max_uses,
+            grant.window_secs,
+            if grant.phase == beams_protocol::launch::Phase::Pre { "acceptance" } else { "interface-ready" },
+            grant.nodes.join(", ")
+        )
+        .unwrap();
+    }
     for (key, origin) in &compilation.origins {
         if key.starts_with("shell.") || key.starts_with("env.") || key.starts_with("package:") {
             writeln!(out, "  {key} <- {}", origin.context()).unwrap();

@@ -25,6 +25,7 @@ pub fn prepare(
         bail!("launch output already exists: {}", output.display());
     }
     let compilation = plan::compile(profile)?;
+    let ssh_grant = compilation.ssh_grant.clone();
     let declaration = beams_artifacts::declaration(compilation.plan)?;
     let temp = TemporaryDirectory::new(
         output
@@ -39,6 +40,9 @@ pub fn prepare(
     };
     // Workstation-only, kept separate from the files that will be uploaded.
     write_json(&temp.0.join("local-inputs.json"), &local)?;
+    if let Some(grant) = &ssh_grant {
+        write_json(&temp.0.join(crate::startup::LaunchGrant::FILE), grant)?;
+    }
     phase(&temp.0, &declaration, &local, Phase::Pre)?;
     temp.publish(output)?;
     Ok(declaration)

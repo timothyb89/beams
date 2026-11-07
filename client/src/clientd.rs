@@ -455,6 +455,9 @@ struct AgentRuntime {
     /// Startup manifests sent but not yet accepted: request id ->
     /// (Beam UUID, grant to issue once accepted, its use budget).
     startup_requests: BTreeMap<String, (String, Option<GrantConfig>, u32)>,
+    /// Grants limited to exact `BEAMS_TASK_RUN` tags (launch grants), by
+    /// grant id; checked on top of `GrantRecord::covers`.
+    grant_scopes: BTreeMap<String, BTreeSet<String>>,
 }
 
 struct PendingAgent {
@@ -2052,12 +2055,29 @@ impl Hub {
             return;
         };
         let window = grant.window();
+        self.issue_grant(beam_uuid, manifest_id, grant.hosts, grant.user, window, max_uses, None);
+    }
+
+    /// Issues a grant for `scope` (a manifest or launch ID) on `beam_uuid`,
+    /// usable for `window` or `max_uses` signatures; `task_runs` limits it
+    /// to those exact task tags (else any task of `scope`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn issue_grant(
+        self: &Arc<Self>,
+        beam_uuid: &str,
+        scope: &str,
+        hosts: Vec<String>,
+        user: String,
+        window: Duration,
+        max_uses: u32,
+        task_runs: Option<BTreeSet<String>>,
+    ) {
         let record = GrantRecord {
             grant_id: Uuid::new_v4().to_string(),
             beam_uuid: beam_uuid.to_string(),
-            manifest_id: manifest_id.to_string(),
-            hosts: grant.hosts,
-            user: grant.user,
+            manifest_id: scope.to_string(),
+            hosts,
+            user,
             uses: 0,
             max_uses,
             expires_at_ms: now_ms() + window.as_millis() as u64,
@@ -2065,7 +2085,13 @@ impl Hub {
         };
         eprintln!("startup: {beam_uuid}: grant {} issued: {}", record.grant_id, record.summary());
         let grant_id = record.grant_id.clone();
-        self.agent.lock().unwrap().grants.insert(grant_id.clone(), record.clone());
+        {
+            let mut agent = self.agent.lock().unwrap();
+            agent.grants.insert(grant_id.clone(), record.clone());
+            if let Some(runs) = task_runs {
+                agent.grant_scopes.insert(grant_id.clone(), runs);
+            }
+        }
         self.broadcast(ServerEvent::GrantChanged { grant: record });
         let weak = Arc::downgrade(self);
         thread::spawn(move || {
@@ -2076,6 +2102,10 @@ impl Hub {
         });
     }
 
+    pub(crate) fn end_grants_for_scope(&self, scope: &str, why: &str) {
+        self.end_grants_where(|g| g.manifest_id == scope, why);
+    }
+
     fn end_grants_for(&self, beam_uuid: &str, why: &str) {
         self.end_grants_where(|g| g.beam_uuid == beam_uuid, why);
     }
@@ -2084,6 +2114,9 @@ impl Hub {
         let ended: Vec<GrantRecord> = {
             let mut agent = self.agent.lock().unwrap();
             let ids: Vec<String> = agent.grants.values().filter(|g| matches(g)).map(|g| g.grant_id.clone()).collect();
+            for id in &ids {
+                agent.grant_scopes.remove(id);
+            }
             ids.iter().filter_map(|id| agent.grants.remove(id)).collect()
         };
         for mut grant in ended {
@@ -2097,10 +2130,13 @@ impl Hub {
     fn take_grant_use(&self, beam_uuid: &str, prompt: &crate::agent::AgentPrompt) -> Option<GrantRecord> {
         let now = now_ms();
         let mut agent = self.agent.lock().unwrap();
-        let grant = agent
-            .grants
+        let AgentRuntime { grants, grant_scopes, .. } = &mut *agent;
+        let in_scope = |id: &str| {
+            grant_scopes.get(id).is_none_or(|runs| prompt.claimed.task_run.as_ref().is_some_and(|run| runs.contains(run)))
+        };
+        let grant = grants
             .values_mut()
-            .find(|g| g.beam_uuid == beam_uuid && g.usable(now) && g.covers(prompt))?;
+            .find(|g| g.beam_uuid == beam_uuid && g.usable(now) && g.covers(prompt) && in_scope(&g.grant_id))?;
         grant.uses += 1;
         Some(grant.clone())
     }
@@ -4977,6 +5013,7 @@ mod tests {
                 stage: LaunchStage::Submitting,
                 status: None,
                 released: Vec::new(),
+                grant_issued: false,
                 message: None,
                 upload: None,
             },
@@ -4985,6 +5022,95 @@ mod tests {
         assert!(next_manifest(&commands).is_none(), "the launch plan is the only configuration source");
         assert!(hub.state.lock().unwrap().startup_submitted.contains("beam-uuid"));
         let _ = fs::remove_file(sock);
+    }
+
+    #[test]
+    fn launch_grants_open_at_their_phase_sign_only_their_tasks_and_are_issued_once() {
+        use beams_protocol::launch::{LaunchStatus, Phase};
+        use ssh_key::{rand_core::OsRng, Algorithm, PrivateKey};
+        let (user, host) = (
+            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
+            PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap(),
+        );
+        let (hub, commands, sock) = startup_hub(&user, &host, 2);
+        let root = std::env::temp_dir().join(format!("beams-launch-grant-{}", Uuid::new_v4()));
+        let add = |id: &str, phase: Phase| {
+            let dir = root.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            let grant = crate::startup::LaunchGrant {
+                hosts: vec!["github.com".into()],
+                user: "git".into(),
+                window_secs: 600,
+                max_uses: 2,
+                nodes: vec!["tasks:core".into()],
+                phase,
+            };
+            fs::write(dir.join(crate::startup::LaunchGrant::FILE), serde_json::to_vec(&grant).unwrap()).unwrap();
+            hub.state.lock().unwrap().launches.insert(
+                id.into(),
+                LaunchRecord {
+                    launch_id: id.into(),
+                    plan_digest: "digest".into(),
+                    beam_id: "beam".into(),
+                    beam_uuid: "beam-uuid".into(),
+                    login: "beams".into(),
+                    launch_dir: dir,
+                    gate: beams_protocol::launch::Gate::Interactive,
+                    stage: LaunchStage::Submitting,
+                    status: None,
+                    released: Vec::new(),
+                    grant_issued: false,
+                    message: None,
+                    upload: None,
+                },
+            );
+        };
+        let say = |message| hub.launch_message("beam-uuid", message);
+        let accepted = |id: &str, released: &[&str]| BeamToClient::LaunchAccepted {
+            request_id: "r".into(),
+            launch_id: id.into(),
+            existing: true,
+            status: LaunchStatus::Running,
+            released: released.iter().map(|c| c.to_string()).collect(),
+        };
+        let grants = || hub.agent.lock().unwrap().grants.values().cloned().collect::<Vec<_>>();
+        add("post-launch", Phase::Post);
+        connect_capable(&hub);
+
+        // A post grant waits for the interface, then signs only its own task.
+        say(accepted("post-launch", &["artifact-ready:pre"]));
+        assert!(grants().is_empty(), "not during pre");
+        say(BeamToClient::LaunchCondition {
+            launch_id: "post-launch".into(),
+            condition: "interface-ready".into(),
+            released: true,
+            message: None,
+        });
+        let issued = grants();
+        assert_eq!(issued.len(), 1);
+        assert!(issued[0].summary().starts_with("Launch: github.com as git"), "{}", issued[0].summary());
+        while commands.try_recv().is_ok() {}
+        github_login(&hub, "c1", &user, &host, Some("post-launch/launch:post-launch:tasks:core"));
+        assert!(pending_agent_ids(&hub).is_empty(), "its task signs without a prompt");
+        assert!(matches!(next_agent_message(&commands), ClientToBeam::AgentResponse { request_id, .. } if request_id == "c1"));
+        github_login(&hub, "c2", &user, &host, Some("post-launch/launch:post-launch:tasks:other"));
+        github_login(&hub, "c3", &user, &host, Some("post-launch/anything"));
+        assert_eq!(pending_agent_ids(&hub).len(), 2, "other tasks of the launch still ask");
+
+        // A reconnect ends it, and the resubmission doesn't issue a new one.
+        hub.end_grants_for("beam-uuid", "the Beam bridge reconnected");
+        say(accepted("post-launch", &["artifact-ready:pre", "interface-ready"]));
+        assert!(grants().is_empty(), "issued at most once per launch");
+        assert!(hub.state.lock().unwrap().launches["post-launch"].grant_issued, "persisted");
+
+        // A pre grant opens at acceptance and ends with the launch.
+        add("pre-launch", Phase::Pre);
+        say(accepted("pre-launch", &[]));
+        assert_eq!(grants().len(), 1);
+        say(BeamToClient::LaunchStatus { launch_id: "pre-launch".into(), status: LaunchStatus::Ok, message: None });
+        assert!(grants().is_empty(), "ended with the launch");
+        let _ = fs::remove_file(sock);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -172,8 +172,8 @@ impl AgentBridges for Hub {
     }
 
     /// A shell's session token wins; else a task of a running
-    /// workstation-submitted manifest goes to the client that submitted
-    /// it; else the only connected client. The run tag is advisory (any
+    /// workstation-submitted manifest or launch goes to the client that
+    /// owns it; else the only connected client. The run tag is advisory (any
     /// process can claim one), but routing on it gives a spoofer nothing
     /// the last rule doesn't: the chosen workstation still evaluates and
     /// approves the request itself.
@@ -191,9 +191,10 @@ impl Hub {
     /// The bridge (advertising `capability`) for a requester: see
     /// `route_agent`, which is this for `CAPABILITY_SSH_AGENT`.
     fn route_bridge(&self, capability: &str, session_token: Option<&str>, task_run: Option<&str>) -> Result<String, String> {
-        let owner = task_run
-            .and_then(|run| run.split_once('/').map(|(manifest, _)| manifest))
-            .and_then(|manifest| self.manifest_owners.lock().unwrap().get(manifest).cloned());
+        // A running manifest's or launch's owner (`<manifest or launch id>/<task>`).
+        let owner = task_run.and_then(|run| run.split_once('/').map(|(scope, _)| scope)).and_then(|scope| {
+            self.manifest_owners.lock().unwrap().get(scope).cloned().or_else(|| self.launches.running_owner(scope))
+        });
         let bridges = self.bridges.lock().unwrap();
         let capable: Vec<&BridgeRegistration> = bridges
             .values()

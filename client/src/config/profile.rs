@@ -132,6 +132,27 @@ struct Profile {
     tasks: BTreeMap<String, Task>,
     #[serde(default)]
     templates: BTreeMap<String, ScriptTemplate>,
+    ssh_grant: Option<SshGrant>,
+}
+
+/// `[ssh_grant]`: lets this launch's SSH tasks use the workstation's key
+/// without a prompt, within limits the workstation enforces (see
+/// `startup::GrantRecord`). A profile's section replaces an inherited one
+/// whole; `hosts = []` removes it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshGrant {
+    /// Host names as the workstation's known_hosts spells them.
+    pub hosts: Vec<String>,
+    /// Default `git`.
+    pub user: Option<String>,
+    /// From when the covered tasks' phase starts. Default 600, max 3600.
+    pub window_secs: Option<u64>,
+    /// Default: one per covered task, plus two.
+    pub max_uses: Option<u32>,
+    /// Task IDs it covers. Default: every `clone-git-repo` task with an
+    /// SSH-style `repo` (`git@…`, `ssh://…`).
+    pub tasks: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -220,6 +241,7 @@ pub struct Resolved {
     pub files: BTreeMap<String, Declared<File>>,
     pub tasks: BTreeMap<String, Declared<Task>>,
     pub templates: BTreeMap<String, Declared<ScriptTemplate>>,
+    pub ssh_grant: Option<Declared<SshGrant>>,
 }
 
 fn merge_entries<T>(
@@ -322,6 +344,9 @@ impl Resolved {
             "templates",
             |v| v.enabled,
         )?;
+        if let Some(grant) = profile.ssh_grant {
+            self.ssh_grant = Some(Declared { value: grant, origin: origin.at("ssh_grant") });
+        }
         self.profiles.push(origin.profile);
         Ok(())
     }

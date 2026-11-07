@@ -15,6 +15,8 @@ pub use beams_protocol::launch::{Action, Artifact, LaunchPlan, Node};
 /// never belong to the remote plan.
 #[derive(Debug, Serialize)]
 pub struct Compilation {
+    /// Workstation-only: see `startup::LaunchGrant`.
+    pub ssh_grant: Option<crate::startup::LaunchGrant>,
     pub profiles: Vec<String>,
     pub origins: BTreeMap<String, Origin>,
     pub sources: BTreeMap<String, Source>,
@@ -478,6 +480,7 @@ fn prerequisite_tasks(tasks: &mut BTreeMap<String, Declared<Task>>) -> anyhow::R
 
 pub fn compile(selection: &str) -> anyhow::Result<Compilation> {
     let mut resolved = profile::resolve(selection)?;
+    let ssh_grant = resolved.ssh_grant.take();
     let mut tasks = BTreeMap::new();
     // Validate template definitions even if they have no instances.
     for declared in resolved.templates.values() {
@@ -876,7 +879,9 @@ pub fn compile(selection: &str) -> anyhow::Result<Compilation> {
         .after = pre;
     let ordered = order_nodes(compiler.nodes, &compiler.origins)?;
     validate_destinations(&ordered)?;
+    let ssh_grant = ssh_grant.map(|grant| compile_grant(grant, &ordered)).transpose()?.flatten();
     Ok(Compilation {
+        ssh_grant,
         profiles: resolved.profiles,
         origins: compiler.origins,
         sources: compiler.sources,
@@ -1065,4 +1070,53 @@ fn validate_destinations(nodes: &[Node]) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolves `[ssh_grant]` against the compiled nodes. `None` for
+/// `hosts = []` (an inherited grant removed).
+fn compile_grant(
+    declared: Declared<profile::SshGrant>,
+    nodes: &[Node],
+) -> anyhow::Result<Option<crate::startup::LaunchGrant>> {
+    const MAX_WINDOW_SECS: u64 = 3600;
+    let context = declared.origin.context();
+    let grant = declared.value;
+    if grant.hosts.is_empty() {
+        return Ok(None);
+    }
+    if grant.hosts.iter().any(|h| h.is_empty() || h.contains(char::is_whitespace)) {
+        bail!("{context}: hosts must be known_hosts names");
+    }
+    let ssh_clone = |node: &Node| {
+        matches!(&node.action, Action::Builtin { template, params } if template == "clone-git-repo"
+            && matches!(params.get("repo"), Some(ManifestParam::Str(repo))
+                if repo.starts_with("git@") || repo.starts_with("ssh://")))
+    };
+    let covered: Vec<&Node> = match &grant.tasks {
+        Some(ids) => ids
+            .iter()
+            .map(|id| {
+                nodes
+                    .iter()
+                    .find(|n| n.id == format!("tasks:{id}"))
+                    .with_context(|| format!("{context}: tasks names {id:?}, which isn't an enabled task"))
+            })
+            .collect::<anyhow::Result<_>>()?,
+        None => nodes.iter().filter(|n| ssh_clone(n)).collect(),
+    };
+    if covered.is_empty() {
+        bail!("{context}: covers no tasks (no clone-git-repo task with an SSH repo; list them in tasks)");
+    }
+    let window_secs = grant.window_secs.unwrap_or(600);
+    if window_secs == 0 || window_secs > MAX_WINDOW_SECS {
+        bail!("{context}: window_secs must be 1..={MAX_WINDOW_SECS}");
+    }
+    Ok(Some(crate::startup::LaunchGrant {
+        hosts: grant.hosts,
+        user: grant.user.unwrap_or_else(|| "git".into()),
+        window_secs,
+        max_uses: grant.max_uses.unwrap_or(covered.len() as u32 + 2),
+        nodes: covered.iter().map(|n| n.id.clone()).collect(),
+        phase: if covered.iter().any(|n| n.phase == Phase::Pre) { Phase::Pre } else { Phase::Post },
+    }))
 }

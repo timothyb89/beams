@@ -1258,8 +1258,11 @@ mod daemon_launches {
         let host = host(&f);
         submit(&f, &host, &launch, "interactive");
         wait_until(&host, &id, "the interface wait", |s| node_status(s, "interface-ready") == NodeStatus::Waiting);
+        assert_eq!(host.launches().running_owner(&id), None, "no owner before the bridge");
         let adopted = submit_over_bridge(&host, &launch, Gate::Interactive);
         assert!(matches!(adopted, BeamToClient::LaunchAccepted { existing: true, .. }), "{adopted:?}");
+        // Its tasks' SSH key use now routes to that workstation.
+        assert_eq!(host.launches().running_owner(&id).as_deref(), Some("client-a"));
 
         ready(&host, &id, "shell");
         ready(&host, &id, "tui");
@@ -1274,6 +1277,7 @@ mod daemon_launches {
         let accepted: serde_json::Value =
             beams_artifacts::read_json(&f.state.join(&id).join("accepted.json")).unwrap();
         assert_eq!(accepted["owner_client_id"], "client-a", "adoption survives a daemon restart");
+        assert_eq!(host.launches().running_owner(&id), None, "a finished launch routes nothing");
     }
 
     #[test]

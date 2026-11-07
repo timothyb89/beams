@@ -79,9 +79,11 @@ flags.
    overlay (`ServerEvent::LaunchChanged`), retry over the bridge.
 2. **Maintainer profile and legacy removal.** `KnownHostsCommand` landed
    (`bootstrap/src/knownhosts.rs`, `client/src/knownhosts.rs`,
-   `client/tests/known-hosts-smoke.sh`). Next: SSH grants for launch
-   tasks (a profile's clones signing without a prompt, like
-   `[startup.ssh_grant]`), then a local profile carrying the current
+   `client/tests/known-hosts-smoke.sh`). Launch SSH grants landed too
+   (`[ssh_grant]`: compiled to workstation-only `ssh-grant.json`, exact
+   task tags, window from the covered phase, once per launch; Beam routes
+   launch tasks to the owner); not yet exercised with a real key on a
+   disposable Beam. Next: a local profile carrying the current
    `[startup]` clones and toolchains plus the optional fixed steps worth
    keeping (starship install, claude update/guidance, kubectl); then
    remove the `[startup]` manifest, `bin/beam-shell`'s fixed run and

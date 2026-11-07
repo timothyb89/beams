@@ -180,6 +180,14 @@ path (runtime delivery, shell preparation, Zellij/TUI with
   2026-11-07 as opt-in `beams ssh --profile` / `[launch] profile`
   (`~/.beams/` runtime, `launch start`, per-launch Zellij session,
   `launch shell` readiness wrapper); validated on disposable Beams.
+- [x] SSH grants for launch tasks (2026-11-07): profile `[ssh_grant]`
+  (hosts/user/window/max_uses/tasks), compiled to workstation-only
+  `ssh-grant.json`; limited to the covered tasks' exact `BEAMS_TASK_RUN`
+  tags; window opens at acceptance (pre) or `interface-ready` (post);
+  ended on finish/disconnect; issued once per launch. The Beam routes a
+  running launch's tasks to its owning workstation. Remaining: a real-key
+  clone on a disposable Beam (needs an approved key; fixture + driver
+  tests only so far).
 - [ ] Remove the legacy startup once the profile path is the default
   (maintainer decision 2026-11-07: no long-term legacy support, single
   user): the `[startup]` manifest submission (`clientd::submit_startup`,

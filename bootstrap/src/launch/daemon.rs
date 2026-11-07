@@ -159,6 +159,14 @@ impl Launches {
         Self { root, home, table: Mutex::default(), uploads }
     }
 
+    /// The workstation that owns launch `id` (its bridge client), while the
+    /// launch is unfinished: routes its tasks' SSH key use.
+    pub fn running_owner(&self, id: &str) -> Option<String> {
+        let table = self.table.lock().unwrap();
+        let entry = table.entries.get(id)?;
+        (!entry.snapshot.status.finished()).then(|| entry.accepted.owner_client_id.clone()).flatten()
+    }
+
     /// Loads accepted launches persisted by an earlier daemon. Anything that
     /// hadn't finished is marked interrupted, not resumed: an old installer
     /// may still be running, and `launch_retry` is the explicit way back.

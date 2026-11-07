@@ -659,6 +659,11 @@ hosts = ["github.com"]
 user = "git"
 ```
 
+A profile launch (`beams ssh --profile`) never gets `[startup]`; the
+profile declares the same grant as a top-level `[ssh_grant]` (same
+fields plus `tasks`), scoped to that launch's own SSH tasks. See
+`../docs/development/launches.md#ssh-key-grants`.
+
 There's no private key on a Beam: its `SSH_AUTH_SOCK` relays to the agent of
 the `beams ssh` terminal attached to it, and every other use of a key shows
 an "SSH key request" toast. Press the menu key to review it: what the

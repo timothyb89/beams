@@ -62,6 +62,7 @@ files and bundled names; cycles fail with the path chain.
 | `[files.ID]` | `source`, `target`, `phase`, `mode`, `overwrite`, `exclude`, `after`, `enabled` |
 | `[tasks.ID]` | `label`, `phase`, `script` or `template`, `script_root`, `exclude`, `interpreter`, `args`, `working_dir`, `env`, `check`, `after`, `resources`, `packages`, `params`, `rerun`, `enabled` |
 | `[templates.ID]` | Script execution fields, `label`, `packages`, `resources`, `params`, `enabled` |
+| `[ssh_grant]` | `hosts`, `user` (default `git`), `window_secs` (default 600, max 3600), `max_uses` (default: covered tasks + 2), `tasks` (default: `clone-git-repo` tasks with an SSH `repo`) |
 
 IDs use letters, numbers, `_`, or `-`. Named files, tasks and templates
 replace the entire inherited entry; `enabled = false` removes it. Shell
@@ -533,6 +534,32 @@ Native template parameters also receive Beam expansion, but specialized
 installers still use their existing paths/process environment. Profile env
 currently applies to hooks; configurable native versions/destinations/env
 are a remaining milestone.
+
+## SSH key grants
+
+`[ssh_grant]` lets the launch's SSH tasks (normally its `git@…` clones)
+use the workstation's key without a prompt, within limits the
+workstation enforces:
+
+- only user-auth logins as `user` to a host in `hosts`, verified against
+  the workstation's known_hosts;
+- only for the covered tasks' exact `BEAMS_TASK_RUN` tags
+  (`<launch>/launch:<launch>:tasks:<id>`), so other tasks of the same
+  launch, and anything else on the Beam, still ask;
+- at most `max_uses` signatures within `window_secs`, which opens when
+  the covered tasks' phase can start (acceptance for pre,
+  `interface-ready` for post), not during a slow pre install;
+- ended when the launch finishes or the bridge drops, and issued at most
+  once per launch (a reconnect doesn't refill it).
+
+The compiler resolves it to node IDs (`config explain` prints an "SSH
+grant" line) and `pack` writes it to `ssh-grant.json` in the
+workstation's launch directory only: it isn't part of the Beam's plan or
+digest, and nothing rebuilds it from Beam state. On the Beam, key
+requests from a running launch's tasks route to the launch's owning
+workstation. A child profile's `[ssh_grant]` replaces an inherited one;
+`hosts = []` removes it. Host keys come from the workstation too (see the
+client README's "Host keys").
 
 ## Ownership and execution
 
