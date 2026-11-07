@@ -11,6 +11,7 @@ pub struct Grid {
     scroll_bottom: u16,
     origin_mode: bool,
     saved_origin_mode: bool,
+    tabs_cleared: bool,
     scrollback: Option<ScrollbackState>,
 }
 
@@ -50,6 +51,7 @@ impl Grid {
             scroll_bottom: size.rows() - 1,
             origin_mode: false,
             saved_origin_mode: false,
+            tabs_cleared: false,
             scrollback,
         }
     }
@@ -72,6 +74,7 @@ impl Grid {
         self.scroll_bottom = self.size.rows() - 1;
         self.origin_mode = false;
         self.saved_origin_mode = false;
+        self.tabs_cleared = false;
     }
 
     pub fn size(&self) -> Size {
@@ -872,9 +875,19 @@ impl Grid {
     }
 
     pub fn col_tab(&mut self) {
+        if self.tabs_cleared {
+            if self.pos.col < self.size.cols() {
+                self.pos.col = self.size.cols() - 1;
+            }
+            return;
+        }
         self.pos.col -= self.pos.col % 8;
         self.pos.col = self.pos.col.saturating_add(8);
         self.col_clamp();
+    }
+
+    pub fn clear_tabs(&mut self) {
+        self.tabs_cleared = true;
     }
 
     pub fn col_set(&mut self, i: u16) {

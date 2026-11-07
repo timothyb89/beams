@@ -16,7 +16,7 @@ use ratatui::style::{Color as TuiColor, Modifier, Style};
 use ratatui::Frame;
 use vt100::{Callbacks, Color as VtColor, Parser, Screen};
 
-use crate::terminal_eligibility::{self, Evidence, Unavailable};
+use crate::terminal_eligibility::{Evidence, Unavailable};
 use crate::terminal_stream::{TerminalStream, CONTROL_SEQUENCE_LIMIT};
 
 const MAX_EVENTS: usize = 128;
@@ -481,7 +481,7 @@ impl TerminalModel {
         drain: bool,
     ) -> Result<(usize, Option<Vec<u8>>), E> {
         self.stream.advance_guarded(bytes, |frame, original| {
-            let supported = terminal_eligibility::supported(original, self.parser.screen());
+            let supported = self.evidence.supported(original, self.parser.screen());
             if covered
                 && (!supported
                     || original == b"\x1bc"
@@ -501,13 +501,10 @@ impl TerminalModel {
             process_frame(&mut self.parser, frame);
             if std::mem::take(&mut self.parser.callbacks_mut().reset_observed) {
                 self.integrity_lost = false;
-                self.evidence.observe(b"\x1bc", false, false);
+                self.evidence.observe(b"\x1bc", false, self.parser.screen());
             } else {
-                self.evidence.observe(
-                    original,
-                    before_alternate,
-                    self.parser.screen().alternate_screen(),
-                );
+                self.evidence
+                    .observe(original, before_alternate, self.parser.screen());
             }
             if let Some(buffers) = &mut self.overlay_buffers {
                 buffers[usize::from(self.parser.screen().alternate_screen())] = true;
@@ -529,9 +526,12 @@ impl TerminalModel {
 
     /// Budget exhaustion makes repainting unsafe until an observed full reset.
     pub fn can_paint(&self) -> bool {
-        !self.integrity_lost
-            && self.unavailable_reason().is_none()
-            && self.evidence.can_paint(self.screen().alternate_screen())
+        self.unavailable_reason().is_none()
+            && self.can_paint_buffer(self.screen().alternate_screen())
+    }
+
+    pub fn can_paint_buffer(&self, alternate: bool) -> bool {
+        !self.integrity_lost && self.evidence.can_paint(alternate)
     }
 
     pub fn unavailable_reason(&self) -> Option<Unavailable> {
@@ -735,6 +735,448 @@ mod tests {
     }
 
     const REINITIALIZE: &[u8] = b"\x1b[?6l\x1b[r\x1b[H\x1b7\x1b[2J";
+    const NORMAL_ROWS: &[u8] = b"\x1b[1;1H\x1b#5\x1b[2;1H\x1b#5\x1b[3;1H\x1b#5\x1b[4;1H\x1b#5";
+
+    const INHERITED_SHARED: &[&[u8]] = &[
+        b"\x18",
+        b"\x1b\\",
+        b"\x1b<",
+        b"\x1b%G",
+        b"\x1b[?7h",
+        b"\x1b[?5l",
+        b"\x1b[?45l",
+        b"\x1b[?69l",
+        b"\x1b[20l",
+        b"\x1b[0\"q",
+        b"\x1b(B",
+        b"\x1b)B",
+        b"\x0f",
+        b"\x1b[0m",
+        b"\x1b]8;;\x1b\\",
+        b"\x1b[4l",
+        b"\x1b[?1l",
+        b"\x1b>",
+        b"\x1b[?25h",
+        b"\x1b[?2004l",
+        b"\x1b[?2026l",
+        b"\x1b[?9l",
+        b"\x1b[?1000l",
+        b"\x1b[?1001l",
+        b"\x1b[?1002l",
+        b"\x1b[?1003l",
+        b"\x1b[?1005l",
+        b"\x1b[?1006l",
+        b"\x1b[?1015l",
+        b"\x1b[?1016l",
+    ];
+
+    fn inherited_initialization(alternate: bool) -> Vec<u8> {
+        [
+            INHERITED_SHARED.concat().as_slice(),
+            if alternate {
+                b"\x1b[?47h"
+            } else {
+                b"\x1b[?47l"
+            },
+            b"\x1b[3g",
+            b"\x1b[?6l\x1b[r",
+            NORMAL_ROWS,
+            REINITIALIZE,
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn inherited_initialization_requires_shared_state_selection_tabs_and_geometry_at_every_split() {
+        for alternate in [false, true] {
+            let trace = inherited_initialization(alternate);
+            for split in 0..=trace.len() {
+                let mut model = TerminalModel::new(size());
+                model.process(&trace[..split]);
+                model.process(&trace[split..]);
+                assert!(model.can_paint(), "buffer {alternate}, split {split}");
+                assert_eq!(model.unavailable_reason(), None);
+                assert_eq!(model.screen().alternate_screen(), alternate);
+                assert!(!model.evidence.can_paint(!alternate));
+                assert!(!model.restore_bytes(alternate).windows(6).any(|s| {
+                    s == if alternate {
+                        b"\x1b[?47l"
+                    } else {
+                        b"\x1b[?47h"
+                    }
+                }));
+            }
+        }
+        for missing in 0..INHERITED_SHARED.len() {
+            let mut model = TerminalModel::new(size());
+            for (index, component) in INHERITED_SHARED.iter().enumerate() {
+                if index != missing {
+                    model.process(component);
+                }
+            }
+            model.process(b"\x1b[?47l\x1b[3g");
+            model.process(b"\x1b[?6l\x1b[r");
+            model.process(NORMAL_ROWS);
+            model.process(REINITIALIZE);
+            assert!(
+                !model.can_paint(),
+                "missing {:?}",
+                INHERITED_SHARED[missing]
+            );
+        }
+        for missing in [
+            b"\x1b[?47l".as_slice(),
+            b"\x1b[3g",
+            b"\x1b[?6l",
+            b"\x1b[r",
+            NORMAL_ROWS,
+            b"\x1b7",
+            b"\x1b[2J",
+        ] {
+            let mut model = TerminalModel::new(size());
+            model.process(&INHERITED_SHARED.concat());
+            for component in [
+                b"\x1b[?47l".as_slice(),
+                b"\x1b[3g",
+                b"\x1b[?6l",
+                b"\x1b[r",
+                NORMAL_ROWS,
+                b"\x1b7",
+                b"\x1b[2J",
+            ] {
+                if component != missing {
+                    model.process(component);
+                }
+            }
+            assert!(!model.can_paint(), "missing {missing:?}");
+        }
+    }
+
+    #[test]
+    fn inherited_unknown_tabs_writes_and_restores_cannot_be_proven_retroactively() {
+        let mut model = TerminalModel::new(size());
+        model.process(&INHERITED_SHARED.concat());
+        model.process(b"\x1b[?47l");
+        model.process(b"\x1b[?6l\x1b[r");
+        model.process(NORMAL_ROWS);
+        model.process(REINITIALIZE);
+        model.process(b"\t\x1b[3g\x1b7\x1b[2J");
+        assert!(
+            !model.can_paint(),
+            "tab at unknown stops loses cursor evidence"
+        );
+        model.process(b"\x1b[H\x1b7");
+        assert!(model.can_paint());
+
+        let mut model = TerminalModel::new(size());
+        model.process(b"\x18\x1b\\\x1b[?47l\x1b[3g\x1b[?6l\x1b[r\x1b[H\x1b[2J");
+        model.process("界 unknown modes".as_bytes());
+        model.process(&INHERITED_SHARED.concat());
+        model.process(b"\x1b7\x1b[2J");
+        assert!(
+            !model.can_paint(),
+            "earlier printing cannot establish coordinates"
+        );
+        model.process(NORMAL_ROWS);
+        model.process(b"\x1b[H\x1b7\x1b[2J");
+        assert!(model.can_paint());
+
+        let mut model = TerminalModel::new(size());
+        model.process(&INHERITED_SHARED.concat());
+        model.process(b"\x1b[?47l\x1b[3g\x1b[?6l\x1b[r");
+        model.process(NORMAL_ROWS);
+        model.process(b"\x1b[H\x1b[2J\x1b8");
+        model.process(b"\x1b[?6l\x1b[H\x1b7\x1b[2J");
+        assert!(
+            !model.can_paint(),
+            "DECRC can restore unknown attributes/modes"
+        );
+        model.process(&inherited_initialization(false));
+        assert!(model.can_paint());
+
+        let mut model = TerminalModel::new(size());
+        model.process(&INHERITED_SHARED.concat());
+        model.process(b"\x1b[3g");
+        model.process(b"\x1b[?6l\x1b[r");
+        model.process(NORMAL_ROWS);
+        model.process(REINITIALIZE);
+        model.process(b"\x1b[?47l");
+        assert!(
+            !model.can_paint(),
+            "a first selection cannot prove earlier buffer-local state"
+        );
+        model.process(b"\x1b[3g");
+        model.process(b"\x1b[?6l\x1b[r");
+        model.process(REINITIALIZE);
+        assert!(
+            !model.can_paint(),
+            "line resets before selection do not prove the target"
+        );
+        model.process(NORMAL_ROWS);
+        model.process(REINITIALIZE);
+        assert!(model.can_paint());
+    }
+
+    #[test]
+    fn inherited_initialization_does_not_recover_unsupported_output_or_budget_loss() {
+        for unsupported in [
+            b"\x1b[?7l".as_slice(),
+            b"\x1b[?45h",
+            b"\x1b[?69h",
+            b"\x1b[20h",
+            b"\x1b[1\"q",
+            b"\x1b[?1016h",
+            b"\x1b[0g",
+            b"\x1bH",
+            b"\x1b[3b",
+            b"\x1b[!p",
+            b"\x1b%@",
+        ] {
+            let mut model = TerminalModel::new(size());
+            model.process(&inherited_initialization(true));
+            let (_, rejected) = model
+                .process_guarded_with_events(unsupported, true, |_| Ok::<(), ()>(()), true)
+                .unwrap();
+            assert_eq!(rejected.as_deref(), Some(unsupported));
+            assert!(model.can_paint(), "last safe state retained");
+            model.process(unsupported);
+            model.resize(size());
+            model.process(&inherited_initialization(true));
+            assert!(!model.can_paint(), "{unsupported:?}");
+            assert_eq!(
+                model.unavailable_reason(),
+                Some(Unavailable::UnsupportedSequence)
+            );
+            model.process(b"\x1bc");
+            assert!(model.can_paint());
+        }
+        let mut model = TerminalModel::new(size());
+        model.process(&inherited_initialization(false));
+        model.discard_oversized_sequence();
+        model.process(b"\x18");
+        model.process(&inherited_initialization(false));
+        assert!(!model.can_paint());
+        assert_eq!(
+            model.unavailable_reason(),
+            Some(Unavailable::SequenceBudget)
+        );
+    }
+
+    #[test]
+    fn inherited_buffer_switch_replays_before_mutation_and_requires_fresh_target_evidence() {
+        for frame in [b"\x1b[?00047l".as_slice(), b"\x1b[?1049l", b"\x1b[?1049h"] {
+            for split in 0..=frame.len() {
+                let mut model = TerminalModel::new(size());
+                model.process(&inherited_initialization(true));
+                model.process(b"known");
+                model.begin_overlay();
+                let snapshot = model.drawing_state();
+                let (_, first) = model
+                    .process_guarded_with_events(&frame[..split], true, |_| Ok::<(), ()>(()), true)
+                    .unwrap();
+                let rejected = first.or_else(|| {
+                    model
+                        .process_guarded_with_events(
+                            &frame[split..],
+                            true,
+                            |_| Ok::<(), ()>(()),
+                            true,
+                        )
+                        .unwrap()
+                        .1
+                });
+                assert_eq!(rejected.as_deref(), Some(frame));
+                assert_eq!(model.drawing_state(), snapshot);
+                assert!(model.can_paint());
+                model.end_overlay();
+                model.process(frame);
+                assert!(!model.can_paint());
+                model.process(REINITIALIZE);
+                assert!(!model.can_paint(), "target tabs are unknown");
+                model.process(b"\x1b[3g");
+                model.process(NORMAL_ROWS);
+                model.process(REINITIALIZE);
+                if frame == b"\x1b[?1049l" {
+                    assert!(
+                        !model.can_paint(),
+                        "1049 also restores an inherited primary slot"
+                    );
+                    model.process(&inherited_initialization(false));
+                }
+                assert!(
+                    model.can_paint(),
+                    "target coordinates/cells now explicitly initialized"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_tab_clear_needs_new_evidence_after_resize_and_matches_future_printing() {
+        let mut model = TerminalModel::new(size());
+        model.process(&inherited_initialization(false));
+        model.process(b"A\tB");
+        assert_eq!(model.screen().cell(0, 11).unwrap().contents(), "B");
+        model.resize(PtySize { cols: 16, ..size() });
+        model.process(REINITIALIZE);
+        assert!(
+            !model.can_paint(),
+            "resize may create stops on the outer terminal"
+        );
+        model.process(b"\x1b[3gA\tB");
+        assert!(model.can_paint());
+        assert_eq!(model.screen().cell(0, 15).unwrap().contents(), "B");
+    }
+
+    #[test]
+    fn inherited_mouse_evidence_requires_complete_groups_and_defers_ambiguous_resets() {
+        let mut model = TerminalModel::new(size());
+        for component in INHERITED_SHARED {
+            if *component != b"\x1b[?1003l" {
+                model.process(component);
+            }
+        }
+        model.process(b"\x1b[?1002h\x1b[?1002l\x1b[?1003l\x1b[?47l\x1b[3g");
+        model.process(REINITIALIZE);
+        assert!(
+            !model.can_paint(),
+            "an enable makes earlier partial group resets stale"
+        );
+        model.process(b"\x1b[?9;1000;1001;1002;1003l");
+        model.process(NORMAL_ROWS);
+        model.process(REINITIALIZE);
+        assert!(model.can_paint());
+        for (enable, ambiguous) in [
+            (b"\x1b[?1002h".as_slice(), b"\x1b[?1003l".as_slice()),
+            (b"\x1b[?1002h", b"\x1b[?1001l"),
+            (b"\x1b[?1006h", b"\x1b[?1016l"),
+        ] {
+            let mut model = TerminalModel::new(size());
+            model.process(&inherited_initialization(false));
+            model.process(enable);
+            assert!(model.can_paint(), "represented enabled modes stay usable");
+            let (_, rejected) = model
+                .process_guarded_with_events(ambiguous, true, |_| Ok::<(), ()>(()), true)
+                .unwrap();
+            assert_eq!(rejected.as_deref(), Some(ambiguous));
+            assert!(model.can_paint());
+        }
+    }
+
+    #[test]
+    fn inherited_row_size_requires_every_row_before_certifying_cells_and_save_slots() {
+        let mut model = TerminalModel::new(size());
+        model.process(&INHERITED_SHARED.concat());
+        model.process(b"\x1b[?47l\x1b[3g\x1b[?6l\x1b[r\x1b[H\x1b#5\x1b#5\x1b#5\x1b#5");
+        model.process(b"\x1b7\x1b[2J");
+        assert!(
+            !model.can_paint(),
+            "repeated resets of one row are not full-screen evidence"
+        );
+        model.process(NORMAL_ROWS);
+        assert!(
+            !model.can_paint(),
+            "normalizing later cannot prove an earlier save or clear"
+        );
+        model.process(b"\x1b[H\x1b7\x1b[2J");
+        assert!(model.can_paint());
+
+        let mut model = TerminalModel::new(size());
+        model.process(&inherited_initialization(false)[3..]);
+        model.process(b"\x18\x1b\\");
+        model.process(REINITIALIZE);
+        assert!(
+            !model.can_paint(),
+            "controls before the parser boundary cannot be certified later"
+        );
+        model.process(&inherited_initialization(false));
+        assert!(model.can_paint());
+    }
+
+    #[test]
+    fn inherited_physical_modes_and_content_survive_painting_without_observing_a_reset() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        // Only the physical/reference terminal sees this pre-session state.
+        // The shadow starts with no knowledge of cells, modes or save slots.
+        let inherited = b"WORKSTATION PRIMARY\x1b[1;31m\x1b7\x1b[?47h\x1b[2;3r\x1b[?6h\
+            \x1b[?7l\x1b[?45h\x1b[?1h\x1b=\x1b[?25l\x1b[?2004h\x1b[?1003h\x1b[?1016h\
+            \x1b[4h\x1b[20h\x1b[3g\x1b[2;3H\x1bH\x1b(0\x1b)0\x0e\x1b[1\"q\
+            \x1b]8;id=old;https://example.test/old\x1b\\\x1b]2;inherited unfinished string";
+        let mut traces = Vec::new();
+        for alternate in [false, true] {
+            for return_to_primary in [false, true] {
+                if !alternate && return_to_primary {
+                    continue;
+                }
+                let mut model = TerminalModel::new(size());
+                let mut physical = Parser::new(nonzero(4), nonzero(12), 0);
+                physical.process(inherited);
+                let before = inherited_initialization(alternate);
+                model.process(&before);
+                physical.process(&before);
+                assert!(model.can_paint());
+                let paint = [
+                    crate::terminal_paint::BEGIN,
+                    b"\x1b[2J\x1b[HLOCAL MENU",
+                    crate::terminal_paint::END,
+                ]
+                .concat();
+                physical.process(&paint);
+                let hidden = b"\x1b[2;2H\x1b[32m\x1b7\x1b[3;1HA\tB\x1b[1;1H";
+                model.begin_overlay();
+                let (_, rejected) = model
+                    .process_guarded_with_events(hidden, true, |_| Ok::<(), ()>(()), true)
+                    .unwrap();
+                assert!(rejected.is_none());
+                let restore = model.restore_bytes(alternate);
+                physical.process(&restore);
+                model.end_overlay();
+                let after = if return_to_primary && alternate {
+                    b"\x1b8!\x1b[?47l\x1b8P".as_slice()
+                } else {
+                    b"\x1b8!\tT\r\nNEXT"
+                };
+                model.process(after);
+                physical.process(after);
+                if !(return_to_primary && alternate) {
+                    assert_eq!(
+                        physical.screen().contents_formatted(),
+                        model.screen().contents_formatted()
+                    );
+                    assert_eq!(
+                        physical.screen().cursor_position(),
+                        model.screen().cursor_position()
+                    );
+                }
+                traces.push(serde_json::json!({
+                    "name": format!("unobserved inherited state, alternate {alternate}, primary {return_to_primary}"),
+                    "rows": 4, "cols": 12, "inherited": inherited.as_slice(),
+                    "before": before, "hidden": hidden.as_slice(), "after": after,
+                    "paint": paint, "restore": restore,
+                }));
+            }
+        }
+        if let Some(module) = std::env::var_os("BEAMS_TEST_XTERM_MODULE") {
+            let mut reference = Command::new("node")
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/terminal-paint-reference.cjs"
+                ))
+                .arg(module)
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            reference
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&serde_json::to_vec(&traces).unwrap())
+                .unwrap();
+            assert!(reference.wait().unwrap().success());
+        }
+    }
 
     #[test]
     fn resized_buffer_requires_each_initialization_component_at_every_split() {

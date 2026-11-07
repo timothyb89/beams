@@ -45,6 +45,10 @@ async function main() {
     const expected = new Terminal(options);
     const actual = new Terminal(options);
     try {
+      if (trace.inherited) {
+        await write(expected, trace.inherited);
+        await write(actual, trace.inherited);
+      }
       if (trace.beforeResize) {
         await write(expected, trace.beforeResize);
         await write(actual, trace.beforeResize);

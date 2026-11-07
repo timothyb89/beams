@@ -472,6 +472,56 @@ write. Painting bytes did not change; workstation gates remain pending.
 
 ## Implementation status and next-session handoff
 
+Explicit inherited initialization is implemented (2026-11-07): observe a supported
+initialization of the state used by painting instead of requiring RIS.
+Track shared attribute/character-set/input-mode evidence separately from
+selected-buffer geometry, ownership, line size and tabs. SGR reset does not prove OSC 8
+closure or character protection; mode-group resets must cover unrepresented
+mouse variants too. Require CAN/ST before accepting initialization, ANSI/UTF-8
+selection, supported wrap/linefeed/margin behavior, explicit tab clearing and
+normal line size on every row, coordinates, a new save and ED 2.
+Writes or saves before the relevant state is known cannot be certified
+retroactively. Keep inactive content unknown and close/replay all buffer
+transitions in this path. Unsupported output and sequence loss still need RIS;
+a soft reset, ordinary clear or application name is not complete evidence.
+Do not broaden REP into this path: its inherited previous graphic character
+and local repaint effects need separate representation. Verify from a
+non-default physical baseline that is absent from the shadow model. Eight
+model tests and three independent traces cover missing components, read
+splits, primary-content preservation, unknown tab/cursor/save state, stronger
+loss reasons and coupled mouse groups. The live PTY renderer checks
+initialization, queries, hyperlinks, form persistence and exactly-once buffer
+switch replay without any RIS. Cleanup now requires evidence for the observed
+outer target buffer; a known active buffer cannot authorize repositioning an
+unknown inactive one.
+
+The required initialization inventory is bounded to the supported ANSI/UTF-8
+terminal behavior; it is not a claim about every terminal protocol. The
+client observes these controls and never injects initialization:
+
+| State | Evidence |
+| --- | --- |
+| Parser/grammar/encoding | CAN followed by ST, then `ESC <`, `ESC % G`; controls before the boundary are insufficient |
+| Represented drawing behavior | `CSI ?7h`, `CSI ?5l`, `CSI ?45l`, `CSI ?69l`, `CSI 20l`, `CSI 0"q` |
+| Character maps | G0/G1 ASCII or DEC graphics designations, SI or SO |
+| Attributes/link | SGR reset and an explicit OSC 8 close |
+| Drawing/input modes | ANSI insert/replace, application cursor, keypad, cursor visibility and bracketed-paste settings |
+| Synchronized output | Observed `CSI ?2026l` |
+| Mouse tracking/encoding | Complete resets of 9/1000/1001/1002/1003 and 1005/1006/1015/1016 |
+| Selected buffer | Explicit 47 selection; a first selection invalidates earlier buffer-local evidence |
+| Buffer state | TBC 3, DECOM reset, full margins, CUP, a fresh DECSC and ED 2 |
+| Line size | CUP to column one and `ESC # 5` for every row, in order, before saving/clearing |
+
+Shared and normal-line evidence must be complete before saving/clearing;
+printing before modes and
+coordinates agree invalidates earlier clear/cursor evidence. Unknown DECRC or
+a 1049 return can restore inherited attributes/maps/modes, requiring new
+shared initialization. Partial mouse resets cannot be reused after an enable;
+ambiguous resets of a different active protocol defer painting. Reset-only
+controls do not authorize unsupported enabled modes. Previously cleared tabs
+need another clear after resize. Regional evidence, borrowing and workstation
+font/reflow validation remain separate gates.
+
 Post-resize eligibility is implemented (2026-11-07): distinguish loss of screen
 geometry from loss of inherited/protocol state. Resize after a known RIS baseline preserves
 shared mode/attribute evidence, but invalidates cells, cursor, margins, origin
@@ -483,13 +533,12 @@ After this recovery, covered buffer switches stop before mutation and replay
 raw after restoring the last safe state. The target needs initialization
 again: emulator buffer switches can transfer cursors and clear alternate
 content differently. Restoration leaves unknown inactive content untouched.
-Initial inherited state, unsupported output and sequence-budget loss still
-require observed RIS.
+Initial inherited state also has the explicit initialization path above.
+Unsupported output and sequence-budget loss still require observed RIS.
 Five unit tests cover missing components, unknown-position writes, stronger
 loss reasons and split/leading-zero buffer switches. Independent xterm.js
 checks include two actual resize traces and the live recovered menu.
-This slice does not establish inherited initialization, regional borrowing
-or lossless covered reflow.
+This geometry slice does not establish regional borrowing or lossless covered reflow.
 
 Observed entry/exit ownership is implemented (2026-11-07). Before forwarding
 child output, a 200 ms / 8192-byte capture queries recognized ANSI/DEC modes,
@@ -529,9 +578,9 @@ the VT model's saved designations.
 Conservative repaint eligibility and frame recovery are implemented (2026-11-07).
 Inherited state starts unknown in both buffers; cursor reports, alternate
 selection and clears alone cannot establish inherited modes/save slots.
-Only an observed RIS (`ESC c`) establishes shared state initially.
-This is intentionally restrictive; richer inherited initialization/region
-evidence is future work, not permission to assume an ordinary TUI initialized
+An observed RIS (`ESC c`) or complete explicit initialization establishes
+shared state initially. This is intentionally restrictive; regional evidence
+remains future work, not permission to assume an ordinary TUI initialized
 every mode. Unsupported controls invalidate eligibility until another RIS.
 Resize loses per-buffer geometry; explicit recovery is described above.
 Reasons distinguish inherited state, unsupported output, resize and budgets.
@@ -626,8 +675,8 @@ Next work, in separately reviewable changes:
    all three gates; none should be ignored.
 2. Query-policy coverage above is implemented. Any new probes must extend the
    explicit inventory and preserve exactly-once replies.
-3. Extend inherited initialization and establish regional/inactive-buffer evidence.
-   Post-resize geometry initialization, common drawing state and conservative
+3. Establish regional/inactive-buffer evidence and safe borrowing.
+   Explicit inherited initialization, post-resize geometry, common drawing state and conservative
    recovery are implemented. Safe
    borrowing still needs stronger ownership evidence and independent switching
    tests; covered resize fidelity remains open.
@@ -649,12 +698,12 @@ fixture stall that made a fairness assertion depend on output throughput.
 This failure policy bounds memory; it does not promise continued service for
 a peer that never drains its input.
 
-Current validation: **232 client unit tests and 3 integration tests pass, with
+Current validation: **241 client unit tests and 3 integration tests pass, with
 zero ignored tests**. The client build, takeover and overlay managed-session
 smokes, and expanded protocol/PTY harness pass. Pinned xterm.js 5.5 replay again
-passes twelve restoration traces, two additional resize traces, two live
-renderer traces and two live non-default lifecycle traces. The harness also
-covers explicit initialization without another RIS, deferred recovery and
+passes twelve restoration traces, two resize traces, three inherited-state
+traces, three live renderer traces and two live non-default lifecycle traces.
+The harness also covers explicit initialization without any RIS, deferred recovery and
 strict disabled-prefix partial-string termination. No real
 workstation font/reflow or graphical-terminal validation has been recorded.
 

@@ -1,8 +1,8 @@
 //! Conservative evidence and an explicit supported output inventory.
 //!
 //! A cursor report or buffer selection never proves inherited cells/modes.
-//! RIS establishes shared state. A resized buffer can subsequently establish
-//! its geometry explicitly; inherited/unsupported state still requires RIS.
+//! RIS or explicit initialization establishes shared state. Unsupported state
+//! still requires RIS; geometry and ownership are established per buffer.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unavailable {
@@ -19,18 +19,89 @@ struct BufferEvidence {
     origin: bool,
     margins: bool,
     saved: bool,
+    selected: bool,
+    tabs: Tabs,
+    normal_rows: NormalRows,
 }
 
 impl BufferEvidence {
     fn complete(self) -> bool {
-        self.cells && self.cursor && self.origin && self.margins && self.saved
+        self.cells
+            && self.cursor
+            && self.origin
+            && self.margins
+            && self.saved
+            && self.selected
+            && self.tabs != Tabs::Unknown
+            && self.normal_rows == NormalRows::Known
     }
 }
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Tabs {
+    #[default]
+    Unknown,
+    Default,
+    Cleared,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NormalRows {
+    Next(u16),
+    Known,
+}
+
+impl Default for NormalRows {
+    fn default() -> Self {
+        Self::Next(0)
+    }
+}
+
+// Each control proves one part of state. This inventory records confidence,
+// not values: the backend remains authoritative for current represented modes.
+const INITIALIZERS: &[&[u8]] = &[
+    b"\x18",      // cancel an inherited partial control
+    b"\x1b\\",    // terminate an inherited string before state initialization
+    b"\x1b<",     // ANSI, including an inherited VT52 terminal
+    b"\x1b%G",    // UTF-8
+    b"\x1b[?7h",  // represented autowrap behavior
+    b"\x1b[?5l",  // normal global video
+    b"\x1b[?45l", // no reverse wrap
+    b"\x1b[?69l", // no horizontal margins
+    b"\x1b[20l",  // LF does not imply CR
+    b"\x1b[0\"q", // unprotected characters
+    b"\x1b(B",
+    b"\x1b)B",
+    b"\x0f",           // G0, G1 and GL
+    b"\x1b[0m",        // complete SGR
+    b"\x1b]8;;\x1b\\", // current hyperlink (independent of SGR)
+    b"\x1b[4l",        // insert/replace
+    b"\x1b[?1l",
+    b"\x1b>", // cursor keys, keypad
+    b"\x1b[?25h",
+    b"\x1b[?2004l", // visibility, paste
+    b"\x1b[?2026l", // synchronized output ends
+    b"\x1b[?9l",
+    b"\x1b[?1000l",
+    b"\x1b[?1001l",
+    b"\x1b[?1002l",
+    b"\x1b[?1003l",
+    b"\x1b[?1005l",
+    b"\x1b[?1006l",
+    b"\x1b[?1015l",
+    b"\x1b[?1016l",
+];
+const ALL_SHARED: u64 = (1 << INITIALIZERS.len()) - 1;
+const PARSER_CANCELLED: u64 = 1;
+const PARSER_BOUNDARY: u64 = 3;
+const MOUSE_TRACKING: &[u16] = &[9, 1000, 1001, 1002, 1003];
+const MOUSE_ENCODING: &[u16] = &[1005, 1006, 1015, 1016];
 
 pub struct Evidence {
     // Resize remains the last loss even after a buffer recovers, so switches
     // cannot silently reuse geometry whose cross-emulator semantics differ.
     reason: Option<Unavailable>,
+    shared: u64,
     buffers: [BufferEvidence; 2],
 }
 
@@ -38,58 +109,167 @@ impl Default for Evidence {
     fn default() -> Self {
         Self {
             reason: Some(Unavailable::InheritedState),
+            shared: 0,
             buffers: [BufferEvidence::default(); 2],
         }
     }
 }
 
 impl Evidence {
-    pub fn observe(&mut self, frame: &[u8], before_alternate: bool, alternate: bool) {
+    pub fn observe(&mut self, frame: &[u8], before_alternate: bool, screen: &vt100::Screen) {
+        let alternate = screen.alternate_screen();
         if frame == b"\x1bc" {
             self.reason = None;
+            self.shared = ALL_SHARED;
             self.buffers = [BufferEvidence {
                 cells: true,
                 cursor: true,
                 origin: true,
                 margins: true,
                 saved: true,
+                selected: true,
+                tabs: Tabs::Default,
+                normal_rows: NormalRows::Known,
             }; 2];
             return;
         }
-        // A geometry recipe cannot reset an unknown font, mode or protocol.
-        if !matches!(self.reason, None | Some(Unavailable::Resize)) {
+        // An explicit baseline cannot recover loss from an arbitrary protocol.
+        if matches!(
+            self.reason,
+            Some(Unavailable::UnsupportedSequence | Unavailable::SequenceBudget)
+        ) {
             return;
         }
-        if self.reason == Some(Unavailable::Resize)
+        if self.reason == Some(Unavailable::InheritedState)
+            && self.shared & PARSER_BOUNDARY != PARSER_BOUNDARY
+        {
+            // Earlier controls may have been swallowed by an inherited string.
+            // Establish a parser boundary before accepting any state evidence.
+            if frame == b"\x18" {
+                self.shared = PARSER_CANCELLED;
+                self.buffers = [BufferEvidence::default(); 2];
+            } else if frame == b"\x1b\\" && self.shared & PARSER_CANCELLED != 0 {
+                self.shared = PARSER_BOUNDARY;
+            }
+            return;
+        }
+        // Ordinary text cannot initialize shared state. Keep the high-volume
+        // passthrough path cheap both before and after a baseline is known.
+        if self.shared != ALL_SHARED
+            && (frame.starts_with(b"\x1b") || matches!(frame, b"\x0e" | b"\x0f" | b"\x18"))
+        {
+            if let Some((true, modes)) = private_modes(frame) {
+                for group in [MOUSE_TRACKING, MOUSE_ENCODING] {
+                    let mask = group_mask(group);
+                    if self.shared & mask != mask
+                        && mode_numbers(modes).any(|m| m.is_some_and(|m| group.contains(&m)))
+                    {
+                        // Enabling before the entire coupled group is initialized
+                        // makes earlier individual resets insufficient.
+                        self.shared &= !mask;
+                    }
+                }
+            }
+            for (index, initializer) in INITIALIZERS.iter().enumerate() {
+                if establishes(frame, initializer) {
+                    self.shared |= 1 << index;
+                }
+            }
+        }
+        if self.reason == Some(Unavailable::InheritedState)
+            && private_modes(frame)
+                .is_some_and(|(set, modes)| !set && mode_numbers(modes).any(|m| m == Some(1049)))
+        {
+            // Leaving 1049 restores a primary save slot, which may predate
+            // the observed initialization just like an explicit DECRC.
+            self.shared = 0;
+        }
+        if self.reason.is_some()
             && (before_alternate != alternate
-                || private_modes(frame)
-                    .is_some_and(|(_, modes)| mode_numbers(modes).any(|m| m == Some(1049))))
+                || private_modes(frame).is_some_and(|(_, modes)| {
+                    mode_numbers(modes).any(|m| {
+                        m == Some(1049)
+                            || m == Some(47) && !self.buffers[usize::from(alternate)].selected
+                    })
+                }))
         {
             // Buffer switches can transfer cursors and clear the alternate
             // buffer differently across emulators. Do not carry recovered
             // geometry through a switch; require initialization in its target.
-            self.buffers[usize::from(alternate)] = BufferEvidence::default();
+            let tabs = self.buffers[usize::from(alternate)].tabs;
+            let normal_rows = self.buffers[usize::from(alternate)].normal_rows;
+            self.buffers[usize::from(alternate)] = BufferEvidence {
+                tabs: if tabs == Tabs::Default {
+                    Tabs::Default
+                } else {
+                    Tabs::Unknown
+                },
+                normal_rows: if normal_rows == NormalRows::Known {
+                    NormalRows::Known
+                } else {
+                    NormalRows::default()
+                },
+                ..BufferEvidence::default()
+            };
             if before_alternate {
-                self.buffers[1] = BufferEvidence::default();
+                let tabs = self.buffers[1].tabs;
+                let normal_rows = self.buffers[1].normal_rows;
+                self.buffers[1] = BufferEvidence {
+                    tabs: if tabs == Tabs::Default {
+                        Tabs::Default
+                    } else {
+                        Tabs::Unknown
+                    },
+                    normal_rows: if normal_rows == NormalRows::Known {
+                        NormalRows::Known
+                    } else {
+                        NormalRows::default()
+                    },
+                    ..BufferEvidence::default()
+                };
             }
+            self.buffers[usize::from(alternate)].selected = true;
             return;
         }
 
+        let shared_known = self.shared == ALL_SHARED;
         let buffer = &mut self.buffers[usize::from(before_alternate)];
         // 1049 saves the departing slot, but selecting/clearing a buffer is
         // deliberately not evidence for that buffer's other inherited state.
         if private_modes(frame)
             .is_some_and(|(set, modes)| set && mode_numbers(modes).any(|mode| mode == Some(1049)))
         {
-            buffer.saved = buffer.cursor && buffer.origin && buffer.margins;
+            buffer.saved = shared_known
+                && buffer.cursor
+                && buffer.origin
+                && buffer.margins
+                && buffer.normal_rows == NormalRows::Known;
         }
         let buffer = &mut self.buffers[usize::from(alternate)];
+        if private_modes(frame)
+            .is_some_and(|(_, modes)| mode_numbers(modes).any(|m| matches!(m, Some(47 | 1049))))
+        {
+            buffer.selected = true;
+        }
+        if frame == b"\x1b[3g" {
+            buffer.tabs = Tabs::Cleared;
+        }
         if frame == b"\x1b[2J" {
-            buffer.cells = true;
-        } else if mutates_cells(frame) && !(buffer.cursor && buffer.origin && buffer.margins) {
+            buffer.cells = shared_known && buffer.normal_rows == NormalRows::Known;
+        } else if (mutates_cells(frame)
+            && !(shared_known
+                && buffer.cursor
+                && buffer.origin
+                && buffer.margins
+                && buffer.normal_rows == NormalRows::Known))
+            || (frame == b"\t" && buffer.tabs == Tabs::Unknown)
+        {
             // Clearing first is safe only if subsequent writes have known
             // coordinates. A later CUP cannot reconstruct an earlier write.
             buffer.cells = false;
+            if !shared_known || frame == b"\t" || buffer.normal_rows != NormalRows::Known {
+                buffer.cursor = false;
+            }
         }
         if private_modes(frame)
             .is_some_and(|(set, modes)| !set && mode_numbers(modes).any(|mode| mode == Some(6)))
@@ -103,18 +283,52 @@ impl Evidence {
         }
         if let Some(body) = frame.strip_prefix(b"\x1b[") {
             if matches!(body.last(), Some(b'H' | b'f')) && buffer.origin && buffer.margins {
-                buffer.cursor = true;
+                // Column one is an anchor even on an inherited double-width
+                // line. Other columns need established normal line size.
+                let params = &body[..body.len() - 1];
+                let col = params.split(|b| *b == b';').nth(1).unwrap_or(b"1");
+                buffer.cursor =
+                    buffer.normal_rows == NormalRows::Known || matches!(col, b"" | b"0" | b"1");
+            }
+        }
+        if frame == b"\x1b#5"
+            && shared_known
+            && buffer.selected
+            && buffer.cursor
+            && buffer.origin
+            && buffer.margins
+        {
+            if let NormalRows::Next(next) = buffer.normal_rows {
+                if screen.cursor_position().0 == next {
+                    buffer.normal_rows = if next + 1 == screen.size().0.get() {
+                        NormalRows::Known
+                    } else {
+                        NormalRows::Next(next + 1)
+                    };
+                }
             }
         }
         if matches!(frame, b"\x1b7" | b"\x1b[s" | b"\x1b[0s") {
-            buffer.saved = buffer.cursor && buffer.origin && buffer.margins;
+            buffer.saved = shared_known
+                && buffer.cursor
+                && buffer.origin
+                && buffer.margins
+                && buffer.normal_rows == NormalRows::Known;
         } else if matches!(frame, b"\x1b8" | b"\x1b[u" | b"\x1b[0u") && !buffer.saved {
             buffer.cursor = false;
+            if self.reason == Some(Unavailable::InheritedState) {
+                // DECRC can restore inherited attributes, maps, wrap and origin.
+                // Earlier initialization cannot prove the restored values.
+                self.shared = 0;
+                buffer.origin = false;
+                buffer.cells = false;
+            }
         }
     }
 
     pub fn invalidate(&mut self, reason: Unavailable) {
         self.reason = Some(reason);
+        self.shared = 0;
         self.buffers = [BufferEvidence::default(); 2];
     }
 
@@ -123,11 +337,29 @@ impl Evidence {
         if matches!(self.reason, None | Some(Unavailable::Resize)) {
             self.reason = Some(Unavailable::Resize);
         }
-        self.buffers = [BufferEvidence::default(); 2];
+        self.buffers = self.buffers.map(|buffer| BufferEvidence {
+            // Known default stops survive resize. Cleared stops may acquire
+            // new ones in an outer terminal; require another explicit clear.
+            tabs: if buffer.tabs == Tabs::Default {
+                Tabs::Default
+            } else {
+                Tabs::Unknown
+            },
+            selected: buffer.selected,
+            normal_rows: if buffer.normal_rows == NormalRows::Known {
+                NormalRows::Known
+            } else {
+                NormalRows::default()
+            },
+            ..BufferEvidence::default()
+        });
     }
 
     pub fn can_paint(&self, alternate: bool) -> bool {
-        matches!(self.reason, None | Some(Unavailable::Resize))
+        !matches!(
+            self.reason,
+            Some(Unavailable::UnsupportedSequence | Unavailable::SequenceBudget)
+        ) && self.shared == ALL_SHARED
             && self.buffers[usize::from(alternate)].complete()
     }
 
@@ -146,10 +378,80 @@ impl Evidence {
             mode_numbers(modes).any(|mode| {
                 matches!(mode, Some(47 | 1049))
                     && (!self.can_paint(set)
-                        || self.reason == Some(Unavailable::Resize)
-                            && (set != alternate || mode == Some(1049)))
+                        || self.reason.is_some() && (set != alternate || mode == Some(1049)))
             })
         })
+    }
+
+    pub fn supported(&self, frame: &[u8], screen: &vt100::Screen) -> bool {
+        // A previous graphic character can predate the inherited baseline.
+        // Local painting also changes REP state; do not broaden its support.
+        if self.reason == Some(Unavailable::InheritedState) {
+            if frame.starts_with(b"\x1b[") && frame.ends_with(b"b") {
+                return false;
+            }
+            if let Some((false, modes)) = private_modes(frame) {
+                let tracking = match screen.mouse_protocol_mode() {
+                    vt100::MouseProtocolMode::None => None,
+                    vt100::MouseProtocolMode::Press => Some(9),
+                    vt100::MouseProtocolMode::PressRelease => Some(1000),
+                    vt100::MouseProtocolMode::ButtonMotion => Some(1002),
+                    vt100::MouseProtocolMode::AnyMotion => Some(1003),
+                };
+                let encoding = match screen.mouse_protocol_encoding() {
+                    vt100::MouseProtocolEncoding::Default => None,
+                    vt100::MouseProtocolEncoding::Utf8 => Some(1005),
+                    vt100::MouseProtocolEncoding::Sgr => Some(1006),
+                };
+                for (group, active) in [(MOUSE_TRACKING, tracking), (MOUSE_ENCODING, encoding)] {
+                    if let Some(active) = active {
+                        if mode_numbers(modes).any(|m| m.is_some_and(|m| group.contains(&m)))
+                            && !mode_numbers(modes).any(|m| m == Some(active))
+                        {
+                            // Some terminals clear the entire group while the
+                            // backend clears only the matching selection.
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        supported(frame, screen)
+    }
+}
+
+fn group_mask(group: &[u16]) -> u64 {
+    INITIALIZERS
+        .iter()
+        .enumerate()
+        .fold(0, |mask, (index, initializer)| {
+            if private_modes(initializer).is_some_and(|(_, modes)| {
+                mode_numbers(modes).any(|m| m.is_some_and(|m| group.contains(&m)))
+            }) {
+                mask | 1 << index
+            } else {
+                mask
+            }
+        })
+}
+
+fn establishes(frame: &[u8], initializer: &[u8]) -> bool {
+    if let (Some((set, modes)), Some((init_set, init_modes))) =
+        (private_modes(frame), private_modes(initializer))
+    {
+        let mode = mode_numbers(init_modes).next().flatten().unwrap();
+        return (set == init_set || matches!(mode, 1 | 25 | 2004))
+            && mode_numbers(modes).any(|m| m == Some(mode));
+    }
+    match initializer {
+        b"\x1b[4l" => matches!(frame, b"\x1b[4l" | b"\x1b[4h"),
+        b"\x1b>" => matches!(frame, b"\x1b>" | b"\x1b="),
+        b"\x1b(B" => matches!(frame, b"\x1b(B" | b"\x1b(0"),
+        b"\x1b)B" => matches!(frame, b"\x1b)B" | b"\x1b)0"),
+        b"\x0f" => matches!(frame, b"\x0f" | b"\x0e"),
+        b"\x1b[0m" => matches!(frame, b"\x1b[m" | b"\x1b[0m"),
+        b"\x1b]8;;\x1b\\" => matches!(frame, b"\x1b]8;;\x1b\\" | b"\x1b]8;;\x07"),
+        _ => frame == initializer,
     }
 }
 
@@ -254,7 +556,8 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
                                     | 1049
                                     | 2004
                                     | 2026
-                            )
+                            ) || action == b'h' && m == 7
+                                || action == b'l' && matches!(m, 5 | 45 | 69 | 1001 | 1015 | 1016)
                         })
                 });
             }
@@ -313,6 +616,12 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
             parser.process(frame);
             return !parser.callbacks().0;
         }
+        if action == b'g' {
+            return args == b"3";
+        }
+        if action == b'q' && args == b"0\"" {
+            return true;
+        }
         if action == b'q' && args.ends_with(b" ") {
             return args.strip_suffix(b" ").is_some_and(|n| {
                 n.is_empty()
@@ -366,7 +675,10 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
                 | b'c'
                 | b'n'
         ) || (matches!(action, b's' | b'u') && matches!(args, b"" | b"0"))
-            || (matches!(action, b'h' | b'l') && args.split(|b| *b == b';').all(|p| p == b"4"));
+            || (matches!(action, b'h' | b'l')
+                && args
+                    .split(|b| *b == b';')
+                    .all(|p| p == b"4" || action == b'l' && p == b"20"));
     }
     if let Some(osc) = frame.strip_prefix(b"\x1b]") {
         let command = osc.split(|b| *b == b';').next().unwrap_or_default();
@@ -413,6 +725,15 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
     }
     matches!(
         frame,
-        b"\x1bc" | b"\x1b7" | b"\x1b=" | b"\x1b>" | b"\x1bM" | b"\x1bg" | b"\x1b\\"
+        b"\x1bc"
+            | b"\x1b7"
+            | b"\x1b="
+            | b"\x1b>"
+            | b"\x1bM"
+            | b"\x1bg"
+            | b"\x1b\\"
+            | b"\x1b<"
+            | b"\x1b%G"
+            | b"\x1b#5"
     )
 }

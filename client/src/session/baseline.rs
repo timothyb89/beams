@@ -22,6 +22,15 @@ pub struct Baseline {
 }
 
 impl Baseline {
+    pub fn observed_final_screen<'a>(
+        &self,
+        model: &'a crate::terminal_model::TerminalModel,
+    ) -> Option<&'a vt100::Screen> {
+        self.modes.get(&47).and_then(|&alternate| {
+            model.can_paint_buffer(alternate).then_some(model.screen())
+        })
+    }
+
     pub fn probes() -> Vec<u8> {
         let mut bytes = Vec::new();
         for mode in MODES {
@@ -417,5 +426,43 @@ mod tests {
             parser.screen().drawing_state().primary.scroll_region,
             (1, 4)
         );
+    }
+
+    #[test]
+    fn cleanup_geometry_requires_evidence_for_the_observed_outer_buffer() {
+        let mut model = crate::terminal_model::TerminalModel::new(portable_pty::PtySize {
+            rows: 6,
+            cols: 12,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
+        model.process(b"\x18\x1b\\\x1b<\x1b%G\x1b[?7h\x1b[?5;45;69l\x1b[20l\x1b[0\"q\
+            \x1b(B\x1b)B\x0f\x1b[0m\x1b]8;;\x1b\\\x1b[4l\x1b[?1l\x1b>\
+            \x1b[?25h\x1b[?2004l\x1b[?2026l\x1b[?9;1000;1001;1002;1003l\
+            \x1b[?1005;1006;1015;1016l\x1b[?47h\x1b[3g\x1b[?6l\x1b[r");
+        for row in 1..=6 {
+            model.process(format!("\x1b[{row};1H\x1b#5").as_bytes());
+        }
+        model.process(b"\x1b[H\x1b7\x1b[2J");
+        assert!(model.can_paint());
+        for (report, known) in [
+            (b"\x1b[?47;2$y".as_slice(), false),
+            (b"\x1b[?47;1$y", true),
+        ] {
+            let mut capture = Capture::default();
+            capture.feed(report);
+            capture.feed(b"\x1b[?6;1$y\x1bP1$r2;5r\x1b\\");
+            let (baseline, _) = capture.finish();
+            let final_screen = baseline.observed_final_screen(&model);
+            assert_eq!(final_screen.is_some(), known);
+            let restore = baseline.restore(final_screen);
+            assert_eq!(restore.windows(5).any(|b| b == b"\x1b[?6h"), known);
+            assert_eq!(restore.windows(6).any(|b| b == b"\x1b[2;5r"), known);
+        }
+        model.process(b"\x1bc");
+        let mut capture = Capture::default();
+        capture.feed(b"\x1b[?47;2$y");
+        let (baseline, _) = capture.finish();
+        assert!(baseline.observed_final_screen(&model).is_some());
     }
 }

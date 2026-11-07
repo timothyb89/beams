@@ -1210,6 +1210,10 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
         self.screen.grid_mut().col_tab();
     }
 
+    pub fn clear_tabs(&mut self) {
+        self.screen.grid_mut().clear_tabs();
+    }
+
     pub fn lf(&mut self) {
         let on_row = Self::on_row(&self.screen, &mut self.callbacks);
         self.screen.grid_mut().row_inc_scroll(1, on_row);
@@ -1456,6 +1460,8 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             match param {
                 [1] => screen.set_mode(MODE_APPLICATION_CURSOR),
                 [6] => screen.grid_mut().set_origin_mode(true),
+                // The model represents only enabled autowrap.
+                [7] => {}
                 [9] => screen.set_mouse_mode(MouseProtocolMode::Press),
                 [25] => screen.clear_mode(MODE_HIDE_CURSOR),
                 [47] => screen.enter_alternate_grid(),
@@ -1494,6 +1500,9 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             match param {
                 [1] => screen.clear_mode(MODE_APPLICATION_CURSOR),
                 [6] => screen.grid_mut().set_origin_mode(false),
+                // Reset-only inventory: these select the behavior already
+                // represented by the model. Their enabled forms stay unknown.
+                [5] | [45] | [69] | [1001] | [1015] | [1016] => {}
                 [9] => screen.clear_mouse_mode(MouseProtocolMode::Press),
                 [25] => screen.set_mode(MODE_HIDE_CURSOR),
                 [47] => {

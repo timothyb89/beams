@@ -547,6 +547,85 @@ def run_resize_reinitialization(root, binary):
         session.close()
 
 
+def inherited_initialization(alternate=True):
+    # Deliberately explicit; an ordinary TUI clear does not prove these states.
+    shared = (b"\x18\x1b\\\x1b<\x1b%G\x1b[?7h\x1b[?5;45;69l\x1b[20l\x1b[0\"q"
+              b"\x1b(B\x1b)B\x0f\x1b[0m\x1b]8;;\x1b\\\x1b[4l"
+              b"\x1b[?1l\x1b>\x1b[?25h\x1b[?2004l\x1b[?2026l"
+              b"\x1b[?9;1000;1001;1002;1003l\x1b[?1005;1006;1015;1016l")
+    select = b"\x1b[?47h" if alternate else b"\x1b[?47l"
+    rows = b"".join(f"\x1b[{row};1H\x1b#5".encode() for row in range(1, 25))
+    return shared + select + b"\x1b[3g\x1b[?6l\x1b[r" + rows + b"\x1b[H\x1b7\x1b[2J"
+
+
+def run_inherited_initialization(root, binary):
+    session = Session(root, binary, initialized=False)
+    try:
+        partial = inherited_initialization().replace(b"\x1b]8;;\x1b\\", b"")
+        session.emit(partial + b"PARTIAL INHERITED INITIALIZATION")
+        session.wait(lambda: b"PARTIAL INHERITED INITIALIZATION" in session.output,
+                     "initialization with an unknown link")
+        baseline = session.remote_input()
+        session.send(b"\x1dyINHERITED INPUT")
+        session.wait(lambda: session.remote_input() == baseline + b"yINHERITED INPUT",
+                     "incomplete inherited initialization defers menu")
+
+        offset = len(session.output)
+        before = inherited_initialization() + b"KNOWN WITHOUT RIS"
+        session.emit(before)
+        session.wait(lambda: before in session.output[offset:], "complete inherited initialization")
+        assert b"\x1bc" not in session.output, "fixture must not establish a RIS baseline"
+        session.open()
+        session.send(b"f8080")
+        session.wait(lambda: b"Forward a Beam port" in session.output[offset:], "inherited menu form")
+        hidden = (b"\x1b[3;3H\x1b[31m\x1b7"
+                  b"\x1b]8;id=remote;https://example.test/remote\x1b\\LINK\x1b]8;;\x1b\\"
+                  b"\x1b[4;1HA\tB\x1b[5;7H\x1b[6n\x1bP$qm\x1b\\")
+        baseline = session.remote_input()
+        session.emit(hidden)
+        session.wait(lambda: session.remote_input() == baseline + b"\x1b[5;7R\x1bP1$r0;31m\x1b\\",
+                     "known inherited cursor and attributes answer queries while covered")
+        session.send(b"\x1dAFTER INHERITED INPUT")
+        session.wait(lambda: session.remote_input().endswith(b"AFTER INHERITED INPUT"),
+                     "inherited menu close")
+        after = b"\x1b8!\x1b[0m\r\nAFTER INHERITED MENU"
+        session.emit(after)
+        session.wait(lambda: after in session.output[offset:], "saved state after inherited menu")
+        if module := os.environ.get("BEAMS_TEST_XTERM_MODULE"):
+            inherited = (b"UNSEEN WORKSTATION PRIMARY\x1b[1;31m\x1b7\x1b[?47h"
+                         b"\x1b[?7l\x1b[?45h\x1b[4h\x1b[20h\x1b(0\x1b)0\x0e"
+                         b"\x1b[?1003h\x1b[?1016h\x1b[?25l\x1b[?2004h"
+                         b"\x1b]8;id=old;https://example.test/old\x1b\\"
+                         b"\x1b]2;inherited unfinished string")
+            trace = dict(name="live inherited initialization", rows=24, cols=100,
+                         inherited=list(inherited), before=list(before), hidden=list(hidden),
+                         after=list(after), physical=list(session.output[offset:]))
+            subprocess.run(["node", str(Path(__file__).with_name("terminal-paint-reference.cjs")), module],
+                           input=json.dumps([trace]), text=True, check=True)
+
+        session.open(b"Forward a Beam port")
+        offset = len(session.output)
+        transition = b"\x1b[?00047lUNINITIALIZED PRIMARY"
+        session.emit(transition[:7])
+        session.emit(transition[7:])
+        session.wait(lambda: transition in session.output[offset:], "inherited switch closes before replay")
+        assert session.output[offset:].count(transition) == 1
+        baseline = session.remote_input()
+        session.send(b"\x1dyUNKNOWN BUFFER INPUT")
+        session.wait(lambda: session.remote_input() == baseline + b"yUNKNOWN BUFFER INPUT",
+                     "unknown buffer cannot consume menu keys")
+        session.emit(inherited_initialization(False) + b"EXPLICIT PRIMARY")
+        session.wait(lambda: b"EXPLICIT PRIMARY" in session.output[offset:], "primary explicitly initialized")
+        session.open(b"Forward a Beam port")
+        session.wait(lambda: b"8080" in session.output[offset:], "inherited form survives deferred switch")
+        os.kill(session.pid, signal.SIGTERM)
+        session.wait(lambda: session.status is not None, "inherited form termination")
+        assert session.status == 143
+        session.assert_termios_restored()
+    finally:
+        session.close()
+
+
 def run_lifecycle(root, binary, outcome):
     disabled = outcome == "disabled"
     settings = {25: False, 47: True, 66: True, 1: True, 4: True, 6: True,
@@ -621,6 +700,9 @@ def main():
         resized = root / "resized"
         resized.mkdir()
         run_resize_reinitialization(resized, binary)
+        inherited = root / "inherited"
+        inherited.mkdir()
+        run_inherited_initialization(inherited, binary)
         for outcome in ["normal", "signal", "disabled"]:
             lifecycle = root / f"lifecycle-{outcome}"
             lifecycle.mkdir()

@@ -876,10 +876,23 @@ bootstrap `Task`s.
     a sequence terminator. Fixtures and the controlling-PTY harness cover this.
   - [ ] Complete snapshot/eligibility coverage for further drawing/input state
     and content provenance. Conservative evidence now rejects inherited
-    state and unsupported sequences; only observed RIS establishes shared
-    state initially. Post-resize buffer geometry can now recover explicitly
-    as described below. Extend inherited initialization/region evidence
-    without guessing modes/save slots.
+    state until observed RIS or complete supported explicit initialization.
+    Shared state, selection, tabs and geometry have independent evidence.
+    Post-resize geometry can recover explicitly as described below.
+    Extend regional/inactive-buffer evidence without guessing modes/save slots.
+  - [x] Explicit inherited-state initialization without RIS: observe complete
+    supported shared settings after CAN/ST, buffer selection, normal line size
+    on every row, tab clearing and geometry.
+    Initial inherited cells/save slots remain unknown until overwritten;
+    ordinary clears, soft resets and application names cannot prove safety.
+    Unknown writes/tabs/restores and 1049 returns invalidate affected evidence,
+    coupled mouse groups require fresh complete initialization, and unknown
+    buffer switches close/replay before mutation. Cleanup also requires
+    evidence for its outer target buffer. Eight model tests, a cleanup test,
+    three independent inherited traces and a live renderer/PTY trace cover
+    this path; forms survive deferral and buffer changes without any RIS.
+    Borrowing, regional evidence and the workstation matrix remain open.
+    REP state still needs representation before expanding its compatibility.
   - [x] Per-buffer geometry evidence after resize of a known baseline:
     observed origin reset, full margins, CUP, DECSC and ED 2 establish the
     active buffer without a new RIS. Unknown-position writes invalidate clear

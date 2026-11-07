@@ -269,3 +269,35 @@ uncovered resize and incomplete initialization, then tests raw switching into
 an unknown buffer and explicit recovery there. This establishes recovery
 after a clear, not lossless covered reflow. Inherited initialization, regional
 borrowing and the real workstation matrix remain open; takeover stays default.
+
+Explicit inherited-initialization pass (2026-11-07): **241 unit tests and 3
+integration tests pass, none ignored**. Shared confidence is recorded
+independently from buffer selection, tabs and geometry. Complete supported
+initialization can establish one buffer without ever observing RIS; the other
+buffer stays unknown. Initializers cover attributes/link closure, character
+sets, fixed supported drawing behavior, input settings and coupled mouse
+groups. Controls before an observed CAN/ST boundary are insufficient, and
+every row requires normal line-size evidence before cells or saves are known.
+TBC 3 is modeled per buffer; unknown tabs lose cursor evidence, and
+previously cleared stops require another clear after resize.
+
+Eight model regressions check every split, omitted components, prior unknown
+writes/save slots, stale partial mouse resets, explicit target recovery and
+stronger unsupported/budget loss. A cleanup regression requires evidence for
+the queried outer target buffer, preventing guessed inactive cursor/margins.
+Independent xterm.js 5.5 replay adds three traces with non-default physical
+state absent from the shadow: drawing, saved state, tabs and untouched primary
+content compare against the same unpainted trace. The live inherited renderer
+trace verifies remote CPR/DECRQSS, OSC 8 metadata and saved-state continuation.
+The PTY fixture also verifies incomplete-init refusal, form persistence,
+split/leading-zero switches replayed once and SIGTERM cleanup without any RIS.
+The reference emulator does not exercise DEC double-width/height line effects.
+Row normalization has model evidence regressions; its physical terminal effects
+remain part of the workstation gate.
+
+The client build, both managed-session smoke modes and expanded protocol/PTY
+harness pass. The initialization inventory is deliberately restrictive:
+ordinary clears/soft resets are insufficient, unrepresented enabled modes and
+inherited REP remain unsupported, and ambiguous coupled mouse resets defer
+painting. Regional evidence, safe borrowing, full model/REP semantics and the
+real workstation font/reflow matrix remain open; the overlay stays opt-in.

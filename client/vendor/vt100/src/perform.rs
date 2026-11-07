@@ -55,6 +55,10 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, b: u8) {
         if matches!(intermediates, b"(" | b")") && matches!(b, b'B' | b'0') {
             self.character_set(intermediates == b")", b == b'0');
+        } else if intermediates == b"%" && b == b'G' {
+            // UTF-8 is the parser's represented encoding.
+        } else if intermediates == b"#" && b == b'5' {
+            // Single-width, single-height is the represented line size.
         } else if let Some(i) = intermediates.first() {
             self.callbacks.unhandled_escape(
                 &mut self.screen,
@@ -68,6 +72,7 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                 b'8' => self.decrc(),
                 b'=' => self.deckpam(),
                 b'>' => self.deckpnm(),
+                b'<' => {} // ANSI is the represented terminal grammar.
                 b'M' => self.ri(),
                 b'c' => {
                     self.ris();
@@ -128,9 +133,17 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                 '`' => self.hpa(canonicalize_params_1(params, 1)),
                 'b' => self.rep(canonicalize_params_1(params, 1)),
                 'd' => self.vpa(canonicalize_params_1(params, 1)),
+                'g' if params.iter().all(|p| p == [3]) => self.clear_tabs(),
                 'm' => self.sgr(params, unhandled),
-                'h' | 'l' if params.iter().all(|p| p == [4]) => {
-                    self.insert_mode(c == 'h');
+                'h' | 'l'
+                    if params.iter().all(|p| p == [4] || c == 'l' && p == [20]) =>
+                {
+                    for param in params {
+                        if param == [4] {
+                            self.insert_mode(c == 'h');
+                        }
+                        // Reset LNM selects LF without CR, already modeled.
+                    }
                 }
                 'r' => self.decstbm(canonicalize_params_decstbm(
                     params,
@@ -191,6 +204,9 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                     );
                 }
             },
+            Some(b'"') if c == 'q' && params.iter().all(|p| p == [0]) => {
+                // Reset-only DECSCA: newly written cells are unprotected.
+            }
             Some(b'?') => {
                 match c {
                     'J' => self

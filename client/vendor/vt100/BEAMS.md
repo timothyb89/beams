@@ -26,3 +26,18 @@ than upstream's 32-byte optimization.
 The optional xterm.js 5.5 reference checks restoration bytes against that
 emulator's unpainted baseline. Its saved-wrap/origin behavior differs from the
 VT/xterm model; it does not establish complete shadow-model equivalence.
+
+The inherited-initialization inventory adds reset-only controls for behavior
+the backend already represents: ANSI/UTF-8 selection, enabled autowrap,
+normal global video, disabled reverse wrap/horizontal margins/newline mode
+unprotected characters and normal line size (`ESC # 5`). Unrepresented mouse-variant resets are admitted
+conservatively; enabled variants remain unsupported. Beams records explicit
+evidence rather than treating these parser defaults as observations. Initial
+controls need an observed CAN/ST boundary, and each row needs normalization
+before its cells/save state can be certified.
+TBC 3 clears all tab stops per buffer, so HT then advances to the final column
+and retains a pending wrap. Custom stops remain unsupported. After resize,
+Beams requires a fresh clear before trusting previously cleared stops; this
+fork does not model terminal-specific tab extension/reflow. Inherited REP
+and ambiguous coupled mouse resets defer painting instead of assuming their
+state is preserved by local output.

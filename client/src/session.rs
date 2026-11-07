@@ -292,7 +292,10 @@ pub fn run(
     // is explicitly killed on a local driver error; on success it has already
     // exited and `kill` is unnecessary.
     if terminal_model.can_paint() {
-        terminal_state.final_screen = Some(terminal_model.screen().clone());
+        terminal_state.final_screen = terminal_state
+            .baseline
+            .observed_final_screen(&terminal_model)
+            .cloned();
         if overlay_enabled && terminal_state.palette_open {
             let _ = restore_terminal_model(&terminal_model, terminal_state.covered_alternate);
             terminal_state.palette_open = false;

@@ -345,16 +345,29 @@ end an unfinished string or synchronized update.
 
 Overlay menus and toasts also require observed drawing state. Both buffers
 start unknown: a cursor report, buffer selection or clear cannot establish
-inherited modes and save slots. Currently an observed full reset (`ESC c`)
-is required to establish the complete baseline. The client does not send that
-reset itself. Unsupported sequences suppress painting until another observed
-reset. After resize of a known baseline, an application can explicitly
+inherited modes and save slots. An observed full reset (`ESC c`) establishes
+the baseline. A complete explicit application initialization can also establish
+shared state and one selected buffer without RIS. This requires a CAN/ST parser
+boundary followed by evidence for
+attributes/link closure, character sets, supported wrap/linefeed behavior,
+input modes, coupled mouse resets, tab clearing, normal size on every row,
+coordinates and a new save
+slot. The [initialization inventory](../docs/designs/TERMINAL_OVERLAY_DESIGN.md#implementation-status-and-next-session-handoff)
+records the required controls. The client observes these controls from remote
+output; it never sends initialization itself. An ordinary TUI clear or soft
+reset is insufficient, and the inactive buffer remains unknown.
+
+Unsupported sequences suppress painting until another observed full reset.
+After resize of a known baseline, an application can explicitly
 reinitialize the active buffer without RIS: reset origin mode, set full margins,
 position the cursor, save it and clear the screen (`CSI ?6l`, `CSI r`, `CUP`,
 `DECSC`, `CSI 2J`). Each component needs observed evidence; earlier writes at
 unknown coordinates invalidate a clear. Shared modes must already be known.
-Buffer switches after this recovery close the menu before raw replay and
-require initialization in the selected buffer again. Inherited state and
+Cleared tab stops also require a new clear after resize, since an outer terminal
+can introduce new stops. Buffer switches after explicit initialization or resize
+recovery close the menu before raw replay and require fresh target initialization.
+Unknown cursor restores can undo earlier attribute/mode evidence; leaving 1049
+can restore an inherited primary slot too. Unsupported output and
 sequence-budget loss still require observed RIS. This policy can defer menus
 in ordinary shells and TUIs; explicit takeover remains available. An unavailable menu key rings
 the terminal bell at the next safe output boundary. Ordinary keys keep going
@@ -378,8 +391,8 @@ of ordinary input, which is retained for normal routing after handoff. Exit,
 driver errors and handled signals restore observed settings rather than
 forcing shell defaults. Mouse modes are disabled before the observed mode is
 enabled, and buffer selection avoids clearing or saving over a cursor slot.
-Origin/margins are restored only with an observed final cursor and known
-buffer ownership; unchanged origin mode is not written because it homes the
+Origin/margins are restored only with evidence for the outer baseline's target
+buffer, including its final cursor; unchanged origin mode is not written because it homes the
 cursor. Unsupported/unanswered settings stay unknown. Such terminals may
 retain modes left unbalanced by a killed remote application. Kitty cleanup
 restores observed current flags without popping an unowned keyboard stack;
