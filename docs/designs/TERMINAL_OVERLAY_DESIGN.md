@@ -500,6 +500,17 @@ Form contents and selection survive. Toasts are removed from the last good
 state before incoming raw output can invalidate it. Menus track every buffer
 touched while hidden, including inactive-buffer updates in round trips.
 
+Deferred availability uses a bell after a safe output boundary; it never
+draws over unknown content or terminates an unfinished OSC with BEL. Ordinary
+keys cancel the pending prefix and remain remote input; doubled prefixes
+retain literal forwarding. Recovery requires an explicit retry and reopens
+the preserved form. Borrowing remains refused when inactive-buffer ownership
+or saved state is unknown. The current RIS-only evidence cannot establish a
+useful additional borrowing case: when all those prerequisites are known,
+ordinary overlay painting is already eligible. A fallback that extends
+availability still requires richer evidence and independently verified buffer
+switching, so this gate remains open rather than assuming a spare buffer.
+
 Covered resize remains a fidelity gate: the outer terminal may already have
 reflowed before the client sees SIGWINCH. Closing from the last snapshot is
 best effort; new painting is then suppressed. This does not establish lossless

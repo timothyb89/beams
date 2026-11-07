@@ -917,7 +917,9 @@ bootstrap `Task`s.
     UX before default use. Unsafe painting is now deferred; explicit best-effort
     takeover remains. A guarded frame closes/replays unsupported output before
     model mutation, preserving forms and bytes. Toasts withdraw before new
-    output. Complete common drawing-state coverage and covered-resize fidelity.
+    output. Common drawing state is covered. Deferred menus acknowledge with
+    a bell only at a safe boundary; recovery needs an explicit retry and keeps
+    forms. Complete richer eligibility and covered-resize fidelity.
   - [ ] Guarded alternate-buffer menu fallback for unknown primary screens:
     preserve primary content and cursor/mode state, establish inactive-buffer
     ownership, close/replay before output overflow or a remote buffer switch,

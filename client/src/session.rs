@@ -555,6 +555,9 @@ fn drive(
                 InputAction::Remote(bytes) => {
                     writer.enqueue(&bytes).context("queueing local PTY input")?;
                 }
+                InputAction::PaletteUnavailable => {
+                    terminal_state.unavailable_notice = true;
+                }
                 InputAction::OpenPalette => {
                     painter.forget();
                     if overlay_enabled {
@@ -595,6 +598,11 @@ fn drive(
         }
         if keys_handled && input_router.mode == InputMode::Palette && palette_terminal.is_some() {
             redraw_palette!();
+        }
+        if terminal_state.unavailable_notice && terminal_state.output.at_boundary(Instant::now()) {
+            io::stdout().write_all(b"\x07").context("acknowledging unavailable menu")?;
+            io::stdout().flush().context("flushing unavailable menu acknowledgement")?;
+            terminal_state.unavailable_notice = false;
         }
     }
 }
@@ -2058,6 +2066,7 @@ enum InputAction {
     Remote(Vec<u8>),
     OpenPalette,
     ClosePalette,
+    PaletteUnavailable,
 }
 
 /// Upper bound on a bracketed paste collected for a menu field.
@@ -2280,6 +2289,9 @@ impl InputRouter {
                 if !self.palette_available {
                     if self.unavailable_prefix {
                         remote.extend_from_slice(encoded);
+                    } else {
+                        flush_remote(actions, remote);
+                        actions.push(InputAction::PaletteUnavailable);
                     }
                     self.unavailable_prefix = !self.unavailable_prefix;
                     return;
@@ -2967,6 +2979,7 @@ struct TerminalState {
     menu_prefix: Vec<u8>,
     menu_snapshot: Option<vt100::Screen>,
     covered_alternate: bool,
+    unavailable_notice: bool,
 }
 
 impl TerminalState {
@@ -2979,6 +2992,7 @@ impl TerminalState {
             menu_prefix: Vec::new(),
             menu_snapshot: None,
             covered_alternate: false,
+            unavailable_notice: false,
         })
     }
 
@@ -3090,11 +3104,11 @@ mod tests {
         let mut on_key = |_| panic!("unseen palette received a key");
         assert_eq!(
             router.route(key, b"\x1dy", std::time::Instant::now(), &mut on_key),
-            vec![super::InputAction::Remote(b"y".to_vec())],
+            vec![super::InputAction::PaletteUnavailable, super::InputAction::Remote(b"y".to_vec())],
         );
         assert_eq!(
             router.route(key, b"\x1d\x1d", std::time::Instant::now(), &mut on_key),
-            vec![super::InputAction::Remote(b"\x1d".to_vec())],
+            vec![super::InputAction::PaletteUnavailable, super::InputAction::Remote(b"\x1d".to_vec())],
         );
         assert_eq!(router.mode, super::InputMode::Passthrough);
     }
