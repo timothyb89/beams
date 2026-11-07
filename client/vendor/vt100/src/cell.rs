@@ -15,8 +15,8 @@ pub struct Cell {
     contents: [u8; CONTENT_BYTES],
     len: u8,
     attrs: crate::attrs::Attrs,
+    pub(crate) hyperlink: Option<alloc::sync::Arc<str>>,
 }
-const _: () = assert!(core::mem::size_of::<Cell>() == 32);
 
 impl PartialEq<Self> for Cell {
     fn eq(&self, other: &Self) -> bool {
@@ -26,6 +26,7 @@ impl PartialEq<Self> for Cell {
         if self.attrs != other.attrs {
             return false;
         }
+        if self.hyperlink != other.hyperlink { return false; }
         let len = self.len();
         self.contents[..len] == other.contents[..len]
     }
@@ -39,6 +40,7 @@ impl Cell {
             contents: [0; CONTENT_BYTES],
             len: 0,
             attrs: crate::attrs::Attrs::new(),
+            hyperlink: None,
         }
     }
 
@@ -53,6 +55,7 @@ impl Cell {
         // character to determine the cell width
         self.set_wide(c.width().unwrap_or(1) > 1);
         self.attrs = a;
+        self.hyperlink = None;
     }
 
     pub(crate) fn append(&mut self, c: char) {
@@ -96,6 +99,7 @@ impl Cell {
     pub(crate) fn clear(&mut self, attrs: crate::attrs::Attrs) {
         self.len = 0;
         self.attrs = attrs;
+        self.hyperlink = None;
     }
 
     /// Returns the text contents of the cell.
@@ -197,6 +201,30 @@ impl Cell {
         self.attrs.inverse()
     }
 
+    /// Whether slow blinking is enabled.
+    #[must_use]
+    pub fn blink(&self) -> bool { self.attrs.blink() }
+
+    /// Whether the invisible attribute is enabled.
+    #[must_use]
+    pub fn hidden(&self) -> bool { self.attrs.hidden() }
+
+    /// Whether the crossed-out attribute is enabled.
+    #[must_use]
+    pub fn strike(&self) -> bool { self.attrs.strike() }
+
+    /// The complete OSC 8 opener attached to this cell, if any.
+    #[must_use]
+    pub fn hyperlink(&self) -> Option<&str> { self.hyperlink.as_deref() }
+
+    pub(crate) fn set_hyperlink(&mut self, link: Option<alloc::sync::Arc<str>>) {
+        self.hyperlink = link;
+    }
+
+    pub(crate) fn write_hyperlink(&self, out: &mut alloc::string::String) {
+        out.push_str(self.hyperlink().unwrap_or("\x1b]8;;\x1b\\"));
+    }
+
     /// SGR commands establishing this cell's attributes from any attributes.
     #[must_use]
     pub fn attributes_formatted(&self) -> alloc::string::String {
@@ -206,6 +234,7 @@ impl Cell {
             &mut out,
             &crate::attrs::Attrs::default(),
         );
+        self.write_hyperlink(&mut out);
         out
     }
 }

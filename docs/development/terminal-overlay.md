@@ -218,3 +218,11 @@ output, inactive-buffer round trips and reopening a preserved form. Only RIS
 establishes a complete baseline today. Covered resize closes the menu and
 invalidates eligibility, but restoring after the physical terminal has
 already reflowed remains best effort and a release gate.
+
+Common drawing-state pass (2026-11-07): 222 unit tests and 3 integration tests,
+client build and the protocol/PTY harness pass. Twelve independent xterm.js
+restoration traces pass, including insert mode, G0/G1 graphics and saved
+mapping, independent SGR attributes and OSC 8 URI/id metadata; the actual
+renderer comparison also passes. Toast tests cover restored hyperlinks and
+unlinked local text, plus continued printing in insert/graphics mode.
+Malformed color parameters no longer count as a complete SGR snapshot.

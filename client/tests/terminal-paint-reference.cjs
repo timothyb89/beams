@@ -15,11 +15,18 @@ function snapshot(terminal) {
     const cells = [];
     for (let x = 0; x < terminal.cols; x++) {
       const cell = line.getCell(x);
+      // Pinned 5.5 internals: compare URI/id, not allocated numeric ids.
+      const raw = terminal._core._bufferService.buffer.lines.get(buffer.baseY + y).loadCell(x,
+        terminal._core._inputHandler._workCell);
+      const link = cell.getWidth() === 0 || !raw.hasExtendedAttrs() ? null :
+        terminal._core._oscLinkService.getLinkData(raw.extended.urlId) || null;
       cells.push([
         cell.getChars() || ' ', cell.getWidth(),
         cell.getFgColorMode(), cell.getFgColor(),
         cell.getBgColorMode(), cell.getBgColor(),
         cell.isBold(), cell.isDim(), cell.isItalic(), cell.isUnderline(), cell.isInverse(),
+        cell.isBlink(), cell.isInvisible(), cell.isStrikethrough(),
+        link,
       ]);
     }
     lines.push(cells);

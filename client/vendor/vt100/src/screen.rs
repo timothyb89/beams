@@ -85,6 +85,10 @@ pub struct Screen {
 
     attrs: crate::attrs::Attrs,
     saved_attrs: [crate::attrs::Attrs; 2],
+    character_sets: crate::CharacterSets,
+    saved_character_sets: [crate::CharacterSets; 2],
+    insert_mode: bool,
+    hyperlink: Option<alloc::sync::Arc<str>>,
 
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
@@ -115,6 +119,10 @@ impl Screen {
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: [crate::attrs::Attrs::default(); 2],
+            character_sets: crate::CharacterSets::default(),
+            saved_character_sets: [crate::CharacterSets::default(); 2],
+            insert_mode: false,
+            hyperlink: None,
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -328,9 +336,11 @@ impl Screen {
     }
 
     fn write_contents_formatted(&self, contents: &mut String) {
+        contents.push_str("\x1b]8;;\x1b\\");
         crate::term::HideCursor::new(self.hide_cursor()).write_buf(contents);
         let prev_attrs = self.grid().write_contents_formatted(contents);
         self.attrs.write_escape_code_diff(contents, &prev_attrs);
+        contents.push_str(self.hyperlink.as_deref().unwrap_or("\x1b]8;;\x1b\\"));
     }
 
     /// Returns the formatted visible contents of the terminal in a "basic"
@@ -639,13 +649,18 @@ impl Screen {
             );
             out
         });
+        let mut primary = self.grid.drawing_state(saved_attributes[0].clone());
+        let mut alternate = self.alternate_grid.drawing_state(saved_attributes[1].clone());
+        primary.saved_character_sets = self.saved_character_sets[0];
+        alternate.saved_character_sets = self.saved_character_sets[1];
         crate::DrawingState {
-            primary: self.grid.drawing_state(saved_attributes[0].clone()),
-            alternate: self
-                .alternate_grid
-                .drawing_state(saved_attributes[1].clone()),
+            primary,
+            alternate,
             alternate_screen: self.alternate_screen(),
             attributes: self.attributes_formatted(),
+            character_sets: self.character_sets,
+            insert_mode: self.insert_mode,
+            hyperlink: self.hyperlink.as_deref().map(String::from),
         }
     }
 
@@ -825,11 +840,13 @@ impl Screen {
     fn save_cursor(&mut self) {
         self.grid_mut().save_cursor();
         self.saved_attrs[usize::from(self.alternate_screen())] = self.attrs;
+        self.saved_character_sets[usize::from(self.alternate_screen())] = self.character_sets;
     }
 
     fn restore_cursor(&mut self) {
         self.grid_mut().restore_cursor();
         self.attrs = self.saved_attrs[usize::from(self.alternate_screen())];
+        self.character_sets = self.saved_character_sets[usize::from(self.alternate_screen())];
     }
 
     fn set_mode(&mut self, mode: u8) {
@@ -949,6 +966,7 @@ impl Screen {
     ) {
         if new_pos.col == 0 {
             let attrs = self.attrs;
+            let link = self.grid().drawing_cell(old_pos).unwrap().hyperlink.clone();
             let contents = self
                 .grid()
                 .drawing_cell(old_pos)
@@ -959,6 +977,7 @@ impl Screen {
                 .drawing_cell_mut(new_pos)
                 .unwrap()
                 .set_contents(&contents, attrs);
+            self.grid_mut().drawing_cell_mut(new_pos).unwrap().set_hyperlink(link);
             self.grid_mut()
                 .drawing_cell_mut(old_pos)
                 .unwrap()
@@ -1090,6 +1109,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
 
     pub fn text(&mut self, c: char) {
         let screen = &mut self.screen;
+        let c = screen.character_sets.map(c);
         let pos = screen.grid().pos();
         let attrs = screen.attrs;
 
@@ -1108,6 +1128,9 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             screen.grid_mut().col_wrap(width, wrap, on_row);
             // col_wrap always sets self.grid().pos() to a valid cell
             base_pos = screen.grid().pos();
+            if screen.insert_mode {
+                screen.grid_mut().insert_cells(width);
+            }
             cell_was_wide =
                 screen.grid().drawing_cell(base_pos).unwrap().is_wide();
 
@@ -1116,6 +1139,8 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 .drawing_cell_mut(base_pos)
                 .unwrap()
                 .set(c, attrs);
+            let link = screen.hyperlink.clone();
+            screen.grid_mut().drawing_cell_mut(base_pos).unwrap().set_hyperlink(link);
             screen.last_char = Some(c);
             screen.grid_mut().col_inc(width);
         } else {
@@ -1258,6 +1283,32 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
     // CSI @
     pub fn ich(&mut self, count: u16) {
         self.screen.grid_mut().insert_cells(count);
+    }
+
+    pub fn character_set(&mut self, g1: bool, dec: bool) {
+        if g1 { self.screen.character_sets.g1_dec = dec; }
+        else { self.screen.character_sets.g0_dec = dec; }
+    }
+
+    pub fn shift_out(&mut self, enabled: bool) {
+        self.screen.character_sets.shift_out = enabled;
+    }
+
+    pub fn insert_mode(&mut self, enabled: bool) {
+        self.screen.insert_mode = enabled;
+    }
+
+    pub fn hyperlink(&mut self, params: &[u8], uri: &[u8]) {
+        self.screen.hyperlink = if uri.is_empty() {
+            None
+        } else {
+            let mut opener = String::from("\x1b]8;");
+            opener.push_str(core::str::from_utf8(params).unwrap());
+            opener.push(';');
+            opener.push_str(core::str::from_utf8(uri).unwrap());
+            opener.push_str("\x1b\\");
+            Some(alloc::sync::Arc::from(opener))
+        };
     }
 
     // CSI A
@@ -1491,7 +1542,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
             () => {
                 match iter.next() {
                     Some(n) => n,
-                    _ => return,
+                    _ => { unhandled(self); return; },
                 }
             };
         }
@@ -1501,6 +1552,7 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 if let Some(n) = u16_to_u8($n) {
                     n
                 } else {
+                    unhandled(self);
                     return;
                 }
             };
@@ -1511,24 +1563,31 @@ impl<CB: crate::Callbacks> WrappedScreen<CB> {
                 if let &[n] = next_param!() {
                     to_u8!(n)
                 } else {
+                    unhandled(self);
                     return;
                 }
             };
         }
 
-        loop {
+        while let Some(param) = iter.next() {
             let screen = &mut self.screen;
-            match next_param!() {
+            match param {
                 [0] => screen.attrs = crate::attrs::Attrs::default(),
                 [1] => screen.attrs.set_bold(),
                 [2] => screen.attrs.set_dim(),
                 [3] => screen.attrs.set_italic(true),
                 [4] => screen.attrs.set_underline(true),
+                [5] => screen.attrs.set_blink(true),
                 [7] => screen.attrs.set_inverse(true),
+                [8] => screen.attrs.set_hidden(true),
+                [9] => screen.attrs.set_strike(true),
                 [22] => screen.attrs.set_normal_intensity(),
                 [23] => screen.attrs.set_italic(false),
                 [24] => screen.attrs.set_underline(false),
+                [25] => screen.attrs.set_blink(false),
                 [27] => screen.attrs.set_inverse(false),
+                [28] => screen.attrs.set_hidden(false),
+                [29] => screen.attrs.set_strike(false),
                 [n] if (30..=37).contains(n) => {
                     screen.attrs.fgcolor = crate::Color::Idx(to_u8!(*n) - 30);
                 }

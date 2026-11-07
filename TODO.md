@@ -885,9 +885,13 @@ bootstrap `Task`s.
     updates. Toasts never borrow a save slot. DEC and xterm-style ANSI aliases
     are covered; saved-cursor and origin/margins gates are unignored.
     Takeover replays deferred bytes from its captured entry state.
-  - [ ] Extend painting to insert mode, DEC character sets, OSC 8 hyperlinks
-    and every touched inactive buffer, with content provenance and resize
-    invalidation. A limited xterm.js 5.5 replay validates nine restoration
+  - [x] Extend painting to insert mode, ASCII/DEC G0/G1 character sets, basic
+    SGR attributes, OSC 8 hyperlinks and every touched inactive buffer.
+    Current and per-buffer saved character sets are restored, links remain
+    attached to remote cells and local UI text never inherits a link.
+    Malformed/advanced attributes and ambiguous link/save combinations defer
+    painting. Conservative content provenance and resize invalidation apply.
+    A limited xterm.js 5.5 replay validates twelve restoration
     traces and the actual menu renderer, but saved-wrap/origin semantics differ
     from the model. Establish the supported terminal behavior or defer painting
     on those variants before changing the default.

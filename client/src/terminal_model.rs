@@ -236,6 +236,7 @@ impl Callbacks for EventCallbacks {
             let mode = params[0].first().copied().unwrap_or(0);
             let private = i1 == Some(b'?');
             let enabled = match (private, mode) {
+                (false, 4) => Some(screen.drawing_state().insert_mode),
                 (true, 1) => Some(screen.application_cursor()),
                 (true, 6) => {
                     let state = screen.drawing_state();
@@ -654,6 +655,15 @@ fn cell_style(cell: &vt100::Cell) -> Style {
     if cell.underline() {
         style = style.add_modifier(Modifier::UNDERLINED);
     }
+    if cell.blink() {
+        style = style.add_modifier(Modifier::SLOW_BLINK);
+    }
+    if cell.hidden() {
+        style = style.add_modifier(Modifier::HIDDEN);
+    }
+    if cell.strike() {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
     style
 }
 
@@ -717,8 +727,8 @@ mod tests {
     fn covered_unsupported_frames_stop_before_mutation_and_replay_exactly_at_every_split() {
         for unsafe_frame in [
             b"\x1b_Ga=q;opaque qy\x1b\\".as_slice(),
-            b"\x1b[4h",
-            b"\x1b]8;;https://example.test\x1b\\",
+            b"\x1b[7777h",
+            b"\x1b]50;unmodeled-font\x1b\\",
         ] {
             let trace = [b"\x1b[31msafe".as_slice(), unsafe_frame, b"after"].concat();
             for split in 0..=trace.len() {
@@ -826,6 +836,49 @@ mod tests {
     }
 
     #[test]
+    fn common_drawing_state_is_eligible_and_split_invariant_but_malformed_sgr_is_not() {
+        let trace = b"\x1bc\x1b(0lqqk\x1b(B\x1b)0\x0ex\x0f\x1b[4h\x1b[1;2;5;8;9m\x1b]8;id=one;https://example.test\x1b\\LINK\x1b[0mNEXT\x1b]8;;\x1b\\";
+        let mut expected = TerminalModel::new(size());
+        expected.process(trace);
+        assert!(expected.can_paint());
+        assert!(expected.drawing_state().insert_mode);
+        assert_eq!(expected.screen().cell(0, 0).unwrap().contents(), "┌");
+        assert!(expected.screen().cell(0, 5).unwrap().bold());
+        assert!(expected.screen().cell(0, 5).unwrap().dim());
+        assert!(expected.screen().cell(0, 5).unwrap().blink());
+        assert!(expected.screen().cell(0, 5).unwrap().hidden());
+        assert!(expected.screen().cell(0, 5).unwrap().strike());
+        assert!(
+            expected.screen().cell(0, 9).unwrap().hyperlink().is_some(),
+            "SGR 0 keeps the link"
+        );
+        for split in 0..=trace.len() {
+            let mut model = TerminalModel::new(size());
+            model.process(&trace[..split]);
+            model.process(&trace[split..]);
+            assert!(model.can_paint(), "split {split}");
+            assert_eq!(
+                model.screen().contents_formatted(),
+                expected.screen().contents_formatted()
+            );
+            assert_eq!(model.drawing_state(), expected.drawing_state());
+        }
+        for unsupported in [
+            b"\x1b[38;2;1m".as_slice(),
+            b"\x1b[38;5;256m",
+            b"\x1b[4:2m",
+            b"\x1b[7 q",
+            b"\x1b(A",
+            b"\x1b]8;id=x;\x1b\\",
+        ] {
+            let mut model = TerminalModel::new(size());
+            model.process(b"\x1bc");
+            model.process(unsupported);
+            assert!(!model.can_paint(), "{unsupported:?}");
+        }
+    }
+
+    #[test]
     fn preserves_private_use_nerd_font_glyphs() {
         let mut model = TerminalModel::new(size());
         model.process("\u{f120} shell".as_bytes());
@@ -908,7 +961,7 @@ mod tests {
                     TerminalEvent::Reply(b"\x1b[?47;1$y".to_vec()),
                     TerminalEvent::Reply(b"\x1b[?1049;1$y".to_vec()),
                     TerminalEvent::Reply(b"\x1b[?9999;0$y".to_vec()),
-                    TerminalEvent::Reply(b"\x1b[4;0$y".to_vec()),
+                    TerminalEvent::Reply(b"\x1b[4;2$y".to_vec()),
                 ],
                 "split {split}"
             );
@@ -1162,6 +1215,24 @@ mod tests {
                 "\x1b[1;3r\x1b[?6h\x1b[3;1Hafter",
                 "\r\nnext",
             ),
+            (
+                "insert mode and independent SGR",
+                "abcdefghijkl\x1b[H\x1b[4h\x1b[1;2;5;8;9m",
+                "\x1b[2;2Hhidden\x1b[H",
+                "XY\x1b[22;25;28;29mZ",
+            ),
+            (
+                "DEC G0 and G1 with saved graphics",
+                "\x1b(0lqqk\x1b7\x1b(B\x1b)0\x0e",
+                "\x1b[2;3Hxqx\x1b[H",
+                "\x0fq\x1b8x\x1b(B\x1b)B\x0fA",
+            ),
+            (
+                "OSC 8 cells and current link",
+                "\x1b]8;id=one;https://example.test/one\x1b\\link\x1b]8;;\x1b\\\x1b7",
+                "\x1b[2;2H\x1b]8;id=two;https://example.test/two\x1b\\new\x1b[0m",
+                "!\x1b]8;;\x1b\\\x1b8X",
+            ),
         ];
         let mut traces = Vec::new();
         for (name, before, hidden, after) in cases {
@@ -1406,7 +1477,7 @@ mod tests {
                 TerminalEvent::Reply(b"\x1bP0+r\x1b\\".to_vec()),
             ]
         );
-        model.process(b"\x1b[9m\x1bP$qm\x1b\\");
+        model.process(b"\x1b[21m\x1bP$qm\x1b\\");
         assert!(model
             .take_events()
             .contains(&TerminalEvent::Reply(b"\x1bP0$r\x1b\\".to_vec())));

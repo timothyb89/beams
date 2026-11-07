@@ -259,10 +259,10 @@ impl Row {
 
         let first_cell = &self.cells[usize::from(start)];
         if wrapping && first_cell == &crate::cell::Cell::DEFAULT {
-            let default_attrs = crate::cell::Cell::DEFAULT.attrs();
-            if prev_attrs != *default_attrs {
+            let default_attrs = crate::attrs::Attrs::default();
+            if prev_attrs != default_attrs {
                 default_attrs.write_escape_code_diff(contents, &prev_attrs);
-                prev_attrs = *default_attrs;
+                prev_attrs = default_attrs;
             }
             contents.push(' ');
             crate::term::Backspace.write_buf(contents);
@@ -340,7 +340,9 @@ impl Row {
 
                     prev_pos.col += if cell.is_wide() { 2 } else { 1 };
                     let cell_contents = cell.contents();
+                    cell.write_hyperlink(contents);
                     contents.push_str(cell_contents);
+                    contents.push_str("\x1b]8;;\x1b\\");
                 } else if erase.is_none() {
                     erase = Some((pos.col, attrs));
                 }
@@ -400,7 +402,9 @@ impl Row {
             new_attrs.write_escape_code_diff_fmt(writer, current_attrs)?;
             *current_attrs = new_attrs;
             if cell.has_contents() {
+                writer.write_str(cell.hyperlink().unwrap_or("\x1b]8;;\x1b\\"))?;
                 writer.write_str(cell.contents())?;
+                writer.write_str("\x1b]8;;\x1b\\")?;
             } else {
                 writer.write_char(' ')?;
             }
@@ -447,7 +451,9 @@ impl Row {
             } else {
                 false
             };
+            prev_first_cell.write_hyperlink(contents);
             contents.push_str(cell_contents);
+            contents.push_str("\x1b]8;;\x1b\\");
             crate::term::Backspace.write_buf(contents);
             if prev_first_cell.is_wide() {
                 crate::term::Backspace.write_buf(contents);
@@ -528,7 +534,9 @@ impl Row {
                     }
 
                     prev_pos.col += if cell.is_wide() { 2 } else { 1 };
+                    cell.write_hyperlink(contents);
                     contents.push_str(cell.contents());
+                    contents.push_str("\x1b]8;;\x1b\\");
                 } else if erase.is_none() {
                     erase = Some((pos.col, attrs));
                 }
@@ -591,7 +599,9 @@ impl Row {
                     attrs.write_escape_code_diff(contents, &prev_attrs);
                     prev_attrs = *attrs;
                 }
+                end_cell.write_hyperlink(contents);
                 contents.push_str(end_cell.contents());
+                contents.push_str("\x1b]8;;\x1b\\");
                 prev_pos.col += if end_cell.is_wide() { 2 } else { 1 };
             }
         }

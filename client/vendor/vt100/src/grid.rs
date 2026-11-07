@@ -179,6 +179,7 @@ impl Grid {
         saved_attributes: alloc::string::String,
     ) -> crate::BufferState {
         crate::BufferState {
+            saved_character_sets: crate::CharacterSets::default(),
             cursor: crate::CursorState {
                 row: self.pos.row,
                 col: self.pos.col,
@@ -468,7 +469,9 @@ impl Grid {
                     crate::term::MoveTo::new(pos).write_buf(contents);
                 }
                 cell.attrs().write_escape_code_diff(contents, &prev_attrs);
+                cell.write_hyperlink(contents);
                 contents.push_str(cell.contents());
+                contents.push_str("\x1b]8;;\x1b\\");
                 prev_attrs.write_escape_code_diff(contents, cell.attrs());
             } else {
                 // if the cell doesn't have contents, we can't have gotten
@@ -515,7 +518,9 @@ impl Grid {
                                     contents,
                                     &prev_attrs,
                                 );
+                                cell.write_hyperlink(contents);
                                 contents.push_str(cell.contents());
+                                contents.push_str("\x1b]8;;\x1b\\");
                                 prev_attrs.write_escape_code_diff(
                                     contents,
                                     cell.attrs(),
@@ -527,7 +532,9 @@ impl Grid {
                                 contents,
                                 &prev_attrs,
                             );
+                            cell.write_hyperlink(contents);
                             contents.push_str(cell.contents());
+                            contents.push_str("\x1b]8;;\x1b\\");
                             prev_attrs.write_escape_code_diff(
                                 contents,
                                 cell.attrs(),

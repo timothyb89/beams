@@ -188,9 +188,7 @@ impl ToastPainter {
         }
         let rect = restoration_area(rect, cols.get());
         let mut out = terminal_paint::BEGIN.to_vec();
-        let mut buf = Buffer::empty(rect);
-        model.render_into(&mut buf, rect);
-        encode_area(&buf, rect, &mut out);
+        restore_area(model.screen(), rect, &mut out);
         terminal_paint::restore(model.screen(), false, &mut out);
         out.extend_from_slice(terminal_paint::END);
         out
@@ -238,9 +236,7 @@ impl ToastPainter {
             if target.as_ref().is_none_or(|(rect, _)| rect != old) {
                 // Put back what the old toast covered.
                 let area = restoration_area(*old, cols.get());
-                let mut buf = Buffer::empty(area);
-                model.render_into(&mut buf, area);
-                encode_area(&buf, area, &mut out);
+                restore_area(model.screen(), area, &mut out);
             }
         }
         match target {
@@ -275,6 +271,21 @@ fn restoration_area(area: Rect, cols: u16) -> Rect {
     let left = area.x.saturating_sub(1);
     let right = area.right().saturating_add(1).min(cols);
     Rect::new(left, area.y, right.saturating_sub(left), area.height)
+}
+
+/// Restore remote cells directly so OSC 8 metadata is not lost through the
+/// local UI's style-only buffer. Expanded edges include complete wide glyphs.
+fn restore_area(screen: &vt100::Screen, area: Rect, out: &mut Vec<u8>) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let Some(cell) = screen.cell(y, x) else { continue };
+            if cell.is_wide_continuation() { continue; }
+            write!(out, "\x1b[{};{}H", y + 1, x + 1).expect("writing to a Vec");
+            out.extend_from_slice(cell.attributes_formatted().as_bytes());
+            out.extend_from_slice(if cell.has_contents() { cell.contents().as_bytes() } else { b" " });
+        }
+    }
+    out.extend_from_slice(b"\x1b]8;;\x1b\\");
 }
 
 /// Writes the cells of `area` from `buf` as positioned, styled text.
@@ -320,7 +331,9 @@ fn sgr(style: Style) -> String {
         (Modifier::DIM, "2"),
         (Modifier::ITALIC, "3"),
         (Modifier::UNDERLINED, "4"),
+        (Modifier::SLOW_BLINK, "5"),
         (Modifier::REVERSED, "7"),
+        (Modifier::HIDDEN, "8"),
         (Modifier::CROSSED_OUT, "9"),
     ] {
         if modifier.contains(flag) {
@@ -556,6 +569,36 @@ mod tests {
             !painter.sync_now(Some(&toast("two")), &model).is_empty(),
             "new content"
         );
+    }
+
+    #[test]
+    fn toast_restores_insert_graphics_and_hyperlinked_cells_without_linking_the_notice() {
+        let mut model = model(10, 60);
+        let remote = b"\x1bc\x1b[8;15H\x1b]8;id=remote;https://example.test\x1b\\LINKED REMOTE TEXT\x1b[H\x1b(0\x1b)0\x0e\x1b[4h\x1b[1;2;5;8;9m";
+        model.process(remote);
+        let mut painter = ToastPainter::default();
+        let paint = painter.sync_now(Some(&toast("local notice")), &model);
+        let clear = painter.clear(&model);
+        let mut physical = screen_after(10, 60, &[remote, &paint]);
+        for row in 0..10 {
+            for col in 0..60 {
+                let cell = physical.screen().cell(row, col).unwrap();
+                if cell.contents() == "╭" { assert!(cell.hyperlink().is_none()); }
+            }
+        }
+        physical.process(&clear);
+        assert_eq!(physical.screen().drawing_state(), model.drawing_state());
+        for row in 0..10 {
+            for col in 0..60 {
+                let expected = model.screen().cell(row, col).unwrap();
+                if expected.has_contents() {
+                    assert_eq!(physical.screen().cell(row, col).unwrap(), expected);
+                }
+            }
+        }
+        physical.process(b"q");
+        model.process(b"q");
+        assert_eq!(physical.screen().cell(0, 0), model.screen().cell(0, 0));
     }
 
     #[test]

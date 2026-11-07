@@ -227,7 +227,7 @@ def run_checks(root, binary):
         mode_baseline = session.remote_input()
         session.emit(b"\x1b[?1002$p\x1b[?1006$p\x1b[?47$p\x1b[?9999$p\x1b[4$p"
                      b"\x1b[?4m\x1b[?u\x1b[>0q")
-        mode_replies = b"\x1b[?1002;1$y\x1b[?1006;1$y\x1b[?47;1$y\x1b[?9999;0$y\x1b[4;0$y"
+        mode_replies = b"\x1b[?1002;1$y\x1b[?1006;1$y\x1b[?47;1$y\x1b[?9999;0$y\x1b[4;2$y"
         session.wait(lambda: session.remote_input() == mode_baseline + mode_replies,
                      "remote input-mode and unsupported mode reports")
         session.wait(lambda: b"\x1b[?4m" in session.output and b"\x1b[>0q" in session.output,

@@ -56,6 +56,23 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
     if !frame.starts_with(b"\x1b") {
         return true;
     }
+    if matches!(frame, b"\x1b7" | b"\x1b[s" | b"\x1b[0s")
+        && screen.drawing_state().hyperlink.is_some()
+    {
+        return false;
+    }
+    if matches!(frame, b"\x1b8" | b"\x1b[u" | b"\x1b[0u") {
+        let state = screen.drawing_state();
+        if state.hyperlink.is_some() {
+            return false;
+        }
+        let buffer = if state.alternate_screen {
+            state.alternate
+        } else {
+            state.primary
+        };
+        return !buffer.saved_cursor.origin_mode && buffer.saved_cursor.col < screen.size().1.get();
+    }
     if let Some(body) = frame.strip_prefix(b"\x1b[") {
         let Some((&action, args)) = body.split_last() else {
             return false;
@@ -129,7 +146,13 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
             return !parser.callbacks().0;
         }
         if action == b'q' && args.ends_with(b" ") {
-            return true;
+            return args.strip_suffix(b" ").is_some_and(|n| {
+                n.is_empty()
+                    || std::str::from_utf8(n)
+                        .ok()
+                        .and_then(|n| n.parse::<u16>().ok())
+                        .is_some_and(|n| n <= 6)
+            });
         }
         if args.iter().any(|b| !b.is_ascii_digit() && *b != b';') {
             return false;
@@ -159,10 +182,27 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
                 | b'r'
                 | b'c'
                 | b'n'
-        ) || (matches!(action, b's' | b'u') && matches!(args, b"" | b"0"));
+        ) || (matches!(action, b's' | b'u') && matches!(args, b"" | b"0"))
+            || (matches!(action, b'h' | b'l') && args.split(|b| *b == b';').all(|p| p == b"4"));
     }
     if let Some(osc) = frame.strip_prefix(b"\x1b]") {
         let command = osc.split(|b| *b == b';').next().unwrap_or_default();
+        if command == b"8" {
+            let osc = osc
+                .strip_suffix(b"\x1b\\")
+                .or_else(|| osc.strip_suffix(b"\x07"));
+            return osc.is_some_and(|osc| {
+                let parts: Vec<_> = osc.splitn(3, |b| *b == b';').collect();
+                parts.len() == 3
+                    && parts[1].len() <= 256
+                    && parts[2].len() <= 2048
+                    && parts[1..].iter().all(|s| {
+                        std::str::from_utf8(s).is_ok() && !s.iter().any(|b| *b < 0x20 || *b == 0x7f)
+                    })
+                    && (parts[2].is_empty() && parts[1].is_empty()
+                        || !parts[2].is_empty() && !parts[2].contains(&b';'))
+            });
+        }
         return matches!(
             command,
             b"0" | b"1"
@@ -185,14 +225,8 @@ pub fn supported(frame: &[u8], screen: &vt100::Screen) -> bool {
             || frame.starts_with(b"\x1bP+q")
             || frame.starts_with(b"\x1bP+Q");
     }
-    if frame == b"\x1b8" {
-        let state = screen.drawing_state();
-        let buffer = if state.alternate_screen {
-            state.alternate
-        } else {
-            state.primary
-        };
-        return !buffer.saved_cursor.origin_mode && buffer.saved_cursor.col < screen.size().1.get();
+    if matches!(frame, b"\x1b(B" | b"\x1b(0" | b"\x1b)B" | b"\x1b)0") {
+        return true;
     }
     matches!(
         frame,

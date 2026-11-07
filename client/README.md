@@ -205,10 +205,10 @@ updates), inside a synchronized update of their own; afterwards the cursor and
 drawing attributes are restored from the model rather than with DECSC, whose
 single slot the remote may be using. A toast is repainted once remote output
 settles (or every 250 ms during a long burst), and the cells it covered are
-repainted from the model when it goes away or the session ends. A remote that
-enables origin mode or insert mode, or selects the DEC line-drawing
-character set, could see a toast drawn incorrectly; the model doesn't expose
-those modes.
+repainted from the model when it goes away or the session ends. Painting
+suspends origin/insert modes, character mapping and OSC 8 hyperlinks, then
+restores current state without using the remote's save slot. Restored cells
+retain their hyperlink targets; local notices do not inherit them.
 
 The menu shows connection/bridge state, then one selectable list: every
 pending remote request for the current Beam (oldest first), then that
@@ -361,9 +361,15 @@ terminal may already have reflowed.
 
 The client uses a focused, vendored `vt100` 0.18.1 extension in
 `vendor/vt100` for read-only current/saved cursor and attribute snapshots,
-per-buffer origin/margins, streaming DCS callbacks and reset notifications.
+per-buffer origin/margins, insert mode, ASCII/DEC G0/G1 designations and SO/SI,
+basic SGR (including independent bold/faint, blink, invisible and crossed-out),
+OSC 8 cell links, streaming DCS callbacks and reset notifications.
+OSC 8 parameters are limited to 256 bytes and URIs to 2048 bytes; malformed
+links, other character sets and richer underline attributes defer painting.
+Cursor saves/restores with an active hyperlink also defer painting because
+their link semantics are not established across supported terminals.
 Bursts of complete query/effect sequences are drained at each parsed frame,
-avoiding event-queue pressure. Broader drawing/input state and content
+avoiding event-queue pressure. Advanced drawing/input state and content
 provenance remain pending.
 
 The [readiness audit](../docs/development/terminal-overlay.md) records the

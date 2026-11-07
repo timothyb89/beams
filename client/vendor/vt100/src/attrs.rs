@@ -21,6 +21,9 @@ const TEXT_MODE_DIM: u8 = 0b0000_0010;
 const TEXT_MODE_ITALIC: u8 = 0b0000_0100;
 const TEXT_MODE_UNDERLINE: u8 = 0b0000_1000;
 const TEXT_MODE_INVERSE: u8 = 0b0001_0000;
+const TEXT_MODE_BLINK: u8 = 0b0010_0000;
+const TEXT_MODE_HIDDEN: u8 = 0b0100_0000;
+const TEXT_MODE_STRIKE: u8 = 0b1000_0000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Attrs {
@@ -57,12 +60,10 @@ impl Attrs {
     }
 
     pub fn set_bold(&mut self) {
-        self.mode &= !TEXT_MODE_INTENSITY;
         self.mode |= TEXT_MODE_BOLD;
     }
 
     pub fn set_dim(&mut self) {
-        self.mode &= !TEXT_MODE_INTENSITY;
         self.mode |= TEXT_MODE_DIM;
     }
 
@@ -106,6 +107,16 @@ impl Attrs {
         }
     }
 
+    pub fn blink(&self) -> bool { self.mode & TEXT_MODE_BLINK != 0 }
+    pub fn hidden(&self) -> bool { self.mode & TEXT_MODE_HIDDEN != 0 }
+    pub fn strike(&self) -> bool { self.mode & TEXT_MODE_STRIKE != 0 }
+    pub fn set_blink(&mut self, enabled: bool) { self.set_flag(TEXT_MODE_BLINK, enabled); }
+    pub fn set_hidden(&mut self, enabled: bool) { self.set_flag(TEXT_MODE_HIDDEN, enabled); }
+    pub fn set_strike(&mut self, enabled: bool) { self.set_flag(TEXT_MODE_STRIKE, enabled); }
+    fn set_flag(&mut self, flag: u8, enabled: bool) {
+        if enabled { self.mode |= flag; } else { self.mode &= !flag; }
+    }
+
     pub fn write_escape_code_diff(
         &self,
         contents: &mut String,
@@ -143,6 +154,8 @@ impl Attrs {
                 0 => crate::term::Intensity::Normal,
                 TEXT_MODE_BOLD => crate::term::Intensity::Bold,
                 TEXT_MODE_DIM => crate::term::Intensity::Dim,
+                // Both bold and faint may be independently enabled.
+                TEXT_MODE_INTENSITY => crate::term::Intensity::Normal,
                 _ => unreachable!(),
             })
         };
@@ -162,6 +175,26 @@ impl Attrs {
             attrs.inverse(self.inverse())
         };
 
-        attrs.write_fmt(writer)
+        // SGR 1 and 2 enable independently; switching intensity must clear
+        // the old bit before enabling the requested one.
+        if self.intensity() != other.intensity() && other.intensity() != 0
+            && self.intensity() != 0 && self.intensity() != TEXT_MODE_INTENSITY {
+            writer.write_str("\x1b[22m")?;
+        }
+        attrs.write_fmt(writer)?;
+        if self.intensity() != other.intensity()
+            && self.intensity() == TEXT_MODE_INTENSITY {
+            writer.write_str("\x1b[1;2m")?;
+        }
+        for (enabled, previous, on, off) in [
+            (self.blink(), other.blink(), 5, 25),
+            (self.hidden(), other.hidden(), 8, 28),
+            (self.strike(), other.strike(), 9, 29),
+        ] {
+            if enabled != previous {
+                write!(writer, "\x1b[{}m", if enabled { on } else { off })?;
+            }
+        }
+        Ok(())
     }
 }

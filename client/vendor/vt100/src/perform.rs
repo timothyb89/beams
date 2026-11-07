@@ -46,15 +46,16 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
             11 => self.vt(),
             12 => self.ff(),
             13 => self.cr(),
-            // we don't implement shift in/out alternate character sets, but
-            // it shouldn't count as an "error"
-            14 | 15 => {}
+            14 => self.shift_out(true),
+            15 => self.shift_out(false),
             _ => self.callbacks.unhandled_control(&mut self.screen, b),
         }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, b: u8) {
-        if let Some(i) = intermediates.first() {
+        if matches!(intermediates, b"(" | b")") && matches!(b, b'B' | b'0') {
+            self.character_set(intermediates == b")", b == b'0');
+        } else if let Some(i) = intermediates.first() {
             self.callbacks.unhandled_escape(
                 &mut self.screen,
                 Some(*i),
@@ -128,6 +129,9 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
                 'b' => self.rep(canonicalize_params_1(params, 1)),
                 'd' => self.vpa(canonicalize_params_1(params, 1)),
                 'm' => self.sgr(params, unhandled),
+                'h' | 'l' if params.iter().all(|p| p == [4]) => {
+                    self.insert_mode(c == 'h');
+                }
                 'r' => self.decstbm(canonicalize_params_decstbm(
                     params,
                     self.screen.grid().size(),
@@ -229,6 +233,10 @@ impl<CB: crate::Callbacks> vte::Perform for crate::screen::WrappedScreen<CB> {
             }
             [b"2", s] => {
                 self.callbacks.set_window_title(&mut self.screen, s);
+            }
+            [b"8", params, uri] if core::str::from_utf8(params).is_ok()
+                && core::str::from_utf8(uri).is_ok() => {
+                self.hyperlink(params, uri);
             }
             [b"52", ty, data] => {
                 match (

@@ -15,7 +15,14 @@ unchanged.
 Behavioral regressions live in `client/src/terminal_model.rs` and the managed
 PTY harness. When updating upstream, compare these changes and rerun those
 checks. Vendoring does not establish fidelity for features upstream does not
-implement, notably character sets, graphics and terminal resize/reflow.
+implement, notably graphics and terminal resize/reflow.
+Additional represented state includes ANSI insert mode, ASCII/DEC G0/G1
+designations and SO/SI (saved per buffer), independent bold/faint and basic
+blink/invisible/crossed-out SGR, and OSC 8 cell links/current link. Links use
+shared immutable strings and are cleared from erased cells; native formatted
+output retains their metadata. Client eligibility bounds link parameters and
+rejects ambiguous cursor-save/link combinations. Cell layout is now larger
+than upstream's 32-byte optimization.
 The optional xterm.js 5.5 reference checks restoration bytes against that
 emulator's unpainted baseline. Its saved-wrap/origin behavior differs from the
 VT/xterm model; it does not establish complete shadow-model equivalence.

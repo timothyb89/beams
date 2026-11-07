@@ -9,7 +9,8 @@ use std::io::Write;
 use vt100::{BufferState, CursorState, Screen};
 
 /// Cancel only the physical parser, hide local drawing, and use absolute rows.
-pub const BEGIN: &[u8] = b"\x18\x1b\\\x1b[?2026h\x1b[?25l\x1b[?6l\x1b[r\x1b[0m";
+pub const BEGIN: &[u8] =
+    b"\x18\x1b\\\x1b[?2026h\x1b[?25l\x1b[?6l\x1b[r\x1b[4l\x1b(B\x1b)B\x0f\x1b]8;;\x1b\\\x1b[0m";
 pub const END: &[u8] = b"\x1b[?2026l";
 
 /// Restore the represented active-buffer state after local drawing.
@@ -31,16 +32,38 @@ pub fn restore(screen: &Screen, restore_saved: bool, out: &mut Vec<u8>) {
             out,
         );
         out.extend_from_slice(buffer.saved_attributes.as_bytes());
+        character_sets(buffer.saved_character_sets, out);
         out.extend_from_slice(b"\x1b7");
+        // Restoration text is Unicode and must not inherit DEC mapping.
+        character_sets(vt100::CharacterSets::default(), out);
     }
     margins(buffer, out);
     cursor(screen, buffer.cursor, buffer.scroll_region, out);
     out.extend_from_slice(snapshot.attributes.as_bytes());
+    out.extend_from_slice(
+        snapshot
+            .hyperlink
+            .as_deref()
+            .unwrap_or("\x1b]8;;\x1b\\")
+            .as_bytes(),
+    );
+    character_sets(snapshot.character_sets, out);
+    out.extend_from_slice(if snapshot.insert_mode {
+        b"\x1b[4h"
+    } else {
+        b"\x1b[4l"
+    });
     out.extend_from_slice(if screen.hide_cursor() {
         b"\x1b[?25l"
     } else {
         b"\x1b[?25h"
     });
+}
+
+fn character_sets(sets: vt100::CharacterSets, out: &mut Vec<u8>) {
+    out.extend_from_slice(if sets.g0_dec { b"\x1b(0" } else { b"\x1b(B" });
+    out.extend_from_slice(if sets.g1_dec { b"\x1b)0" } else { b"\x1b)B" });
+    out.push(if sets.shift_out { 0x0e } else { 0x0f });
 }
 
 fn margins(buffer: &BufferState, out: &mut Vec<u8>) {

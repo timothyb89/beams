@@ -472,6 +472,17 @@ write. Painting bytes did not change; workstation gates remain pending.
 
 ## Implementation status and next-session handoff
 
+Common drawing-state coverage is implemented (2026-11-07): ANSI insert mode,
+ASCII/DEC G0/G1 designations and SO/SI, per-buffer saved character sets, basic
+blink/invisible/crossed-out SGR and independent bold/faint, and OSC 8 cell
+links/current link. Menus/toasts suspend these while drawing and restore them.
+Native cell serialization retains link targets, and toast removal uses raw
+remote cells rather than losing links in a style-only UI buffer. Link parameters
+and URI lengths are bounded. Malformed colors, richer underline attributes,
+other charsets and active-link cursor saves/restores defer painting. Twelve
+independent xterm.js traces now compare basic SGR and URI/id metadata as well
+as cells, cursor and origin. These additions do not establish reflow fidelity.
+
 Conservative repaint eligibility and frame recovery are implemented (2026-11-07).
 Inherited state starts unknown in both buffers; cursor reports, alternate
 selection and clears alone cannot establish inherited modes/save slots.

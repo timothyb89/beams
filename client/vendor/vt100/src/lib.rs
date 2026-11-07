@@ -70,4 +70,4 @@ pub use parser::Parser;
 pub use screen::{
     CursorStyle, MouseProtocolEncoding, MouseProtocolMode, Screen,
 };
-pub use state::{BufferState, CursorState, DrawingState};
+pub use state::{BufferState, CharacterSets, CursorState, DrawingState};
