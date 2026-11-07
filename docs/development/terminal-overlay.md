@@ -247,3 +247,25 @@ restores before covered mutation. All original acceptance gates remain active.
 Unknown initialization/saved state, original keyboard-stack history, useful
 safe borrowing and physical resize/reflow remain unestablished; no workstation
 matrix was available in this Beam. The overlay remains opt-in.
+
+Post-resize eligibility pass (2026-11-07): **232 unit tests and 3 integration
+tests pass, with none ignored**, along with the client build, both
+managed-session smoke modes and the expanded protocol/PTY harness.
+After resize of a known baseline, per-buffer evidence requires origin reset,
+full margins, CUP, DECSC and ED 2; this reestablishes the active buffer without
+another RIS. Missing components or writes at unknown coordinates defer
+painting. Resize cannot weaken inherited/unsupported/budget loss into a
+recoverable geometry reason. Covered buffer switches stop before mutation,
+restore the safe buffer and replay the original frame once, including split
+and leading-zero mode parameters. Target geometry requires initialization
+again, and unknown inactive content is never serialized.
+
+Pinned xterm.js 5.5 independently passes the twelve existing restoration
+traces plus two new traces that actually resize before reinitialization,
+check subsequent saved-state output, and return to the untouched primary.
+Live replay passes the existing renderer/lifecycle traces and an additional
+recovered-menu trace. The PTY fixture proves saved form input survives an
+uncovered resize and incomplete initialization, then tests raw switching into
+an unknown buffer and explicit recovery there. This establishes recovery
+after a clear, not lossless covered reflow. Inherited initialization, regional
+borrowing and the real workstation matrix remain open; takeover stays default.

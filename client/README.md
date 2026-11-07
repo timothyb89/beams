@@ -347,14 +347,21 @@ Overlay menus and toasts also require observed drawing state. Both buffers
 start unknown: a cursor report, buffer selection or clear cannot establish
 inherited modes and save slots. Currently an observed full reset (`ESC c`)
 is required to establish the complete baseline. The client does not send that
-reset itself. Unsupported sequences and resize suppress painting until another
-observed reset. This conservative policy can defer menus in ordinary shells
-and TUIs; explicit takeover remains available. An unavailable menu key rings
+reset itself. Unsupported sequences suppress painting until another observed
+reset. After resize of a known baseline, an application can explicitly
+reinitialize the active buffer without RIS: reset origin mode, set full margins,
+position the cursor, save it and clear the screen (`CSI ?6l`, `CSI r`, `CUP`,
+`DECSC`, `CSI 2J`). Each component needs observed evidence; earlier writes at
+unknown coordinates invalidate a clear. Shared modes must already be known.
+Buffer switches after this recovery close the menu before raw replay and
+require initialization in the selected buffer again. Inherited state and
+sequence-budget loss still require observed RIS. This policy can defer menus
+in ordinary shells and TUIs; explicit takeover remains available. An unavailable menu key rings
 the terminal bell at the next safe output boundary. Ordinary keys keep going
 to the remote, and pressing the prefix twice still sends one prefix. A later
-reset never opens the menu automatically; retry the prefix to reopen a
-preserved form. The client refuses to borrow an alternate buffer whose
-ownership, content or saved state is unknown.
+reset or explicit initialization never opens the menu automatically; retry
+the prefix to reopen a preserved form. The client refuses to borrow an
+alternate buffer whose ownership, content or saved state is unknown.
 
 If unsupported output arrives during a menu, the client restores the last
 represented state before forwarding the complete original sequence and its

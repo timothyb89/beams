@@ -40,10 +40,17 @@ async function main() {
   for await (const chunk of process.stdin) input += chunk;
   const traces = JSON.parse(input);
   for (const trace of traces) {
-    const options = { rows: trace.rows, cols: trace.cols, scrollback: 0, allowProposedApi: true };
+    const options = { rows: trace.initialRows || trace.rows, cols: trace.initialCols || trace.cols,
+      scrollback: 0, allowProposedApi: true };
     const expected = new Terminal(options);
     const actual = new Terminal(options);
     try {
+      if (trace.beforeResize) {
+        await write(expected, trace.beforeResize);
+        await write(actual, trace.beforeResize);
+        expected.resize(trace.cols, trace.rows);
+        actual.resize(trace.cols, trace.rows);
+      }
       if (trace.expectedModes) {
         await write(actual, trace.physical);
         for (const [name, value] of Object.entries(trace.expectedModes)) {

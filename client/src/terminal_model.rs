@@ -482,22 +482,32 @@ impl TerminalModel {
     ) -> Result<(usize, Option<Vec<u8>>), E> {
         self.stream.advance_guarded(bytes, |frame, original| {
             let supported = terminal_eligibility::supported(original, self.parser.screen());
-            if covered && (!supported || original == b"\x1bc") {
+            if covered
+                && (!supported
+                    || original == b"\x1bc"
+                    || self
+                        .evidence
+                        .enters_unknown_buffer(original, self.parser.screen().alternate_screen()))
+            {
                 return Ok(false);
             }
             if !supported {
                 self.evidence.invalidate(Unavailable::UnsupportedSequence);
             }
+            let before_alternate = self.parser.screen().alternate_screen();
             if let Some(buffers) = &mut self.overlay_buffers {
-                buffers[usize::from(self.parser.screen().alternate_screen())] = true;
+                buffers[usize::from(before_alternate)] = true;
             }
             process_frame(&mut self.parser, frame);
             if std::mem::take(&mut self.parser.callbacks_mut().reset_observed) {
                 self.integrity_lost = false;
-                self.evidence.observe(b"\x1bc", false);
+                self.evidence.observe(b"\x1bc", false, false);
             } else {
-                self.evidence
-                    .observe(original, self.parser.screen().alternate_screen());
+                self.evidence.observe(
+                    original,
+                    before_alternate,
+                    self.parser.screen().alternate_screen(),
+                );
             }
             if let Some(buffers) = &mut self.overlay_buffers {
                 buffers[usize::from(self.parser.screen().alternate_screen())] = true;
@@ -525,7 +535,8 @@ impl TerminalModel {
     }
 
     pub fn unavailable_reason(&self) -> Option<Unavailable> {
-        self.evidence.reason
+        self.evidence
+            .unavailable_reason(self.screen().alternate_screen())
     }
 
     pub fn begin_overlay(&mut self) {
@@ -545,7 +556,7 @@ impl TerminalModel {
 
     pub fn resize(&mut self, size: PtySize) {
         self.parser.set_size(nonzero(size.rows), nonzero(size.cols));
-        self.evidence.invalidate(Unavailable::Resize);
+        self.evidence.resize();
     }
 
     pub fn screen(&self) -> &Screen {
@@ -721,6 +732,227 @@ mod tests {
         );
         model.process(b"\x1bc");
         assert!(model.can_paint());
+    }
+
+    const REINITIALIZE: &[u8] = b"\x1b[?6l\x1b[r\x1b[H\x1b7\x1b[2J";
+
+    #[test]
+    fn resized_buffer_requires_each_initialization_component_at_every_split() {
+        let components: [&[u8]; 5] = [b"\x1b[?6l", b"\x1b[r", b"\x1b[H", b"\x1b7", b"\x1b[2J"];
+        for missing in 0..components.len() {
+            let mut model = TerminalModel::new(size());
+            model.process(b"\x1bc\x1b[?1049h");
+            model.resize(size());
+            for (index, component) in components.iter().enumerate() {
+                if index != missing {
+                    model.process(component);
+                }
+            }
+            assert!(!model.can_paint(), "missing component {missing}");
+            assert_eq!(model.unavailable_reason(), Some(Unavailable::Resize));
+        }
+        for alternate in [false, true] {
+            for split in 0..=REINITIALIZE.len() {
+                let mut model = TerminalModel::new(size());
+                model.process(b"\x1bc");
+                if alternate {
+                    model.process(b"\x1b[?1049h");
+                }
+                model.resize(size());
+                model.process(&REINITIALIZE[..split]);
+                model.process(&REINITIALIZE[split..]);
+                assert!(model.can_paint(), "buffer {alternate}, split {split}");
+                assert_eq!(model.unavailable_reason(), None);
+                assert!(!model.evidence.can_paint(!alternate));
+            }
+        }
+    }
+
+    #[test]
+    fn initialization_does_not_retroactively_prove_unknown_writes_or_saved_positions() {
+        for mutation in [b"unknown".as_slice(), b"\n", b"\x1b[K", b"\x1bM"] {
+            let mut model = TerminalModel::new(size());
+            model.process(b"\x1bc");
+            model.resize(size());
+            model.process(b"\x1b[2J");
+            model.process(mutation);
+            model.process(b"\x1b[?6l\x1b[r\x1b[H\x1b7");
+            assert!(!model.can_paint(), "mutation {mutation:?}");
+            model.process(b"\x1b[2J");
+            assert!(model.can_paint());
+        }
+        let mut model = TerminalModel::new(size());
+        model.process(b"\x1bc");
+        model.resize(size());
+        model.process(b"\x1b7\x1b[?6l\x1b[r\x1b[H\x1b[2J");
+        assert!(
+            !model.can_paint(),
+            "a later CUP cannot prove an earlier save"
+        );
+        model.process(b"\x1b8\x1b7");
+        assert!(
+            !model.can_paint(),
+            "restoring unknown coordinates stays unknown"
+        );
+        model.process(b"\x1b[H\x1b[s");
+        assert!(
+            model.can_paint(),
+            "explicit coordinates and a new save recover"
+        );
+    }
+
+    #[test]
+    fn geometry_initialization_and_resize_cannot_recover_unknown_shared_state() {
+        for reason in [
+            Unavailable::InheritedState,
+            Unavailable::UnsupportedSequence,
+            Unavailable::SequenceBudget,
+        ] {
+            let mut model = TerminalModel::new(size());
+            match reason {
+                Unavailable::InheritedState => {}
+                Unavailable::UnsupportedSequence => model.process(b"\x1bc\x1b[7777h"),
+                Unavailable::SequenceBudget => {
+                    model.process(b"\x1bc");
+                    model.discard_oversized_sequence();
+                    model.process(b"\x18");
+                }
+                _ => unreachable!(),
+            }
+            model.resize(size());
+            model.process(REINITIALIZE);
+            assert!(!model.can_paint(), "{reason:?}");
+            assert_eq!(model.unavailable_reason(), Some(reason));
+            model.process(b"\x1bc");
+            assert!(model.can_paint());
+        }
+    }
+
+    #[test]
+    fn recovered_buffer_switch_stops_before_mutation_and_replays_at_every_split() {
+        for frame in [
+            b"\x1b[?47l".as_slice(),
+            b"\x1b[?00047l",
+            b"\x1b[?25;47l",
+            b"\x1b[?1049l",
+            b"\x1b[?01049l",
+            b"\x1b[?1049h",
+        ] {
+            for split in 0..=frame.len() {
+                let mut model = TerminalModel::new(size());
+                model.process(b"\x1bc\x1b[?1049h");
+                model.resize(size());
+                model.process(REINITIALIZE);
+                model.process(b"last safe");
+                model.begin_overlay();
+                let snapshot = model.drawing_state();
+                let (consumed, first) = model
+                    .process_guarded_with_events(&frame[..split], true, |_| Ok::<(), ()>(()), true)
+                    .unwrap();
+                assert_eq!(consumed, split);
+                let replay = first.or_else(|| {
+                    model
+                        .process_guarded_with_events(
+                            &frame[split..],
+                            true,
+                            |_| Ok::<(), ()>(()),
+                            true,
+                        )
+                        .unwrap()
+                        .1
+                });
+                assert_eq!(replay.as_deref(), Some(frame), "split {split}");
+                assert_eq!(model.drawing_state(), snapshot);
+                assert!(model.can_paint());
+                assert_eq!(model.screen().contents(), "last safe");
+                let restoration = model.restore_bytes(true);
+                assert!(
+                    !restoration.windows(6).any(|s| s == b"\x1b[?47l"),
+                    "restoration must leave the unknown primary untouched"
+                );
+                model.end_overlay();
+                model.process(replay.as_ref().unwrap());
+                assert!(!model.can_paint());
+                assert_eq!(model.unavailable_reason(), Some(Unavailable::Resize));
+                model.process(REINITIALIZE);
+                assert!(model.can_paint(), "target explicitly reinitialized");
+            }
+        }
+    }
+
+    #[test]
+    fn resized_reinitialization_restores_active_state_and_leaves_inactive_content_untouched() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let before_resize =
+            b"\x1bcPRIMARY\x1b7\x1b[?1049h\x1b[2;3r\x1b[?6h\x1b[1;2H\x1b[31mOLD\x1b7";
+        let reinitialized = [REINITIALIZE, "界e\u{301} resized".as_bytes()].concat();
+        let hidden = b"\x1b[4;2H\x1b[32mhidden\x1b7\x1b[2;2H\x1b[34m";
+        let mut traces = Vec::new();
+        for after in [b"\x1b8!".as_slice(), b"\x1b8!\x1b[?47l\x1b8P"] {
+            let mut model = TerminalModel::new(size());
+            let mut physical = Parser::new(nonzero(4), nonzero(12), 0);
+            model.process(before_resize);
+            physical.process(before_resize);
+            model.resize(PtySize {
+                rows: 6,
+                cols: 16,
+                ..size()
+            });
+            physical.set_size(nonzero(6), nonzero(16));
+            model.process(&reinitialized);
+            physical.process(&reinitialized);
+            assert!(model.can_paint());
+            assert!(!model.evidence.can_paint(false));
+            model.begin_overlay();
+            let paint = [
+                crate::terminal_paint::BEGIN,
+                b"\x1b[2J\x1b[HLOCAL MENU",
+                crate::terminal_paint::END,
+            ]
+            .concat();
+            physical.process(&paint);
+            let (_, rejected) = model
+                .process_guarded_with_events(hidden, true, |_| Ok::<(), ()>(()), true)
+                .unwrap();
+            assert!(rejected.is_none());
+            let restore = model.restore_bytes(true);
+            physical.process(&restore);
+            model.end_overlay();
+            model.process(after);
+            physical.process(after);
+            assert_eq!(
+                physical.screen().contents_formatted(),
+                model.screen().contents_formatted()
+            );
+            assert_eq!(physical.screen().drawing_state(), model.drawing_state());
+            traces.push(serde_json::json!({
+                "name": format!("reinitialized resize, after {after:?}"),
+                "initialRows": 4, "initialCols": 12, "rows": 6, "cols": 16,
+                "beforeResize": before_resize.as_slice(),
+                "before": reinitialized, "hidden": hidden.as_slice(), "after": after,
+                "paint": paint, "restore": restore,
+            }));
+        }
+        if let Some(module) = std::env::var_os("BEAMS_TEST_XTERM_MODULE") {
+            let mut reference = Command::new("node")
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/terminal-paint-reference.cjs"
+                ))
+                .arg(module)
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            reference
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&serde_json::to_vec(&traces).unwrap())
+                .unwrap();
+            assert!(reference.wait().unwrap().success());
+        }
     }
 
     #[test]

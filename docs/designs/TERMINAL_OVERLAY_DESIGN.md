@@ -472,6 +472,25 @@ write. Painting bytes did not change; workstation gates remain pending.
 
 ## Implementation status and next-session handoff
 
+Post-resize eligibility is implemented (2026-11-07): distinguish loss of screen
+geometry from loss of inherited/protocol state. Resize after a known RIS baseline preserves
+shared mode/attribute evidence, but invalidates cells, cursor, margins, origin
+and saved-slot geometry independently in both buffers. Explicit DECOM reset,
+full margins, CUP, DECSC and ED 2 can reinitialize one buffer without another
+RIS. Drawing at an unknown position must invalidate any earlier clear evidence.
+Do not infer this initialization from a TUI name, buffer selection or a clear.
+After this recovery, covered buffer switches stop before mutation and replay
+raw after restoring the last safe state. The target needs initialization
+again: emulator buffer switches can transfer cursors and clear alternate
+content differently. Restoration leaves unknown inactive content untouched.
+Initial inherited state, unsupported output and sequence-budget loss still
+require observed RIS.
+Five unit tests cover missing components, unknown-position writes, stronger
+loss reasons and split/leading-zero buffer switches. Independent xterm.js
+checks include two actual resize traces and the live recovered menu.
+This slice does not establish inherited initialization, regional borrowing
+or lossless covered reflow.
+
 Observed entry/exit ownership is implemented (2026-11-07). Before forwarding
 child output, a 200 ms / 8192-byte capture queries recognized ANSI/DEC modes,
 SGR, margins/cursor style, Kitty current flags and xterm modifier options.
@@ -510,10 +529,11 @@ the VT model's saved designations.
 Conservative repaint eligibility and frame recovery are implemented (2026-11-07).
 Inherited state starts unknown in both buffers; cursor reports, alternate
 selection and clears alone cannot establish inherited modes/save slots.
-Currently only an observed RIS (`ESC c`) establishes the complete baseline.
-This is intentionally restrictive; richer initialization/region evidence is
-future work, not permission to assume an ordinary TUI initialized every mode.
-Unsupported controls and resize invalidate eligibility until another RIS.
+Only an observed RIS (`ESC c`) establishes shared state initially.
+This is intentionally restrictive; richer inherited initialization/region
+evidence is future work, not permission to assume an ordinary TUI initialized
+every mode. Unsupported controls invalidate eligibility until another RIS.
+Resize loses per-buffer geometry; explicit recovery is described above.
 Reasons distinguish inherited state, unsupported output, resize and budgets.
 
 The shared framer now returns a rejected frame's complete original bytes,
@@ -529,15 +549,15 @@ draws over unknown content or terminates an unfinished OSC with BEL. Ordinary
 keys cancel the pending prefix and remain remote input; doubled prefixes
 retain literal forwarding. Recovery requires an explicit retry and reopens
 the preserved form. Borrowing remains refused when inactive-buffer ownership
-or saved state is unknown. The current RIS-only evidence cannot establish a
-useful additional borrowing case: when all those prerequisites are known,
-ordinary overlay painting is already eligible. A fallback that extends
+or saved state is unknown. Post-resize initialization establishes only the
+selected buffer and does not authorize borrowing an inactive one. A fallback that extends
 availability still requires richer evidence and independently verified buffer
 switching, so this gate remains open rather than assuming a spare buffer.
 
 Covered resize remains a fidelity gate: the outer terminal may already have
 reflowed before the client sees SIGWINCH. Closing from the last snapshot is
-best effort; new painting is then suppressed. This does not establish lossless
+best effort; new painting is suppressed until explicit geometry recovery or RIS.
+This does not establish lossless
 resize/reflow support and must not enable the default switch. Safe borrowing
 and terminal-specific resize validation remain separate work.
 
@@ -606,8 +626,9 @@ Next work, in separately reviewable changes:
    all three gates; none should be ignored.
 2. Query-policy coverage above is implemented. Any new probes must extend the
    explicit inventory and preserve exactly-once replies.
-3. Extend eligibility beyond RIS and establish regional/inactive-buffer evidence.
-   Common drawing state and conservative recovery are implemented. Safe
+3. Extend inherited initialization and establish regional/inactive-buffer evidence.
+   Post-resize geometry initialization, common drawing state and conservative
+   recovery are implemented. Safe
    borrowing still needs stronger ownership evidence and independent switching
    tests; covered resize fidelity remains open.
 4. Update READMEs, audit and TODO with each slice. Run the client suite/build
@@ -628,11 +649,12 @@ fixture stall that made a fairness assertion depend on output throughput.
 This failure policy bounds memory; it does not promise continued service for
 a peer that never drains its input.
 
-Current validation: **227 client unit tests and 3 integration tests pass, with
+Current validation: **232 client unit tests and 3 integration tests pass, with
 zero ignored tests**. The client build, takeover and overlay managed-session
 smokes, and expanded protocol/PTY harness pass. Pinned xterm.js 5.5 replay again
-passes twelve restoration traces, the actual renderer trace and two live
-non-default lifecycle traces. The harness also covers deferred recovery and
+passes twelve restoration traces, two additional resize traces, two live
+renderer traces and two live non-default lifecycle traces. The harness also
+covers explicit initialization without another RIS, deferred recovery and
 strict disabled-prefix partial-string termination. No real
 workstation font/reflow or graphical-terminal validation has been recorded.
 

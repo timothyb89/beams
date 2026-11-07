@@ -473,6 +473,80 @@ def run_unknown_and_recovery(root, binary):
         session.close()
 
 
+def run_resize_reinitialization(root, binary):
+    session = Session(root, binary)
+    try:
+        session.open()
+        session.send(b"f8080")
+        session.wait(lambda: b"Forward a Beam port" in session.output, "form before resize")
+        session.send(b"\x1dBEFORE RESIZE INPUT")
+        session.wait(lambda: session.remote_input().endswith(b"BEFORE RESIZE INPUT"),
+                     "menu closed before resizing")
+        fcntl.ioctl(session.master, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 60, 0, 0))
+        session.wait(lambda: "12 60\n" in (root / "sizes").read_text(), "uncovered PTY resize")
+
+        # A clear and explicit coordinates still lack a known saved slot.
+        session.emit(b"\x1b[?6l\x1b[r\x1b[H\x1b[2JPARTIAL INITIALIZATION")
+        session.wait(lambda: b"PARTIAL INITIALIZATION" in session.output, "partial initialization")
+        baseline = session.remote_input()
+        offset = len(session.output)
+        session.send(b"\x1dyDEFERRED AFTER RESIZE")
+        session.wait(lambda: session.remote_input() == baseline + b"yDEFERRED AFTER RESIZE",
+                     "incomplete initialization forwards ordinary input")
+        assert b"Forward a Beam port" not in session.output[offset:]
+
+        # No new RIS: the application explicitly initializes only this buffer.
+        offset = len(session.output)
+        before = b"\x1b[?6l\x1b[r\x1b[H\x1b7\x1b[2JREINITIALIZED WITHOUT RIS"
+        session.emit(before)
+        session.wait(lambda: b"REINITIALIZED WITHOUT RIS" in session.output[offset:],
+                     "explicit buffer initialization")
+        session.open(b"Forward a Beam port")
+        session.wait(lambda: b"8080" in session.output[offset:], "form preserved across resize")
+        hidden = b"\x1b[3;3H\x1b[31mRESIZED HIDDEN\x1b7\x1b[5;7H\x1b[6n"
+        baseline = session.remote_input()
+        session.emit(hidden)
+        session.wait(lambda: session.remote_input() == baseline + b"\x1b[5;7R",
+                     "remote cursor query after recovered menu")
+        session.send(b"\x1dAFTER RESIZE INPUT")
+        session.wait(lambda: session.remote_input().endswith(b"AFTER RESIZE INPUT"),
+                     "close recovered menu")
+        after = b"\x1b8!\x1b[0mAFTER RESIZED MENU"
+        session.emit(after)
+        session.wait(lambda: after in session.output[offset:], "saved state after recovered menu")
+        if module := os.environ.get("BEAMS_TEST_XTERM_MODULE"):
+            trace = dict(name="live explicit resize initialization", rows=12, cols=60,
+                         initialRows=24, initialCols=100,
+                         beforeResize=list(b"\x1bc\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?2004h"),
+                         before=list(before), hidden=list(hidden), after=list(after),
+                         physical=list(session.output[offset:]))
+            subprocess.run(["node", str(Path(__file__).with_name("terminal-paint-reference.cjs")), module],
+                           input=json.dumps([trace]), text=True, check=True)
+
+        # A target buffer that has not been initialized must be selected raw,
+        # after restoring the last safe buffer, even with a split mode frame.
+        session.open(b"Forward a Beam port")
+        offset = len(session.output)
+        transition = b"\x1b[?00047lUNKNOWN PRIMARY"
+        session.emit(transition[:7])
+        session.emit(transition[7:])
+        session.wait(lambda: transition in session.output[offset:], "unsafe buffer switch replay")
+        assert session.output[offset:].count(transition) == 1
+        baseline = session.remote_input()
+        session.send(b"\x1dyUNKNOWN PRIMARY INPUT")
+        session.wait(lambda: session.remote_input() == baseline + b"yUNKNOWN PRIMARY INPUT",
+                     "uninitialized target defers menu")
+        session.emit(before)
+        session.wait(lambda: before in session.output[offset:], "initialize selected primary buffer")
+        session.open(b"Forward a Beam port")
+        os.kill(session.pid, signal.SIGTERM)
+        session.wait(lambda: session.status is not None, "termination after primary initialization")
+        assert session.status == 143
+        session.assert_termios_restored()
+    finally:
+        session.close()
+
+
 def run_lifecycle(root, binary, outcome):
     disabled = outcome == "disabled"
     settings = {25: False, 47: True, 66: True, 1: True, 4: True, 6: True,
@@ -544,6 +618,9 @@ def main():
         recovery = root / "recovery"
         recovery.mkdir()
         run_unknown_and_recovery(recovery, binary)
+        resized = root / "resized"
+        resized.mkdir()
+        run_resize_reinitialization(resized, binary)
         for outcome in ["normal", "signal", "disabled"]:
             lifecycle = root / f"lifecycle-{outcome}"
             lifecycle.mkdir()

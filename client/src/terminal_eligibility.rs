@@ -1,8 +1,8 @@
 //! Conservative evidence and an explicit supported output inventory.
 //!
 //! A cursor report or buffer selection never proves inherited cells/modes.
-//! For now only RIS establishes the complete drawing baseline; unsupported
-//! state and resize require another observed RIS before local painting.
+//! RIS establishes shared state. A resized buffer can subsequently establish
+//! its geometry explicitly; inherited/unsupported state still requires RIS.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unavailable {
@@ -12,42 +12,175 @@ pub enum Unavailable {
     SequenceBudget,
 }
 
+#[derive(Clone, Copy, Default)]
+struct BufferEvidence {
+    cells: bool,
+    cursor: bool,
+    origin: bool,
+    margins: bool,
+    saved: bool,
+}
+
+impl BufferEvidence {
+    fn complete(self) -> bool {
+        self.cells && self.cursor && self.origin && self.margins && self.saved
+    }
+}
+
 pub struct Evidence {
-    pub reason: Option<Unavailable>,
-    pub cells: [bool; 2],
+    // Resize remains the last loss even after a buffer recovers, so switches
+    // cannot silently reuse geometry whose cross-emulator semantics differ.
+    reason: Option<Unavailable>,
+    buffers: [BufferEvidence; 2],
 }
 
 impl Default for Evidence {
     fn default() -> Self {
         Self {
             reason: Some(Unavailable::InheritedState),
-            cells: [false; 2],
+            buffers: [BufferEvidence::default(); 2],
         }
     }
 }
 
 impl Evidence {
-    pub fn observe(&mut self, frame: &[u8], alternate: bool) {
+    pub fn observe(&mut self, frame: &[u8], before_alternate: bool, alternate: bool) {
         if frame == b"\x1bc" {
             self.reason = None;
-            self.cells = [true; 2];
-        } else if matches!(frame, b"\x1b[2J" | b"\x1b[J") {
-            // This establishes cells only when cursor/state already agrees.
-            // CSI J at an unknown cursor is not a full clear.
-            if frame == b"\x1b[2J" {
-                self.cells[usize::from(alternate)] = true;
+            self.buffers = [BufferEvidence {
+                cells: true,
+                cursor: true,
+                origin: true,
+                margins: true,
+                saved: true,
+            }; 2];
+            return;
+        }
+        // A geometry recipe cannot reset an unknown font, mode or protocol.
+        if !matches!(self.reason, None | Some(Unavailable::Resize)) {
+            return;
+        }
+        if self.reason == Some(Unavailable::Resize)
+            && (before_alternate != alternate
+                || private_modes(frame)
+                    .is_some_and(|(_, modes)| mode_numbers(modes).any(|m| m == Some(1049))))
+        {
+            // Buffer switches can transfer cursors and clear the alternate
+            // buffer differently across emulators. Do not carry recovered
+            // geometry through a switch; require initialization in its target.
+            self.buffers[usize::from(alternate)] = BufferEvidence::default();
+            if before_alternate {
+                self.buffers[1] = BufferEvidence::default();
             }
+            return;
+        }
+
+        let buffer = &mut self.buffers[usize::from(before_alternate)];
+        // 1049 saves the departing slot, but selecting/clearing a buffer is
+        // deliberately not evidence for that buffer's other inherited state.
+        if private_modes(frame)
+            .is_some_and(|(set, modes)| set && mode_numbers(modes).any(|mode| mode == Some(1049)))
+        {
+            buffer.saved = buffer.cursor && buffer.origin && buffer.margins;
+        }
+        let buffer = &mut self.buffers[usize::from(alternate)];
+        if frame == b"\x1b[2J" {
+            buffer.cells = true;
+        } else if mutates_cells(frame) && !(buffer.cursor && buffer.origin && buffer.margins) {
+            // Clearing first is safe only if subsequent writes have known
+            // coordinates. A later CUP cannot reconstruct an earlier write.
+            buffer.cells = false;
+        }
+        if private_modes(frame)
+            .is_some_and(|(set, modes)| !set && mode_numbers(modes).any(|mode| mode == Some(6)))
+        {
+            buffer.origin = true;
+            // Require CUP after both origin and margins have been established.
+            // Do not rely on emulator-specific implicit homing.
+        }
+        if matches!(frame, b"\x1b[r" | b"\x1b[0r" | b"\x1b[;r" | b"\x1b[0;0r") {
+            buffer.margins = true;
+        }
+        if let Some(body) = frame.strip_prefix(b"\x1b[") {
+            if matches!(body.last(), Some(b'H' | b'f')) && buffer.origin && buffer.margins {
+                buffer.cursor = true;
+            }
+        }
+        if matches!(frame, b"\x1b7" | b"\x1b[s" | b"\x1b[0s") {
+            buffer.saved = buffer.cursor && buffer.origin && buffer.margins;
+        } else if matches!(frame, b"\x1b8" | b"\x1b[u" | b"\x1b[0u") && !buffer.saved {
+            buffer.cursor = false;
         }
     }
 
     pub fn invalidate(&mut self, reason: Unavailable) {
         self.reason = Some(reason);
-        self.cells = [false; 2];
+        self.buffers = [BufferEvidence::default(); 2];
+    }
+
+    pub fn resize(&mut self) {
+        // Never replace a stronger loss reason with recoverable geometry.
+        if matches!(self.reason, None | Some(Unavailable::Resize)) {
+            self.reason = Some(Unavailable::Resize);
+        }
+        self.buffers = [BufferEvidence::default(); 2];
     }
 
     pub fn can_paint(&self, alternate: bool) -> bool {
-        self.reason.is_none() && self.cells[usize::from(alternate)]
+        matches!(self.reason, None | Some(Unavailable::Resize))
+            && self.buffers[usize::from(alternate)].complete()
     }
+
+    pub fn unavailable_reason(&self, alternate: bool) -> Option<Unavailable> {
+        if self.can_paint(alternate) {
+            None
+        } else {
+            self.reason
+        }
+    }
+
+    /// Check every selection in a multi-mode frame, including intermediate
+    /// switches. Unknown buffers and post-resize transitions need raw output.
+    pub fn enters_unknown_buffer(&self, frame: &[u8], alternate: bool) -> bool {
+        private_modes(frame).is_some_and(|(set, modes)| {
+            mode_numbers(modes).any(|mode| {
+                matches!(mode, Some(47 | 1049))
+                    && (!self.can_paint(set)
+                        || self.reason == Some(Unavailable::Resize)
+                            && (set != alternate || mode == Some(1049)))
+            })
+        })
+    }
+}
+
+fn mode_numbers(modes: &[u8]) -> impl Iterator<Item = Option<u16>> + '_ {
+    modes.split(|b| *b == b';').map(|mode| {
+        std::str::from_utf8(mode)
+            .ok()
+            .and_then(|mode| mode.parse().ok())
+    })
+}
+
+fn private_modes(frame: &[u8]) -> Option<(bool, &[u8])> {
+    let (&action, modes) = frame.strip_prefix(b"\x1b[?")?.split_last()?;
+    match action {
+        b'h' => Some((true, modes)),
+        b'l' => Some((false, modes)),
+        _ => None,
+    }
+}
+
+fn mutates_cells(frame: &[u8]) -> bool {
+    if !frame.starts_with(b"\x1b") {
+        return frame.iter().any(|b| *b >= 0x20 || matches!(*b, 10..=12));
+    }
+    frame == b"\x1bM"
+        || frame.strip_prefix(b"\x1b[").is_some_and(|body| {
+            matches!(
+                body.last(),
+                Some(b'@' | b'J' | b'K' | b'L' | b'M' | b'P' | b'S' | b'T' | b'X' | b'b')
+            )
+        })
 }
 
 /// This is a support policy, not a second cursor/mode emulator. The backend

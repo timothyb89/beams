@@ -856,7 +856,7 @@ bootstrap `Task`s.
   records completed commits, validation and implementation entry points.
   DECRQSS SGR/margin replies use remote state, and child-input writes now use a
   bounded worker queue. The explicit query inventory and conservative frame
-  recovery are implemented. Next: common drawing state and richer content provenance;
+  recovery and common drawing state are implemented. Next: richer content provenance;
   the saved-cursor and origin/margins fixes do not complete compatibility work.
   Follow the [resolution plan](docs/designs/TERMINAL_OVERLAY_DESIGN.md) in
   separately reviewable milestones:
@@ -876,9 +876,19 @@ bootstrap `Task`s.
     a sequence terminator. Fixtures and the controlling-PTY harness cover this.
   - [ ] Complete snapshot/eligibility coverage for further drawing/input state
     and content provenance. Conservative evidence now rejects inherited
-    state, unsupported sequences and resize; only observed RIS establishes
-    the complete baseline. Extend initialization/region evidence without
-    guessing inherited modes/save slots.
+    state and unsupported sequences; only observed RIS establishes shared
+    state initially. Post-resize buffer geometry can now recover explicitly
+    as described below. Extend inherited initialization/region evidence
+    without guessing modes/save slots.
+  - [x] Per-buffer geometry evidence after resize of a known baseline:
+    observed origin reset, full margins, CUP, DECSC and ED 2 establish the
+    active buffer without a new RIS. Unknown-position writes invalidate clear
+    evidence; geometry cannot recover unsupported/inherited/budget state.
+    Covered buffer switches close before mutation/replay and require target
+    initialization again; restoration leaves unknown inactive content alone.
+    Five unit tests, two independent resize traces and a live recovered-menu
+    trace cover this slice. Forms survive resize and deferred retries.
+    Lossless covered resize, inherited initialization and borrowing stay open.
   - [x] Shared painting for represented saved/current cursors, SGR attributes,
     origin mode and vertical margins. Menus and toasts draw under full margins
     with origin off; close restores per-buffer saved slots, including hidden
