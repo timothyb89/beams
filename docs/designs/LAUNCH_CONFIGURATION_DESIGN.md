@@ -1,11 +1,13 @@
 # Configurable Beam launches
 
 Status: offline compiler, phase archive packing/verification, foreground
-execution, daemon launch acceptance/snapshots and opt-in `beams ssh
---profile` implemented, 2026-11-07. The supported profile syntax
+execution, daemon launch acceptance/snapshots and `beams ssh` profile
+launches implemented; the legacy startup is removed, 2026-11-07. The supported profile syntax
 and explicit pack/unpack/run commands are documented in the
-[developer guide](../development/launches.md). Overlay visibility,
-legacy-startup removal and the default migration remain planned. This design
+[developer guide](../development/launches.md). Overlay visibility and
+`config init` remain planned. Sections below that describe the old fixed
+startup, `bin/beam-shell` or `[startup]` are the design's starting point,
+kept for context; none of that code exists any more. This design
 builds on [DESIGN.md](DESIGN.md)'s task graph and
 [CLIENT_SERVICES_DESIGN.md](CLIENT_SERVICES_DESIGN.md)'s workstation-owned
 transport. [TODO.md](../../TODO.md)
@@ -25,8 +27,9 @@ sequence below). A new Beam can now be created for a launch: the
 workstation packs the profile first, copies a small runtime and the pre
 bundle (no Git checkout), and the Beam runs pre, opens a per-launch Zellij
 session and reports readiness; post goes over the bridge as with `beams
-config launch`. It is opt-in (`--profile` or `[launch] profile`); without
-a profile `beams ssh` is the legacy path.
+config launch`. Since the legacy removal (same day) every `beams ssh`
+Beam is a launch: `--profile`, `[launch] profile`, else
+`builtin:development`.
 
 | Commit | Completed milestone | Main implementation |
 |---|---|---|
@@ -40,6 +43,9 @@ a profile `beams ssh` is the legacy path.
 | `6cff233` | `launch` bridge capability: chunked resumable uploads, submission by ID/digest, owner-routed status/conditions; the Beam stages each bundle itself (`launch receive`) | `protocol/src/lib.rs`, `launch/upload.rs`, `launch/daemon.rs` |
 | `59cdd45` | Workstation driver and `beams config launch`; bridge writer stops polling | `client/src/clientd/launches.rs`, `client/src/config/mod.rs`, `client/src/bridge.rs` |
 | (2026-11-07) | `beams ssh --profile`/`--push-repo`, `[launch] profile`; `~/.beams/` runtime staging; `launch start`/`launch shell`; per-launch Zellij session; bridge adopts a Beam-submitted launch; launch Beams skip `[startup]`; plan PATH `~` expansion | `client/src/main.rs`, `stage.rs`, `bridge.rs`, `clientd.rs`, `bootstrap/src/launch/session.rs`, `launch/daemon.rs`, `shell/runtime/` |
+| `52c0363`, `c75b48c` | `KnownHostsCommand` through the workstation; launch `[ssh_grant]` | `bootstrap/src/knownhosts.rs`, `client/src/knownhosts.rs`, `client/src/config/plan.rs`, `client/src/clientd/launches.rs` |
+| `1c9f0e7`, `a967019` | starship as a pre template in `builtin:development`; `beams` on the session `PATH` | `bootstrap/src/tasks/install_starship.rs`, `launch/session.rs` |
+| `fe7556c` + Beam-side commit | Legacy removal: profile always, no `[startup]`/`RunManifest`, no fixed steps, `bin/`, `shell/fish`, `shell/zellij` | `client/src/main.rs`, `clientd.rs`, `protocol/src/lib.rs`, `bootstrap/src/main.rs`, `bootstrap/src/install/` |
 
 Available commands are `beams config validate/explain/pack/pack-post/launch`,
 `beams ssh --profile`, and `beam-bootstrap launch
@@ -51,7 +57,7 @@ flags.
 
 ### Current execution boundary
 
-- `beams ssh --profile` packs, creates the Beam, copies `~/.beams/`
+- `beams ssh` packs, creates the Beam, copies `~/.beams/`
   (runtime + launch) with one `tsh beams scp`, registers the launch with
   the local daemon before its bridge, and runs `launch start`. That starts
   the daemon via `beamctl` from the runtime binary, submits locally (no
@@ -60,14 +66,16 @@ flags.
   owner, so `interface-ready` reaches the workstation, which packs and
   uploads post.
 - Readiness: every pane's shell starts via `beams-shell` → `launch shell`
-  (reports `shell`, execs `$BEAMS_SHELL`); the TUI reports `tui`. The fish
-  conf.d hook remains for the legacy/`config launch` paths.
+  (reports `shell`, execs `$BEAMS_SHELL`); the TUI reports `tui`.
+  `config launch` onto an existing Beam has no shell reporter (the fish
+  conf.d hook is gone): use `--headless` or `launch ready`.
 - Reuse records the launch in the purpose entry and reruns `launch
-  start`, which reattaches. A different profile, or `--profile` on a
-  legacy Beam, is refused. A launch Beam gets no `[startup]` manifest and
-  no fixed startup run; the maintainer's clones/toolchains/k3s etc. need a
-  local profile before the legacy path can go (planned: removed rather
-  than kept, per the maintainer).
+  start`, which reattaches. A different profile is refused; a tracked
+  Beam with no launch isn't reused, and `--beam` refuses one. The
+  maintainer's clones, grant and old fixed steps (claude update/CLAUDE.md
+  merge, kubectl, tbot/tctl from the staging CDN, k3s bot) are a
+  gitignored local profile (`environments/local/personal.toml` +
+  `personal/` hooks).
 - Unchanged from before: bridge uploads are bounded by an 8 × 32 KiB
   window; no cancel op and no cleanup of finished launches; retry is
   Beam-side only; owned-subprocess reconciliation is missing. The session
@@ -77,17 +85,12 @@ flags.
 
 1. **Visibility.** Launch status and upload progress in the session
    overlay (`ServerEvent::LaunchChanged`), retry over the bridge.
-2. **Maintainer profile and legacy removal.** `KnownHostsCommand` landed
-   (`bootstrap/src/knownhosts.rs`, `client/src/knownhosts.rs`,
-   `client/tests/known-hosts-smoke.sh`). Launch SSH grants landed too
-   (`[ssh_grant]`: compiled to workstation-only `ssh-grant.json`, exact
-   task tags, window from the covered phase, once per launch; Beam routes
-   launch tasks to the owner); not yet exercised with a real key on a
-   disposable Beam. Next: a local profile carrying the current
-   `[startup]` clones and toolchains plus the optional fixed steps worth
-   keeping (starship install, claude update/guidance, kubectl); then
-   remove the `[startup]` manifest, `bin/beam-shell`'s fixed run and
-   Git-push delivery.
+2. **Legacy-removal follow-ups.** Done: maintainer profile, real-key
+   grant clones, removal. Left (blocked on the overlay work in
+   `client/src/session.rs`): drop `LocalDaemon::unavailable` and the
+   "Startup" grant wording, rename `client/src/startup.rs` to
+   `grants.rs`. Validate the ported personal tasks (tbot, claude update,
+   kubectl) on a disposable Beam.
 3. Then timing/transport baselines (bridge upload vs scp), `config init`,
    native parameterization, sanitized default migration, git config
    seeding and optional ControlMaster.
@@ -106,12 +109,12 @@ flags.
 - **Old Beam runtimes.** A Beam whose `beam-bootstrap` predates
   `CAPABILITY_LAUNCH` never advertises it; the driver now says so on the
   launch ("no launch support") instead of waiting on the bridge.
-  `beams ssh --profile` always ships the current runtime to a new Beam,
+  `beams ssh` always ships the current runtime to a new Beam,
   but a reattached Beam keeps the runtime it was launched with.
 - **Zellij sessions.** Launch sessions are per launch (`beams-<id
   prefix>`), so `BEAMS_LAUNCH_ID` is never stale. Reattaching still keeps
   the session's original environment, so a new `BEAMS_SESSION_TOKEN` from
-  a later `beams ssh` doesn't reach existing panes (same as legacy).
+  a later `beams ssh` doesn't reach existing panes.
 - **Process matching.** Cleanup that matches `pkill -f` against a
   scratch path also matches the shell running the command; kill by PID.
 - **Beam TTL.** Beams now get at most 12h; `beams ssh` reuses a tracked
@@ -122,9 +125,12 @@ flags.
   thread's queue (256) fills. Keep slow work (packing post, hashing) off
   it, as `start_post` does.
 - **Testing safely.** Smokes use scratch HOME/XDG/sockets and never touch
-  this session's `beam-bootstrapd` or fixed startup. A scratch workstation
-  config must set `[startup] tasks = []`, or the default startup manifest
-  installs toolchains into the scratch Beam over the network. Cleanup that
+  this session's `beam-bootstrapd`. A command that auto-starts the
+  workstation daemon (`config launch`) must see the same socket as the
+  smoke's daemon (`XDG_RUNTIME_DIR`, see `ssh-agent-smoke.sh`), or it
+  starts a second one. A fake `tsh` matching the bridge must match
+  `beam-bootstrap client-bridge`, not just `client-bridge`, which scratch
+  paths can contain. Cleanup that
   kills by pattern must match only the run's unique scratch path (never an
   empty pattern). The real TUI can be driven under `script` (see
   `launch-daemon-smoke.sh`). Staged files are sealed read-only: `chmod -R
@@ -132,6 +138,10 @@ flags.
 - **Shell environment on this Beam.** Non-interactive shells may lack
   `~/.cargo/bin` on `PATH`; a filtered build command can then look clean
   while nothing compiled. Check the exit status or export the path first.
+- **Pre-profile Beams.** A Beam from before the removal (e.g. the one an
+  earlier session ran in) has no `~/.beams/runtime`; the new bridge
+  command needs it. Link `~/.beams/runtime/bin/beam-bootstrap` to that
+  Beam's binary to keep its bridge working until it expires.
 
 ### Validation at handoff
 
@@ -958,6 +968,6 @@ profile ownership or adding another execution engine.
 The completed milestones and next implementation slice are recorded in
 [the handoff](#implementation-status-and-next-session-handoff) above.
 The sequence is partially complete: compiler, archive, execution and
-daemon/interactive launch integration (`beams ssh --profile`) are
-available; visibility, legacy removal and rollout remain open. Keep the existing startup path available until
-the opt-in replacement passes the acceptance checks.
+daemon/interactive launch integration (`beams ssh`) are available, and
+the legacy startup is removed (2026-11-07, maintainer decision: no
+long-term legacy support). Visibility and `config init` remain open.

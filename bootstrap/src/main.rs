@@ -1,20 +1,18 @@
 mod agentproxy;
 mod agentspike;
-mod aptlock;
 mod clientbridge;
 mod commandlog;
 mod daemon;
-mod events;
 mod executor;
 mod fetch;
 mod graph;
+mod install;
 mod knownhosts;
 mod launch;
 mod pathutil;
 mod packages;
 mod releaseutil;
 mod sshagent;
-mod steps;
 mod taskcli;
 mod tasks;
 mod tui;
@@ -26,33 +24,20 @@ use uuid::Uuid;
 use pathutil::expand_tilde;
 use tasks::Template;
 
-/// Bootstraps a fresh (or partially set up) Teleport Beam: links this
-/// repo's dotfiles/bin into $HOME, installs apt packages, and runs
-/// `claude update`. Safe to re-run.
+/// The Beam side of Teleport Beams: the launch runtime (`launch start`
+/// and friends, run by `beams ssh`), the daemon behind the TUI, task
+/// templates, the workstation bridge and the SSH agent relay. Invoked as
+/// `beams`, it's the Beam-side `beams fetch` CLI instead.
 #[derive(Parser)]
 struct Args {
     #[command(subcommand)]
-    command: Option<Command>,
-
-    /// Path to the beams repo checkout to bootstrap from. Only used when
-    /// running the full startup sequence (no subcommand given).
-    #[arg(long, default_value = "~/beams")]
-    repo: String,
-
-    /// Force JSON-lines event output instead of human-readable, even on a
-    /// TTY. Useful for piping to a future client wrapper.
-    #[arg(long)]
-    json: bool,
-
-    /// Run only the step with this id (e.g. `link-files`), instead of the
-    /// full sequence.
-    #[arg(long)]
-    only: Option<String>,
+    command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Explicit verified-artifact and launch operations (no fixed startup).
+    /// Verified-artifact and launch operations, including `launch start`
+    /// (what `beams ssh` runs).
     Launch {
         #[command(subcommand)]
         command: launch::Command,
@@ -61,7 +46,7 @@ enum Command {
     /// `tasks::TemplateInfo`).
     ListTasks,
     /// Instantiate and run a single templated task on demand, outside
-    /// the fixed startup sequence. A stand-in for the daemon-backed
+    /// any launch. A stand-in for the daemon-backed
     /// `beams task run` described in docs/designs/DESIGN.md - until that exists, this
     /// runs the task directly, in-process, and does not check or resolve
     /// its declared dependencies against anything else.
@@ -72,9 +57,8 @@ enum Command {
     /// Run the long-lived daemon: listens on a UDS socket for
     /// `list_tasks`/`run_task` requests (see `daemon`), broadcasting
     /// task-status events to every connected client. Meant to be
-    /// supervised by `beamctl start`, not run directly for day-to-day
-    /// use yet - nothing drives this from the fixed startup sequence or
-    /// a TUI yet (see `docs/designs/DESIGN.md`'s migration plan).
+    /// supervised by `beamctl start` (`launch start` does that), not run
+    /// directly for day-to-day use.
     Daemon {
         /// UDS socket path to listen on. Defaults to
         /// `~/.beam-bootstrap/daemon.sock`.
@@ -142,7 +126,7 @@ enum Command {
         allow: Vec<String>,
     },
     /// `beams fetch` under this binary's own name (normally run through
-    /// `~/beams/bin/beams`).
+    /// the runtime's `beams` link).
     #[command(hide = true)]
     Fetch(fetch::FetchArgs),
 }
@@ -315,7 +299,7 @@ enum TaskCommand {
     WaitSshAgent,
 }
 
-/// Whether this process was started as `beams` (`~/beams/bin/beams`).
+/// Whether this process was started as `beams` (`~/.beams/runtime/bin/beams`).
 fn invoked_as_beams() -> bool {
     std::env::args_os()
         .next()
@@ -330,31 +314,31 @@ fn main() {
     }
     let args = Args::parse();
     let exit_code = match args.command {
-        Some(Command::Launch { command }) => match launch::run(command) {
+        Command::Launch { command } => match launch::run(command) {
             Ok(()) => 0,
             Err(err) => { eprintln!("error: {err:#}"); 1 }
         },
-        Some(Command::ListTasks) => {
+        Command::ListTasks => {
             list_tasks();
             0
         }
-        Some(Command::RunTask { task }) => run_task(task),
-        Some(Command::Daemon { socket }) => {
+        Command::RunTask { task } => run_task(task),
+        Command::Daemon { socket } => {
             run_daemon(socket);
             0 // run_daemon exits the process itself on error; reaching here means a clean shutdown
         }
-        Some(Command::Tui { socket }) => {
+        Command::Tui { socket } => {
             run_tui(socket);
             0 // ditto
         }
-        Some(Command::Task { task }) => run_daemon_task(task),
-        Some(Command::ClientBridge { socket }) => {
+        Command::Task { task } => run_daemon_task(task),
+        Command::ClientBridge { socket } => {
             run_client_bridge(socket);
             0
         }
-        Some(Command::Client { command }) => run_client_command(command),
-        Some(Command::Fetch(args)) => fetch::run_fetch(args),
-        Some(Command::AgentProxySpike { listen, upstream, delay_ms, delay_identities_ms, known_hosts, allow }) => {
+        Command::Client { command } => run_client_command(command),
+        Command::Fetch(args) => fetch::run_fetch(args),
+        Command::AgentProxySpike { listen, upstream, delay_ms, delay_identities_ms, known_hosts, allow } => {
             let config = agentspike::SpikeConfig {
                 listen,
                 upstream,
@@ -370,10 +354,6 @@ fn main() {
                     1
                 }
             }
-        }
-        None => {
-            run_bootstrap(&args);
-            0 // run_bootstrap exits the process itself; see its own doc comment
         }
     };
     std::process::exit(exit_code);
@@ -627,17 +607,6 @@ fn list_tasks() {
             .collect();
         println!("{} ({})", info.template, params.join(", "));
     }
-}
-
-fn run_bootstrap(args: &Args) {
-    let repo = expand_tilde(&args.repo);
-    let emitter = events::default_emitter(args.json);
-
-    let ok = match &args.only {
-        Some(step_id) => steps::run_only(&repo, &*emitter, step_id),
-        None => steps::run_all(&repo, &*emitter),
-    };
-    std::process::exit(if ok { 0 } else { 1 });
 }
 
 /// Builds the `(template name, JSON params)` pair for a `TaskCommand` -

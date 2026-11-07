@@ -21,8 +21,8 @@ pub struct PurposeEntry {
     pub beam_id: String,
     pub uuid: String,
     pub created_at: String,
-    /// Set for a Beam created by `beams ssh --profile`: the launch it runs.
-    /// Absent for a legacy (repo checkout, `beam-shell`) Beam.
+    /// The launch the Beam runs (`beams ssh`). Absent only in entries from
+    /// before profile launches, which `beams ssh` no longer reuses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<PurposeLaunch>,
 }

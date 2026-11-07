@@ -954,7 +954,7 @@ impl App {
 
     /// Single vertical stack, no row ever split into side-by-side panes -
     /// the sidebar this runs in (a zellij `size="30%"` pane, see
-    /// `shell/zellij/beam-shell.kdl`) is tall and narrow, so horizontal
+    /// `shell/runtime/zellij/beams-launch.kdl`) is tall and narrow, so horizontal
     /// space is the scarce resource. Param entry used to be a second pane
     /// here, competing for half the already-narrow width; it's now
     /// `draw_param_modal`, drawn on top of everything else only while

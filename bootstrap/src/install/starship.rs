@@ -1,12 +1,9 @@
 use std::fs;
-use std::path::Path;
 use std::process::Command;
 
 use anyhow::Context;
 
 use crate::releaseutil::{arch_target, download, run, verify_checksum};
-use super::{cap, Step};
-use crate::graph::Capability;
 
 /// starship isn't packaged for Debian - install a pinned binary release
 /// from GitHub instead. Bump this (and re-check asset names at
@@ -14,26 +11,9 @@ use crate::graph::Capability;
 const VERSION: &str = "v1.27.0";
 const INSTALL_PATH: &str = "/usr/local/bin/starship";
 
-pub struct InstallStarship;
-
-impl Step for InstallStarship {
-    fn id(&self) -> &'static str {
-        "install-starship"
-    }
-
-    fn provides(&self) -> Vec<Capability> {
-        vec![cap::STARSHIP_INSTALLED.into()]
-    }
-
-    fn run(&self, _repo: &Path) -> anyhow::Result<Option<String>> {
-        install()
-    }
-}
-
-/// Installs the pinned release (`Ok(None)` if it's already there). Shared
-/// by this fixed step and the `install-starship` template that profiles
-/// use (`tasks::install_starship`).
-pub(crate) fn install() -> anyhow::Result<Option<String>> {
+/// Installs the pinned release (`Ok(None)` if it's already there), for
+/// the `install-starship` template (`tasks::install_starship`).
+pub fn install() -> anyhow::Result<Option<String>> {
     if already_installed() {
         return Ok(None);
     }

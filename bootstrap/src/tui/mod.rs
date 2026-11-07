@@ -26,12 +26,10 @@ const TICK: Duration = Duration::from_millis(120);
 
 /// How long to keep retrying the initial connection before giving up.
 /// Matters when this is baked into a zellij pane that starts around the
-/// same time as the daemon itself (see `bin/beam-shell`/
-/// `shell/zellij/beam-shell.kdl`) - `start-bootstrap-daemon` runs
-/// synchronously before zellij launches specifically to avoid this race,
-/// but retrying here is cheap insurance against the daemon just being
-/// slow to bind its socket, rather than a hard requirement on exact
-/// ordering elsewhere.
+/// same time as the daemon itself (`shell/runtime/zellij/beams-launch.kdl`) -
+/// `launch start` waits for the daemon before Zellij launches, but
+/// retrying here is cheap insurance against it being slow to bind its
+/// socket, rather than a hard requirement on exact ordering elsewhere.
 const CONNECT_RETRY_FOR: Duration = Duration::from_secs(5);
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 

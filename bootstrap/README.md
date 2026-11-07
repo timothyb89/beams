@@ -1,81 +1,27 @@
 # beam-bootstrap
 
-Bootstraps a Teleport Beam from a checkout of this `beams` repo: links
-dotfiles/`bin` into `$HOME`, installs some apt packages and tools, sets up
-fish/starship, and updates `claude`. Safe to re-run — every step checks
-what's already in place and skips it.
-
-`bin/beam-shell` runs this automatically after copying the repo onto a
-fresh beam (see its own section below), or the client wrapper in
-`../client/` runs the whole thing for you via `beams ssh`. You can also
-still run it manually inside a beam you've already `ssh`'d into.
+The Beam side of Teleport Beams. `beams ssh` copies this binary onto a new
+Beam as `~/.beams/runtime/bin/beam-bootstrap` together with a packed
+launch, and runs `launch start` as the interactive command. Everything a
+Beam starts with (packages, files, repo clones, toolchains, hooks) comes
+from that launch's profile (`../environments/`,
+`../docs/development/launches.md`); this binary has no fixed startup of
+its own.
 
 ## What it does
 
-The steps below run in dependency order, resolved from each step's
-declared capabilities (`provides`/`requires` in `src/steps/mod.rs`, see
-`docs/designs/DESIGN.md`) rather than a hardcoded sequence, and **concurrently**
-wherever the graph allows it (see `docs/designs/DESIGN.md`'s "Concurrent execution") -
-e.g. `apt-install` and `install-teleport-bin` run at the same time, not
-one after the other just because they're both in this list. The numbered
-order below is just this doc's presentation order (and still a valid
-*serial* order, dependency-wise) - the steps that shell out to
-`apt-get`/`dpkg` (`apt-install`, `install-kubectl`) are tagged so they
-never run concurrently with *each other*, even though nothing else stops
-them from doing so.
-
-1. **link-files** — symlinks `bin` from the repo checkout into `$HOME`.
-   The repo needs no `.ssh` directory; Beam-managed `~/.ssh` is preserved.
-   SSH key use goes through the daemon's relay.
-   (`.claude` is *not* symlinked — `~/.claude` already holds real
-   beam state like session history and credentials, so it can't be
-   replaced wholesale the same way.)
-2. **claude-md-merge** — appends the repo's `.claude/CLAUDE.md` into
-   `~/.claude/CLAUDE.md` once.
-3. **apt-install** — installs `micro`, `less`, `fish`.
-4. **install-kubectl** — adds the official Kubernetes apt repo and installs
-   `kubectl` (not in Debian's default repos).
-5. **install-zellij** — downloads a pinned `zellij` release binary from
-   GitHub and verifies its checksum (not packaged for Debian at all).
-6. **shell-config** — symlinks `shell/fish/config.fish` and
-   `shell/starship.toml` from the repo into `~/.config/`.
-7. **install-starship** — downloads a pinned `starship` release binary from
-   GitHub and verifies its checksum (not packaged for Debian either).
-8. **default-shell** — sets fish as the user's login shell (`chsh`).
-9. **install-teleport-bin** — downloads `tctl`/`tbot` from
-   `cdn.teleport.dev`, matching the cluster's proxy version
-   (`tsh version -f json`), with sha256 verification, into
-   `~/.teleport-bot/bin/`.
-10. **k3s-bot-join** — requests a join token for the `k3s-bot` bot (see
-    `bot-onboarding/`, applied once, cluster-wide, separately from this
-    tool) and writes a static `~/.teleport-bot/tbot.yaml` with a Kubernetes
-    output for the `k3s` cluster and an identity output for SSH to its host
-    node. Skips requesting a new token once already joined
-    (`~/.teleport-bot/storage/key` exists).
-11. **start-tbot** — runs tbot as a `beamctl`-managed background service
-    (`beamctl show tbot`) so both outputs keep renewing for the beam's
-    lifetime.
-12. **kubeconfig-symlink** — symlinks tbot's generated
-    `~/.teleport-bot/kube/kubeconfig.yaml` into `~/.kube/config`, so
-    `kubectl` works against the k3s cluster with no extra flags.
-13. **claude-update** — runs `claude update`.
-14. **start-bootstrap-daemon** — starts `beam-bootstrap daemon` (see
-    "Daemon" below) as a `beamctl`-managed background service, same
-    pattern as `start-tbot`. No dependencies on anything else here, so
-    it comes up as early as possible - `bin/beam-shell` also runs this
-    one synchronously (like `link-files`/`install-zellij`/etc.) before
-    launching zellij, since the `tui` pane in its layout needs something
-    to connect to right away.
-
-SSH to the k3s host node isn't wired into `tsh`/`ssh` directly yet - use the
-identity output explicitly for now:
-
-```sh
-tsh --identity=~/.teleport-bot/identity/identity ssh core@workstation
-```
-
-If a step fails, the ones after it don't run; fix the issue and re-run the
-whole binary — earlier steps will just skip.
+- **Launch runtime.** `launch start` starts the daemon under `beamctl`,
+  submits and stages the launch, installs Zellij (a pinned, verified
+  release, `src/install/zellij.rs`) while pre runs, and opens the
+  per-launch Zellij session; `launch shell` is that session's shell
+  wrapper. See "Daemon launch execution" below.
+- **Daemon** (`beam-bootstrapd`). Runs launches and templated tasks,
+  serves the TUI, the workstation bridge (requests, forwards, copies,
+  launches), the SSH agent relay and host key lookups.
+- **Task templates** (`src/tasks/`): `clone-git-repo`,
+  `checkout-pr-worktree`, toolchains, `install-starship`, code-server,
+  `wait-ssh-agent`. Profiles use them as `template = "..."`.
+- **TUI** and the Beam-side **`beams fetch`** CLI.
 
 ## Building
 
@@ -122,64 +68,15 @@ at the fallback path).
 
 ## Running
 
-```sh
-./target/debug/beam-bootstrap --repo /home/beams/beams
-```
-
-- `--repo <path>` — path to the beams repo checkout to bootstrap from.
-  Defaults to `~/beams`.
-- `--json` — force JSON-lines event output even on a TTY. Output is JSON
-  automatically when stdout isn't a TTY (e.g. piped), otherwise it's
-  rendered human-readable. Each line looks like:
-
-  ```json
-  {"type":"step","step":"apt-install","status":"ok","message":"installed micro, less"}
-  ```
-
-  `status` is one of `start`, `ok`, `skip`, `error`.
-- `--only <step-id>` — run just that one step (e.g. `link-files`) instead
-  of the full sequence. `bin/beam-shell` uses this to get `~/bin`
-  in place synchronously before anything that needs them, ahead of
-  backgrounding the full run.
-
-Exit code is `0` if every step succeeded (or was skipped), `1` if any step
-failed.
-
-### PATH
-
-Two steps make `beam-bootstrap` itself, and later the Go/code-server
-toolchains' `bin/` dirs, reachable by bare name instead of a full path:
-
-- `link-tool-paths` symlinks whichever binary ran it to
-  `~/.local/bin/beam-bootstrap`, and creates (empty, if not already
-  installed) `~/.local/toolchains/go/bin` and
-  `~/.local/toolchains/code-server/bin` ahead of their own install
-  tasks ever running.
-- `shell-config` also links `shell/fish/conf.d/beams-launch.fish`, which
-  only acts inside a launch (`BEAMS_LAUNCH_ID`): see "Daemon launch
-  execution" below.
-- `shell-config` links `shell/fish/conf.d/beams-path.fish`, which adds
-  all of those (plus `~/bin` and `~/.local/bin` itself) to fish's
-  PATH via `fish_add_path` - every example below works by bare name
-  (`beam-bootstrap task run ...`) once both have run at least once, not
-  just `./target/debug/beam-bootstrap`.
-
-Because `fish_add_path` stores these in the *universal* `$fish_user_paths`
-variable, and the directories already exist before a tool is ever
-installed into them (that's the point of creating them empty), an
-already-open interactive fish shell picks up a tool installed later -
-`install-toolchain-go`, say, run from a different shell or the daemon -
-immediately, with no new shell or reconfiguration needed. Confirmed
-directly: a second process's `fish_add_path` call becomes visible in an
-already-running interactive fish session within about a second.
-`~/.cargo/bin` isn't part of this - rustup's own installer already wires
-that into both bash and fish on its own.
+Every command is a subcommand (`beam-bootstrap --help`). In a launch's
+Zellij session `beam-bootstrap` and `beams` are on `PATH`
+(`~/.beams/runtime/bin/`, after the profile's own `[shell] path`).
 
 ### On-demand templated tasks
 
-Separate from the fixed startup sequence above: `src/tasks/` holds
-templated tasks that take runtime params instead of running
-unconditionally at startup (see `docs/designs/DESIGN.md`'s "Templates vs. instances").
+`src/tasks/` holds templated tasks that take runtime params (see
+`docs/designs/DESIGN.md`'s "Templates vs. instances"); profiles run them as
+launch nodes.
 Two ways to reach them - directly (no daemon involved), or through the
 daemon (see "Daemon" below):
 
@@ -191,8 +88,7 @@ daemon (see "Daemon" below):
 
 Each runs exactly one task in-process - no dependency resolution against
 other tasks (so run `clone-git-repo` against `--base` before
-`checkout-pr-worktree` depends on it having happened). Idempotent like
-the startup steps: re-running `clone-git-repo` against an existing
+`checkout-pr-worktree` depends on it having happened). Idempotent: re-running `clone-git-repo` against an existing
 checkout, or `checkout-pr-worktree` against an existing worktree, is a
 no-op.
 
@@ -200,9 +96,9 @@ Built-in template names and parameter schemas now live in
 `protocol/src/task_catalog.rs`, shared with the workstation's offline
 `beams config validate/explain` compiler. Bootstrap coverage tests check
 that catalog against actual instantiation and the task CLI. Runtime
-implementations and scheduling remain here; compiled launch plans and
-custom script templates can run through the foreground launch executor
-below, but are not daemon inputs yet. See
+implementations and scheduling remain here; compiled launch plans
+(with custom script templates) run through the daemon or the foreground
+executor below. See
 [the launch developer guide](../docs/development/launches.md) for the
 compiler contract and next execution milestones.
 
@@ -212,7 +108,7 @@ compiler contract and next execution milestones.
 verifies a client-packed tar or gzip tar and publishes private staging
 atomically. The descriptor binds bytes/SHA-256 to a launch UUID, plan digest
 and phase; the archive's `bundle.json` describes selected payload entries.
-It never installs over live targets, starts a daemon, or runs startup.
+It never installs over live targets or starts a daemon.
 The receiver must already be present; first-runtime delivery is pending.
 
 Entries must match the declared paths, kinds, sizes, modes and hashes.
@@ -287,8 +183,7 @@ daemon verifies staging itself first). `launch status [--launch-id ID]
 interrupted. `launch ready --component shell|tui [--launch-id ID]` reports
 an interface component (default launch `$BEAMS_LAUNCH_ID`; without one it
 does nothing): an interactive launch releases `interface-ready` once both
-have, which `shell/fish/conf.d/beams-launch.fish` and the TUI do on their
-own. `launch receive --launch-id ID --phase pre|post --archive A
+have, which `launch shell` and the TUI do on their own. `launch receive --launch-id ID --phase pre|post --archive A
 --descriptor D` stages a bundle for a daemon launch and releases its
 artifact-ready condition (a workstation's bridge uploads take the same
 path, and need no command here). State is `launch-state/` next to the daemon socket. The ops,
@@ -299,28 +194,29 @@ end-to-end check is `tests/launch-daemon-smoke.sh`.
 `client known-hosts HOST [--socket PATH]` is ssh's `KnownHostsCommand`
 here: it prints the connected workstation's known_hosts entries for `HOST`
 (routed like an agent request, 10 s timeout), always exiting 0 with any
-failure on one stderr line. The `known-hosts-command` step (run
-synchronously by `bin/beam-shell`, and by `launch start`) installs
+failure on one stderr line. `launch start` installs
 `/etc/ssh/ssh_config.d/beams-known-hosts.conf` pointing at this binary.
 See `src/knownhosts.rs`.
 
 `launch start --launch-dir DIR [--socket PATH]` is the interactive
-command `beams ssh --profile` runs (from `~/.beams/runtime/bin/`, no repo
+command `beams ssh` runs (from `~/.beams/runtime/bin/`, no repo
 checkout): it starts the daemon under `beamctl` unless it answers,
 submits `DIR/launch.json` (interactive gate), receives `DIR/pre/`,
 installs Zellij alongside pre, prints pre progress, and then execs
-`zellij attach beams-<id> --create` with the plan's environment. A pre
+`zellij attach beams-<id> --create` with the plan's environment (plus
+the runtime's `bin/` on `PATH`, with a `beams` link for `beams fetch`). A pre
 failure opens `bash -l` instead. Rerunning it reattaches. `launch shell
 [-- ARGS]` is that session's `default_shell` (via `beams-shell`): it
 reports `shell` readiness in the background and execs `$BEAMS_SHELL`.
-See `src/launch/session.rs` and the guide's "`beams ssh --profile`".
+See `src/launch/session.rs` and the guide's "Launch a new Beam".
 
 ### Shared package transactions
 
 Package actions batch one install per phase and skip when a batched
 `dpkg-query` probe confirms all requested architectures/versions. The
-shared helper holds `~/.beam-bootstrap/apt.lock` across re-probing, refreshing
-and installing, interoperating with existing `aptlock` callers. It refreshes
+shared helper holds `~/.beam-bootstrap/apt.lock` (`flock(2)`) across
+re-probing, refreshing and installing, so concurrent launches and tasks
+never run apt at once. It refreshes
 indexes on first use, source/keyring content changes or missing index files,
 then installs noninteractively and verifies the result. Successful refresh
 fingerprints live in `~/.beam-bootstrap/apt-index.json`.
@@ -350,9 +246,7 @@ supervised, e.g.:
 beamctl start --name beam-bootstrapd -- ./target/debug/beam-bootstrap daemon
 ```
 
-Nothing drives this from the fixed startup sequence, a TUI, or
-`client/` yet (see `docs/designs/DESIGN.md`'s migration plan) - today it only exists
-so these ops are reachable over a socket at all, same instantiation path
+`launch start` does that. Its task ops use the same instantiation path
 as `run-task` above (`tasks::instantiate`), with task-status progress
 broadcast to every connected client, not just whoever asked - try it
 with two terminals:
@@ -368,13 +262,12 @@ echo '{"request_id":"1","op":"run_task","task":"clone-git-repo","params":{"repo"
 
 `run_manifest` is `run_task` generalized to several task instances at
 once, resolved against each other (so they can be listed in any order)
-via the same capability graph the fixed startup sequence uses - this is
+via the capability graph - this is
 what lets `checkout-pr-worktree` and the `clone-git-repo` it depends on
 be requested together in one call. Each entry starts as soon as the
 entries it depends on finish (independent ones run concurrently); a
 failure only blocks its dependents, which get a `"blocked"` status.
-Local and workstation bridge manifest acceptance is queued before their
-worker starts, so their start/progress/completion events cannot overtake
+Acceptance is queued before the worker starts, so their start/progress/completion events cannot overtake
 the acceptance reply.
 Neither op blocks the connection or other submissions - both reply
 `accepted` and run in the background, serialized only where tasks share
@@ -415,8 +308,7 @@ Approval creates a workstation-owned `tsh ssh -N -L` process bound only to
 daemon; the Beam never receives a privileged command that can start it
 directly. Every remotely submitted request begins as `pending_approval`.
 
-`beams fetch PATH... [DEST]` (installed as `~/beams/bin/beams`, or for a
-`beams ssh --profile` launch `~/.beams/runtime/bin/beams`, which runs
+`beams fetch PATH... [DEST]` (`~/.beams/runtime/bin/beams`, which runs
 this binary under the name `beams`; `beam-bootstrap fetch` is the same command)
 proposes a multi-file `file_fetch` request: absolute Beam paths with their
 sizes (directory totals included) and an optional destination suggestion. It
@@ -445,7 +337,8 @@ The default mode is `two-way-safe` with VCS metadata ignored;
 choices.
 
 `beams ssh` supplies `BEAMS_CLIENT_ID` and a random
-`BEAMS_SESSION_TOKEN` to its remote `beam-shell` command. A direct SSH shell,
+`BEAMS_SESSION_TOKEN` to its remote `launch start` command (and so to the
+launch's Zellij session). A direct SSH shell,
 or a managed shell whose bridge has gone stale, fails before routing a
 request:
 
@@ -497,8 +390,8 @@ accepted) polls `ssh-add -l` against the daemon's SSH agent relay until the
 workstation is sharing a key (a `beams ssh` session is attached and a key
 is allowed), erroring out after a ~10 minute timeout rather than waiting
 forever. `clone-git-repo` requires its capability automatically for an
-ssh-style `repo` (`git@...` or `ssh://...`), and the workstation adds it to
-its startup manifest whenever that has ssh clones.
+ssh-style `repo` (`git@...` or `ssh://...`), and the profile compiler adds
+it to a launch whenever that has ssh clones.
 Reaching it is then a separate, manual step, same as any other published
 app: `tsh beams publish $BEAM_ALIAS` (per `~/AGENTS.md`'s "Publishing
 apps from beam" - port 8080 is the only one forwarded, which is why
@@ -518,7 +411,7 @@ lines tall: status glyph + task id, then the task's latest progress or
 result message at full width (or, while pending, which of its
 dependencies it's still waiting on), plus an aggregate gauge
 (`done/total, N running`) above them. `run_once` templates (toolchain
-installs, `wait-ssh-agent` - things the startup manifest already runs)
+installs, `wait-ssh-agent` - things a launch normally runs)
 are left out of the template list; their runs still show up
 in the task list, and `task run` still reaches them. `r`
 refreshes the template list, `tab` (outside a form) switches focus
@@ -557,43 +450,22 @@ triggered them.
 
 ## Trying it out
 
-```sh
-cd bootstrap
-cargo build
-./target/debug/beam-bootstrap --repo ~/beams
-# run it again - everything should now report "skip" except claude-update
-./target/debug/beam-bootstrap --repo ~/beams
-```
-
-## bin/beam-shell
-
-A convenience entrypoint for day-to-day use, once `cargo build --release`
-has produced the binary (or `cargo build` for a debug one): starts the
-bootstrap daemon (which also serves the SSH agent relay), runs
-`beam-bootstrap` in the background logging to `~/.beam-bootstrap.log`,
-then attaches to (or creates) a `beam` zellij session
-(`shell/zellij/beam-shell.kdl`) with the main pane next to the bootstrap
-TUI and a log pane tailing `~/.beam-bootstrap.log`:
+The smokes run the real daemon (and, where needed, the workstation daemon
+with a fake `tsh`) against scratch HOME/sockets, never this session's own:
 
 ```sh
-~/bin/beam-shell
+bash tests/launch-daemon-smoke.sh
+bash ../client/tests/launch-bridge-smoke.sh
 ```
 
-Safe to run repeatedly - it's just the attach-or-create flow each time, and
-`beam-bootstrap` is idempotent.
-
-Startup tasks (toolchains, repo clones) come from the workstation: the
-`beams` client sends its `[startup]` config (see `client/README.md`) over
-the bridge the first time it connects to a beam.
-
-### SSH agent: a relay, no keys on the beam
+## SSH agent: a relay, no keys on the beam
 
 `beam-bootstrapd` listens on `~/.beam-bootstrap/ssh-agent.sock` (next to
 its own socket) and relays agent requests to the workstation over the
 client bridge; the private key never leaves the workstation's own agent,
 and the user approves each signature in `beams ssh` (see
-`docs/designs/SSH_AGENT_PROXY_DESIGN.md`). `beam-shell` and `config.fish` set
-`SSH_AUTH_SOCK` to it for every shell, interactive or not; tasks run by the
+`docs/designs/SSH_AGENT_PROXY_DESIGN.md`). `launch start` sets `SSH_AUTH_SOCK`
+to it for the launch's Zellij session; tasks run by the
 daemon (clones, PR checkouts, `wait-ssh-agent`) pass it explicitly (see
 `src/sshagent.rs`). With no `beams ssh` attached the relay lists no keys,
 so `ssh`/`git` fail fast with `Permission denied (publickey)` rather than

@@ -358,7 +358,7 @@ pub struct AgentPrompt {
     pub claimed: Claimed,
     /// When the request is denied unless approved (Unix ms).
     pub expires_at_ms: u64,
-    /// Set when a grant approved it without asking ("startup grant, 2 of 5").
+    /// Set when a grant approved it without asking ("launch grant, 2 of 5").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted: Option<String>,
 }

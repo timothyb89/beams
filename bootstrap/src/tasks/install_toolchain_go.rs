@@ -22,7 +22,7 @@ const ARM64_SHA256: &str = "a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193
 
 /// Installs the official Go toolchain to `~/.local/toolchains/go` -
 /// self-contained, no `PATH`/shell-config changes attempted (same
-/// pattern as `steps::teleport_bin`'s `~/.teleport-bot/bin`): the
+/// pattern as the other pinned installers): the
 /// official tarball already extracts to a top-level `go/` directory, so
 /// `go/bin/go` ends up at a predictable path either way.
 pub struct InstallToolchainGo;

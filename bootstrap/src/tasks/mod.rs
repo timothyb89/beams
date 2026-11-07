@@ -1,9 +1,7 @@
 //! Runtime-instantiated, templated tasks - see `docs/designs/DESIGN.md`'s "Templates
-//! vs. instances". Unlike `steps::Step` (a fixed, compile-time-known list
-//! run once at startup), a `Task` here is produced by *instantiating* a
-//! template with concrete parameters at runtime: its id and capabilities
-//! are derived from those params rather than being a compile-time
-//! constant.
+//! vs. instances". A `Task` is produced by *instantiating* a template with
+//! concrete parameters at runtime: its id and capabilities are derived
+//! from those params rather than being compile-time constants.
 //!
 //! Two ways these get run - see `main.rs`'s `run-task` and `daemon.rs`'s
 //! `run_task` op for the first: instantiate and run exactly *one* task
@@ -17,10 +15,8 @@
 //!
 //! The other way - `daemon.rs`'s `run_manifest` op - *does* resolve
 //! several task instances against each other (`graph::resolve_levels`)
-//! and runs them concurrently where the graph allows via
-//! `executor::run`, which is also what the fixed startup sequence itself
-//! runs on (see `steps::StepAsTask`, the adapter that lets a `Step` join
-//! the same `Task` graph).
+//! and runs them concurrently where the graph allows via the executor.
+//! Launches run templates as native plan nodes (`launch::runner`).
 
 pub mod checkout_pr_worktree;
 pub mod clone_git_repo;
@@ -44,8 +40,7 @@ use install_toolchain_go::InstallToolchainGo;
 use install_toolchain_rust::InstallToolchainRust;
 use wait_ssh_agent::WaitSshAgent;
 
-/// Capability names provided/required by templates below - mirrors
-/// `steps::cap`'s role for fixed steps. Centralized so a dependent
+/// Capability names provided/required by templates below. Centralized so a dependent
 /// template references the same constant rather than retyping the
 /// string.
 pub mod cap {
@@ -55,9 +50,8 @@ pub mod cap {
 /// A task instance, produced by instantiating a template with concrete
 /// params (e.g. `clone_git_repo::CloneGitRepo { repo, dest }`).
 ///
-/// Mirrors `steps::Step`'s shape (`id`/`run`/`provides`/`requires`) but
-/// with an owned, params-derived `id` and `Capability` values instead of
-/// compile-time `&'static str` ones - see the module doc comment.
+/// Its `id` and `Capability` values are owned and params-derived - see the
+/// module doc comment.
 ///
 /// `Send` so `executor::run` can hand a task off to whichever thread
 /// ends up running its wave.
@@ -92,9 +86,8 @@ pub trait Task: Send {
     /// same resource, enforced only at runtime by `executor::run`, which
     /// is the only thing that needs to care: two tasks with no
     /// capability relationship can still be unsafe to run at the same
-    /// time (the canonical example here: `apt-install` and
-    /// `install-kubectl` both shell out to `apt-get`/`dpkg`, which don't
-    /// tolerate two concurrent invocations - see `steps::resource`).
+    /// time (the canonical example: two tasks that both shell out to
+    /// `apt-get`/`dpkg`, which don't tolerate concurrent invocations).
     fn exclusive_resources(&self) -> Vec<Capability> {
         Vec::new()
     }

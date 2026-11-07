@@ -1,4 +1,6 @@
-//! Probe, refresh and install while holding aptlock's cross-process lock.
+//! Probe, refresh and install while holding a cross-process lock
+//! (`flock(2)` on `<state>/apt.lock`), so concurrent launches and tasks
+//! never run apt/dpkg at once.
 use crate::{commandlog, pathutil::expand_tilde};
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};

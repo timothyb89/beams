@@ -63,10 +63,7 @@ pub fn start(launch_dir: &Path, socket: Option<String>) -> anyhow::Result<()> {
 
     // Zellij (a pinned, verified download) doesn't depend on pre; fetch it
     // while pre runs.
-    let zellij = std::thread::spawn(|| {
-        use crate::steps::Step;
-        crate::steps::InstallZellij.run(Path::new("")).map_err(|err| format!("{err:#}"))
-    });
+    let zellij = std::thread::spawn(|| crate::install::zellij::install().map_err(|err| format!("{err:#}")));
 
     // Before pre: profile hooks and post clones may use ssh.
     if let Err(err) = crate::knownhosts::install_ssh_config(&exe) {

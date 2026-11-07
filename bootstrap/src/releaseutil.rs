@@ -5,10 +5,8 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context};
 
-/// Shared helpers for steps/tasks that install a pinned release binary -
-/// `steps::zellij`/`steps::starship`/`steps::teleport_bin`, and
-/// `tasks::install_toolchain_go`. Lives at the crate root (not nested
-/// under `steps`) since both `steps` and `tasks` need it.
+/// Shared helpers for installing a pinned release binary - `install::zellij`,
+/// `install::starship` and `tasks::install_toolchain_go`.
 pub fn arch_target(project: &str) -> anyhow::Result<&'static str> {
     let output = Command::new("uname")
         .arg("-m")

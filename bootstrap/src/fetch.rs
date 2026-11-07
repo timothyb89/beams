@@ -8,8 +8,8 @@
 //! rejected; Ctrl-C withdraws the request (the daemon notices this
 //! connection closing - see `daemon::ConnectionContext::tied_requests`).
 //!
-//! Installed as `~/beams/bin/beams`, which runs this binary under the name
-//! `beams`; `main` dispatches on that.
+//! `launch start` links `~/.beams/runtime/bin/beams` to this binary; run
+//! under that name, it's this CLI (`main` dispatches on it).
 
 use std::io::{IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};

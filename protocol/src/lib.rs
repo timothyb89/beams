@@ -434,14 +434,6 @@ pub enum ClientToBeam {
     },
 }
 
-/// One entry of a startup manifest: a task template and its params.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct ManifestTask {
-    pub template: String,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub params: std::collections::BTreeMap<String, ManifestParam>,
-}
-
 /// A task parameter value (templates only take these three kinds).
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(untagged)]

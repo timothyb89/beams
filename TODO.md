@@ -185,22 +185,34 @@ path (runtime delivery, shell preparation, Zellij/TUI with
   `ssh-grant.json`; limited to the covered tasks' exact `BEAMS_TASK_RUN`
   tags; window opens at acceptance (pre) or `interface-ready` (post);
   ended on finish/disconnect; issued once per launch. The Beam routes a
-  running launch's tasks to its owning workstation. Remaining: a real-key
-  clone on a disposable Beam (needs an approved key; fixture + driver
-  tests only so far).
-- [ ] Remove the legacy startup once the profile path is the default
-  (maintainer decision 2026-11-07: no long-term legacy support, single
-  user): the `[startup]` manifest submission (`clientd::submit_startup`,
-  `startup.rs`, `RunManifest` startup grants unless launch tasks reuse
-  them), `bin/beam-shell`'s fixed background run and the Git-push
-  delivery, the `~/beams/bin/beam-client-bridge` fallback, and the
-  implicit Go/Rust defaults, and the fixed `install-starship` step (now
-  the `install-starship` template in `builtin:development`'s pre). The
-  maintainer's clones and grant are in gitignored
-  `environments/local/personal.toml` (2026-11-07; `KnownHostsCommand`
-  and launch grants landed). Still to decide: which other fixed steps
-  (claude update/CLAUDE.md merge, kubectl, teleport binary from the
-  staging CDN, k3s bot/tbot/kubeconfig) become profile tasks.
+  running launch's tasks to its owning workstation. The maintainer's
+  real-key clones (3 of 5 uses) worked on a disposable Beam 2026-11-07,
+  and `client/tests/ssh-agent-smoke.sh` now runs a launch clone over ssh
+  under a grant end to end.
+- [x] Legacy startup removed (2026-11-07; maintainer decision: no
+  long-term legacy support, single user). `beams ssh` always launches a
+  profile (`--profile`, `[launch] profile`, else `builtin:development`).
+  Gone: the workstation `[startup]` manifest (`RunManifest`/`Manifest*`
+  bridge messages, `CAPABILITY_STARTUP_MANIFEST`, startup grants, the
+  implicit Go/Rust defaults; a leftover `[startup]` is refused), the
+  repo-checkout staging and Git push (now only `--push-repo`),
+  `--no-client-daemon`, the `~/beams/bin/beam-client-bridge` fallback,
+  `bin/` (`beam-shell`, `beams`, `beam-client-bridge`), the fixed step
+  run (`bootstrap/src/steps/`, `events.rs`, `aptlock.rs`, `--repo`/
+  `--only`/`--json`), and `shell/fish`, `shell/zellij`,
+  `shell/starship.toml`. Zellij/starship installers live in
+  `bootstrap/src/install/`. The maintainer's fixed steps (claude update,
+  CLAUDE.md merge, kubectl, tbot/tctl from the staging CDN, k3s bot and
+  kubeconfig) are script tasks in gitignored
+  `environments/local/personal.toml` + `personal/`.
+- [ ] Legacy-removal follow-ups: `client/src/session.rs` still has
+  `LocalDaemon::unavailable` (now unused, a build warning) and
+  "Startup" grant wording/tests (`GrantRecord::is_launch`, menu title);
+  rename `client/src/startup.rs` to `grants.rs` with it. Left alone while
+  the overlay hardening lands there. `beams config launch` with the
+  interactive gate onto an existing Beam has no shell readiness reporter
+  any more (the fish conf.d hook went with `shell/fish`); use
+  `--headless`, or report with `beam-bootstrap launch ready`.
 - [x] `beams ssh` never reused a Beam once the maximum Beam TTL dropped to
   12h (`MIN_TTL_HOURS` was 12; ~11h left observed 2026-11-07). Now 6h,
   plus `beams ssh --beam ID|UUID|PURPOSE` to connect to a specific Beam
@@ -208,17 +220,16 @@ path (runtime delivery, shell preparation, Zellij/TUI with
 - [ ] Profile-launch follow-ups: a reattached Beam keeps the runtime it
   was launched with (no runtime upgrade path); `launch start`'s pre
   progress repeats `pending` lines; measure scp vs. bridge upload for
-  the runtime; `--no-client-daemon` is refused rather than running
-  local-only work.
+  the runtime.
 - [ ] Phase 4: projected upload progress in the session overlay/Beam TUI,
   bounded task concurrency and retry/recovery. Background uploads and
   receive-driven release of artifact-ready landed 2026-11-06 (`beams config
   launch`); submitting-client routing for SSH key use landed with the SSH
   agent follow-ups.
-- [ ] Phase 5: migrate the maintainer's setup onto a local profile,
-  distribute a sanitized development default, adapt legacy `[startup]`,
-  document customization, and validate on disposable Beams before
-  switching defaults.
+- [ ] Phase 5: the maintainer's setup is a local profile and
+  `builtin:development` is the default (2026-11-07). Remaining: document
+  customization (`config init`) and validate the ported personal tasks
+  (tbot, claude update, kubectl) on a disposable Beam.
 - [ ] Phase 6: optional daemon-owned OpenSSH ControlMaster for preparation
   and uploads after the workstation compatibility matrix passes. Share
   the Phase 7 client-services transport work below, not a second backend.
@@ -229,18 +240,12 @@ path (runtime delivery, shell preparation, Zellij/TUI with
 
 ## Done so far (for context, not actionable)
 
-- `beam-bootstrap`: dotfile linking, apt packages, fish/starship,
-  kubectl/zellij install, k3s-bot join + `tbot` as a background service,
-  kubeconfig symlink, `claude update`. Idempotent, JSON or human output.
-  Current implementation: a fixed, run-once step list — see "Migration"
-  below for how this becomes the daemon/task-graph's zero-param
-  templates.
-- `beams` client: spawn-or-reuse by purpose, concurrency cap, git push of
-  the repo + scp of a prebuilt bootstrap binary (no SSH key), `tsh ssh`
-  into `beam-shell`.
-- `bin/beam-shell`: zellij layout with the main pane next to the bootstrap
-  TUI and log tail. SSH goes through the daemon's agent relay (see "SSH
-  agent proxy" below); there is no unlock pane anymore.
+- `beam-bootstrap`: originally a fixed, run-once step list (dotfiles,
+  apt, fish/starship, kubectl/zellij, k3s bot + tbot, `claude update`),
+  replaced 2026-11-07 by profile launches (`launch start`) and templates.
+- `beams` client: spawn-or-reuse by purpose, concurrency cap; originally
+  git push + scp of the bootstrap binary into `bin/beam-shell`, now a
+  packed profile launch (`~/.beams/` runtime + pre bundle, no SSH key).
 - `AGENTS.md`, `docs/designs/DESIGN.md`: architecture/conventions + the
   daemon/task-graph design written up and agreed.
 

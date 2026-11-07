@@ -14,19 +14,21 @@ of it, and `TODO.md` as the live task list).
 
 Two halves:
 
-- **`bootstrap/`** (Rust binary `beam-bootstrap`) — runs *inside* a beam.
-  Idempotent, ordered steps (`bootstrap/src/steps/*.rs`) that link
-  dotfiles, install packages/tools, set up fish/starship, join the beam to
-  the cluster as a bot, and start `tbot` for k3s access. See
-  `bootstrap/README.md` for the full step list and build instructions.
-- **`client/`** (Rust binary `beams`) — runs on your *workstation*. Spawns
-  or reuses a beam, stages+copies this repo onto it, and `tsh ssh`s in.
-  See `client/README.md`.
+- **`bootstrap/`** (Rust binary `beam-bootstrap`) — runs *inside* a beam:
+  the launch runtime (`launch start` runs a profile's pre phase and opens
+  the Zellij session), the daemon behind the TUI, task templates, the
+  workstation bridge and the SSH agent relay. See `bootstrap/README.md`.
+- **`client/`** (Rust binary `beams`) — runs on your *workstation*. Packs
+  a launch profile, spawns or reuses a beam, copies the runtime and
+  launch onto it, and `tsh ssh`s in. See `client/README.md`.
 
 Plus:
-- `bin/` — scripts symlinked into a beam's `$HOME` (`beam-shell`,
-  `beams`).
-- `shell/` — fish config, starship config, zellij layout, all symlinked in.
+- `environments/` — launch profiles: `core.toml`/`development.toml`
+  (embedded in the client as `builtin:*`), `examples/`, and gitignored
+  `local/` profiles. What a Beam starts with (packages, files, clones,
+  toolchains, hooks) lives here; see `docs/development/launches.md`.
+- `shell/runtime/` — the launch runtime's `beams-shell` wrapper and Zellij
+  layout, embedded in the client.
 - `bot-onboarding/` — cluster-level (not per-beam) Teleport role/bot setup
   for the `k3s-bot`, applied once via `tctl`.
 - `docs/designs/` — design docs and spikes (see below).
@@ -37,16 +39,12 @@ Plus:
 
 ## Task runner
 
-`bootstrap/src/tasks/` holds templated, on-demand tasks (distinct from
-the fixed startup `steps/` — see `docs/designs/DESIGN.md`'s "Templates vs.
-instances"). This is how to actually reach for one from an agent session,
-today, not just a description of the design:
+`bootstrap/src/tasks/` holds templated tasks (see `docs/designs/DESIGN.md`'s
+"Templates vs. instances"); profiles use them as `template = "..."`. This
+is how to reach for one from an agent session:
 
-- `beam-bootstrap` itself is reachable by bare name below (no
-  `./target/debug/` prefix needed) once a beam's been bootstrapped at
-  least once — see `bootstrap/README.md`'s "PATH" section for the two
-  steps (`link-tool-paths`/`shell-config`) that make that, and the Go/
-  code-server toolchains, true.
+- `beam-bootstrap` (and `beams`) are on `PATH` in a launch's Zellij
+  session (`~/.beams/runtime/bin/`).
 
 - **Daemon-backed, the normal way to reach any template now**:
   `beam-bootstrap task list` / `task run <template> --param value ...`
@@ -69,17 +67,16 @@ today, not just a description of the design:
   that needs its `exclusive_resources` tag actually serialized against
   other *concurrently running* tasks - a bare `run-task` only ever runs
   the one task you gave it, so that tag has nothing to serialize against
-  there. Real cross-process contention (e.g. `apt-get`) goes through
-  `aptlock`'s `flock(1)` regardless of which path you use, so that part's
-  covered either way.
+  there. Package installs take `packages.rs`'s cross-process apt lock
+  either way.
 - **Standing permission**: run templated tasks (either path above)
   against a beam — including this session's own — without asking first.
   They're idempotent and scoped to exactly what they say (installing a
   toolchain, cloning a repo), same trust level as any other read/build/
   install command already run freely in this repo. This doesn't extend
-  to the *startup sequence* or daemon lifecycle itself (don't restart
-  `beam-bootstrapd`, don't re-run the fixed sequence against a beam
-  that's mid-session) — only to invoking an existing template.
+  to a launch or the daemon lifecycle itself (don't restart
+  `beam-bootstrapd`, don't retry or resubmit a launch on a beam that's
+  mid-session) — only to invoking an existing template.
 - **Need a toolchain on a beam (including this session's own) to build or
   test something?** Check for an existing install task first -
   `install-toolchain-go`/`install-toolchain-rust` (and anything named
@@ -111,18 +108,15 @@ today, not just a description of the design:
 
 ## Working conventions
 
-- **Steps must stay idempotent.** Every `bootstrap` step checks what's
-  already in place and reports `skip` instead of redoing work. Re-running
-  the whole binary after a partial failure is the expected recovery path
-  — don't add steps that assume a clean slate.
-- **Steps run in a fixed order and stop on first failure** (see
-  `bootstrap/src/steps/mod.rs`). If a step fails, nothing after it runs.
-  Keep that in mind when reordering or inserting new steps — put anything
-  a later step depends on strictly before it.
-- **Event protocol**: steps report `start`/`ok`/`skip`/`error` via
-  `bootstrap/src/events.rs`, rendered human-readable on a TTY or as
-  JSON-lines otherwise. Keep new steps emitting through this, not raw
-  `println!`, so `--json` and the human renderer both keep working.
+- **Tasks must stay idempotent.** Every template checks what's already in
+  place and reports `skip` instead of redoing work, and profile hooks
+  should do the same (or declare a `check`). `launch retry` after a
+  partial failure is the expected recovery path — don't write tasks that
+  assume a clean slate.
+- **Order comes from the graph**, not declaration order: templates
+  declare capabilities, profile tasks `after`/`packages`/`resources`
+  (see `docs/development/launches.md`). A failure blocks only what
+  depends on it.
 - **Cross-compilation matters.** `client/src/stage.rs` prefers a
   statically-linked `x86_64-unknown-linux-musl` build of `beam-bootstrap`
   (via `bootstrap/build-cross.sh`) and refuses to ship anything that isn't
@@ -130,9 +124,7 @@ today, not just a description of the design:
   keep that fallback/validation logic honest.
 - **No Rust toolchain on a stock beam.** `beam-bootstrap` is always built
   elsewhere and copied over (`tsh beams scp`) — never assume `cargo` is
-  available inside a beam itself. If a beam already has `beam-bootstrap`
-  (any prior bootstrap run leaves it on `PATH` — see
-  `bootstrap/README.md`'s "PATH" section) and you need `cargo`/`go` there
+  available inside a beam itself. If you need `cargo`/`go` on a beam
   anyway (e.g. to build and test a change to this repo's own Rust code,
   in-session), use its `install-toolchain-rust`/`install-toolchain-go`
   task instead of installing by hand — see "Task runner" above.
@@ -143,7 +135,7 @@ today, not just a description of the design:
   mutable/local state.
 - **Keep docs in sync with behavior.** Each of `bootstrap/README.md` and
   `client/README.md` documents its own binary's behavior in detail —
-  when you change a step or a client flag, update the matching README in
+  when you change a template, a launch behavior or a client flag, update the matching README in
   the same change. `project.md` is the original design brief; update it
   only if the design itself changes, not for incremental implementation
   details (those belong in the READMEs, `AGENTS.md`, or `TODO.md`).
@@ -187,14 +179,12 @@ sequenced:
 
 ## Testing
 
-- `client/src/stage.rs` has unit tests today (staging-directory assembly,
-  binary validation). `bootstrap`'s steps have none yet — most touch real
-  system state (apt, symlinks, systemd-less background services via
-  `beamctl`) and would need either mocking or an actual beam to exercise;
-  see `TODO.md`.
+- `cargo test` in `bootstrap/`, `client/`, `protocol/` and `artifacts/`,
+  plus the smokes in `client/tests/` and `bootstrap/tests/` (scratch
+  HOME/sockets and a fake `tsh`; they never touch this session's daemon).
 - There's no CI configured in this repo yet (no `.github/workflows`) —
-  testing today is manual: build, run against a real or disposable beam,
-  check `--json` output and re-run idempotency.
+  end-to-end checks beyond the smokes mean a disposable beam
+  (`beams ssh --purpose NAME`, then `tsh beams rm`).
 
 ## Building
 
@@ -205,6 +195,7 @@ Quick reference:
 # bootstrap binary, cross-compiled static build for shipping to a beam
 ./bootstrap/build-cross.sh
 
-# client wrapper, run from your workstation
+# client wrapper, run from your workstation (launches builtin:development
+# unless --profile or [launch] profile says otherwise)
 cd client && cargo build --release && ./target/release/beams ssh
 ```

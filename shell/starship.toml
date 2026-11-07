@@ -1,9 +1,0 @@
-# Synced into ~/.config/starship.toml by beam-bootstrap (shell-config
-# step). This is a placeholder - starship uses its built-in defaults for
-# anything not overridden here. Tweak to taste.
-
-add_newline = false
-
-[character]
-success_symbol = "[➜](bold green)"
-error_symbol = "[➜](bold red)"

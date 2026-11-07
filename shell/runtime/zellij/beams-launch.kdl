@@ -1,8 +1,6 @@
-// Layout for a `beams ssh --profile` launch session, written by the
-// workstation into ~/.beams/runtime/zellij/ (see
-// bootstrap/src/launch/session.rs). Same chrome and split as
-// shell/zellij/beam-shell.kdl, without the fixed-startup log pane: launch
-// progress is in the TUI. Panes Zellij opens itself run `beams-shell`
+// Layout for a `beams ssh` launch session, written by the workstation
+// into ~/.beams/runtime/zellij/ (see bootstrap/src/launch/session.rs).
+// The main pane next to the TUI, which shows launch progress. Panes Zellij opens itself run `beams-shell`
 // (its default_shell), which reports readiness and execs the plan's shell.
 layout {
     tab name="beams" {

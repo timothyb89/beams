@@ -1,8 +1,8 @@
 use super::{Task, Template};
 use crate::graph::Capability;
 
-/// The pinned starship release (`steps::starship`, also a fixed step on
-/// legacy Beams) as a template, so profiles choose it and its phase.
+/// The pinned starship release (`install::starship`) as a template, so
+/// profiles choose it and its phase.
 /// `builtin:development` runs it in pre, so the first shell's prompt is
 /// there; it downloads while pre's apt batch runs.
 pub struct InstallStarship;
@@ -17,7 +17,7 @@ impl Task for InstallStarship {
     }
 
     fn run(&self) -> anyhow::Result<Option<String>> {
-        crate::steps::install_starship()
+        crate::install::starship::install()
     }
 }
 

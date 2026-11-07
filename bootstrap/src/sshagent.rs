@@ -3,8 +3,8 @@
 //! The agent is the daemon's own relay (`agentproxy`): it holds no keys
 //! itself and asks the workstation for each signature (see
 //! `docs/designs/SSH_AGENT_PROXY_DESIGN.md`). Interactive shells get the same socket as
-//! `SSH_AUTH_SOCK` from `bin/beam-shell` and `shell/fish/config.fish`; the
-//! daemon's own environment predates those, so tasks that run `git`/`ssh`
+//! `SSH_AUTH_SOCK` from `launch start`'s Zellij session; the daemon's own
+//! environment predates that, so tasks that run `git`/`ssh`
 //! (`clone_git_repo`, `checkout_pr_worktree`, `wait_ssh_agent`) prepare
 //! their commands with `relay_command`.
 
@@ -40,8 +40,8 @@ pub fn discover_ssh_auth_sock() -> Option<String> {
 
 /// Points `cmd` at the relay (`discover_ssh_auth_sock`) and, inside a
 /// tagged run, sets `BEAMS_TASK_RUN` (`executor::current_task_run`) so the
-/// workstation can match the key use to the manifest that asked for it
-/// (a startup grant covers only its own tasks). Every task that runs
+/// workstation can match the key use to the launch task that asked for
+/// it (a launch's grant covers only its own tasks). Every task that runs
 /// `git`/`ssh` should go through this rather than setting either by hand:
 /// a command without the tag falls outside the grant and prompts.
 pub fn relay_command(cmd: &mut Command) -> &mut Command {

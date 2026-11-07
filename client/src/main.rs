@@ -36,8 +36,8 @@ const MAX_CONCURRENT_BEAMS: usize = 5;
 const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 const DEFAULT_LOGIN: &str = "beams";
 const DEFAULT_PURPOSE: &str = "default";
-/// Where the repo lands on the beam, relative to its `$HOME` - matches
-/// what `bin/beam-shell`, the zellij layout, etc. all assume (`~/beams`).
+/// Where `--push-repo` puts the checkout on the beam, relative to its
+/// `$HOME` (`~/beams`).
 const REMOTE_REPO_PATH: &str = "beams";
 
 /// Spawn or reuse a Teleport Beam and drop straight into it.

@@ -11,10 +11,8 @@
 //! was done, so a slow, unrelated task - a big `git clone` - held up
 //! everything queued behind it.)
 //!
-//! Used by both `daemon::run_manifest` (templated task instances) and
-//! `steps::run` (the fixed startup sequence, via `steps::StepAsTask` -
-//! the adapter that turns a `Step` into a `Task` so the two can share one
-//! graph/executor instead of two separate, incompatible run loops).
+//! Used by `daemon::run_manifest` (templated task instances) and the
+//! launch runner (`launch::runner`).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc;
@@ -87,9 +85,8 @@ impl Resources {
     }
 }
 
-/// `run_with` against a fresh, private `Resources` - fine for a caller
-/// that's the only thing running tasks in-process (the fixed startup
-/// sequence, tests).
+/// `run_with` against a fresh, private `Resources` (tests).
+#[cfg(test)]
 pub fn run(tasks: Vec<Box<dyn Task>>, on_event: &(dyn Fn(Event) + Sync)) -> anyhow::Result<bool> {
     run_with(tasks, &Resources::default(), on_event)
 }
@@ -108,6 +105,7 @@ pub fn run(tasks: Vec<Box<dyn Task>>, on_event: &(dyn Fn(Event) + Sync)) -> anyh
 /// any failed or was blocked, `Err` only if the graph itself doesn't
 /// resolve (cycle, missing capability, duplicate provider), before
 /// anything has run at all.
+#[cfg(test)]
 pub fn run_with(
     tasks: Vec<Box<dyn Task>>,
     resources: &Resources,
@@ -123,8 +121,8 @@ thread_local! {
 /// `<tag>/<task id>` while a task of a tagged run (`run_tagged`) runs on
 /// this thread. Tasks put it in their subprocesses' environment as
 /// `BEAMS_TASK_RUN`, which the SSH agent relay reports to the workstation
-/// (advisory: it's how a startup grant tells its own clones apart from
-/// anything else using the key during its window).
+/// (advisory: it's how a launch's SSH key grant tells its own tasks apart
+/// from anything else using the key during its window).
 pub fn current_task_run() -> Option<String> {
     TASK_RUN.with(|run| run.borrow().clone())
 }

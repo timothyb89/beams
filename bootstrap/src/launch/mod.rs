@@ -1,4 +1,5 @@
-//! Explicit launch tooling; never restarts the daemon or runs fixed startup.
+//! Launch tooling: explicit artifact/phase commands, the daemon ops' CLI,
+//! and `launch start`/`launch shell` (`session`). Never restarts the daemon.
 pub mod daemon;
 mod files;
 mod runner;

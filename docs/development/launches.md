@@ -482,8 +482,8 @@ edge to it; a task without package requirements can overlap apt. Each
 action probes requested names/architectures/versions in one `dpkg-query`
 call. An already-satisfied batch skips without apt.
 
-The shared package helper acquires the same kernel lock as
-`aptlock`: `~/.beam-bootstrap/apt.lock`. It probes again under the lock,
+The shared package helper takes a kernel lock (`flock(2)`) on
+`~/.beam-bootstrap/apt.lock`. It probes again under the lock,
 fingerprints apt source/keyring contents, refreshes indexes on first use,
 changed inputs or missing index files, installs the batch noninteractively,
 then checks installed versions. The cache records a successful refresh,
