@@ -847,6 +847,28 @@ mod tests {
     }
 
     #[test]
+    fn read_splits_inside_utf8_text_keep_paint_eligibility() {
+        // Zellij borders and claude's prompt glyphs routinely straddle reads.
+        let text = "\x1b[H─┐╰❯\u{a0}".as_bytes();
+        for split in 0..=text.len() {
+            let mut model = TerminalModel::new(size());
+            model.process(b"\x1bc");
+            for chunk in [&text[..split], &text[split..]] {
+                let (consumed, rejected) = model
+                    .process_guarded(chunk, true, false, |_| Ok::<(), ()>(()), true)
+                    .unwrap();
+                assert_eq!((consumed, rejected), (chunk.len(), None), "split {split}");
+            }
+            assert!(model.can_paint(), "split {split}: {:?}", model.unavailable_reason());
+            assert_eq!(model.screen().contents(), "─┐╰❯\u{a0}");
+        }
+        let mut model = TerminalModel::new(size());
+        model.process(b"\x1bc\xe2\x94");
+        model.process(b"\r");
+        assert_eq!(model.unavailable_reason(), Some(Unavailable::UnsupportedSequence));
+    }
+
+    #[test]
     fn borrowed_menu_requires_reset_owned_unused_alternate_and_known_primary_geometry() {
         let mut model = TerminalModel::new(size());
         assert!(

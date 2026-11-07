@@ -60,6 +60,15 @@ impl TerminalStream {
                     i += 1;
                 }
                 if i > start {
+                    // A read can split a UTF-8 character. The parser receives
+                    // every byte as it arrives, but `original` holds only whole
+                    // characters: a character carried from an earlier read is
+                    // prefixed and one left unfinished here is deferred.
+                    let carried = if self.utf8_pending != 0 {
+                        self.pending.clone()
+                    } else {
+                        Vec::new()
+                    };
                     // Only the final UTF-8 character can be unfinished.
                     // Avoid per-byte bookkeeping for long text/log bursts.
                     let tail = if i - start >= 4 {
@@ -72,11 +81,35 @@ impl TerminalStream {
                     for &byte in &bytes[tail..i] {
                         self.text_byte(byte);
                     }
-                    if !frame(&bytes[start..i], &bytes[start..i])? {
+                    let unfinished = if self.utf8_pending != 0 {
+                        self.pending.len()
+                    } else {
+                        0
+                    };
+                    let combined = if carried.is_empty() {
+                        std::borrow::Cow::Borrowed(&bytes[start..i])
+                    } else {
+                        std::borrow::Cow::Owned([carried.as_slice(), &bytes[start..i]].concat())
+                    };
+                    let original = &combined[..combined.len() - unfinished];
+                    if !frame(&bytes[start..i], original)? {
+                        // Nothing here was written physically; replay it all,
+                        // including the carried prefix and unfinished tail.
+                        let replay = combined.into_owned();
                         self.cancel_pending();
-                        return Ok((i, Some(bytes[start..i].to_vec())));
+                        return Ok((i, Some(replay)));
                     }
                     continue;
+                }
+                // A C0 control or ESC abandons an unfinished character; the
+                // terminal shows a replacement for it. Classify those bytes.
+                if self.utf8_pending != 0 && !self.pending.is_empty() {
+                    let dangling = std::mem::take(&mut self.pending);
+                    self.utf8_pending = 0;
+                    if !frame(b"", &dangling)? {
+                        self.cancel_pending();
+                        return Ok((i, Some(dangling)));
+                    }
                 }
                 if bytes[i] != 0x1b {
                     self.text_byte(bytes[i]);
@@ -326,6 +359,54 @@ mod tests {
                 );
             }
             assert_eq!(output, trace, "split at {split}");
+            assert!(stream.at_boundary());
+        }
+    }
+
+    #[test]
+    fn text_originals_hold_whole_characters_at_every_read_split() {
+        // Box drawing, a 4-byte emoji and NBSP, as in zellij/claude frames.
+        let trace = "─┐x😀\u{a0}│\x1b[m╰".as_bytes();
+        for first in 0..=trace.len() {
+            for second in first..=trace.len() {
+                let mut stream = TerminalStream::default();
+                let (mut fed, mut originals) = (Vec::new(), Vec::new());
+                for chunk in [&trace[..first], &trace[first..second], &trace[second..]] {
+                    let consumed = stream
+                        .advance_guarded(chunk, |frame, original| {
+                            fed.extend_from_slice(frame);
+                            if !original.starts_with(b"\x1b") {
+                                assert!(
+                                    std::str::from_utf8(original).is_ok(),
+                                    "split {first}/{second}: {original:?}"
+                                );
+                                originals.extend_from_slice(original);
+                            }
+                            Ok::<_, ()>(true)
+                        })
+                        .unwrap();
+                    assert_eq!(consumed, (chunk.len(), None));
+                }
+                assert_eq!(fed, trace, "parser bytes, split {first}/{second}");
+                assert_eq!(originals, "─┐x😀\u{a0}│╰".as_bytes(), "split {first}/{second}");
+                assert!(stream.at_boundary());
+            }
+        }
+    }
+
+    #[test]
+    fn abandoned_utf8_lead_is_still_classified_and_replayed() {
+        for abandon in [b"\x1b[m".as_slice(), b"\r", b"x"] {
+            let mut stream = TerminalStream::default();
+            let mut originals = Vec::new();
+            let mut classify = |_: &[u8], original: &[u8]| {
+                originals.push(original.to_vec());
+                Ok::<_, ()>(std::str::from_utf8(original).is_ok() || original.starts_with(b"\x1b"))
+            };
+            assert_eq!(stream.advance_guarded(b"ok\xe2\x94", &mut classify), Ok((4, None)));
+            let (_, rejected) = stream.advance_guarded(abandon, &mut classify).unwrap();
+            let rejected = rejected.expect("a dangling lead is not valid text");
+            assert!(rejected.starts_with(b"\xe2\x94"), "{abandon:?}: {rejected:?}");
             assert!(stream.at_boundary());
         }
     }
