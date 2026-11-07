@@ -495,16 +495,22 @@ impl TerminalModel {
                 self.evidence.invalidate(Unavailable::UnsupportedSequence);
             }
             let before_alternate = self.parser.screen().alternate_screen();
+            let before_cursor = self.parser.screen().cursor_position();
             if let Some(buffers) = &mut self.overlay_buffers {
                 buffers[usize::from(before_alternate)] = true;
             }
             process_frame(&mut self.parser, frame);
             if std::mem::take(&mut self.parser.callbacks_mut().reset_observed) {
                 self.integrity_lost = false;
-                self.evidence.observe(b"\x1bc", false, self.parser.screen());
-            } else {
                 self.evidence
-                    .observe(original, before_alternate, self.parser.screen());
+                    .observe(b"\x1bc", false, before_cursor, self.parser.screen());
+            } else {
+                self.evidence.observe(
+                    original,
+                    before_alternate,
+                    before_cursor,
+                    self.parser.screen(),
+                );
             }
             if let Some(buffers) = &mut self.overlay_buffers {
                 buffers[usize::from(self.parser.screen().alternate_screen())] = true;
@@ -532,6 +538,23 @@ impl TerminalModel {
 
     pub fn can_paint_buffer(&self, alternate: bool) -> bool {
         !self.integrity_lost && self.evidence.can_paint(alternate)
+    }
+
+    /// Current-state restoration never uses a save slot. The entire requested
+    /// area must have observed content, including any expanded wide edges.
+    pub fn can_paint_area(&self, area: Rect) -> bool {
+        let screen = self.screen();
+        !self.integrity_lost
+            && area.width > 0
+            && area.height > 0
+            && area.width <= screen.size().1.get().saturating_sub(area.x)
+            && area.height <= screen.size().0.get().saturating_sub(area.y)
+            && self.evidence.can_paint_rows(
+                screen.alternate_screen(),
+                area.top(),
+                area.bottom(),
+                screen,
+            )
     }
 
     pub fn unavailable_reason(&self) -> Option<Unavailable> {
@@ -784,6 +807,155 @@ mod tests {
             REINITIALIZE,
         ]
         .concat()
+    }
+
+    fn regional_initialization() -> Vec<u8> {
+        [
+            INHERITED_SHARED.concat().as_slice(),
+            b"\x1b[?47l\x1b[?6l\x1b[r",
+            NORMAL_ROWS,
+            b"\x1b[2;1H\x1b[2K\x1b[3;1H\x1b[2K\x1b[H",
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn regional_rows_require_observed_erasure_and_state_at_every_split() {
+        let trace = regional_initialization();
+        let area = Rect::new(2, 1, 8, 2);
+        for split in 0..=trace.len() {
+            let mut model = TerminalModel::new(size());
+            model.process(&trace[..split]);
+            model.process(&trace[split..]);
+            assert!(model.can_paint_area(area), "split {split}");
+            assert!(
+                !model.can_paint(),
+                "inherited cells and save slot remain unknown"
+            );
+            assert!(!model.can_paint_area(Rect::new(0, 0, 1, 1)));
+            assert!(!model.can_paint_area(Rect::new(0, 3, 1, 1)));
+            assert!(!model.can_paint_area(Rect::new(11, 1, 2, 1)));
+            assert!(!model.can_paint_area(Rect::new(0, 1, 0, 1)));
+            assert!(!model.can_paint_area(Rect::new(0, 1, 1, 0)));
+        }
+        for missing in [
+            b"\x1b[2;1H\x1b[2K".as_slice(),
+            b"\x1b[3;1H\x1b[2K",
+            b"\x1b#5",
+            b"\x1b[?7h",
+        ] {
+            let mut model = TerminalModel::new(size());
+            // Remove the first exact occurrence, retaining all other controls.
+            let offset = trace
+                .windows(missing.len())
+                .position(|s| s == missing)
+                .unwrap();
+            model.process(&trace[..offset]);
+            model.process(&trace[offset + missing.len()..]);
+            assert!(!model.can_paint_area(area), "missing {missing:?}");
+        }
+        let mut model = TerminalModel::new(size());
+        model.process(&trace);
+        model.process(b"\x1b[H\x1b[2K\x1b[4;1H\x1b[2K\x1b[H");
+        assert!(model.can_paint_area(Rect::new(0, 0, 12, 4)));
+        assert!(
+            !model.can_paint(),
+            "a menu also needs tabs and its save slot"
+        );
+        model.process(b"\x1b[3g\x1b7");
+        assert!(
+            model.can_paint(),
+            "all observed rows establish whole-screen content"
+        );
+        model.begin_overlay();
+        model.process(b"\x1b[4;1H\n\x1b[S\x1b[T");
+        assert!(
+            model.can_paint(),
+            "a complete redraw has known scroll sources while covered"
+        );
+    }
+
+    #[test]
+    fn regional_rows_survive_confined_edits_but_not_uncertain_scroll_or_loss() {
+        let area = Rect::new(2, 1, 8, 2);
+        for edit in [
+            b"\x1b[2;2Habc".as_slice(),
+            b"\x1b[2;2H\x1b[@",
+            b"\x1b[3;2H\x1b[P",
+            b"\x1b[3;2H\x1b[2X",
+            b"\x1b[2;2H\x1b[K",
+        ] {
+            let mut model = TerminalModel::new(size());
+            model.process(&regional_initialization());
+            model.process(edit);
+            assert!(model.can_paint_area(area), "confined {edit:?}");
+        }
+        for loss in [
+            b"\n".as_slice(),
+            b"\x1bM",
+            b"\x1b[S",
+            b"\x1b[T",
+            b"\x1b[L",
+            b"\x1b[M",
+            b"\x1b[J",
+            b"\x1b[1J",
+            b"\x1b[4;1Habcdefghijklmnopqrstuvwx",
+            b"\t",
+            b"\x1b8",
+            b"\x1b[?47h",
+            b"\x1b[?1049l",
+            b"\x1b[7777h",
+        ] {
+            let mut model = TerminalModel::new(size());
+            model.process(&regional_initialization());
+            model.process(loss);
+            assert!(!model.can_paint_area(area), "loss {loss:?}");
+            model.process(b"\x1b[H");
+            assert!(
+                !model.can_paint_area(area),
+                "CUP cannot recover content/state {loss:?}"
+            );
+        }
+        let mut model = TerminalModel::new(size());
+        model.process(&regional_initialization());
+        model.resize(size());
+        assert!(!model.can_paint_area(area));
+        model.process(b"\x1b[?6l\x1b[r\x1b[H");
+        assert!(!model.can_paint_area(area), "resize loses regional content");
+        model.process(b"\x1b[2;1H\x1b[2K\x1b[3;1H\x1b[2K\x1b[H");
+        assert!(model.can_paint_area(area));
+        model.discard_oversized_sequence();
+        model.process(b"\x18");
+        model.process(&regional_initialization());
+        assert!(
+            !model.can_paint_area(area),
+            "initialization cannot recover a budget loss"
+        );
+        model.process(b"\x1bc");
+        assert!(model.can_paint_area(area));
+    }
+
+    #[test]
+    fn regional_restore_requires_known_cells_for_pending_wrap_outside_the_area() {
+        let mut model = TerminalModel::new(size());
+        let area = Rect::new(2, 1, 8, 2);
+        model.process(&regional_initialization());
+        model.process(b"\x1b[4;1Habcdefghijkl");
+        assert_eq!(model.screen().cursor_position(), (3, 12));
+        assert!(
+            !model.can_paint_area(area),
+            "restoring wrap reprints an unknown glyph"
+        );
+        model.process(b"\x1b[4;1H\x1b[2Kabcdefghijkl");
+        assert!(
+            model.can_paint_area(area),
+            "wrap glyph outside the toast is now observed"
+        );
+        model.process(b"\x1b[H");
+        assert!(
+            model.can_paint_area(area),
+            "ordinary CUP needs no outside cells"
+        );
     }
 
     #[test]

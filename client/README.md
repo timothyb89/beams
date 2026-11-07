@@ -347,7 +347,8 @@ Overlay menus and toasts also require observed drawing state. Both buffers
 start unknown: a cursor report, buffer selection or clear cannot establish
 inherited modes and save slots. An observed full reset (`ESC c`) establishes
 the baseline. A complete explicit application initialization can also establish
-shared state and one selected buffer without RIS. This requires a CAN/ST parser
+shared state and one selected buffer without RIS. For full menus, this path
+requires a CAN/ST parser
 boundary followed by evidence for
 attributes/link closure, character sets, supported wrap/linefeed behavior,
 input modes, coupled mouse resets, tab clearing, normal size on every row,
@@ -356,6 +357,19 @@ slot. The [initialization inventory](../docs/designs/TERMINAL_OVERLAY_DESIGN.md#
 records the required controls. The client observes these controls from remote
 output; it never sends initialization itself. An ordinary TUI clear or soft
 reset is insufficient, and the inactive buffer remains unknown.
+
+Toasts can use less content evidence than menus. With shared drawing settings,
+buffer selection, normal line sizes and current cursor/origin/margins known,
+an observed full-line erase (`CSI 2K`) establishes that row. A toast needs every
+row it will restore, including its wide-glyph edges; other inherited rows and
+the application's saved cursor remain untouched. It uses no saved-cursor slot
+or tab stops. If restoring pending wrap requires a glyph outside the toast,
+that row must also be known. Confined writes and row edits preserve this
+evidence; possible wrapping/scrolling, unknown cursor operations, resize and
+buffer switches discard partial row evidence. Fresh row erases can recover it.
+Clearing every row establishes complete content, but a menu still needs its
+saved-state and tab evidence. This does not make an uninitialized plain shell
+eligible or authorize borrowing an unknown inactive buffer.
 
 Unsupported sequences suppress painting until another observed full reset.
 After resize of a known baseline, an application can explicitly

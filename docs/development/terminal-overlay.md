@@ -301,3 +301,31 @@ ordinary clears/soft resets are insufficient, unrepresented enabled modes and
 inherited REP remain unsupported, and ambiguous coupled mouse resets defer
 painting. Regional evidence, safe borrowing, full model/REP semantics and the
 real workstation font/reflow matrix remain open; the overlay stays opt-in.
+
+Regional toast pass (2026-11-07): **246 unit tests and 3 integration tests
+pass, none ignored**. Content confidence now records observed full-line
+erases per buffer, separately from shared/current drawing state and the
+saved-cursor/tab requirements of a full menu. Toasts can restore their rows
+while leaving inherited content elsewhere and inherited save slots untouched.
+Expanded wide-glyph edges and any outside glyph needed to restore pending
+wrap must also be known. Storage is bounded by terminal height.
+
+Three model regressions cover split initialization, missing erases/state,
+confined edits, scroll/loss/recovery, pending wrap and promotion of all-row
+erasure to complete content. Two toast regressions include independent
+xterm.js 5.5 primary/alternate traces with unobserved sentinel cells and saved
+cursors, wide glyphs on both edges, cell/current hyperlinks, origin/margins,
+insert mode and character maps. Subsequent saved-cursor output matches an
+unpainted session. Local toast bytes never select a buffer or save a cursor.
+The earlier seventeen model traces and five live renderer/lifecycle traces
+also pass, for nineteen model and five live independent comparisons.
+
+The client build, takeover and overlay managed-session smoke tests and
+expanded protocol/PTY harness pass. Regional evidence is deliberately limited
+to full-width rows under known normal line sizes; possible scrolls or display
+edits discard partial evidence instead of guessing movement of inherited
+cells. Physical DEC line-size effects, finer regions, full model/grapheme/REP
+semantics and covered reflow still need work. Knowing the primary buffer is
+active does not establish ownership of an unknown inactive alternate buffer.
+Borrowing remains gated pending ownership and independent switching/replay
+tests, and the overlay remains opt-in.

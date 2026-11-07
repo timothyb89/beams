@@ -472,6 +472,34 @@ write. Painting bytes did not change; workstation gates remain pending.
 
 ## Implementation status and next-session handoff
 
+Row-level content evidence is implemented (2026-11-07). Separate the cells and
+state required by a toast from the full menu gate. After complete shared
+initialization and selected-buffer normal-line/current cursor/origin/margin
+evidence, `CSI 2K` proves one full-width row. Toasts require their restoration
+rows, including wide-glyph edges, and any outside row whose last glyph must be
+reprinted to restore pending wrap. They never use or overwrite an inherited
+saved cursor, tab stops or inactive buffer. Other rows can remain inherited.
+The observer retains only a terminal-height-bounded row map, not another cell
+or cursor emulator.
+
+Confined writes and row edits preserve row confidence. Possible wrapping,
+scrolling, display edits, unknown coordinates, resize and buffer transitions
+discard partial evidence rather than guessing how unknown cells moved. Fresh
+full-line erases recover it. Once all rows are known, promote to complete
+content so supported hidden scrolling keeps known source cells; menus still
+require saved-slot and tab evidence. Normal line sizes remain a whole-buffer
+precondition; finer cell/line-size regions and partial scroll propagation are
+future work. Three model tests and two toast tests include two independent
+primary/alternate replay traces with inherited sentinel content and saved slots.
+
+Borrowing remains gated. A baseline report that the primary buffer is active
+does not identify the inactive alternate contents, saved slot or ownership.
+Regional painting never switches buffers and does not supply that missing
+evidence. The next borrowing slice must establish a genuinely owned scratch
+buffer, preserve its relevant contents/state, and independently test selection
+and ordered bounded replay before enabling a fallback. Keep ordinary inherited
+primary sessions deferred when those preconditions are absent.
+
 Explicit inherited initialization is implemented (2026-11-07): observe a supported
 initialization of the state used by painting instead of requiring RIS.
 Track shared attribute/character-set/input-mode evidence separately from
@@ -519,8 +547,8 @@ a 1049 return can restore inherited attributes/maps/modes, requiring new
 shared initialization. Partial mouse resets cannot be reused after an enable;
 ambiguous resets of a different active protocol defer painting. Reset-only
 controls do not authorize unsupported enabled modes. Previously cleared tabs
-need another clear after resize. Regional evidence, borrowing and workstation
-font/reflow validation remain separate gates.
+need another clear after resize. Row-level evidence is implemented above;
+finer regions, borrowing and workstation font/reflow validation remain gates.
 
 Post-resize eligibility is implemented (2026-11-07): distinguish loss of screen
 geometry from loss of inherited/protocol state. Resize after a known RIS baseline preserves
@@ -675,9 +703,9 @@ Next work, in separately reviewable changes:
    all three gates; none should be ignored.
 2. Query-policy coverage above is implemented. Any new probes must extend the
    explicit inventory and preserve exactly-once replies.
-3. Establish regional/inactive-buffer evidence and safe borrowing.
-   Explicit inherited initialization, post-resize geometry, common drawing state and conservative
-   recovery are implemented. Safe
+3. Establish inactive-buffer ownership and safe borrowing.
+   Explicit inherited initialization, post-resize geometry, common drawing
+   state, conservative recovery and row-level toast evidence are implemented. Safe
    borrowing still needs stronger ownership evidence and independent switching
    tests; covered resize fidelity remains open.
 4. Update READMEs, audit and TODO with each slice. Run the client suite/build
@@ -698,11 +726,12 @@ fixture stall that made a fairness assertion depend on output throughput.
 This failure policy bounds memory; it does not promise continued service for
 a peer that never drains its input.
 
-Current validation: **241 client unit tests and 3 integration tests pass, with
+Current validation: **246 client unit tests and 3 integration tests pass, with
 zero ignored tests**. The client build, takeover and overlay managed-session
 smokes, and expanded protocol/PTY harness pass. Pinned xterm.js 5.5 replay again
 passes twelve restoration traces, two resize traces, three inherited-state
-traces, three live renderer traces and two live non-default lifecycle traces.
+traces, two regional toast traces, three live renderer traces and two live
+non-default lifecycle traces.
 The harness also covers explicit initialization without any RIS, deferred recovery and
 strict disabled-prefix partial-string termination. No real
 workstation font/reflow or graphical-terminal validation has been recorded.

@@ -25,15 +25,16 @@ struct BufferEvidence {
 }
 
 impl BufferEvidence {
-    fn complete(self) -> bool {
-        self.cells
-            && self.cursor
+    fn drawing_known(self) -> bool {
+        self.cursor
             && self.origin
             && self.margins
-            && self.saved
             && self.selected
-            && self.tabs != Tabs::Unknown
             && self.normal_rows == NormalRows::Known
+    }
+
+    fn complete(self) -> bool {
+        self.drawing_known() && self.saved && self.tabs != Tabs::Unknown
     }
 }
 
@@ -103,6 +104,9 @@ pub struct Evidence {
     reason: Option<Unavailable>,
     shared: u64,
     buffers: [BufferEvidence; 2],
+    // Full-width rows established by EL 2. Never infer inherited cells from
+    // the backend's default blanks. Storage is bounded by terminal height.
+    known_rows: [Vec<bool>; 2],
 }
 
 impl Default for Evidence {
@@ -111,12 +115,19 @@ impl Default for Evidence {
             reason: Some(Unavailable::InheritedState),
             shared: 0,
             buffers: [BufferEvidence::default(); 2],
+            known_rows: [Vec::new(), Vec::new()],
         }
     }
 }
 
 impl Evidence {
-    pub fn observe(&mut self, frame: &[u8], before_alternate: bool, screen: &vt100::Screen) {
+    pub fn observe(
+        &mut self,
+        frame: &[u8],
+        before_alternate: bool,
+        before_cursor: (u16, u16),
+        screen: &vt100::Screen,
+    ) {
         let alternate = screen.alternate_screen();
         if frame == b"\x1bc" {
             self.reason = None;
@@ -131,6 +142,7 @@ impl Evidence {
                 tabs: Tabs::Default,
                 normal_rows: NormalRows::Known,
             }; 2];
+            self.known_rows.iter_mut().for_each(Vec::clear);
             return;
         }
         // An explicit baseline cannot recover loss from an arbitrary protocol.
@@ -148,6 +160,7 @@ impl Evidence {
             if frame == b"\x18" {
                 self.shared = PARSER_CANCELLED;
                 self.buffers = [BufferEvidence::default(); 2];
+                self.known_rows.iter_mut().for_each(Vec::clear);
             } else if frame == b"\x1b\\" && self.shared & PARSER_CANCELLED != 0 {
                 self.shared = PARSER_BOUNDARY;
             }
@@ -211,6 +224,7 @@ impl Evidence {
                 },
                 ..BufferEvidence::default()
             };
+            self.known_rows[usize::from(alternate)].clear();
             if before_alternate {
                 let tabs = self.buffers[1].tabs;
                 let normal_rows = self.buffers[1].normal_rows;
@@ -227,6 +241,7 @@ impl Evidence {
                     },
                     ..BufferEvidence::default()
                 };
+                self.known_rows[1].clear();
             }
             self.buffers[usize::from(alternate)].selected = true;
             return;
@@ -254,8 +269,20 @@ impl Evidence {
         if frame == b"\x1b[3g" {
             buffer.tabs = Tabs::Cleared;
         }
+        let rows = &mut self.known_rows[usize::from(alternate)];
+        let positioned = shared_known && buffer.drawing_known();
         if frame == b"\x1b[2J" {
             buffer.cells = shared_known && buffer.normal_rows == NormalRows::Known;
+            rows.clear();
+        } else if frame == b"\x1b[2K" && positioned && !buffer.cells {
+            rows.resize(usize::from(screen.size().0.get()), false);
+            rows[usize::from(before_cursor.0)] = true;
+            if rows.iter().all(|known| *known) {
+                // Once every row is observed, ordinary supported scrolling
+                // has fully known source cells just as it does after ED 2.
+                buffer.cells = true;
+                rows.clear();
+            }
         } else if (mutates_cells(frame)
             && !(shared_known
                 && buffer.cursor
@@ -267,8 +294,27 @@ impl Evidence {
             // Clearing first is safe only if subsequent writes have known
             // coordinates. A later CUP cannot reconstruct an earlier write.
             buffer.cells = false;
+            rows.clear();
             if !shared_known || frame == b"\t" || buffer.normal_rows != NormalRows::Known {
                 buffer.cursor = false;
+            }
+        } else if !buffer.cells && mutates_cells(frame) {
+            // Preserve row evidence only for operations confined to one row.
+            // Bound printed columns without emulating the cursor: ASCII uses
+            // one, other codepoints at most two in the supported width model.
+            // Crossing the edge may scroll even when the final cursor is
+            // still on the same row. Do not infer scroll provenance.
+            let text_in_row = !frame.starts_with(b"\x1b")
+                && frame.iter().all(|b| *b >= 0x20)
+                && text_fits_row(
+                    frame,
+                    usize::from(screen.size().1.get().saturating_sub(before_cursor.1)),
+                );
+            let row_edit = frame
+                .strip_prefix(b"\x1b[")
+                .is_some_and(|body| matches!(body.last(), Some(b'@' | b'K' | b'P' | b'X')));
+            if !positioned || !(text_in_row || row_edit) {
+                rows.clear();
             }
         }
         if private_modes(frame)
@@ -322,6 +368,7 @@ impl Evidence {
                 self.shared = 0;
                 buffer.origin = false;
                 buffer.cells = false;
+                rows.clear();
             }
         }
     }
@@ -330,9 +377,11 @@ impl Evidence {
         self.reason = Some(reason);
         self.shared = 0;
         self.buffers = [BufferEvidence::default(); 2];
+        self.known_rows.iter_mut().for_each(Vec::clear);
     }
 
     pub fn resize(&mut self) {
+        self.known_rows.iter_mut().for_each(Vec::clear);
         // Never replace a stronger loss reason with recoverable geometry.
         if matches!(self.reason, None | Some(Unavailable::Resize)) {
             self.reason = Some(Unavailable::Resize);
@@ -355,12 +404,40 @@ impl Evidence {
         });
     }
 
-    pub fn can_paint(&self, alternate: bool) -> bool {
+    fn shared_known(&self) -> bool {
         !matches!(
             self.reason,
             Some(Unavailable::UnsupportedSequence | Unavailable::SequenceBudget)
         ) && self.shared == ALL_SHARED
-            && self.buffers[usize::from(alternate)].complete()
+    }
+
+    fn rows_known(&self, alternate: bool, top: u16, bottom: u16) -> bool {
+        let index = usize::from(alternate);
+        self.buffers[index].cells
+            || self.known_rows[index]
+                .get(usize::from(top)..usize::from(bottom))
+                .is_some_and(|rows| !rows.is_empty() && rows.iter().all(|known| *known))
+    }
+
+    pub fn can_paint(&self, alternate: bool) -> bool {
+        let index = usize::from(alternate);
+        self.shared_known() && self.buffers[index].complete() && self.buffers[index].cells
+    }
+
+    /// Toasts do not use the application's saved cursor or tab stops. They
+    /// need their restoration rows, plus the last glyph when restoring wrap.
+    pub fn can_paint_rows(
+        &self,
+        alternate: bool,
+        top: u16,
+        bottom: u16,
+        screen: &vt100::Screen,
+    ) -> bool {
+        let (row, col) = screen.cursor_position();
+        self.shared_known()
+            && self.buffers[usize::from(alternate)].drawing_known()
+            && self.rows_known(alternate, top, bottom)
+            && (col < screen.size().1.get() || self.rows_known(alternate, row, row + 1))
     }
 
     pub fn unavailable_reason(&self, alternate: bool) -> Option<Unavailable> {
@@ -482,6 +559,17 @@ fn mutates_cells(frame: &[u8]) -> bool {
                 body.last(),
                 Some(b'@' | b'J' | b'K' | b'L' | b'M' | b'P' | b'S' | b'T' | b'X' | b'b')
             )
+        })
+}
+
+fn text_fits_row(frame: &[u8], columns: usize) -> bool {
+    // Bytes are already an upper bound; only inspect UTF-8 near the edge.
+    frame.len() <= columns
+        || std::str::from_utf8(frame).is_ok_and(|text| {
+            text.chars()
+                .map(|c| if c.is_ascii() { 1 } else { 2 })
+                .sum::<usize>()
+                <= columns
         })
 }
 

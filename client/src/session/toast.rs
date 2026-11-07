@@ -17,9 +17,8 @@
 //!   repainted once output settles (or periodically during a long burst).
 //! - **Going away.** The cells under a toast are repainted from the model.
 //!
-//! Known gaps: a remote that enabled insert mode, or switched
-//! to the DEC line-drawing character set, would see the toast drawn
-//! incorrectly; those states are not yet represented.
+//! Eligibility covers the restoration rows and current drawing state. A toast
+//! never needs the application's saved cursor or unknown cells elsewhere.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -175,18 +174,15 @@ impl ToastPainter {
     /// Takes the toast down now, whatever the remote stream is doing; for
     /// when the session is ending and there won't be a better moment.
     pub fn clear(&mut self, model: &TerminalModel) -> Vec<u8> {
-        if !model.can_paint() {
-            self.forget();
-            return Vec::new();
-        }
         let Some((rect, _)) = self.shown.take() else {
             return Vec::new();
         };
-        let (rows, cols) = model.screen().size();
-        if rect.right() > cols.get() || rect.bottom() > rows.get() {
+        let cols = model.screen().size().1.get();
+        let rect = restoration_area(rect, cols);
+        if !model.can_paint_area(rect) {
+            self.forget();
             return Vec::new();
         }
-        let rect = restoration_area(rect, cols.get());
         let mut out = terminal_paint::BEGIN.to_vec();
         restore_area(model.screen(), rect, &mut out);
         terminal_paint::restore(model.screen(), false, &mut out);
@@ -203,13 +199,16 @@ impl ToastPainter {
         tracker: &mut OutputTracker,
         now: Instant,
     ) -> Vec<u8> {
-        if !model.can_paint() {
+        let (rows, cols) = model.screen().size();
+        if self.shown.as_ref().is_some_and(|(rect, _)| {
+            !model.can_paint_area(restoration_area(*rect, cols.get()))
+        }) {
             self.forget();
             return Vec::new();
         }
-        let (rows, cols) = model.screen().size();
         let target = desired
-            .and_then(|toast| placement(toast, rows.get(), cols.get()).map(|rect| (rect, toast)));
+            .and_then(|toast| placement(toast, rows.get(), cols.get()).map(|rect| (rect, toast)))
+            .filter(|(rect, _)| model.can_paint_area(restoration_area(*rect, cols.get())));
         let unchanged = match (&self.shown, &target) {
             (None, None) => true,
             (Some((rect, shown)), Some((target_rect, toast))) => {
@@ -398,6 +397,101 @@ mod tests {
             title: "Beams".to_string(),
             lines: vec![Line::from(Span::raw(text.to_string()))],
         }
+    }
+
+    fn regional_initialization(alternate: bool) -> Vec<u8> {
+        let mut bytes = b"\x18\x1b\\\x1b<\x1b%G\x1b[?7h\x1b[?5l\x1b[?45l\x1b[?69l\x1b[20l\x1b[0\"q\
+            \x1b(B\x1b)B\x0f\x1b[0m\x1b]8;;\x1b\\\x1b[4l\x1b[?1l\x1b>\x1b[?25h\
+            \x1b[?2004l\x1b[?2026l\x1b[?9;1000;1001;1002;1003;1005;1006;1015;1016l".to_vec();
+        bytes.extend_from_slice(if alternate { b"\x1b[?47h" } else { b"\x1b[?47l" });
+        bytes.extend_from_slice(b"\x1b[?6l\x1b[r");
+        for row in 1..=10 {
+            write!(bytes, "\x1b[{row};1H\x1b#5").unwrap();
+        }
+        for row in 7..=9 {
+            write!(bytes, "\x1b[{row};1H\x1b[2K").unwrap();
+        }
+        bytes.extend_from_slice(b"\x1b[H");
+        bytes
+    }
+
+    #[test]
+    fn regional_toast_preserves_unobserved_cells_and_saved_cursor_in_independent_replay() {
+        use std::process::{Command, Stdio};
+
+        let mut traces = Vec::new();
+        for alternate in [false, true] {
+            let mut inherited = b"\x1bcPRIMARY SENTINEL\x1b[2;4H\x1b[1;31m\x1b7".to_vec();
+            if alternate {
+                inherited.extend_from_slice(b"\x1b[?47hALTERNATE SENTINEL\x1b[3;5H\x1b[32m\x1b7");
+            }
+            let mut model = TerminalModel::new(PtySize {
+                rows: 10, cols: 60, pixel_width: 0, pixel_height: 0,
+            });
+            let notice = toast("known rows");
+            let rect = placement(&notice, 10, 60).unwrap();
+            let mut before = regional_initialization(alternate);
+            // Put wide glyphs across both restoration edges and linked text
+            // under the toast. The save slot and all other rows stay inherited.
+            write!(before, "\x1b[{};{}H界\x1b[{};{}H界",
+                rect.y + 1, rect.x, rect.y + 2, rect.right()).unwrap();
+            before.extend_from_slice(b"\x1b[8;40H\x1b]8;id=region;https://example.com/region\x1b\\link\
+                \x1b]8;;\x1b\\\x1b[H\x1b[3;9r\x1b[?6h\x1b[2;3H\x1b[2;34m\x1b)0\x0e\x1b[4h\
+                \x1b]8;id=current;https://example.com/current\x1b\\");
+            model.process(&before);
+            assert!(!model.can_paint());
+            assert!(model.can_paint_area(restoration_area(rect, 60)));
+            let mut painter = ToastPainter::default();
+            let paint = painter.sync_now(Some(&notice), &model);
+            assert!(!paint.is_empty());
+            let restore = painter.clear(&model);
+            assert!(!restore.is_empty());
+            assert!(!restore.windows(2).any(|s| s == b"\x1b7"), "never overwrite an inherited save slot");
+            for bytes in [&paint, &restore] {
+                assert!(!bytes.windows(5).any(|s| s == b"\x1b[?47"), "a toast never switches buffers");
+            }
+            let after = b"\x1b[4l\x0f\x1b8X\r\nnext";
+            let mut expected = screen_after(10, 60, &[&inherited, &before]);
+            let mut actual = screen_after(10, 60, &[&inherited, &before, &paint, &restore]);
+            assert_eq!(actual.screen().drawing_state(), expected.screen().drawing_state());
+            expected.process(after);
+            actual.process(after);
+            assert_eq!(visible(actual.screen()).trim_end(), visible(expected.screen()).trim_end());
+            assert_eq!(actual.screen().drawing_state(), expected.screen().drawing_state());
+            traces.push(serde_json::json!({
+                "name": format!("regional toast with inherited cells and save slot, alternate {alternate}"),
+                "rows": 10, "cols": 60, "inherited": inherited, "before": before,
+                "hidden": [], "paint": paint, "restore": restore, "after": after.as_slice(),
+            }));
+        }
+        if let Some(module) = std::env::var_os("BEAMS_TEST_XTERM_MODULE") {
+            let mut reference = Command::new("node")
+                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/terminal-paint-reference.cjs"))
+                .arg(module).stdin(Stdio::piped()).spawn().unwrap();
+            reference.stdin.take().unwrap()
+                .write_all(&serde_json::to_vec(&traces).unwrap()).unwrap();
+            assert!(reference.wait().unwrap().success());
+        }
+    }
+
+    #[test]
+    fn regional_toast_requires_every_restoration_row_and_recovers_after_fresh_erasure() {
+        let notice = toast("known rows");
+        let mut model = TerminalModel::new(PtySize {
+            rows: 10, cols: 60, pixel_width: 0, pixel_height: 0,
+        });
+        let mut painter = ToastPainter::default();
+        model.process(&regional_initialization(false));
+        assert!(!painter.sync_now(Some(&notice), &model).is_empty());
+        assert!(!painter.clear(&model).is_empty());
+        model.process(b"\x1b[10;1H\n");
+        assert!(painter.sync_now(Some(&notice), &model).is_empty(), "scroll loses row evidence");
+        model.process(b"\x1b[7;1H\x1b[2K\x1b[8;1H\x1b[2K");
+        assert!(painter.sync_now(Some(&notice), &model).is_empty(), "one covered row still unknown");
+        model.process(b"\x1b[9;1H\x1b[2K");
+        assert!(!painter.sync_now(Some(&notice), &model).is_empty());
+        assert!(!painter.clear(&model).is_empty());
+        assert!(!model.can_paint(), "toast eligibility must not enable a full menu");
     }
 
     /// Applies `bytes` (remote output, then our paint) to a fresh emulator

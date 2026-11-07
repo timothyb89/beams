@@ -879,7 +879,8 @@ bootstrap `Task`s.
     state until observed RIS or complete supported explicit initialization.
     Shared state, selection, tabs and geometry have independent evidence.
     Post-resize geometry can recover explicitly as described below.
-    Extend regional/inactive-buffer evidence without guessing modes/save slots.
+    Row-level regional evidence is implemented below; extend finer regions and
+    inactive-buffer ownership without guessing modes/save slots.
   - [x] Explicit inherited-state initialization without RIS: observe complete
     supported shared settings after CAN/ST, buffer selection, normal line size
     on every row, tab clearing and geometry.
@@ -891,8 +892,21 @@ bootstrap `Task`s.
     evidence for its outer target buffer. Eight model tests, a cleanup test,
     three independent inherited traces and a live renderer/PTY trace cover
     this path; forms survive deferral and buffer changes without any RIS.
-    Borrowing, regional evidence and the workstation matrix remain open.
+    Borrowing, finer regional evidence and the workstation matrix remain open.
     REP state still needs representation before expanding its compatibility.
+  - [x] Row-level content evidence and separate toast/menu eligibility:
+    full-line erases under known current drawing state establish individual
+    rows without overwriting inherited cells elsewhere or requiring a known
+    saved cursor/tab stops. Toast restoration covers all affected rows and any
+    outside glyph needed for pending wrap. Confined writes/row edits preserve
+    confidence; possible scrolls, resize, buffer switches and unknown state
+    discard it. All-row erasure promotes to complete content so hidden
+    scrolling remains modeled. Three model tests and two toast tests cover
+    split initialization, missing rows/state, loss/recovery, menu isolation,
+    pending wrap, wide edges and hyperlinks. Two independent primary/alternate
+    replay traces preserve inherited sentinel cells and saved slots.
+    Finer regions, partial scroll propagation and borrowed-buffer ownership
+    remain open; physical line-size and reflow checks require a workstation.
   - [x] Per-buffer geometry evidence after resize of a known baseline:
     observed origin reset, full margins, CUP, DECSC and ED 2 establish the
     active buffer without a new RIS. Unknown-position writes invalidate clear
@@ -901,7 +915,7 @@ bootstrap `Task`s.
     initialization again; restoration leaves unknown inactive content alone.
     Five unit tests, two independent resize traces and a live recovered-menu
     trace cover this slice. Forms survive resize and deferred retries.
-    Lossless covered resize, inherited initialization and borrowing stay open.
+    Lossless covered resize and borrowing stay open.
   - [x] Shared painting for represented saved/current cursors, SGR attributes,
     origin mode and vertical margins. Menus and toasts draw under full margins
     with origin off; close restores per-buffer saved slots, including hidden
