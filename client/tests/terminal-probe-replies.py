@@ -24,6 +24,9 @@ import time
 import tty
 
 MODES = [1, 5, 6, 7, 9, 25, 45, 47, 66, 69, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 2004, 2026]
+# Sent first so the client can tell, before forwarding anything, whether the
+# terminal answers positioning queries at all (the entry scrollback push).
+CPR = b"\x1b[6n"
 EXTRA = b"\x1b[4$p\x1b[20$p\x1bP$qm\x1b\\\x1bP$qr\x1b\\\x1bP$q q\x1b\\\x1b[?u\x1b[?4m\x1b[c"
 
 # The client waits for the DA1 sentinel (the last probe) this long before
@@ -32,7 +35,7 @@ CLIENT_WINDOW = 0.5
 
 
 def probes():
-    return b"".join(f"\x1b[?{mode}$p".encode() for mode in MODES) + EXTRA
+    return CPR + b"".join(f"\x1b[?{mode}$p".encode() for mode in MODES) + EXTRA
 
 
 def main():

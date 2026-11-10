@@ -447,7 +447,8 @@ mod tests {
                 \x1b]8;;\x1b\\\x1b[H\x1b[3;9r\x1b[?6h\x1b[2;3H\x1b[2;34m\x1b)0\x0e\x1b[4h\
                 \x1b]8;id=current;https://example.com/current\x1b\\");
             model.process(&before);
-            assert!(!model.can_paint());
+            assert!(model.can_paint());
+            assert!(model.doubtful_restore(alternate), "most rows were never observed");
             assert!(model.can_paint_area(restoration_area(rect, 60)));
             let mut painter = ToastPainter::default();
             let paint = painter.sync_now(Some(&notice), &model);
@@ -483,8 +484,10 @@ mod tests {
     }
 
     #[test]
-    fn regional_toast_requires_every_restoration_row_and_recovers_after_fresh_erasure() {
+    fn regional_toast_paints_through_scroll_and_tracks_doubtful_restoration() {
         let notice = toast("known rows");
+        let rect = placement(&notice, 10, 60).unwrap();
+        let area = restoration_area(rect, 60);
         let mut model = TerminalModel::new(PtySize {
             rows: 10, cols: 60, pixel_width: 0, pixel_height: 0,
         });
@@ -492,14 +495,27 @@ mod tests {
         model.process(&regional_initialization(false));
         assert!(!painter.sync_now(Some(&notice), &model).is_empty());
         assert!(!painter.clear(&model).is_empty());
+        assert!(!model.doubtful_restore_area(area), "the toast's own rows were cleared");
         model.process(b"\x1b[10;1H\n");
-        assert!(painter.sync_now(Some(&notice), &model).is_empty(), "scroll loses row evidence");
+        // A scroll untracks cell knowledge for the covered rows, but no
+        // longer blocks the toast: unobserved cells restore as blank.
+        assert!(
+            !painter.sync_now(Some(&notice), &model).is_empty(),
+            "scroll no longer blocks the toast"
+        );
+        assert!(model.doubtful_restore_area(area), "scroll loses row evidence");
+        assert!(!painter.clear(&model).is_empty());
         model.process(b"\x1b[7;1H\x1b[2K\x1b[8;1H\x1b[2K");
-        assert!(painter.sync_now(Some(&notice), &model).is_empty(), "one covered row still unknown");
+        // Clear first each time: an unchanged toast otherwise short-circuits
+        // to nothing-to-repaint, independent of cell-knowledge underneath.
+        assert!(!painter.sync_now(Some(&notice), &model).is_empty());
+        assert!(model.doubtful_restore_area(area), "one covered row still unknown");
+        assert!(!painter.clear(&model).is_empty());
         model.process(b"\x1b[9;1H\x1b[2K");
         assert!(!painter.sync_now(Some(&notice), &model).is_empty());
+        assert!(!model.doubtful_restore_area(area), "every covered row is observed again");
         assert!(!painter.clear(&model).is_empty());
-        assert!(!model.can_paint(), "toast eligibility must not enable a full menu");
+        assert!(model.can_paint(), "state stayed known throughout");
     }
 
     /// Applies `bytes` (remote output, then our paint) to a fresh emulator

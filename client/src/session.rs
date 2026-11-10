@@ -280,6 +280,17 @@ pub fn run(
         // nor needs entry evidence; it keeps its fixed cleanup.
         if terminal_state.managed && overlay_enabled {
             terminal_state.capture_baseline()?;
+            if terminal_state.baseline.answered_cpr {
+                // Confirmed positioning support: push whatever was visible
+                // before the session started into scrollback, so a later
+                // paint restoring unseen cells as blank never looks like
+                // data loss.
+                let mut stdout = io::stdout().lock();
+                stdout
+                    .write_all(&baseline::entry_scrollback_push(initial_size.rows))
+                    .context("pushing pre-session screen into scrollback")?;
+                stdout.flush().context("flushing entry scrollback push")?;
+            }
             {
                 // Before any remote output: reset the few settings no
                 // terminal can report, then let the model observe both
@@ -626,10 +637,17 @@ fn drive(
                     // Overlay only what the model can restore. Otherwise take
                     // the screen over: a menu must always appear, and keys
                     // after the prefix must reach it, never the remote.
-                    let overlay = overlay_enabled && terminal_model.can_paint();
-                    let borrow = overlay_enabled && !overlay && borrow_enabled()
+                    let can_overlay = overlay_enabled && terminal_model.can_paint();
+                    // Unknown cells no longer block the overlay, but borrowing
+                    // never touches primary content at all: prefer it over an
+                    // overlay that would restore unobserved cells as blank.
+                    let borrow = overlay_enabled
+                        && borrow_enabled()
                         && terminal_model.can_borrow()
-                        && terminal_state.output.at_boundary(Instant::now());
+                        && terminal_state.output.at_boundary(Instant::now())
+                        && (!can_overlay
+                            || terminal_model.doubtful_restore(terminal_model.screen().alternate_screen()));
+                    let overlay = can_overlay && !borrow;
                     if overlay {
                         terminal_model.begin_overlay();
                     }
@@ -2902,6 +2920,10 @@ fn close_palette(
         } else if terminal_state.overlay_menu {
             terminal_state.close_palette()?;
             deferred.clear();
+            // A restore covering cells Beams never actually observed is
+            // painted blank; ask the remote to repaint so that blank patch
+            // doesn't linger, the same way takeover's close always does.
+            let doubtful = terminal_model.doubtful_restore(terminal_state.covered_alternate);
             restore_terminal_model(terminal_model, terminal_state.covered_alternate)?;
             let mut stdout = io::stdout().lock();
             if terminal_state.output.synchronized_update() {
@@ -2915,6 +2937,10 @@ fn close_palette(
             stdout
                 .flush()
                 .context("flushing unfinished remote sequence")?;
+            drop(stdout);
+            if doubtful {
+                force_remote_redraw(master, size)?;
+            }
         } else {
             terminal_state.close_palette()?;
             let mut stdout = io::stdout().lock();

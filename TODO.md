@@ -980,11 +980,20 @@ bootstrap `Task`s.
     standard VT behavior); only cursor/cells need fresh evidence, via an
     ordinary CUP and redraw. Real sessions previously lost the overlay on
     every resize because the remote never resends an explicit reset of
-    either. The first Ctrl-] of a session still needs the fallback (the
-    launch-phase primary screen's unknown cells, unaddressed below).
-  - [ ] Gate simplification: entry CPR + scrollback push and client-sent
-    initialization; require known state, tolerate unknown cells; remote
-    repaint pulse for doubtful restores. See the design doc's next work.
+    either; this also fixed the first Ctrl-] of a session always needing
+    the fallback, which turned out to be the same root cause (confirmed
+    live on both counts).
+  - [x] Gate simplification (2026-11-10): `can_paint`/`can_paint_rows` no
+    longer require cell content, only drawing state - restoring an unseen
+    cell as blank is accepted (except a pending wrap, which still needs
+    the row known). An entry CPR probe gates a one-time scrollback push
+    (cursor to the last row, a screen's worth of linefeeds) so a blank
+    restore over unseen content is never actually unrecoverable. Closing
+    an overlay now pulses the remote's repaint only when the restore was
+    actually doubtful (covered an unobserved row); borrowing now takes
+    priority over a doubtful overlay restore, since it never touches
+    primary content at all. See the design doc's "Gate simplification"
+    entry for the full writeup. Real-session confirmation is next.
   - [ ] Toast flicker over frequently redrawn rows (e.g. claude's input/status
     lines): erase, pass through and repaint in one synchronized update when a
     chunk ends at a boundary, instead of repainting after 30 ms of quiet.

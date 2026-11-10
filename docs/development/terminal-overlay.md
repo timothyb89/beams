@@ -556,5 +556,65 @@ gained a check that the overlay recovers from an ordinary margins-reset+CUP+
 clear with no origin reset, and that closing an overlay (as opposed to
 takeover) never pulses the remote size. 270 unit tests and 3 integration
 tests, every managed-session variant, the PTY harness and the xterm.js replay
-pass. Real-session confirmation (does the first Ctrl-] still need the
-fallback, does resize now recover rather than lose eligibility) is next.
+pass. Real-session confirmation: both fixed (resize now recovers instead of
+losing eligibility, and the first Ctrl-] no longer always needs the
+fallback - the second effect turned out to already follow from this fix,
+since the launch-phase resize had been invalidating the entry probes'
+origin/margins evidence before Ctrl-] was ever pressed).
+
+Gate simplification (2026-11-10): the remaining gap - the "plain shell with
+unknown history" case from the follow-up discussion above, where state is
+known but the screen was never cleared - is now addressed directly rather
+than through zellij's redraw happening to land first.
+
+- `Evidence::can_paint`/`can_paint_rows` (`terminal_eligibility.rs`) no
+  longer require cell content to be known, only drawing state (cursor,
+  origin, margins, selection, normal-row sizing) and shared modes.
+  Restoring a cell Beams never observed as blank is accepted, matching
+  `clear`, inline pickers and takeover itself. The one exception kept
+  strict: restoring a pending wrap (a cursor sitting at the right edge)
+  still needs the row's content known, since that specifically risks
+  reprinting a wide character wrong, not just blanking something unseen.
+  `known_rows`/`cells` tracking is unchanged; it now feeds a new
+  `doubtful_restore` query instead of gating painting.
+- Entry-time scrollback push (`baseline.rs`'s `entry_scrollback_push`,
+  wired into `session.rs`): a DSR/CPR probe (`\x1b[6n`) was added to the
+  front of the existing entry-probe round trip. Only once the terminal
+  answers it - never assumed - the client moves the cursor to the last
+  row and emits a full screen's worth of linefeeds before writing
+  `ENTRY_RESETS`. Linefeed-at-the-bottom-row scroll is ordinary VT
+  behavior on every terminal, unlike relying on `CSI 2J` for the same
+  effect. This means a blank restore over content Beams never saw isn't
+  actually lost - it is one scroll back away, the same guarantee `clear`
+  already gives real shells.
+- Closing the overlay menu now checks `TerminalModel::doubtful_restore`
+  (did the restore cover any row that was never actually observed) and,
+  if so, pulses the remote's own repaint afterward via the same
+  `force_remote_redraw` takeover's close already used - so a blank patch
+  from an unobserved region gets corrected by the remote's next redraw
+  instead of lingering. An overlay close that restored fully-known
+  content still never pulses (unchanged from the resize-recovery fix).
+- Borrowing (`BEAMS_OVERLAY_BORROW=1`) stops requiring the overlay to be
+  *ineligible* as its precondition - it is strictly safer than an overlay
+  restore that would have to guess blank cells, so it now takes priority
+  whenever it's available (opted in, `can_borrow()`, output at a
+  boundary) and the overlay's own restore would otherwise be doubtful.
+  When the overlay's restore is fully known, the nicer dimmed-overlay
+  experience still wins over switching to a borrowed scratch buffer.
+- Toast placement went through the identical relaxation (`can_paint_rows`
+  backs both `can_show`/`sync`/`clear`), so a toast no longer needs every
+  covered row freshly cleared either.
+- Unit tests across `terminal_eligibility.rs`, `terminal_model.rs`,
+  `session/baseline.rs`, `session/toast.rs` and `session/borrowed.rs` were
+  updated for the new, intentionally tolerant policy; several were
+  rewritten rather than just re-asserted, since cell-knowledge no longer
+  gates most of what they were encoding (see each test's updated comment
+  for which specific invariant, if any, still blocks painting). Added: CPR
+  reply recognition/dedup tests in `baseline.rs`, and a PTY harness
+  scenario (`run_tolerated_unknown_cells`) exercising a plain-shell session
+  that establishes state via entry probes and a normal-row redraw but never
+  clears the screen - the overlay now opens on it directly, stays live
+  while open, and pulses the remote once on close. 273 unit tests, 3
+  integration tests, every managed-session smoke variant and the PTY
+  harness pass (the xterm.js reference replay was not available in this
+  environment to re-run). Real-session confirmation of this slice is next.

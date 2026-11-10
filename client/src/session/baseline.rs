@@ -14,6 +14,19 @@ const MOUSE_MODES: &[u16] = &[9, 1000, 1001, 1002, 1003, 1005, 1006, 1015, 1016]
 /// Parser boundary, UTF-8, ASCII in G0/G1 with G0 active, unprotected
 /// characters and no open hyperlink. Queryable settings are observed instead.
 pub const ENTRY_RESETS: &[u8] = b"\x18\x1b\\\x1b%G\x1b(B\x1b)B\x0f\x1b[0\"q\x1b]8;;\x1b\\";
+
+/// Move to the last row and scroll a full screen's worth of linefeeds, so
+/// whatever was visible before the session started ends up in scrollback
+/// rather than possibly being painted over as blank later. Linefeed scroll
+/// at the bottom row is ordinary VT behavior on every terminal, unlike
+/// relying on `CSI 2J` to do the same thing. Only ever sent to the local
+/// terminal (never fed to the remote), and only once the terminal has
+/// confirmed it answers positioning queries (`Baseline::answered_cpr`).
+pub fn entry_scrollback_push(rows: u16) -> Vec<u8> {
+    let mut bytes = format!("\x1b[{rows};1H").into_bytes();
+    bytes.resize(bytes.len() + usize::from(rows), b'\n');
+    bytes
+}
 const REPLY_LIMIT: usize = 4096;
 const SENTINEL: &[u8] = b"\x1b[c";
 const MOUSE_GROUPS: &[&[u16]] = &[&[9, 1000, 1001, 1002, 1003], &[1005, 1006, 1015, 1016]];
@@ -46,6 +59,10 @@ pub struct Baseline {
     cursor_style: Option<u8>,
     kitty: Option<u32>,
     modifiers: Option<u8>,
+    /// Whether the terminal answered the entry CPR query. An unconfirmed
+    /// terminal gets no entry scrollback push: act on observed evidence
+    /// only, never an assumed default.
+    pub answered_cpr: bool,
 }
 
 impl Baseline {
@@ -60,6 +77,9 @@ impl Baseline {
 
     pub fn probes() -> Vec<u8> {
         let mut bytes = Vec::new();
+        // Answered before any remote output: confirms the terminal supports
+        // positioning well enough to trust the entry scrollback push.
+        bytes.extend_from_slice(b"\x1b[6n");
         for mode in MODES {
             bytes.extend_from_slice(format!("\x1b[?{mode}$p").as_bytes());
         }
@@ -275,6 +295,7 @@ pub struct Capture {
     seen_kitty: bool,
     seen_modifiers: bool,
     seen_sentinel: bool,
+    seen_cpr: bool,
 }
 
 impl Capture {
@@ -391,6 +412,17 @@ impl Capture {
                 self.seen_linefeed = true;
                 // Unrecognized LNM cannot be set: newline does not imply CR.
                 self.baseline.linefeed = enabled.or(Some(false).filter(|_| value == 0));
+                return true;
+            }
+        }
+        if let Some(body) = frame
+            .strip_prefix(b"\x1b[")
+            .filter(|_| !self.seen_cpr)
+            .and_then(|b| b.strip_suffix(b"R"))
+        {
+            if numbers(body).is_some() {
+                self.seen_cpr = true;
+                self.baseline.answered_cpr = true;
                 return true;
             }
         }
@@ -785,14 +817,17 @@ mod tests {
     #[test]
     fn probe_reply_script_sends_the_session_probes() {
         let script = include_str!("../../tests/terminal-probe-replies.py");
+        assert!(script.contains("CPR = b\"\\x1b[6n\""));
         let modes: Vec<String> = MODES.iter().map(u16::to_string).collect();
         assert!(script.contains(&format!("MODES = [{}]", modes.join(", "))));
-        let mode_probes: Vec<u8> = MODES
-            .iter()
-            .flat_map(|mode| format!("\x1b[?{mode}$p").into_bytes())
-            .collect();
+        let mut prefix: Vec<u8> = b"\x1b[6n".to_vec();
+        prefix.extend(
+            MODES
+                .iter()
+                .flat_map(|mode| format!("\x1b[?{mode}$p").into_bytes()),
+        );
         let probes = Baseline::probes();
-        let extra = probes.strip_prefix(mode_probes.as_slice()).unwrap();
+        let extra = probes.strip_prefix(prefix.as_slice()).unwrap();
         let literal: String = extra
             .iter()
             .map(|b| match b {
@@ -848,7 +883,13 @@ mod tests {
                     )
                 });
                 if let Some(frame_end) = first_frame {
-                    assert_eq!(first, frame_end / 512, "{context}: eligible after the first frame");
+                    // Unknown cells no longer block painting, so eligibility
+                    // can arrive as soon as state is established - at or
+                    // before the first synchronized frame, never after it.
+                    assert!(
+                        first <= frame_end / 512,
+                        "{context}: eligible no later than the first frame"
+                    );
                 }
                 assert!(model.screen().alternate_screen(), "{context}");
                 let toast = ratatui::layout::Rect::new(recording.cols - 58, 1, 56, 6);
@@ -908,6 +949,36 @@ mod tests {
         assert!(input.is_empty());
         assert_eq!(baseline.margins.map(|m| m.rows(24)), Some((0, 23)));
         assert!(baseline.entry_evidence(24).windows(3).any(|w| w == b"\x1b[r"));
+    }
+
+    #[test]
+    fn a_cpr_reply_confirms_the_entry_push_and_is_never_forwarded() {
+        let mut capture = Capture::default();
+        capture.feed(b"\x1b[24;80R");
+        let (baseline, input) = capture.finish();
+        assert!(baseline.answered_cpr);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn no_cpr_reply_leaves_the_entry_push_unconfirmed() {
+        let mut capture = Capture::default();
+        capture.feed(b"\x1b[?25;1$y");
+        let (baseline, input) = capture.finish();
+        assert!(!baseline.answered_cpr);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn a_second_cpr_shaped_reply_answers_the_remote_instead() {
+        let mut capture = Capture::default();
+        capture.feed(b"\x1b[24;80R");
+        // A later identical shape answers the remote's own query, e.g. an
+        // application polling the cursor position mid-session.
+        capture.feed(b"\x1b[3;9R");
+        let (baseline, input) = capture.finish();
+        assert!(baseline.answered_cpr);
+        assert_eq!(input, b"\x1b[3;9R");
     }
 
     #[test]

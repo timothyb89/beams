@@ -606,6 +606,21 @@ impl TerminalModel {
             .unavailable_reason(self.screen().alternate_screen())
     }
 
+    /// Whether restoring `covered_alternate` (as `restore_bytes` would)
+    /// would paint back any cell content Beams never actually observed.
+    pub fn doubtful_restore(&self, covered_alternate: bool) -> bool {
+        let rows = self.screen().size().0.get();
+        self.evidence.doubtful_restore(covered_alternate, 0, rows)
+    }
+
+    /// Whether painting `area` (current buffer, screen coordinates) would
+    /// restore any cell content Beams never actually observed.
+    #[cfg(test)]
+    pub fn doubtful_restore_area(&self, area: Rect) -> bool {
+        self.evidence
+            .doubtful_restore(self.screen().alternate_screen(), area.top(), area.bottom())
+    }
+
     pub fn begin_overlay(&mut self) {
         self.overlay_buffers = Some([
             !self.screen().alternate_screen(),
@@ -935,11 +950,10 @@ mod tests {
             model.can_borrow(),
             "geometry can recover while primary cells stay uncertain"
         );
-        assert!(!model.can_paint());
-        assert!(
-            !model.can_paint_area(Rect::new(0, 0, 12, 4)),
-            "toasts never borrow"
-        );
+        // Unknown cells no longer block an ordinary paint either; borrowing
+        // stays available alongside it as the no-overwrite alternative.
+        assert!(model.can_paint());
+        assert!(model.can_paint_area(Rect::new(0, 0, 12, 4)));
         for selection in [
             b"\x1b[?47h".as_slice(),
             b"\x1b[?00047h",
@@ -1001,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn regional_rows_require_observed_erasure_and_state_at_every_split() {
+    fn regional_rows_require_observed_state_but_tolerate_unknown_cells_at_every_split() {
         let trace = regional_initialization();
         let area = Rect::new(2, 1, 8, 2);
         for split in 0..=trace.len() {
@@ -1009,24 +1023,22 @@ mod tests {
             model.process(&trace[..split]);
             model.process(&trace[split..]);
             assert!(model.can_paint_area(area), "split {split}");
+            // State (cursor/origin/margins/selection/normal rows) is known,
+            // so the whole buffer paints too; cells outside the cleared
+            // rows were never observed and restore as blank.
+            assert!(model.can_paint(), "split {split}");
             assert!(
-                !model.can_paint(),
-                "inherited cells and save slot remain unknown"
+                model.doubtful_restore(false),
+                "rows 1 and 4 were never observed, split {split}"
             );
-            assert!(!model.can_paint_area(Rect::new(0, 0, 1, 1)));
-            assert!(!model.can_paint_area(Rect::new(0, 3, 1, 1)));
-            assert!(!model.can_paint_area(Rect::new(11, 1, 2, 1)));
-            assert!(!model.can_paint_area(Rect::new(0, 1, 0, 1)));
-            assert!(!model.can_paint_area(Rect::new(0, 1, 1, 0)));
+            assert!(!model.can_paint_area(Rect::new(11, 1, 2, 1)), "past the right edge");
+            assert!(!model.can_paint_area(Rect::new(0, 1, 0, 1)), "zero width");
+            assert!(!model.can_paint_area(Rect::new(0, 1, 1, 0)), "zero height");
         }
-        for missing in [
-            b"\x1b[2;1H\x1b[2K".as_slice(),
-            b"\x1b[3;1H\x1b[2K",
-            b"\x1b#5",
-            b"\x1b[?7h",
-        ] {
+        // These still block painting: they remove *state* evidence, not
+        // just cell content.
+        for missing in [b"\x1b#5".as_slice(), b"\x1b[?7h"] {
             let mut model = TerminalModel::new(size());
-            // Remove the first exact occurrence, retaining all other controls.
             let offset = trace
                 .windows(missing.len())
                 .position(|s| s == missing)
@@ -1034,6 +1046,18 @@ mod tests {
             model.process(&trace[..offset]);
             model.process(&trace[offset + missing.len()..]);
             assert!(!model.can_paint_area(area), "missing {missing:?}");
+        }
+        // Removing a row's own erasure no longer blocks painting: unknown
+        // cells there just restore as blank.
+        for missing in [b"\x1b[2;1H\x1b[2K".as_slice(), b"\x1b[3;1H\x1b[2K"] {
+            let mut model = TerminalModel::new(size());
+            let offset = trace
+                .windows(missing.len())
+                .position(|s| s == missing)
+                .unwrap();
+            model.process(&trace[..offset]);
+            model.process(&trace[offset + missing.len()..]);
+            assert!(model.can_paint_area(area), "missing {missing:?}");
         }
         let mut model = TerminalModel::new(size());
         model.process(&trace);
@@ -1043,6 +1067,7 @@ mod tests {
             model.can_paint(),
             "a menu needs no tab stops or save slot to paint"
         );
+        assert!(!model.doubtful_restore(false), "every row now observed");
         assert_covered_rejects(&mut model, b"\x1b8", "a menu cannot restore an unknown slot");
         model.process(b"\x1b[3g\x1b7");
         assert!(
@@ -1058,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn regional_rows_survive_confined_edits_but_not_uncertain_scroll_or_loss() {
+    fn regional_rows_survive_confined_edits_cell_loss_but_not_state_loss() {
         let area = Rect::new(2, 1, 8, 2);
         for edit in [
             b"\x1b[2;2Habc".as_slice(),
@@ -1072,7 +1097,11 @@ mod tests {
             model.process(edit);
             assert!(model.can_paint_area(area), "confined {edit:?}");
         }
-        for loss in [
+        // Cell content only: scrolling or erasing untracks cell knowledge,
+        // but painting no longer needs it. The cursor stays at (0, 0)
+        // throughout (regional_initialization ends with a plain CUP), so
+        // the pending-wrap guard never engages either.
+        for tolerated in [
             b"\n".as_slice(),
             b"\x1bM",
             b"\x1b[S",
@@ -1081,9 +1110,38 @@ mod tests {
             b"\x1b[M",
             b"\x1b[J",
             b"\x1b[1J",
-            b"\x1b[4;1Habcdefghijklmnopqrstuvwx",
-            b"\t",
-            b"\x1b8",
+        ] {
+            let mut model = TerminalModel::new(size());
+            model.process(&regional_initialization());
+            model.process(tolerated);
+            assert!(model.can_paint_area(area), "tolerated {tolerated:?}");
+            assert!(model.doubtful_restore(false), "tolerated {tolerated:?}");
+        }
+        // Writing exactly two full rows left to right (with wraps and a
+        // scroll along the way, but no interleaved repositioning) still
+        // counts as a complete overwrite of the row the cursor lands on:
+        // the pending-wrap guard is satisfied even though a scroll
+        // happened, so this is also just tolerated cell uncertainty.
+        {
+            let mut model = TerminalModel::new(size());
+            model.process(&regional_initialization());
+            model.process(b"\x1b[4;1Habcdefghijklmnopqrstuvwx");
+            assert!(model.can_paint_area(area), "a clean edge-to-edge overwrite is observed");
+        }
+        // A tab at unknown stops drops the cursor (not just cells), but an
+        // ordinary CUP reestablishes it just like after a resize.
+        {
+            let mut model = TerminalModel::new(size());
+            model.process(&regional_initialization());
+            model.process(b"\t");
+            assert!(!model.can_paint_area(area), "cursor lost at an unknown tab stop");
+            model.process(b"\x1b[H");
+            assert!(model.can_paint_area(area), "a CUP reestablishes the cursor");
+        }
+        // These lose real state (not just cells) and a bare CUP cannot
+        // recover it.
+        for loss in [
+            b"\x1b8".as_slice(),
             b"\x1b[?47h",
             b"\x1b[?1049l",
             b"\x1b[7777h",
@@ -1095,7 +1153,7 @@ mod tests {
             model.process(b"\x1b[H");
             assert!(
                 !model.can_paint_area(area),
-                "CUP cannot recover content/state {loss:?}"
+                "CUP cannot recover lost state {loss:?}"
             );
         }
         let mut model = TerminalModel::new(size());
@@ -1103,9 +1161,10 @@ mod tests {
         model.resize(size());
         assert!(!model.can_paint_area(area));
         model.process(b"\x1b[?6l\x1b[r\x1b[H");
-        assert!(!model.can_paint_area(area), "resize loses regional content");
-        model.process(b"\x1b[2;1H\x1b[2K\x1b[3;1H\x1b[2K\x1b[H");
-        assert!(model.can_paint_area(area));
+        assert!(
+            model.can_paint_area(area),
+            "origin/margins survive resize; an ordinary CUP reestablishes the rest"
+        );
         model.discard_oversized_sequence();
         model.process(b"\x18");
         model.process(&regional_initialization());
@@ -1126,12 +1185,19 @@ mod tests {
         for split in 0..=full.len() {
             let mut model = TerminalModel::new(size());
             model.process(&regional_initialization());
-            assert!(!model.can_paint_area(row4));
+            // State alone (cursor at (0, 0), not pending wrap) already
+            // makes row 4 paintable before anything is written to it.
+            assert!(model.can_paint_area(row4));
             model.process(&full[..split]);
             model.process(&full[split..]);
             assert_eq!(model.screen().cursor_position(), (3, 12), "split {split}");
             assert!(model.can_paint_area(row4), "split {split}");
         }
+        // None of these complete a left-to-right overwrite of row 4, so it
+        // never becomes "known". That no longer blocks painting on its own
+        // (unknown cells restore as blank); it only matters if it also
+        // leaves the cursor pending-wrap (at the right edge), which still
+        // needs a known row to restore safely.
         for (name, trace) in [
             ("starts mid-row", b"\x1b[4;2Habcdefghijk".as_slice()),
             ("cursor moves within the run", b"\x1b[4;1Habc\x1b[4;5Hefghijkl"),
@@ -1146,7 +1212,19 @@ mod tests {
             let mut model = TerminalModel::new(size());
             model.process(&regional_initialization());
             model.process(trace);
-            assert!(!model.can_paint_area(row4), "{name}");
+            if name == "tab inside the run" {
+                // Tab stops were never cleared (`\x1b[3g`), so a tab at
+                // unknown stops drops the cursor itself, not just cells.
+                assert!(!model.can_paint_area(row4), "{name}");
+                continue;
+            }
+            let (_, col) = model.screen().cursor_position();
+            let pending_wrap = col == model.screen().size().1.get();
+            assert_eq!(
+                model.can_paint_area(row4),
+                !pending_wrap,
+                "{name}: cursor at col {col}, row 4 never fully observed"
+            );
         }
         // Every row overwritten: whole-buffer content, as after ED 2.
         let mut model = TerminalModel::new(size());
@@ -1253,6 +1331,9 @@ mod tests {
                 b"\x1b[3g" => {
                     assert!(model.can_paint(), "unknown tabs do not block painting");
                     assert_covered_rejects(&mut model, b"\t", "tab at unknown stops");
+                }
+                b"\x1b[2J" => {
+                    assert!(model.can_paint(), "unknown cells no longer block painting");
                 }
                 b"\x1b7" => {
                     assert!(model.can_paint(), "an unknown save slot does not block painting");
@@ -1603,8 +1684,10 @@ mod tests {
         // margins to the full new screen - vendor/vt100/src/grid.rs's
         // "xterm always resets the scroll region... when the screen is
         // resized"). Known evidence for both survives resize without a new
-        // `CSI ?6l`/`CSI r`; only cursor and cell content still need fresh
-        // evidence, which an ordinary CUP and clear/redraw already supply.
+        // `CSI ?6l`/`CSI r`; only cursor still needs fresh evidence, which
+        // an ordinary CUP supplies. Cell content (`CSI 2J`) is no longer
+        // required to paint at all: restoring unobserved cells as blank is
+        // within terminal norms.
         let components: [&[u8]; 5] = [b"\x1b[?6l", b"\x1b[r", b"\x1b[H", b"\x1b7", b"\x1b[2J"];
         for missing in 0..components.len() {
             let mut model = TerminalModel::new(size());
@@ -1619,6 +1702,8 @@ mod tests {
                 assert!(model.can_paint(), "the save slot is not needed to paint");
                 assert!(!model.evidence.saved_known(true));
                 assert_covered_rejects(&mut model, b"\x1b8", "restore of an unknown slot");
+            } else if components[missing] == b"\x1b[2J" {
+                assert!(model.can_paint(), "unknown cells no longer block painting");
             } else if matches!(components[missing], b"\x1b[?6l" | b"\x1b[r") {
                 assert!(
                     model.can_paint(),
@@ -1655,9 +1740,16 @@ mod tests {
             model.process(b"\x1b[2J");
             model.process(mutation);
             model.process(b"\x1b[?6l\x1b[r\x1b[H\x1b7");
-            assert!(!model.can_paint(), "mutation {mutation:?}");
+            // State is fully reestablished, so painting no longer waits on
+            // cells; but the mutation's write landed before the cursor was
+            // known again, so those cells stay unobserved and a restore
+            // would paint them back as blank (a corrective pulse is due).
+            assert!(model.can_paint(), "mutation {mutation:?}");
+            let alternate = model.screen().alternate_screen();
+            assert!(model.doubtful_restore(alternate), "mutation {mutation:?}");
             model.process(b"\x1b[2J");
             assert!(model.can_paint());
+            assert!(!model.doubtful_restore(alternate), "a fresh clear reobserves cells");
         }
         let mut model = TerminalModel::new(size());
         model.process(b"\x1bc");

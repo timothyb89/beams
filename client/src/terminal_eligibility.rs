@@ -550,12 +550,23 @@ impl Evidence {
                 .is_some_and(|rows| !rows.is_empty() && rows.iter().all(|known| *known))
     }
 
-    /// A saved slot or tab stops may remain unknown: painting never uses
-    /// them. Covered output that depends on one closes first (`depends_on_unknown`)
-    /// and restoration never writes an unknown saved slot.
+    /// A saved slot, tab stops, or cell content may remain unknown: painting
+    /// never uses a saved slot or tab stops, and restoring unseen cells as
+    /// blank is within terminal norms (the same as `clear`, an inline
+    /// picker, or takeover itself). Covered output that depends on a saved
+    /// slot or tabs closes first (`depends_on_unknown`); restoration never
+    /// writes an unknown saved slot. `doubtful_restore` reports when a paint
+    /// actually covered unobserved cells, for callers that want to prompt a
+    /// corrective remote repaint afterward.
     pub fn can_paint(&self, alternate: bool) -> bool {
-        let index = usize::from(alternate);
-        self.shared_known() && self.buffers[index].drawing_known() && self.buffers[index].cells
+        self.shared_known() && self.buffers[usize::from(alternate)].drawing_known()
+    }
+
+    /// Whether painting `[top, bottom)` of `alternate` would restore any
+    /// cell content Beams never actually observed (restored as blank). Not
+    /// a painting precondition; informs an optional post-close repaint.
+    pub fn doubtful_restore(&self, alternate: bool, top: u16, bottom: u16) -> bool {
+        !self.rows_known(alternate, top, bottom)
     }
 
     pub fn saved_known(&self, alternate: bool) -> bool {
@@ -586,19 +597,20 @@ impl Evidence {
             && state.primary.cursor.col < screen.size().1.get()
     }
 
-    /// Toasts do not use the application's saved cursor or tab stops. They
-    /// need their restoration rows, plus the last glyph when restoring wrap.
+    /// Toasts do not use the application's saved cursor or tab stops, and
+    /// may restore unobserved cells as blank like any other paint. They
+    /// still need the last glyph known when restoring a pending wrap: that
+    /// guards reprinting a wide character, not general cell certainty.
     pub fn can_paint_rows(
         &self,
         alternate: bool,
-        top: u16,
-        bottom: u16,
+        _top: u16,
+        _bottom: u16,
         screen: &vt100::Screen,
     ) -> bool {
         let (row, col) = screen.cursor_position();
         self.shared_known()
             && self.buffers[usize::from(alternate)].drawing_known()
-            && self.rows_known(alternate, top, bottom)
             && (col < screen.size().1.get() || self.rows_known(alternate, row, row + 1))
     }
 

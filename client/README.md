@@ -387,18 +387,22 @@ open, the theme query, graphics query and Zellij DCS reach the real terminal
 once, and their replies and focus reports go to the remote rather than the
 menu. Other graphics commands and DCS strings remain unsupported.
 
-Toasts can use less content evidence than menus. With shared drawing settings,
-buffer selection, normal line sizes and current cursor/origin/margins known,
-an observed full-line erase (`CSI 2K`) establishes that row. A toast needs every
-row it will restore, including its wide-glyph edges; other inherited rows and
-the application's saved cursor remain untouched. It uses no saved-cursor slot
-or tab stops. If restoring pending wrap requires a glyph outside the toast,
-that row must also be known. Confined writes and row edits preserve this
-evidence; possible wrapping/scrolling, unknown cursor operations, resize and
-buffer switches discard partial row evidence. Fresh row erases can recover it.
-Clearing every row establishes complete content, but a menu still needs its
-saved-state and tab evidence. This does not make an uninitialized plain shell
-eligible or authorize borrowing an unknown inactive buffer.
+Painting (menus and toasts alike) requires shared drawing settings, buffer
+selection, normal line sizes and current cursor/origin/margins - but not cell
+content. Restoring a cell Beams never observed as blank is accepted, the same
+as `clear`, an inline picker or takeover itself already do. The one exception:
+restoring a pending wrap (the cursor sitting at the right edge) still needs
+that row's content known, since that specifically risks reprinting a wide
+character wrong rather than just blanking something unseen. Cell content is
+still tracked (an observed full-line erase, `CSI 2K`, or a complete
+left-to-right overwrite establishes a row; resize, buffer switches and
+uncertain scroll/writes discard that evidence) but only to decide, on close,
+whether the restore was *doubtful* - whether it actually painted back any row
+it never observed. A doubtful overlay close pulses the remote size so the
+remote's own repaint corrects it, the same way takeover's close always does;
+a restore of fully-known content never pulses. A menu additionally needs no
+saved-cursor slot or tab stops to paint; covered output that depends on
+either closes the menu first instead (see below).
 
 Unsupported sequences suppress painting until another observed full reset.
 After resize of a known baseline, an application can explicitly
@@ -422,16 +426,22 @@ be painted rings the terminal bell once instead; the menu lists its request.
 
 Opt-in (`BEAMS_OVERLAY_BORROW=1`) menu fallback borrows the alternate buffer: after an observed full
 reset (`ESC c`) with no later remote alternate-buffer use, the inactive
-alternate is a known-blank scratch buffer. If the primary buffer's content is
-uncertain (for example after a resize) but its origin, margins, cursor and
-save slot are known, a menu opens there via `CSI ?47h`, leaving primary cells
-and save slots untouched. Remote drawing is retained (at most 256 KiB) and
+alternate is a known-blank scratch buffer. If the primary buffer's state
+(origin, margins, cursor, save slot) is known, a menu opens there via
+`CSI ?47h`, leaving primary cells and save slots completely untouched -
+strictly safer than an overlay restore that would have to guess blank cells
+it never saw. Borrowing therefore takes priority over the overlay whenever
+both are available (opted in, `can_borrow()`, output at a boundary) and the
+overlay's own restore would otherwise be doubtful; when the overlay's restore
+is fully known, painting over the real (dimmed) screen stays the better
+experience and wins instead. Remote drawing is retained (at most 256 KiB) and
 replayed exactly once after the menu clears the scratch buffer and returns to
 the primary. Queries, terminal effects, non-ASCII or unsupported output, buffer
 switches and retention exhaustion close the menu first, so the real terminal
 answers them once in order. Toasts never borrow. Under a live redraw that
 close can come before the menu is ever seen, so borrowing stays opt-in and
-takeover covers these cases by default.
+the overlay (or takeover, when even that is ineligible) covers these cases by
+default.
 
 If unsupported output arrives during a menu, the client restores the last
 represented state before forwarding the complete original sequence and its
@@ -442,9 +452,14 @@ restoration during covered resize is still best effort because the outer
 terminal may already have reflowed.
 
 Overlay sessions query an outer-terminal baseline before forwarding child
-output: recognized ANSI/DEC input modes, SGR, margins/cursor style, Kitty flags
-and xterm modifier options, followed by a DA1 sentinel that every terminal
-answers in order. Output waits for the sentinel, at most 500 ms; up to 8192
+output: a DSR/CPR position query, recognized ANSI/DEC input modes, SGR,
+margins/cursor style, Kitty flags and xterm modifier options, followed by a
+DA1 sentinel that every terminal answers in order. Only if the terminal
+answers the CPR query - confirming it, never assumed - the client also moves
+the cursor to the last row and emits a full screen's worth of linefeeds
+before writing any other entry bytes, so whatever was on screen before the
+session started lands in scrollback rather than risking a later blank
+restore looking like data loss. Output waits for the sentinel, at most 500 ms; up to 8192
 bytes of ordinary input are retained for normal routing after handoff. Replies
 that arrive later are still recognized for 5 s and never reach the remote as
 typed input. Each probe claims one reply, so a matching report after that

@@ -186,6 +186,10 @@ class Session:
             modes = [1, 5, 6, 7, 9, 25, 45, 47, 66, 69, 1000, 1001, 1002, 1003, 1004, 1005, 1006,
                      1015, 1016, 2004, 2026]
             reports = b""
+            if self.baseline.get("cpr", True):
+                # Confirms positioning support, enabling the entry
+                # scrollback push. The row/col values themselves are unused.
+                reports += b"\x1b[24;1R"
             for mode in modes:
                 enabled = self.baseline.get(mode, mode in (7, 25))
                 value = 0 if enabled is None else 1 if enabled else 2
@@ -675,6 +679,45 @@ def run_inherited_initialization(root, binary):
         session.close()
 
 
+def run_tolerated_unknown_cells(root, binary):
+    """State (shared modes, origin, margins, geometry, cursor) is fully
+    established via the client's own entry probes and the remote's
+    normal-row redraw, but the screen is never cleared - the motivating
+    "plain shell with unknown history" case. The overlay must open
+    directly on that (no takeover fallback first), stay live while open
+    (remote queries still answered immediately, proving it is not
+    deferred like takeover), and pulse the remote once on close since
+    that restore covered cells Beams never actually observed."""
+    session = Session(root, binary, initialized=False)
+    try:
+        state_without_cells = inherited_initialization(False).removesuffix(b"\x1b7\x1b[2J")
+        session.emit(state_without_cells + b"UNCLEARED PROMPT")
+        session.wait(lambda: b"UNCLEARED PROMPT" in session.output,
+                     "state established without ever clearing the screen")
+        assert b"\x1b[24;1H" + b"\n" * 24 in session.output, \
+            "entry scrollback push did not run before baseline output"
+        pulses = (root / "sizes").read_text().count("\n")
+        offset = len(session.output)
+        session.send(b"\x1d")
+        session.wait(lambda: b"Beams local menu" in session.output[offset:],
+                     "overlay opens directly despite unobserved cells", timeout=2)
+        baseline = session.remote_input()
+        session.emit(b"\x1b[3;3H\x1b[6n")
+        session.wait(lambda: session.remote_input() == baseline + b"\x1b[3;3R",
+                     "a query while open is answered immediately: the overlay stayed live")
+        session.send(b"\x1dAFTER TOLERATED CELLS")
+        session.wait(lambda: session.remote_input().endswith(b"AFTER TOLERATED CELLS"),
+                     "overlay menu close")
+        assert (root / "sizes").read_text().count("\n") == pulses + 2, \
+            "closing a doubtful restore pulses the remote exactly once"
+        os.kill(session.pid, signal.SIGTERM)
+        session.wait(lambda: session.status is not None, "termination with tolerated cells")
+        assert session.status == 143
+        session.assert_termios_restored()
+    finally:
+        session.close()
+
+
 def run_owned_borrowing(root, binary, outcome):
     session = Session(root, binary, initialized=False, borrow=True)
     try:
@@ -902,6 +945,9 @@ def main():
         inherited = root / "inherited"
         inherited.mkdir()
         run_inherited_initialization(inherited, binary)
+        tolerated = root / "tolerated-cells"
+        tolerated.mkdir()
+        run_tolerated_unknown_cells(tolerated, binary)
         for outcome in ["signal", "normal"]:
             borrowed = root / f"borrowed-{outcome}"
             borrowed.mkdir()

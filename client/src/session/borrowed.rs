@@ -126,7 +126,6 @@ mod tests {
         model.resize(size());
         model.process(INITIALIZE);
         assert!(model.can_borrow());
-        assert!(!model.can_paint());
         model
     }
 
@@ -338,7 +337,6 @@ mod tests {
             model.resize(size());
             model.process(INITIALIZE);
             assert!(model.can_borrow());
-            assert!(!model.can_paint());
             let mut menu = BorrowedMenu::new(model.screen());
             let hidden =
                 b"\x1b[4;2HA\x1b[35m\x1b7\x1b]8;id=remote;https://example.test/link\x1b\\LINK\
