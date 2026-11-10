@@ -185,7 +185,8 @@ class Session:
                 and (self.root / "ready").exists()):
             modes = [1, 5, 6, 7, 9, 25, 45, 47, 66, 69, 1000, 1001, 1002, 1003, 1004, 1005, 1006,
                      1015, 1016, 2004, 2026]
-            reports = b""
+            # Typed or pasted ahead of the terminal's replies.
+            reports = self.baseline.get("early_input", b"")
             if self.baseline.get("cpr", True):
                 # Confirms positioning support, enabling the entry
                 # scrollback push. The row/col values themselves are unused.
@@ -516,6 +517,22 @@ def run_unknown_and_recovery(root, binary):
         session.wait(lambda: session.status is not None, "termination during recovered form")
         assert session.status == 143
         session.assert_termios_restored()
+    finally:
+        session.close()
+
+
+def run_paste_during_probes(root, binary):
+    """A paste larger than the capture budget arriving before the probe
+    replies must not end the session: capture stops early, the paste reaches
+    the remote in order, and the late replies are still kept from it."""
+    paste = b"PASTE[" + b"p" * 20000 + b"]END"
+    session = Session(root, binary, baseline={"early_input": paste})
+    try:
+        session.wait(lambda: session.remote_input().endswith(paste), "paste during probes delivered")
+        assert session.status is None, "session survived the paste"
+        assert b"\x1b[" not in session.remote_input(), "probe replies leaked into remote input"
+        session.send(b"AFTER")
+        session.wait(lambda: session.remote_input() == paste + b"AFTER", "input after the paste")
     finally:
         session.close()
 
@@ -939,6 +956,9 @@ def main():
         recovery = root / "recovery"
         recovery.mkdir()
         run_unknown_and_recovery(recovery, binary)
+        pasted = root / "pasted"
+        pasted.mkdir()
+        run_paste_during_probes(pasted, binary)
         resized = root / "resized"
         resized.mkdir()
         run_resize_reinitialization(resized, binary)

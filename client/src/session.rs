@@ -59,6 +59,8 @@ const INPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
 /// Remote output waits this long for the terminal to answer the entry
 /// probes (normally a few milliseconds, ended early by the DA1 sentinel).
 const PROBE_WINDOW: Duration = Duration::from_millis(500);
+/// Ordinary input buffered while probing before capture stops early.
+const CAPTURE_INPUT_BUDGET: usize = 8192;
 /// Replies to the entry probes are recognized for this long after they
 /// were sent, so a slow terminal's answers never reach the remote as input.
 const LATE_REPLY_WINDOW: Duration = Duration::from_secs(5);
@@ -3146,8 +3148,11 @@ impl TerminalState {
                 let read = io::stdin().read(&mut bytes)?;
                 if read == 0 { break; }
                 capture.feed(&bytes[..read]);
-                if capture.input.len() > 8192 {
-                    bail!("terminal input exceeded the 8192-byte baseline capture budget");
+                if capture.input.len() > CAPTURE_INPUT_BUDGET {
+                    // Typing or a paste during the probe window. Stop
+                    // buffering it (bounding memory) and hand it to the
+                    // remote; replies still due are claimed late, below.
+                    break;
                 }
             }
         }
@@ -3155,7 +3160,6 @@ impl TerminalState {
         if capture.finished() {
             let (baseline, input) = capture.finish();
             self.baseline = baseline;
-            if input.len() > 8192 { bail!("terminal input exceeded the 8192-byte baseline capture budget"); }
             self.initial_input = input;
         } else {
             // A slow terminal: keep claiming replies to our own probes, so
@@ -3264,6 +3268,13 @@ impl TerminalState {
             } else if self.palette_open {
                 if let Some(snapshot) = &self.menu_snapshot {
                     let mut restore = crate::terminal_paint::BEGIN.to_vec();
+                    if !self.overlay_menu {
+                        // A takeover menu cleared the screen when it opened,
+                        // so nothing inherited is left to lose: don't leave
+                        // the menu itself behind on an error exit. (`run`
+                        // repaints the model over an overlay menu instead.)
+                        restore.extend_from_slice(b"\x1b[2J\x1b[H");
+                    }
                     crate::terminal_paint::restore(snapshot, false, &mut restore);
                     restore.extend_from_slice(crate::terminal_paint::END);
                     let _ = io::stdout().write_all(&restore);

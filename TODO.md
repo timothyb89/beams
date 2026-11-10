@@ -994,11 +994,11 @@ bootstrap `Task`s.
     priority over a doubtful overlay restore, since it never touches
     primary content at all. See the design doc's "Gate simplification"
     entry for the full writeup. Real-session confirmation is next.
-  - [ ] Toast flicker over frequently redrawn rows (e.g. claude's input/status
+  - [x] Toast flicker over frequently redrawn rows (e.g. claude's input/status
     lines): erase, pass through and repaint in one synchronized update when a
     chunk ends at a boundary, instead of repainting after 30 ms of quiet.
-    Second attempt (2026-11-10, damage tracking - needs real-session
-    confirmation in zellij before ticking): the vendored vt100 now records
+    Done (2026-11-10, confirmed in a real zellij session including over
+    htop/btop): the vendored vt100 now records
     per-chunk cell writes and row moves, so `ToastPainter::pass_output`
     leaves the toast up across output that misses it, repaints it in the
     same synchronized update as output that overwrites it (folding the
@@ -1008,8 +1008,8 @@ bootstrap `Task`s.
     better in zellij; remaining flicker over htop/btop addressed by holding
     back a read's unfinished tail (and repainting inside a remote sync block
     open across reads), so only unholdable tails (C0 inside a sequence,
-    budget overflow) still erase + settle - needs re-checking over htop/btop.
-    See `docs/development/terminal-overlay.md`.
+    budget overflow) still erase + settle. See
+    `docs/development/terminal-overlay.md`.
     First attempt, tried and reverted (2026-11-10, commit 896f9c7/c35a84e): repainting right
     after every chunk that ends at a parser boundary is not safe - "at a
     boundary" only means we're not mid-escape-sequence, not that the remote
@@ -1019,6 +1019,17 @@ bootstrap `Task`s.
     duplicating the status bar and leaving junk the next erase doesn't
     target. Any real fix needs an actual end-of-burst signal (what
     quiet/settle approximates), not just stream framing.
+  - [ ] Record an htop/btop (or other scrolling, `?2026`-framed) session as
+    a fixture for `a_toast_kept_up_through_recordings_never_leaves_fragments`:
+    the zellij reattach recording never scrolls through the toast's rows
+    while it's up, so the erase-before-move and open-remote-frame paths are
+    covered only by synthetic unit tests.
+  - [ ] REP (`CSI b`) right after any local paint (toast, restore) repeats
+    our last printed glyph physically, not the remote's. Pre-existing and
+    rare (needs a remote that uses REP, e.g. ncurses with `rep` in terminfo,
+    right after we paint). Needs a design: erasing ahead of the chunk
+    doesn't help (restoration prints cells too), so either expand REP into
+    the repeated glyph before writing it, or treat it as unsupported.
   - [ ] Guarded alternate-buffer menu fallback for unknown primary screens:
     preserve primary content and cursor/mode state, establish inactive-buffer
     ownership, close/replay before output overflow or a remote buffer switch,

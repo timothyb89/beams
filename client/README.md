@@ -467,8 +467,9 @@ answers the CPR query - confirming it, never assumed - the client also moves
 the cursor to the last row and emits a full screen's worth of linefeeds
 before writing any other entry bytes, so whatever was on screen before the
 session started lands in scrollback rather than risking a later blank
-restore looking like data loss. Output waits for the sentinel, at most 500 ms; up to 8192
-bytes of ordinary input are retained for normal routing after handoff. Replies
+restore looking like data loss. Output waits for the sentinel, at most 500 ms;
+ordinary input typed meanwhile is retained for normal routing after handoff
+(past 8192 bytes, waiting stops early and the rest arrives normally). Replies
 that arrive later are still recognized for 5 s and never reach the remote as
 typed input. Each probe claims one reply, so a matching report after that
 answers a remote query and is forwarded. Takeover sessions send no probes and
