@@ -190,6 +190,50 @@ impl ToastPainter {
         out
     }
 
+    /// Erases a shown toast ahead of a chunk of remote output, without
+    /// forgetting it: `repaint_shown` redraws it once that chunk has been
+    /// passed through and the model reflects it. Erasing with the model's
+    /// *current* (pre-chunk) cells and redrawing once it's caught up lets a
+    /// toast survive output that redraws its corner every few milliseconds —
+    /// erase, pass through, repaint, all as one synchronized update, rather
+    /// than erasing immediately and repainting only once output goes quiet.
+    pub fn erase_for_output(&mut self, model: &TerminalModel) -> Vec<u8> {
+        let Some((rect, _)) = &self.shown else { return Vec::new() };
+        let cols = model.screen().size().1.get();
+        let area = restoration_area(*rect, cols);
+        if !model.can_paint_area(area) {
+            self.forget();
+            return Vec::new();
+        }
+        let mut out = terminal_paint::BEGIN.to_vec();
+        restore_area(model.screen(), area, &mut out);
+        terminal_paint::restore(model.screen(), false, &mut out);
+        out.extend_from_slice(terminal_paint::END);
+        out
+    }
+
+    /// Redraws the toast erased by `erase_for_output`, now that `model`
+    /// reflects the output that was passed through in between. Call this
+    /// only once that output ended at a safe boundary; otherwise leave the
+    /// toast erased and dirty, for `sync` to redraw once a boundary arrives.
+    pub fn repaint_shown(&mut self, model: &TerminalModel, now: Instant) -> Vec<u8> {
+        let Some((rect, toast)) = self.shown.clone() else { return Vec::new() };
+        let cols = model.screen().size().1.get();
+        if !model.can_paint_area(restoration_area(rect, cols)) {
+            self.forget();
+            return Vec::new();
+        }
+        let mut buf = Buffer::empty(rect);
+        render_toast(&toast, rect, &mut buf);
+        let mut out = terminal_paint::BEGIN.to_vec();
+        encode_area(&buf, rect, &mut out);
+        terminal_paint::restore(model.screen(), false, &mut out);
+        out.extend_from_slice(terminal_paint::END);
+        self.dirty = false;
+        self.last_paint = Some(now);
+        out
+    }
+
     /// Brings the screen in line with `desired`, if now is a safe moment.
     /// Returns the bytes to write (empty when nothing needs doing).
     /// Whether `toast` could be painted on the current screen: it fits, and
@@ -687,6 +731,66 @@ mod tests {
             !painter.sync_now(Some(&toast("two")), &model).is_empty(),
             "new content"
         );
+    }
+
+    #[test]
+    fn erase_for_output_and_repaint_shown_survive_a_chunk_without_waiting_for_settle() {
+        let mut model = model(10, 60);
+        let mut painter = ToastPainter::default();
+        let notice = toast("hi");
+        let shown = painter.sync_now(Some(&notice), &model);
+        assert!(!shown.is_empty());
+
+        // Simulate a chunk landing: erase, feed the model (as the real
+        // passthrough write would), then repaint — all in the same tick, no
+        // SETTLE/BURST wait, as long as the chunk ends at a boundary.
+        let erase = painter.erase_for_output(&model);
+        assert!(!erase.is_empty(), "the shown toast should be erased");
+        assert!(painter.is_shown(), "erase_for_output must not forget it");
+        model.process(b"\x1b[5;5Hredrawn row");
+        let repaint = painter.repaint_shown(&model, Instant::now());
+        assert!(!repaint.is_empty());
+        assert!(painter.is_shown());
+
+        // Nothing pending: a normal `sync` call right after is a no-op.
+        let mut tracker = OutputTracker::default();
+        assert!(painter
+            .sync(Some(&notice), &model, &mut tracker, Instant::now())
+            .is_empty());
+    }
+
+    #[test]
+    fn repaint_shown_defers_to_sync_when_the_chunk_ends_mid_sequence() {
+        let model = model(10, 60);
+        let mut painter = ToastPainter::default();
+        let notice = toast("hi");
+        assert!(!painter.sync_now(Some(&notice), &model).is_empty());
+
+        let erase = painter.erase_for_output(&model);
+        assert!(!erase.is_empty());
+        // The chunk ended mid-escape-sequence: no immediate repaint, but the
+        // toast must stay known so a later boundary (via `output_written`
+        // and `sync`) still brings it back.
+        painter.output_written();
+        assert!(painter.is_shown());
+
+        let mut tracker = OutputTracker::default();
+        tracker.feed(b"\x1b[3", Instant::now());
+        assert!(
+            painter
+                .sync(Some(&notice), &model, &mut tracker, Instant::now())
+                .is_empty(),
+            "not at a boundary yet"
+        );
+        tracker.feed(b"m", Instant::now());
+        assert!(!painter
+            .sync(
+                Some(&notice),
+                &model,
+                &mut tracker,
+                Instant::now() + BURST_REPAINT
+            )
+            .is_empty());
     }
 
     #[test]

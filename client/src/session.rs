@@ -2790,11 +2790,13 @@ fn drain_output(
                     continue;
                 }
                 if mode == InputMode::Passthrough {
-                    // Remove a toast using the last represented state before
-                    // new output can invalidate it. Raw output then stays raw.
-                    let clear = painter.clear(terminal_model);
-                    if !clear.is_empty() {
-                        stdout.write_all(&clear).context("removing toast before remote output")?;
+                    // Erase a toast using the last represented state before
+                    // new output can invalidate it. Raw output then stays
+                    // raw; the toast comes back right after, once this chunk
+                    // ends at a safe boundary, rather than waiting on quiet.
+                    let erase = painter.erase_for_output(terminal_model);
+                    if !erase.is_empty() {
+                        stdout.write_all(&erase).context("removing toast before remote output")?;
                         wrote = true;
                     }
                 }
@@ -2854,6 +2856,14 @@ fn drain_output(
                         .write_all(&bytes)
                         .context("writing remote PTY output")?;
                     wrote = true;
+                    if tracker.at_boundary(Instant::now()) {
+                        let repaint = painter.repaint_shown(terminal_model, Instant::now());
+                        if !repaint.is_empty() {
+                            stdout.write_all(&repaint).context("restoring toast after remote output")?;
+                        }
+                    } else {
+                        painter.output_written();
+                    }
                 }
             }
             Ok(OutputEvent::Eof) | Err(TryRecvError::Disconnected) => {
