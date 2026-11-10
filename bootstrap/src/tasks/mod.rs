@@ -20,6 +20,7 @@
 
 pub mod checkout_pr_worktree;
 pub mod clone_git_repo;
+pub mod configure_git_identity;
 pub mod install_code_server;
 mod install_starship;
 pub mod install_toolchain_go;
@@ -34,6 +35,7 @@ use beams_protocol::task_catalog::TemplateInfo;
 use crate::graph::{Capability, Node};
 use checkout_pr_worktree::CheckoutPrWorktree;
 use clone_git_repo::CloneGitRepo;
+use configure_git_identity::ConfigureGitIdentity;
 use install_code_server::InstallCodeServer;
 use install_starship::InstallStarship;
 use install_toolchain_go::InstallToolchainGo;
@@ -170,6 +172,17 @@ pub fn instantiate(name: &str, params: Value) -> anyhow::Result<Box<dyn Task>> {
                 pr: p.pr,
                 dest: crate::pathutil::expand_tilde(&p.dest),
             }))
+        }
+        ConfigureGitIdentity::NAME => {
+            // Keep in sync with `templates()`'s schema for this name.
+            #[derive(serde::Deserialize)]
+            struct Params {
+                name: Option<String>,
+                email: Option<String>,
+            }
+            let p: Params = serde_json::from_value(params)
+                .with_context(|| format!("parsing params for {name:?}"))?;
+            Ok(Box::new(ConfigureGitIdentity { name: p.name, email: p.email }))
         }
         InstallStarship::NAME => Ok(Box::new(InstallStarship)),
         InstallToolchainGo::NAME => Ok(Box::new(InstallToolchainGo)),

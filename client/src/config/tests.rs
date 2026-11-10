@@ -1,10 +1,19 @@
 use std::path::{Path, PathBuf};
 
+use beams_protocol::ManifestParam;
+
 use super::{
     explain,
     plan::{self, Action, Compilation, Node},
     profile::{Phase, Source},
 };
+
+fn param_str(value: &ManifestParam) -> &str {
+    match value {
+        ManifestParam::Str(v) => v,
+        _ => panic!("expected a string param"),
+    }
+}
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -70,6 +79,42 @@ fn bundled_profiles_have_no_checkout_dependency_and_minimal_pre_work() {
         Source::Embedded(name) => !super::profile::embedded_asset(name).unwrap().is_empty(),
         _ => false,
     }));
+}
+
+#[test]
+fn builtin_core_configures_git_identity_from_the_workstation_by_default() {
+    // builtin:core declares this task with no explicit params - the
+    // compiler fills whatever the workstation's own `git config` has
+    // (nothing, on a workstation with no git identity, is just as
+    // valid a result as something).
+    let core = plan::compile("builtin:core").unwrap();
+    let Action::Builtin { template, params } = &node(&core, "tasks:git_identity").action else {
+        panic!("expected a builtin task");
+    };
+    assert_eq!(template, "configure-git-identity");
+    for key in params.keys() {
+        assert!(["name", "email"].contains(&key.as_str()));
+    }
+}
+
+#[test]
+fn a_profiles_explicit_git_identity_params_are_not_overridden_by_the_workstations() {
+    let fixture = Fixture::new();
+    let compiled = fixture
+        .compile(
+            "[tasks.git_identity]\n\
+             template = \"configure-git-identity\"\n\
+             phase = \"pre\"\n\
+             [tasks.git_identity.params]\n\
+             name = \"Override Name\"\n\
+             email = \"override@example.invalid\"\n",
+        )
+        .unwrap();
+    let Action::Builtin { params, .. } = &node(&compiled, "tasks:git_identity").action else {
+        panic!("expected a builtin task");
+    };
+    assert_eq!(param_str(&params["name"]), "Override Name");
+    assert_eq!(param_str(&params["email"]), "override@example.invalid");
 }
 
 #[test]

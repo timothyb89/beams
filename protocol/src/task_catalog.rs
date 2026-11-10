@@ -64,6 +64,26 @@ pub fn templates() -> Vec<TemplateInfo> {
             run_once: true,
         },
         TemplateInfo {
+            template: "configure-git-identity",
+            // Both optional: a profile can set either, and the client
+            // fills whichever is missing from the workstation's own
+            // `git config` at compile time (see
+            // `client/src/config/plan.rs`'s `default_git_identity`).
+            params: &[
+                ParamSchema {
+                    name: "name",
+                    kind: "string",
+                    required: false,
+                },
+                ParamSchema {
+                    name: "email",
+                    kind: "string",
+                    required: false,
+                },
+            ],
+            run_once: false,
+        },
+        TemplateInfo {
             template: "install-toolchain-go",
             params: &[],
             run_once: true,

@@ -5,3 +5,11 @@ schema_version = 1
 program = "/bin/bash"
 path = ["~/.local/bin"]
 change_login_shell = false
+
+# user.name/user.email default from the workstation's own `git config`
+# at compile time (empty if it has none); set either under this task's
+# params in a profile to override.
+[tasks.git_identity]
+label = "Configure git identity"
+template = "configure-git-identity"
+phase = "pre"
