@@ -667,3 +667,46 @@ what each chunk *did* to the toast's area.
   across 518 of 611 chunks it was shown for). That recording never scrolls
   through the toast's rows while it's up, so the move path is exercised
   only by the unit tests. Real-session confirmation in zellij is next.
+
+Follow-up, held tails (2026-11-10): in a real zellij session the above was
+clearly better, with occasional flicker left over continuously refreshing
+content (htop/btop). Those redraw in large frames that span PTY reads, so
+reads often end mid-sequence or inside btop's synchronized update - exactly
+the fallback that erased the toast and waited on settle. Two changes remove
+that fallback for ordinary splits:
+
+- **Held tails.** `TerminalStream::holdable_tail` is the unfinished prefix
+  when it can be delayed unchanged: empty between sequences, otherwise the
+  complete retained prefix, provided it's inert until finished. `None` past
+  the 64 KiB budget (prefix no longer retained), with a C0 control inside a
+  sequence (real terminals execute those immediately, and the model's
+  cursor would already include it), or when an ESC both ended the previous
+  string and began this sequence (`prefix_emitted`). `pass_output` writes
+  everything up to that tail and keeps the tail in `ToastPainter::held`,
+  written ahead of the next read (validated as a suffix of held + chunk).
+  The terminal is therefore always between sequences while a toast is up,
+  so an erase can always precede the next chunk. The model never applied
+  the unfinished frame either, so restores stay consistent.
+- **Remote frames across reads.** If the remote's `?2026` update is still
+  open at the end of a read, the repaint goes inside it with no `?2026l` of
+  ours (which would end the remote's frame), and nothing is stripped; the
+  remote's own end displays it. A fallback erase inside an open remote
+  update likewise omits our end.
+- **Who else writes held bytes.** The held tail is always the tracker's
+  `pending()`. Opening a menu already treats `pending()` as interrupted and
+  replays it on close (overlay: `pending()`; takeover: `menu_prefix`;
+  borrowing requires a boundary so there is none), so
+  `ToastPainter::hand_over_to_menu` drops our copy instead of writing it.
+  `clear` (session end paths) writes it after the toast is gone. `forget`
+  (resize) keeps it for the next read. `sync` and the unpaintable-notice
+  bell wait for a tracker boundary, which never coincides with a held tail.
+- Cost: an unfinished sequence reaches the terminal one read later. It has
+  no visible effect until complete either way; a remote stalled
+  mid-sequence also delays toast removal until its next output.
+- Tests: `holdable_tails_are_complete_inert_prefixes` (stream), and in
+  `session/toast.rs` held CSI/OSC/UTF-8 tails (including one whose read
+  overwrites the toast), release on `clear`, menu hand-over, an unholdable
+  C0-in-CSI tail falling back, and remote frames open across reads for
+  overwrite, scroll and untouched reads. The recording replay now asserts
+  the toast is never taken down: at 23-byte reads it stayed up across all
+  1019 chunks it was shown for (9 repaints).

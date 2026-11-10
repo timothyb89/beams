@@ -223,6 +223,32 @@ impl TerminalStream {
         self.state == State::Ground && self.utf8_pending == 0 && !self.sync_open
     }
 
+    /// The unfinished tail of the stream, if a writer can hold it back from
+    /// the physical terminal and write it unchanged later, with the terminal
+    /// between sequences in the meantime: empty between sequences and
+    /// characters, otherwise the complete retained prefix. `None` when that
+    /// prefix is incomplete (budget overflow) or not inert until finished: a
+    /// C0 control inside a sequence executes immediately in real terminals,
+    /// and an ESC that also ended the previous string belongs to both.
+    /// Ignores the remote's synchronized update; see `synchronized_update`.
+    pub fn holdable_tail(&self) -> Option<&[u8]> {
+        if self.state == State::Ground && self.utf8_pending == 0 {
+            return Some(&[]);
+        }
+        if self.discarding || self.prefix_emitted != 0 || self.pending.is_empty() {
+            return None;
+        }
+        if self.state == State::Ground {
+            // A split UTF-8 character: continuation bytes only.
+            return Some(&self.pending);
+        }
+        let inert = self.pending[0] == 0x1b
+            && self.pending[1..]
+                .iter()
+                .all(|&b| b >= 0x20 || b == 0x1b && self.state == State::StringEscape);
+        inert.then_some(self.pending.as_slice())
+    }
+
     fn text_byte(&mut self, byte: u8) {
         if (0x80..=0xbf).contains(&byte) && self.utf8_pending != 0 {
             self.pending.push(byte);
@@ -342,6 +368,30 @@ impl TerminalStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn holdable_tails_are_complete_inert_prefixes() {
+        let tail = |bytes: &[u8]| {
+            let mut stream = TerminalStream::default();
+            stream.observe(bytes);
+            stream.holdable_tail().map(<[u8]>::to_vec)
+        };
+        assert_eq!(tail(b"text\x1b[1m"), Some(Vec::new()), "between sequences");
+        assert_eq!(tail(b"x\x1b[38;5"), Some(b"\x1b[38;5".to_vec()));
+        assert_eq!(tail(b"x\x1b]0;title"), Some(b"\x1b]0;title".to_vec()));
+        assert_eq!(tail(b"x\x1bP+q\x1b"), Some(b"\x1bP+q\x1b".to_vec()), "ST may follow");
+        assert_eq!(tail(&"a界".as_bytes()[..3]), Some("界".as_bytes()[..2].to_vec()));
+        assert_eq!(tail(b"\x1b[?2026h"), Some(Vec::new()), "a remote frame is separate");
+        // Not inert: a C0 control inside a sequence executes immediately.
+        assert_eq!(tail(b"\x1b[3\n"), None);
+        assert_eq!(tail(b"\x1b]0;a\x08"), None);
+        // ESC that ended the previous string also begins this sequence.
+        assert_eq!(tail(b"\x1b]0;a\x1b["), None);
+        // Past the budget the prefix is no longer retained in full.
+        let mut oversized = b"\x1b]0;".to_vec();
+        oversized.resize(CONTROL_SEQUENCE_LIMIT + 10, b'a');
+        assert_eq!(tail(&oversized), None);
+    }
 
     #[test]
     fn framing_preserves_bytes_at_every_read_split() {

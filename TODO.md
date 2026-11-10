@@ -1004,9 +1004,12 @@ bootstrap `Task`s.
     same synchronized update as output that overwrites it (folding the
     remote's own `?2026l` into ours), and erases it *before* output that
     scrolls/shifts its rows or switches buffers - which is what makes
-    painting mid-redraw safe without an end-of-burst signal. Chunks ending
-    mid-sequence or inside a remote sync block still fall back to the
-    erase + settle path. See `docs/development/terminal-overlay.md`.
+    painting mid-redraw safe without an end-of-burst signal. Confirmed much
+    better in zellij; remaining flicker over htop/btop addressed by holding
+    back a read's unfinished tail (and repainting inside a remote sync block
+    open across reads), so only unholdable tails (C0 inside a sequence,
+    budget overflow) still erase + settle - needs re-checking over htop/btop.
+    See `docs/development/terminal-overlay.md`.
     First attempt, tried and reverted (2026-11-10, commit 896f9c7/c35a84e): repainting right
     after every chunk that ends at a parser boundary is not safe - "at a
     boundary" only means we're not mid-escape-sequence, not that the remote

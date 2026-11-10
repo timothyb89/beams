@@ -671,16 +671,18 @@ mod tests {
                 let (mut kept, mut repainted, mut erased) = (0, 0, 0);
                 for chunk in bytes[..exit].chunks(size) {
                     model.take_damage();
-                    let erase = painter.prepare_output(&model);
+                    let erase = painter.prepare_output(&model, &tracker);
                     let shown = painter.is_shown();
                     model.process(chunk);
                     tracker.feed(chunk, now);
                     let damage = model.take_damage();
                     let out = painter.pass_output(erase, &damage, chunk, &model, &mut tracker, now);
                     if shown {
-                        match (painter.is_shown(), out.as_ref() == chunk) {
-                            (true, true) => kept += 1,
-                            (true, false) => repainted += 1,
+                        let begin = crate::terminal_paint::BEGIN;
+                        let painted = out.windows(begin.len()).any(|w| w == begin);
+                        match (painter.is_shown(), painted) {
+                            (true, false) => kept += 1,
+                            (true, true) => repainted += 1,
                             (false, _) => erased += 1,
                         }
                     }
@@ -715,6 +717,8 @@ mod tests {
                     );
                 }
                 assert!(kept + repainted > 0, "{name}: the toast stayed up across output");
+                // Read splits mid-sequence hold the tail back instead.
+                assert_eq!(erased, 0, "{name}: never taken down for an unfinished read");
                 eprintln!("{name}: kept {kept}, repainted {repainted}, erased {erased}");
                 physical.process(&painter.clear(&model));
                 physical.process(&bytes[exit..]);

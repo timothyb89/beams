@@ -207,9 +207,12 @@ single slot the remote may be using. A toast stays up across remote output
 that doesn't touch it; output that overwrites it is passed through and
 repainted in the same synchronized update, and output that scrolls or shifts
 its rows is preceded by an erase so the move can't carry it into the remote's
-screen. Only when a read ends mid-sequence or inside the remote's own
-synchronized update is it taken down and repainted once output settles (or
-every 250 ms during a long burst). The cells it covered are repainted from the
+screen. A read that ends partway through a sequence has that unfinished tail
+held back and written with the next read, so the terminal is always between
+sequences while a toast is up. Only a tail that can't safely be delayed (one
+past the 64 KiB sequence budget, or with a control character inside it) takes
+the toast down; it is repainted once output settles (or every 250 ms during a
+long burst). The cells it covered are repainted from the
 model when it goes away or the session ends. Painting
 suspends origin/insert modes, character mapping and OSC 8 hyperlinks, then
 restores current state without using the remote's save slot. Restored cells

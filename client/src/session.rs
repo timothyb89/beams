@@ -633,7 +633,9 @@ fn drive(
                     writer.enqueue(&bytes).context("queueing local PTY input")?;
                 }
                 InputAction::OpenPalette => {
-                    painter.forget();
+                    // Remote bytes held back for a toast are the tracker's
+                    // pending prefix, which every menu replays on close.
+                    painter.hand_over_to_menu();
                     // Overlay only what the model can restore. Otherwise take
                     // the screen over: a menu must always appear, and keys
                     // after the prefix must reach it, never the remote.
@@ -2794,7 +2796,7 @@ fn drain_output(
                 // Whether it's needed is known once the chunk is processed.
                 let erase = if mode == InputMode::Passthrough {
                     terminal_model.take_damage();
-                    painter.prepare_output(terminal_model)
+                    painter.prepare_output(terminal_model, tracker)
                 } else {
                     None
                 };
