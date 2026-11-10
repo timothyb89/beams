@@ -24,10 +24,11 @@ import time
 import tty
 
 MODES = [1, 5, 6, 7, 9, 25, 45, 47, 66, 69, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1015, 1016, 2004, 2026]
-EXTRA = b"\x1b[4$p\x1b[20$p\x1bP$qm\x1b\\\x1bP$qr\x1b\\\x1bP$q q\x1b\\\x1b[?u\x1b[?4m"
+EXTRA = b"\x1b[4$p\x1b[20$p\x1bP$qm\x1b\\\x1bP$qr\x1b\\\x1bP$q q\x1b\\\x1b[?u\x1b[?4m\x1b[c"
 
-# The client waits this long for replies before forwarding remote output.
-CLIENT_WINDOW = 0.2
+# The client waits for the DA1 sentinel (the last probe) this long before
+# forwarding remote output; later replies are still claimed for 5 s.
+CLIENT_WINDOW = 0.5
 
 
 def probes():

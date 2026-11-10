@@ -12,6 +12,8 @@ switch. The model/backend foundation and represented cursor/margin painting
 are implemented. Saved-cursor, origin/margins and DCS queries pass, and child
 input is bounded without blocking the driver. Later compatibility/lifecycle
 milestones remain pending.
+Since 2026-11-10 the prefix always opens a menu: when the overlay cannot
+restore the screen, it falls back to takeover (see "Usability reset" below).
 The [next-session handoff](../designs/TERMINAL_OVERLAY_DESIGN.md#implementation-status-and-next-session-handoff)
 records the current commits, code entry points and concrete next steps.
 
@@ -140,12 +142,11 @@ directories; it kills fixture children and removes files on completion.
 The existing smoke test also checks daemon-connected forms and path completion
 in both display modes.
 
-> **Known breakage (2026-11-07):** `main` at `94be084` removed
-> `beams ssh --no-client-daemon` (every launch now needs the client daemon),
-> but `managed-session-smoke.sh` and `terminal-overlay-smoke.py` still pass it,
-> so both fail at argument parsing on `main` and on this branch. They passed on
-> the same overlay code before the rebase. Fixing them needs a
-> daemon-connected fake launch, which belongs to the launch workstream.
+Both session smokes run through a real profile launch against the fake
+`tsh` (new Beam, runtime copy, parked bridge) and build the bootstrap runtime
+they stage. `BEAMS_TEST_NO_RIS=1` makes the fake remote skip its initial RIS,
+like Zellij: with `BEAMS_TEST_OVERLAY=1` the menu must still appear, through
+the takeover fallback.
 
 ## Adding terminal recordings
 
@@ -178,9 +179,9 @@ ignored) until trimmed and reviewed.
    ```
 
    It sends exactly `Baseline::probes()` (a unit test keeps the two in sync),
-   saves the raw replies and reports when the last one arrived. Replies later
-   than the client's 200 ms window are themselves a finding: that terminal
-   gets no evidence for them.
+   saves the raw replies and reports when the last one arrived. Replies after
+   the DA1 sentinel's 500 ms window are themselves a finding: that terminal
+   gets no evidence for them (they are still kept out of remote input).
 
 3. **Session output in strict passthrough.** `--escape-key none` makes the
    client a pure pipe, so the file is exactly what the remote sent (plus the
@@ -502,3 +503,30 @@ Twenty-three model and seven live independent comparisons pass; both
 managed-session smokes and the PTY harness pass. Real entry-probe replies,
 other terminals' Zellij output, line-size behavior and the workstation matrix
 remain open; the overlay stays opt-in.
+
+Usability reset (2026-11-10): the first real session with this branch was
+unusable, under iTerm2 3.6 with Zellij. iTerm2 answers DECRQSS DECSTBM as
+`1$rr` (the full screen, no parameters). Unrecognized, it went to the remote
+as typed input, where the cooked launch PTY echoed it. The missing margin
+evidence kept the overlay ineligible for the whole session. Ctrl-] then only
+rang the bell, so no approval prompt could be reached, and the keys typed
+after it went to the remote. The fake remote in every smoke sent RIS, which
+hid this.
+
+Policy now: **the menu always appears.** An ineligible overlay falls back to
+takeover per menu; borrowing is opt-in (`BEAMS_OVERLAY_BORROW=1`); an
+unpaintable toast rings the bell once. Only overlay sessions probe. A DA1
+sentinel ends the probe window, and late replies to our own probes are
+claimed for 5 s, one per probe; `1$rr` means full margins. The smokes are
+repaired, with a no-RIS variant that fails on the previous code. 269 unit
+tests and 3 integration tests, all managed-session variants, the PTY harness
+and the optional xterm.js replay pass.
+
+Next: simplify the gate to require known *state* (cursor, margins, modes,
+stream sync) while tolerating unknown *cells*. Push the pre-session screen
+into scrollback at entry: CPR, then linefeeds at the bottom row, which works
+the same in every terminal, unlike `CSI 2J`. Then send the client's own
+initialization (restoring default tab stops after TBC). Use the remote repaint
+pulse as the backstop for doubtful restores. Recordings become regression
+fixtures for that gate (iTerm2 plus Terminal.app), not per-terminal gates.
+UI and input stay entirely client-side; nothing relies on remote sequencing.

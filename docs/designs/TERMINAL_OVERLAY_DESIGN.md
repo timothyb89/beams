@@ -47,11 +47,21 @@ Prefer preserving the remote session when its screen cannot be restored:
   forwarding that sequence. Preserve form contents and selection for reopening.
   If a transition cannot do this safely, it fails the default-readiness gate.
 
-This is the recommended UX choice, subject to user preference. Automatically
-falling back to legacy takeover would preserve menu availability, but would
-retain the audit's unknown-screen restoration risk. Decide this policy before
-integrating automatic eligibility checks; passing the three existing
-acceptance tests alone does not settle it.
+**Decided (2026-11-10): automatic takeover is the backstop.** A missing
+prompt is a loss of basic function (approvals), and keys typed after an
+unanswered prefix reached the remote. Whenever the overlay cannot paint, the
+prefix opens a takeover menu, which clears the screen and pulses the remote
+size on close. Its best-effort restoration is the accepted cost; the remote's
+own repaint covers it under Zellij. Toasts that cannot be painted ring the bell
+once. The "defer" wording above now applies only to painting *over* remote
+content, never to whether a menu appears.
+
+Further direction from the same review: require known *state* (cursor,
+margins, modes, stream sync), but tolerate unknown *cells*. Restoring cells we
+never saw as blank is within terminal norms (`clear`, inline pickers, takeover
+itself). Push the pre-session screen into scrollback at entry so even that is
+rare. All UI and input routing stays on the workstation: nothing may depend on
+the Beam rendering prompts or sequencing its output.
 
 ### Detecting when restoration is unsafe
 
@@ -820,15 +830,23 @@ Implementation entry points:
 | `client/tests/terminal-probe-replies.py` | Records a terminal's answers to the entry probes |
 | `bootstrap/src/fetch.rs` | Persistent request acknowledgement; no new notice protocol |
 
+Done (2026-11-10, usability reset): smokes repaired through a fake profile
+launch, with a no-RIS variant; per-menu takeover fallback; borrowing opt-in
+(`BEAMS_OVERLAY_BORROW=1`); probes only in overlay sessions, ended by a DA1
+sentinel, late replies claimed for 5 s, one per probe, and `1$rr` accepted
+as full margins; a bell for unpaintable toasts. See the audit's
+"Usability reset" entry.
+
 Next work, in separately reviewable changes:
 
-1. **Restore the smoke tests.** `main`'s `fe7556c` removed
-   `--no-client-daemon`; `managed-session-smoke.sh` and
-   `terminal-overlay-smoke.py` still pass it and fail at argument parsing
-   (also on `main`). They need a daemon-connected fake launch; coordinate with
-   the launch workstream rather than reintroducing the flag. Until then,
-   validate with the unit suite and run the harness on a pre-`fe7556c` base if
-   painting changes.
+1. **Gate simplification.** At entry, query CPR, then send linefeeds at the
+   bottom row to push the pre-session screen into scrollback; this behaves the
+   same in every terminal, unlike `CSI 2J`. Then send the client's own
+   initialization (the inventory below, restoring 8-column tab stops after TBC 3,
+   plus a DECSC at home). Require known state, tolerate unknown cells, use the
+   resize pulse when restoration is doubtful, and keep takeover for lost
+   stream sync or unsupported output. Overlay-only; takeover sessions are
+   unchanged.
 2. **Toast flicker** over frequently redrawn rows (claude's input/status
    lines under Zellij). Today a toast is erased before each output chunk and
    repainted after 30 ms of quiet output. Erase, pass through and repaint in
@@ -900,8 +918,10 @@ No real workstation font/reflow or graphical-terminal pass has been recorded.
 
 Retain these decisions and remaining gates:
 
-- Prefer deferring unsafe painting, with explicit best-effort takeover available.
-  Unknown inherited primary cells cannot be recovered from a cursor report.
+- Never paint over content the model cannot restore, but always show a menu:
+  takeover is the automatic backstop (decided 2026-11-10). Unknown inherited
+  primary cells cannot be recovered from a cursor report; push them into
+  scrollback at entry rather than refusing to paint.
   Zellij is eligible from observed entry state and its own full redraw, not
   from its name; a session that bypasses it gets no such evidence.
 - A borrowed alternate buffer is implemented only for a RIS-owned, unused

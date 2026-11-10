@@ -90,6 +90,7 @@ mkdir -p "$TEST_DIR/picker/Downloads-smoke"
     printf 'q'
 } |
     env \
+        BEAMS_TEST_NO_RIS="${BEAMS_TEST_NO_RIS:-0}" \
         PATH="$CLIENT_DIR/tests/fixtures/bin:$PATH" \
         XDG_CONFIG_HOME="$TEST_DIR/config" \
         XDG_RUNTIME_DIR="$TEST_DIR/runtime" \
@@ -117,7 +118,9 @@ strings "$TRANSCRIPT" | grep -q "REMOTE READY"
 strings "$TRANSCRIPT" | grep -q "REMOTE TITLE"
 strings "$TRANSCRIPT" | grep -q "24 100"
 strings "$TRANSCRIPT" | grep -q "REMOTE ECHO: hello"
-if [ "${BEAMS_TEST_OVERLAY:-0}" != 1 ]; then
+# Without RIS the overlay cannot restore the screen, so the menu must fall
+# back to takeover (with its redraw pulse) rather than not appearing.
+if [ "${BEAMS_TEST_OVERLAY:-0}" != 1 ] || [ "${BEAMS_TEST_NO_RIS:-0}" = 1 ]; then
     strings "$TRANSCRIPT" | grep -q "REMOTE RESIZE: 24 99"
     strings "$TRANSCRIPT" | grep -q "REMOTE RESIZE: 24 100"
 fi

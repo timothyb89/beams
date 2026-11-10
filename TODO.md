@@ -954,9 +954,8 @@ bootstrap `Task`s.
     UX before default use. Unsafe painting is now deferred; explicit best-effort
     takeover remains. A guarded frame closes/replays unsupported output before
     model mutation, preserving forms and bytes. Toasts withdraw before new
-    output. Common drawing state is covered. Deferred menus acknowledge with
-    a bell only at a safe boundary; recovery needs an explicit retry and keeps
-    forms. Complete richer eligibility and covered-resize fidelity.
+    output. Common drawing state is covered. A menu the overlay cannot paint
+    falls back to takeover (formerly: a bell and no menu); forms are kept. Complete richer eligibility and covered-resize fidelity.
     Zellij eligibility (2026-11-07): Zellij's controls are classified, overlay
     sessions derive shared state from entry probe replies plus one-time
     unqueryable resets, saved slot/tabs are lazy, full-row overwrites prove
@@ -968,10 +967,16 @@ bootstrap `Task`s.
     (including iTerm2's), and check the line-size assumption per terminal.
     Procedure: "Adding terminal recordings" in docs/development/terminal-overlay.md
     (`client/tests/terminal-probe-replies.py`, `RECORDINGS` in baseline.rs).
-  - [ ] Restore the managed-session and overlay PTY smokes: `fe7556c` removed
-    `beams ssh --no-client-daemon`, which both still pass, so they fail at
-    argument parsing (on `main` too). Needs a daemon-connected fake launch,
-    coordinated with the launch workstream.
+  - [x] Restore the managed-session and overlay PTY smokes: both now run a
+    fake profile launch (new Beam, runtime copy, parked bridge), plus a no-RIS
+    variant (`BEAMS_TEST_NO_RIS=1`) that requires a visible menu.
+  - [x] Usability reset (2026-11-10): the prefix always opens a menu (takeover
+    when the overlay cannot paint); borrowing opt-in; probes only in overlay
+    sessions, ended by a DA1 sentinel, late replies claimed one per probe;
+    iTerm2's `1$rr` accepted; an unpaintable toast rings the bell once.
+  - [ ] Gate simplification: entry CPR + scrollback push and client-sent
+    initialization; require known state, tolerate unknown cells; remote
+    repaint pulse for doubtful restores. See the design doc's next work.
   - [ ] Toast flicker over frequently redrawn rows (e.g. claude's input/status
     lines): erase, pass through and repaint in one synchronized update when a
     chunk ends at a boundary, instead of repainting after 30 ms of quiet.

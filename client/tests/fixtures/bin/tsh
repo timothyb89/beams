@@ -23,7 +23,11 @@ esac
 if [ "$1" = "ssh" ]; then
     # Exercise terminal state that the managed-session relay must preserve:
     # title/clipboard OSCs plus bracketed paste and SGR mouse modes.
-    printf '\033c'
+    # Real multiplexers (zellij) never send RIS; BEAMS_TEST_NO_RIS=1 leaves
+    # the overlay without the evidence it needs to paint.
+    if [ "${BEAMS_TEST_NO_RIS:-0}" != 1 ]; then
+        printf '\033c'
+    fi
     printf '\033]2;REMOTE TITLE\007'
     printf '\033]52;c;SGVsbG8=\007'
     printf '\033[?1006h\033[?2004h'

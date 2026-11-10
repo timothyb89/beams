@@ -15,7 +15,25 @@ const MOUSE_MODES: &[u16] = &[9, 1000, 1001, 1002, 1003, 1005, 1006, 1015, 1016]
 /// characters and no open hyperlink. Queryable settings are observed instead.
 pub const ENTRY_RESETS: &[u8] = b"\x18\x1b\\\x1b%G\x1b(B\x1b)B\x0f\x1b[0\"q\x1b]8;;\x1b\\";
 const REPLY_LIMIT: usize = 4096;
+const SENTINEL: &[u8] = b"\x1b[c";
 const MOUSE_GROUPS: &[&[u16]] = &[&[9, 1000, 1001, 1002, 1003], &[1005, 1006, 1015, 1016]];
+
+/// A DECSTBM report. Some terminals (iTerm2) report the full screen with
+/// no parameters, so its rows are only known at the point of use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Margins {
+    Full,
+    Rows(u16, u16),
+}
+
+impl Margins {
+    fn rows(self, rows: u16) -> (u16, u16) {
+        match self {
+            Margins::Full => (0, rows.saturating_sub(1)),
+            Margins::Rows(top, bottom) => (top, bottom),
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct Baseline {
@@ -24,7 +42,7 @@ pub struct Baseline {
     insert: Option<bool>,
     linefeed: Option<bool>,
     attributes: Option<Vec<u8>>,
-    margins: Option<(u16, u16)>,
+    margins: Option<Margins>,
     cursor_style: Option<u8>,
     kitty: Option<u32>,
     modifiers: Option<u8>,
@@ -48,6 +66,9 @@ impl Baseline {
         bytes.extend_from_slice(
             b"\x1b[4$p\x1b[20$p\x1bP$qm\x1b\\\x1bP$qr\x1b\\\x1bP$q q\x1b\\\x1b[?u\x1b[?4m",
         );
+        // Every terminal answers DA1, and answers in order: once its reply
+        // arrives, any probe still unanswered never will be.
+        bytes.extend_from_slice(SENTINEL);
         bytes
     }
 
@@ -111,7 +132,7 @@ impl Baseline {
             bytes.extend_from_slice(attributes);
         }
         if self.modes.get(&47) == Some(&false)
-            && self.margins == Some((0, rows.saturating_sub(1)))
+            && self.margins.map(|m| m.rows(rows)) == Some((0, rows.saturating_sub(1)))
         {
             bytes.extend_from_slice(b"\x1b[r");
         }
@@ -176,7 +197,10 @@ impl Baseline {
                     } else {
                         state.primary
                     };
-                    let margins = self.margins.unwrap_or(buffer.scroll_region);
+                    let margins = self
+                        .margins
+                        .map(|m| m.rows(rows.get()))
+                        .unwrap_or(buffer.scroll_region);
                     let changed = margins.1 < rows.get()
                         && (margins != buffer.scroll_region
                             || *origin != buffer.cursor.origin_mode);
@@ -250,9 +274,16 @@ pub struct Capture {
     negative_settings: u8,
     seen_kitty: bool,
     seen_modifiers: bool,
+    seen_sentinel: bool,
 }
 
 impl Capture {
+    /// Every probe has been answered, or the sentinel proved the rest
+    /// never will be. Until then, replies to the probes are still ours.
+    pub fn finished(&self) -> bool {
+        self.seen_sentinel || self.complete()
+    }
+
     pub fn complete(&self) -> bool {
         self.seen_modes.len() == MODES.len()
             && self.seen_insert
@@ -300,6 +331,21 @@ impl Capture {
         self.pending.drain(..consumed);
     }
 
+    /// Ordinary input decoded so far. A partial sequence older than
+    /// `flush_partial` is released as input too: a lone Escape key must not
+    /// wait for a reply that never comes.
+    pub fn take_input(&mut self, flush_partial: bool) -> Vec<u8> {
+        if flush_partial {
+            let pending = std::mem::take(&mut self.pending);
+            self.input.extend_from_slice(&pending);
+        }
+        std::mem::take(&mut self.input)
+    }
+
+    pub fn has_partial(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     pub fn finish(mut self) -> (Baseline, Vec<u8>) {
         self.input.extend_from_slice(&self.pending);
         (self.baseline, self.input)
@@ -323,7 +369,11 @@ impl Capture {
                 2 | 4 => Some(false),
                 _ => None,
             };
-            if private && MODES.contains(&(mode as u16)) && mode <= u16::MAX as u32 {
+            // Each probe has one reply. A second report of the same kind
+            // answers a remote query and must reach the remote.
+            if private && mode <= u16::MAX as u32 && MODES.contains(&(mode as u16))
+                && !self.seen_modes.contains(&(mode as u16))
+            {
                 self.seen_modes.insert(mode as u16);
                 if let Some(enabled) = enabled {
                     self.baseline.modes.insert(mode as u16, enabled);
@@ -332,12 +382,12 @@ impl Capture {
                 }
                 return true;
             }
-            if !private && mode == 4 {
+            if !private && mode == 4 && !self.seen_insert {
                 self.seen_insert = true;
                 self.baseline.insert = enabled;
                 return true;
             }
-            if !private && mode == 20 {
+            if !private && mode == 20 && !self.seen_linefeed {
                 self.seen_linefeed = true;
                 // Unrecognized LNM cannot be set: newline does not imply CR.
                 self.baseline.linefeed = enabled.or(Some(false).filter(|_| value == 0));
@@ -353,6 +403,7 @@ impl Capture {
         }
         if let Some(style) = frame
             .strip_prefix(b"\x1bP1$r")
+            .filter(|_| !self.seen_style)
             .and_then(|s| s.strip_suffix(b" q\x1b\\"))
             .and_then(number)
         {
@@ -364,18 +415,25 @@ impl Capture {
         }
         if let Some(body) = frame
             .strip_prefix(b"\x1bP1$r")
+            .filter(|_| !self.seen_margins)
             .and_then(|s| s.strip_suffix(b"r\x1b\\"))
         {
+            if body.is_empty() {
+                self.seen_margins = true;
+                self.baseline.margins = Some(Margins::Full);
+                return true;
+            }
             if let Some((top, bottom)) = numbers(body) {
                 if top > 0 && top < bottom && bottom <= u16::MAX as u32 {
                     self.seen_margins = true;
-                    self.baseline.margins = Some((top as u16 - 1, bottom as u16 - 1));
+                    self.baseline.margins = Some(Margins::Rows(top as u16 - 1, bottom as u16 - 1));
                     return true;
                 }
             }
         }
         if let Some(sgr) = frame
             .strip_prefix(b"\x1bP1$r")
+            .filter(|_| !self.seen_attributes)
             .and_then(|s| s.strip_suffix(b"m\x1b\\"))
         {
             if sgr.len() < REPLY_LIMIT
@@ -390,6 +448,7 @@ impl Capture {
         }
         if let Some(flags) = frame
             .strip_prefix(b"\x1b[?")
+            .filter(|_| !self.seen_kitty)
             .and_then(|s| s.strip_suffix(b"u"))
             .and_then(number)
         {
@@ -399,6 +458,7 @@ impl Capture {
         }
         if let Some(body) = frame
             .strip_prefix(b"\x1b[>")
+            .filter(|_| !self.seen_modifiers)
             .and_then(|s| s.strip_suffix(b"m"))
         {
             if let Some((4, value @ 0..=2)) = numbers(body) {
@@ -406,6 +466,14 @@ impl Capture {
                 self.baseline.modifiers = Some(value as u8);
                 return true;
             }
+        }
+        if !self.seen_sentinel
+            && frame.starts_with(b"\x1b[?")
+            && frame.ends_with(b"c")
+            && frame[3..frame.len() - 1].iter().all(|b| b.is_ascii_digit() || *b == b';')
+        {
+            self.seen_sentinel = true;
+            return true;
         }
         false
     }
@@ -828,6 +896,44 @@ mod tests {
         let (baseline, input) = capture.finish();
         assert_eq!(baseline.restore(None), b"\x18\x1b\\");
         assert_eq!(input, b"\x1b[?25;9$y\x1bP1$r0mBAD\x1b\\\x1b[>5;2m");
+    }
+
+    #[test]
+    fn parameterless_margin_report_means_the_full_screen() {
+        // iTerm2 answers DECRQSS DECSTBM with `1$rr`. Unrecognized, it
+        // reached the remote as typed input and was echoed there.
+        let mut capture = Capture::default();
+        capture.feed(b"\x1b[?47;2$y\x1bP1$rr\x1b\\");
+        let (baseline, input) = capture.finish();
+        assert!(input.is_empty());
+        assert_eq!(baseline.margins.map(|m| m.rows(24)), Some((0, 23)));
+        assert!(baseline.entry_evidence(24).windows(3).any(|w| w == b"\x1b[r"));
+    }
+
+    #[test]
+    fn the_sentinel_ends_the_capture_and_later_reports_belong_to_the_remote() {
+        let mut capture = Capture::default();
+        // A terminal that answers only a few probes, then the DA1 sentinel.
+        capture.feed(b"\x1b[?25;1$y\x1bP0$r\x1b\\typed");
+        assert!(!capture.finished());
+        assert_eq!(capture.take_input(false), b"typed");
+        capture.feed(b"\x1b[?62;22c");
+        assert!(capture.finished() && !capture.complete());
+        // The same reports again answer the remote's own queries.
+        capture.feed(b"\x1b[?25;1$y\x1b[?62;22c\x1bP1$rr\x1b\\");
+        let (baseline, input) = capture.finish();
+        assert_eq!(baseline.modes.get(&25), Some(&true));
+        assert_eq!(input, b"\x1b[?25;1$y\x1b[?62;22c");
+    }
+
+    #[test]
+    fn a_partial_reply_is_released_only_when_asked() {
+        let mut capture = Capture::default();
+        capture.feed(b"x\x1b");
+        assert_eq!(capture.take_input(false), b"x");
+        assert!(capture.has_partial());
+        assert_eq!(capture.take_input(true), b"\x1b");
+        assert!(!capture.has_partial());
     }
 
     #[test]

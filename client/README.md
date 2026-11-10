@@ -411,15 +411,16 @@ can introduce new stops. Buffer switches after explicit initialization or resize
 recovery close the menu before raw replay and require fresh target initialization.
 Unknown cursor restores can undo earlier attribute/mode evidence; leaving 1049
 can restore an inherited primary slot too. Unsupported output and
-sequence-budget loss still require observed RIS. This policy can defer menus
-in ordinary shells and TUIs; explicit takeover remains available. An unavailable menu key rings
-the terminal bell at the next safe output boundary. Ordinary keys keep going
-to the remote, and pressing the prefix twice still sends one prefix. A later
-reset or explicit initialization never opens the menu automatically; retry
-the prefix to reopen a preserved form. The client refuses to borrow an
-alternate buffer whose ownership, content or saved state is unknown.
+sequence-budget loss still require observed RIS.
 
-One narrow menu fallback borrows the alternate buffer: after an observed full
+**The menu prefix always opens a menu.** When the overlay cannot restore the
+screen, that menu takes the screen over instead (takeover), and closing it
+pulses the remote size so the remote repaints, as takeover sessions always
+have. Keys after the prefix go to the visible menu, never to the remote, and
+pressing the prefix again closes it and sends one prefix. A toast that cannot
+be painted rings the terminal bell once instead; the menu lists its request.
+
+Opt-in (`BEAMS_OVERLAY_BORROW=1`) menu fallback borrows the alternate buffer: after an observed full
 reset (`ESC c`) with no later remote alternate-buffer use, the inactive
 alternate is a known-blank scratch buffer. If the primary buffer's content is
 uncertain (for example after a resize) but its origin, margins, cursor and
@@ -428,8 +429,9 @@ and save slots untouched. Remote drawing is retained (at most 256 KiB) and
 replayed exactly once after the menu clears the scratch buffer and returns to
 the primary. Queries, terminal effects, non-ASCII or unsupported output, buffer
 switches and retention exhaustion close the menu first, so the real terminal
-answers them once in order. Toasts never borrow, and a shell that never
-observed a reset still defers.
+answers them once in order. Toasts never borrow. Under a live redraw that
+close can come before the menu is ever seen, so borrowing stays opt-in and
+takeover covers these cases by default.
 
 If unsupported output arrives during a menu, the client restores the last
 represented state before forwarding the complete original sequence and its
@@ -439,10 +441,15 @@ before incoming output. A resize closes the menu and invalidates eligibility;
 restoration during covered resize is still best effort because the outer
 terminal may already have reflowed.
 
-Managed sessions query an outer-terminal baseline before forwarding child
+Overlay sessions query an outer-terminal baseline before forwarding child
 output: recognized ANSI/DEC input modes, SGR, margins/cursor style, Kitty flags
-and xterm modifier options. This window is bounded to 200 ms and 8192 bytes
-of ordinary input, which is retained for normal routing after handoff. Exit,
+and xterm modifier options, followed by a DA1 sentinel that every terminal
+answers in order. Output waits for the sentinel, at most 500 ms; up to 8192
+bytes of ordinary input are retained for normal routing after handoff. Replies
+that arrive later are still recognized for 5 s and never reach the remote as
+typed input. Each probe claims one reply, so a matching report after that
+answers a remote query and is forwarded. Takeover sessions send no probes and
+keep the fixed cleanup of ordinary shell input modes. In overlay sessions, exit,
 driver errors and handled signals restore observed settings rather than
 forcing shell defaults. Mouse modes are disabled before the observed mode is
 enabled, and buffer selection avoids clearing or saving over a cursor slot.

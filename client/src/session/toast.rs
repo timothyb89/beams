@@ -192,6 +192,14 @@ impl ToastPainter {
 
     /// Brings the screen in line with `desired`, if now is a safe moment.
     /// Returns the bytes to write (empty when nothing needs doing).
+    /// Whether `toast` could be painted on the current screen: it fits, and
+    /// the model can restore the cells it would cover.
+    pub fn can_show(toast: &Toast, model: &TerminalModel) -> bool {
+        let (rows, cols) = model.screen().size();
+        placement(toast, rows.get(), cols.get())
+            .is_some_and(|rect| model.can_paint_area(restoration_area(rect, cols.get())))
+    }
+
     pub fn sync(
         &mut self,
         desired: Option<&Toast>,

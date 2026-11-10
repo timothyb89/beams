@@ -108,7 +108,7 @@ def fake_tsh(args):
 
 
 class Session:
-    def __init__(self, root, binary, initialized=True, baseline=None, disabled=False):
+    def __init__(self, root, binary, initialized=True, baseline=None, disabled=False, borrow=False):
         self.root = root
         self.command = 0
         self.output = bytearray()
@@ -135,6 +135,7 @@ class Session:
             BEAMS_OVERLAY_FIXTURE=str(root),
             TERM="xterm-256color",
             BEAMS_OVERLAY_INITIALIZED="1" if initialized else "0",
+            BEAMS_OVERLAY_BORROW="1" if borrow else "0",
         )
         # Every launch needs the workstation daemon. Run one per session so
         # it is isolated and reliably stopped.
@@ -180,7 +181,7 @@ class Session:
             pid, status = os.waitpid(self.pid, os.WNOHANG)
             if pid:
                 self.status = os.waitstatus_to_exitcode(status)
-        if (not self.disabled and not self.baseline_replied and b"\x1b[?4m" in self.output
+        if (not self.disabled and not self.baseline_replied and b"\x1b[?4m\x1b[c" in self.output
                 and (self.root / "ready").exists()):
             modes = [1, 5, 6, 7, 9, 25, 45, 47, 66, 69, 1000, 1001, 1002, 1003, 1004, 1005, 1006,
                      1015, 1016, 2004, 2026]
@@ -196,6 +197,7 @@ class Session:
             reports += f"\x1bP1$r{self.baseline.get('style', 0)} q\x1b\\".encode()
             reports += f"\x1b[?{self.baseline.get('kitty', 0)}u".encode()
             reports += f"\x1b[>4;{self.baseline.get('modifiers', 0)}m".encode()
+            reports += b"\x1b[?62;22c"
             self.send(reports + self.baseline.get("input", b""))
             self.baseline_replied = True
 
@@ -221,6 +223,24 @@ class Session:
         tmp.rename(self.root / f"command-{self.command}")
         self.wait(lambda: (self.root / "ack").exists()
                   and (self.root / "ack").read_text() == str(self.command), "remote output command")
+
+    def takeover(self, text, label=b"Beams local menu", description="takeover menu"):
+        """Ctrl-] where the overlay cannot restore the screen. The menu must
+        still appear (taking the screen over), keys after the prefix belong
+        to it, and closing pulses the remote size so it repaints."""
+        baseline = self.remote_input()
+        pulses = (self.root / "sizes").read_text().count("\n")
+        offset = len(self.output)
+        self.send(b"\x1d")
+        self.wait(lambda: label in self.output[offset:], f"{description}: opens", timeout=2)
+        if label == b"Beams local menu":
+            # An approval key reaches the visible menu, never the remote.
+            self.send(b"y")
+        self.send(b"\x1d" + text)
+        self.wait(lambda: self.remote_input() == baseline + b"\x1d" + text,
+                  f"{description}: closes and only the literal prefix and later keys reach the remote")
+        self.wait(lambda: (self.root / "sizes").read_text().count("\n") >= pulses + 2,
+                  f"{description}: closing redraws the remote")
 
     def open(self, label=b"Beams local menu"):
         offset = len(self.output)
@@ -392,16 +412,14 @@ def run_checks(root, binary):
         oversized = b"\x1b]52;c;" + b"A" * (64 * 1024 + 19)
         session.emit(oversized)
         session.wait(lambda: oversized in session.output[offset:], "oversized OSC prefix recovery")
-        blocked_offset = len(session.output)
-        session.send(b"\x1dyAFTER LIMIT")
-        session.wait(lambda: session.remote_input().endswith(b"yAFTER LIMIT"),
-                     "unsafe model cannot interpret unseen approval keys")
         ending = b"\x1b\\AFTER OVERSIZED"
         session.emit(ending)
         session.wait(lambda: oversized + ending in session.output[offset:],
                      "oversized OSC resumed byte-for-byte")
         assert session.output.count(oversized + ending) == 1, "oversized OSC duplicated"
-        assert b"Beams local menu" not in session.output[blocked_offset:], "unsafe menu reopened"
+        # Painting stays suppressed until an observed reset; the menu takes
+        # the screen over instead.
+        session.takeover(b"AFTER LIMIT", description="model lost to an oversized string")
         session.emit(b"\x1bc\x1b[?1049hRECOVERED MODEL")
         session.wait(lambda: b"RECOVERED MODEL" in session.output, "full model reset")
 
@@ -473,11 +491,7 @@ def run_input_pressure(root, binary, outcome):
 def run_unknown_and_recovery(root, binary):
     session = Session(root, binary, initialized=False)
     try:
-        offset = len(session.output)
-        session.send(b"\x1dy\x1d\x1dORDINARY INPUT")
-        session.wait(lambda: session.remote_input() == b"y\x1dORDINARY INPUT",
-                     "unknown screen defers menus and forwards ordinary/doubled-prefix input")
-        assert b"Beams local menu" not in session.output[offset:]
+        session.takeover(b"ORDINARY INPUT", description="unknown screen")
         session.emit(b"\x1bc\x1b[?1049hRECOVERED BASELINE")
         session.wait(lambda: b"RECOVERED BASELINE" in session.output, "observed initialization")
         session.open()
@@ -489,10 +503,7 @@ def run_unknown_and_recovery(root, binary):
         session.emit(unsafe[8:])
         session.wait(lambda: unsafe in session.output[offset:], "unsupported sequence replay after close")
         assert session.output[offset:].count(unsafe) == 1
-        baseline = session.remote_input()
-        session.send(b"\x1dyUNSEEN KEY")
-        session.wait(lambda: session.remote_input() == baseline + b"yUNSEEN KEY",
-                     "unsupported state cannot consume unseen approval keys")
+        session.takeover(b"UNSEEN KEY", b"Forward a Beam port", "unsupported state")
         session.emit(b"\x1bc\x1b[?1049hRECOVERED AGAIN")
         session.wait(lambda: b"RECOVERED AGAIN" in session.output, "second baseline recovery")
         session.open(b"Forward a Beam port")
@@ -521,12 +532,8 @@ def run_resize_reinitialization(root, binary):
         # after resize. (A saved slot may stay unknown; painting never uses it.)
         session.emit(b"\x1b[r\x1b[H\x1b[2JPARTIAL INITIALIZATION")
         session.wait(lambda: b"PARTIAL INITIALIZATION" in session.output, "partial initialization")
-        baseline = session.remote_input()
-        offset = len(session.output)
-        session.send(b"\x1dyDEFERRED AFTER RESIZE")
-        session.wait(lambda: session.remote_input() == baseline + b"yDEFERRED AFTER RESIZE",
-                     "incomplete initialization forwards ordinary input")
-        assert b"Forward a Beam port" not in session.output[offset:]
+        session.takeover(b"DEFERRED AFTER RESIZE", b"Forward a Beam port",
+                         "incomplete initialization")
 
         # No new RIS: the application explicitly initializes only this buffer.
         offset = len(session.output)
@@ -565,10 +572,7 @@ def run_resize_reinitialization(root, binary):
         session.emit(transition[7:])
         session.wait(lambda: transition in session.output[offset:], "unsafe buffer switch replay")
         assert session.output[offset:].count(transition) == 1
-        baseline = session.remote_input()
-        session.send(b"\x1dyUNKNOWN PRIMARY INPUT")
-        session.wait(lambda: session.remote_input() == baseline + b"yUNKNOWN PRIMARY INPUT",
-                     "uninitialized target defers menu")
+        session.takeover(b"UNKNOWN PRIMARY INPUT", b"Forward a Beam port", "uninitialized target")
         session.emit(before)
         session.wait(lambda: before in session.output[offset:], "initialize selected primary buffer")
         session.open(b"Forward a Beam port")
@@ -601,10 +605,7 @@ def run_inherited_initialization(root, binary):
         session.emit(partial + b"PARTIAL INHERITED INITIALIZATION")
         session.wait(lambda: b"PARTIAL INHERITED INITIALIZATION" in session.output,
                      "initialization with unknown autowrap")
-        baseline = session.remote_input()
-        session.send(b"\x1dyINHERITED INPUT")
-        session.wait(lambda: session.remote_input() == baseline + b"yINHERITED INPUT",
-                     "incomplete inherited initialization defers menu")
+        session.takeover(b"INHERITED INPUT", description="incomplete inherited initialization")
 
         offset = len(session.output)
         before = inherited_initialization() + b"KNOWN WITHOUT RIS"
@@ -646,10 +647,7 @@ def run_inherited_initialization(root, binary):
         session.emit(transition[7:])
         session.wait(lambda: transition in session.output[offset:], "inherited switch closes before replay")
         assert session.output[offset:].count(transition) == 1
-        baseline = session.remote_input()
-        session.send(b"\x1dyUNKNOWN BUFFER INPUT")
-        session.wait(lambda: session.remote_input() == baseline + b"yUNKNOWN BUFFER INPUT",
-                     "unknown buffer cannot consume menu keys")
+        session.takeover(b"UNKNOWN BUFFER INPUT", b"Forward a Beam port", "unknown buffer")
         session.emit(inherited_initialization(False) + b"EXPLICIT PRIMARY")
         session.wait(lambda: b"EXPLICIT PRIMARY" in session.output[offset:], "primary explicitly initialized")
         session.open(b"Forward a Beam port")
@@ -663,7 +661,7 @@ def run_inherited_initialization(root, binary):
 
 
 def run_owned_borrowing(root, binary, outcome):
-    session = Session(root, binary, initialized=False)
+    session = Session(root, binary, initialized=False, borrow=True)
     try:
         before_resize = b"\x1bcPRIMARY SENTINEL\x1b[2;2H\x1b[31m\x1b7"
         session.emit(before_resize)
@@ -673,10 +671,7 @@ def run_owned_borrowing(root, binary, outcome):
         partial = b"\x1b[?6l\x1b[r\x1b[2;3H"
         session.emit(partial)
         session.wait(lambda: partial in session.output, "partial primary geometry")
-        baseline = session.remote_input()
-        session.send(b"\x1dyUNKNOWN GEOMETRY INPUT")
-        session.wait(lambda: session.remote_input() == baseline + b"yUNKNOWN GEOMETRY INPUT",
-                     "borrow requires saved geometry too")
+        session.takeover(b"UNKNOWN GEOMETRY INPUT", description="borrow without saved geometry")
 
         offset = len(session.output)
         before = partial + b"\x1b7\x1b[32mKNOWN CURSOR"
@@ -781,10 +776,7 @@ def run_owned_borrowing(root, binary, outcome):
         assert session.output[mark:].count(transition) == 1
         session.emit(b"\x1b[?47l" + before)
         session.wait(lambda: b"\x1b[?47l" + before in session.output[mark:], "remote returns to primary")
-        baseline = session.remote_input()
-        session.send(b"\x1dyNO SCRATCH INPUT")
-        session.wait(lambda: session.remote_input() == baseline + b"yNO SCRATCH INPUT",
-                     "alternate ownership cannot be guessed after remote use")
+        session.takeover(b"NO SCRATCH INPUT", b"Forward a Beam port", "no owned scratch buffer")
 
         # A new RIS establishes a new scratch lifetime. Controlled covered
         # resize closes; this is not a workstation reflow guarantee.

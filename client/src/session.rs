@@ -56,6 +56,12 @@ use keys::{Decoded, Key};
 
 const LOOP_TICK: Duration = Duration::from_millis(25);
 const INPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
+/// Remote output waits this long for the terminal to answer the entry
+/// probes (normally a few milliseconds, ended early by the DA1 sentinel).
+const PROBE_WINDOW: Duration = Duration::from_millis(500);
+/// Replies to the entry probes are recognized for this long after they
+/// were sent, so a slow terminal's answers never reach the remote as input.
+const LATE_REPLY_WINDOW: Duration = Duration::from_secs(5);
 const MAX_INPUT_SEQUENCE_LEN: usize = 64;
 const EXIT_OUTPUT_GRACE: Duration = Duration::from_millis(250);
 const REDRAW_RESIZE_DELAY: Duration = Duration::from_millis(40);
@@ -270,9 +276,11 @@ pub fn run(
     terminal_state.managed = escape_key != EscapeKey::Disabled;
     let mut terminal_model = TerminalModel::new(initial_size);
     let drive_result = (|| {
-        if terminal_state.managed {
+        // Takeover never paints over remote output, so it neither probes
+        // nor needs entry evidence; it keeps its fixed cleanup.
+        if terminal_state.managed && overlay_enabled {
             terminal_state.capture_baseline()?;
-            if overlay_enabled {
+            {
                 // Before any remote output: reset the few settings no
                 // terminal can report, then let the model observe both
                 // those resets and the reported settings as evidence.
@@ -313,7 +321,7 @@ pub fn run(
             .baseline
             .observed_final_screen(&terminal_model)
             .cloned();
-        if overlay_enabled && terminal_state.palette_open && terminal_state.borrowed.is_none() {
+        if terminal_state.overlay_menu && terminal_state.palette_open {
             let _ = restore_terminal_model(&terminal_model, terminal_state.covered_alternate);
             terminal_state.palette_open = false;
         }
@@ -356,6 +364,8 @@ fn drive(
     let mut painter = toast::ToastPainter::default();
     // What the toast on screen is about, for the menu prefix.
     let mut toast_subject: Option<notices::Subject> = None;
+    // The last notice announced with a bell because it could not be painted.
+    let mut belled_subject: Option<notices::Subject> = None;
     macro_rules! clear_toast {
         () => {{
             let clear = painter.clear(terminal_model);
@@ -390,7 +400,7 @@ fn drive(
                 escape_key,
                 &daemon_view,
                 terminal_model,
-                overlay_enabled && terminal_state.borrowed.is_none(),
+                terminal_state.overlay_menu,
             )?
         };
     }
@@ -417,7 +427,6 @@ fn drive(
                 &mut deferred,
                 last_size,
                 terminal_model,
-                overlay_enabled,
             )?;
             return Ok((128 + signal).clamp(1, 255) as u8);
         }
@@ -428,7 +437,7 @@ fn drive(
             &mut deferred,
             &mut output_finished,
             terminal_model,
-            overlay_enabled,
+            terminal_state.overlay_menu,
             &mut terminal_state.output,
             Some(writer),
             &mut painter,
@@ -451,7 +460,6 @@ fn drive(
                 &mut deferred,
                 last_size,
                 terminal_model,
-                overlay_enabled,
             )?;
             terminal_model.process(&resume);
             terminal_model.take_events();
@@ -467,7 +475,9 @@ fn drive(
         if output_changed && input_router.mode == InputMode::Passthrough {
             painter.output_written();
         }
-        if output_changed && overlay_enabled && input_router.mode == InputMode::Palette {
+        if output_changed && terminal_state.menu_over_live_output()
+            && input_router.mode == InputMode::Palette
+        {
             redraw_palette!();
         }
 
@@ -479,6 +489,19 @@ fn drive(
             let now = Instant::now();
             let current = toast_policy.current(&daemon_view, escape_key, now);
             toast_subject = current.as_ref().map(|(_, subject)| subject.clone());
+            // A notice that cannot be painted rings the bell once instead of
+            // vanishing; the menu (always available) lists what it was about.
+            if let Some((toast, subject)) = &current {
+                if belled_subject.as_ref() != Some(subject)
+                    && !toast::ToastPainter::can_show(toast, terminal_model)
+                    && terminal_state.output.at_boundary(now)
+                {
+                    let mut stdout = io::stdout().lock();
+                    stdout.write_all(b"\x07").context("ringing for an unpainted notice")?;
+                    stdout.flush().context("flushing notice bell")?;
+                    belled_subject = Some(subject.clone());
+                }
+            }
             let paint = painter.sync(
                 current.as_ref().map(|(toast, _)| toast),
                 terminal_model,
@@ -502,7 +525,6 @@ fn drive(
                 &mut deferred,
                 last_size,
                 terminal_model,
-                overlay_enabled,
             )?;
             finish_output(output_rx, &mut output_finished, terminal_model)?;
             return Ok(exit_code(&status));
@@ -511,13 +533,13 @@ fn drive(
 
         if let Ok(size) = current_size() {
             if size != last_size {
-                if overlay_enabled && input_router.mode == InputMode::Palette {
+                if terminal_state.menu_over_live_output() && input_router.mode == InputMode::Palette {
                     // Close using the last represented snapshot. The outer
                     // terminal may already have reflowed it: fidelity during
                     // a covered resize remains an explicit compatibility gate.
                     close_palette(master, terminal_state, &mut palette_terminal,
                         &mut input_router.mode, &mut deferred, last_size,
-                        terminal_model, overlay_enabled)?;
+                        terminal_model)?;
                 }
                 master.resize(size).context("resizing local PTY")?;
                 terminal_model.resize(size);
@@ -532,8 +554,6 @@ fn drive(
         }
 
         let now = Instant::now();
-        input_router.palette_available = !overlay_enabled || terminal_model.can_paint()
-            || terminal_model.can_borrow() && terminal_state.output.at_boundary(now);
         if input_router.mode == InputMode::Passthrough {
             input_router.mouse_utf8 = terminal_model.screen().mouse_protocol_encoding()
                 == vt100::MouseProtocolEncoding::Utf8;
@@ -549,12 +569,16 @@ fn drive(
                 keys_handled = true;
                 daemon_view.handle_key(key, local_daemon)
             };
-            let initial_input = std::mem::take(&mut terminal_state.initial_input);
+            let mut initial_input = std::mem::take(&mut terminal_state.initial_input);
+            initial_input.extend(terminal_state.expire_late_replies(now));
             if !initial_input.is_empty() {
                 actions.extend(input_router.route(escape_key, &initial_input, now, &mut on_key));
             }
             actions.extend(input_router.flush_expired(escape_key, now, &mut on_key));
-            let poll_timeout = input_router.poll_timeout(now);
+            let mut poll_timeout = input_router.poll_timeout(now);
+            if terminal_state.late_replies.is_some() {
+                poll_timeout = poll_timeout.min(LOOP_TICK);
+            }
             if stdin_ready(poll_timeout).context("polling terminal input")? {
                 let mut bytes = [0u8; 4096];
                 let read = io::stdin()
@@ -563,12 +587,15 @@ fn drive(
                 if read == 0 {
                     stdin_closed = true;
                 } else {
-                    actions.extend(input_router.route(
-                        escape_key,
-                        &bytes[..read],
-                        Instant::now(),
-                        &mut on_key,
-                    ));
+                    let input = terminal_state.filter_late_replies(&bytes[..read], Instant::now());
+                    if !input.is_empty() {
+                        actions.extend(input_router.route(
+                            escape_key,
+                            &input,
+                            Instant::now(),
+                            &mut on_key,
+                        ));
+                    }
                 }
             }
             if !stdin_closed {
@@ -586,7 +613,6 @@ fn drive(
                 &mut deferred,
                 last_size,
                 terminal_model,
-                overlay_enabled,
             )?;
             return Ok(0);
         }
@@ -595,17 +621,19 @@ fn drive(
                 InputAction::Remote(bytes) => {
                     writer.enqueue(&bytes).context("queueing local PTY input")?;
                 }
-                InputAction::PaletteUnavailable => {
-                    terminal_state.unavailable_notice = true;
-                }
                 InputAction::OpenPalette => {
                     painter.forget();
-                    let borrow = overlay_enabled && !terminal_model.can_paint()
-                        && terminal_model.can_borrow();
-                    if overlay_enabled && !borrow {
+                    // Overlay only what the model can restore. Otherwise take
+                    // the screen over: a menu must always appear, and keys
+                    // after the prefix must reach it, never the remote.
+                    let overlay = overlay_enabled && terminal_model.can_paint();
+                    let borrow = overlay_enabled && !overlay && borrow_enabled()
+                        && terminal_model.can_borrow()
+                        && terminal_state.output.at_boundary(Instant::now());
+                    if overlay {
                         terminal_model.begin_overlay();
                     }
-                    terminal_state.open_palette(terminal_model.screen(), borrow)?;
+                    terminal_state.open_palette(terminal_model.screen(), overlay, borrow)?;
                     palette_terminal = Some(new_palette_terminal()?);
                     // The prefix while a request's toast is up goes straight
                     // to that request.
@@ -633,18 +661,12 @@ fn drive(
                         &mut deferred,
                         last_size,
                         terminal_model,
-                        overlay_enabled,
                     )?;
                 }
             }
         }
         if keys_handled && input_router.mode == InputMode::Palette && palette_terminal.is_some() {
             redraw_palette!();
-        }
-        if terminal_state.unavailable_notice && terminal_state.output.at_boundary(Instant::now()) {
-            io::stdout().write_all(b"\x07").context("acknowledging unavailable menu")?;
-            io::stdout().flush().context("flushing unavailable menu acknowledgement")?;
-            terminal_state.unavailable_notice = false;
         }
     }
 }
@@ -2108,7 +2130,6 @@ enum InputAction {
     Remote(Vec<u8>),
     OpenPalette,
     ClosePalette,
-    PaletteUnavailable,
 }
 
 /// Upper bound on a bracketed paste collected for a menu field.
@@ -2136,9 +2157,6 @@ struct InputRouter {
     /// An oversized OSC/DCS reply is streamed without retaining its payload.
     /// Keep consuming it opaquely through its terminator.
     string_tail: Option<(bool, bool)>,
-    /// An unsafe shadow state must never decode unseen palette shortcuts.
-    palette_available: bool,
-    unavailable_prefix: bool,
 }
 
 impl Default for InputRouter {
@@ -2151,8 +2169,6 @@ impl Default for InputRouter {
             remote_paste: false,
             mouse_utf8: false,
             string_tail: None,
-            palette_available: true,
-            unavailable_prefix: false,
         }
     }
 }
@@ -2331,22 +2347,12 @@ impl InputRouter {
                 _ => {}
             }
             if !self.remote_paste && logical.is_some() && escape_key.byte() == logical {
-                if !self.palette_available {
-                    if self.unavailable_prefix {
-                        remote.extend_from_slice(encoded);
-                    } else {
-                        flush_remote(actions, remote);
-                        actions.push(InputAction::PaletteUnavailable);
-                    }
-                    self.unavailable_prefix = !self.unavailable_prefix;
-                    return;
-                }
-                self.unavailable_prefix = false;
+                // The prefix always opens a menu; the driver decides whether
+                // it can overlay the remote screen or must take it over.
                 flush_remote(actions, remote);
                 self.mode = InputMode::Palette;
                 actions.push(InputAction::OpenPalette);
             } else {
-                self.unavailable_prefix = false;
                 remote.extend_from_slice(encoded);
             }
             return;
@@ -2885,7 +2891,6 @@ fn close_palette(
     deferred: &mut DeferredOutput,
     size: PtySize,
     terminal_model: &mut TerminalModel,
-    overlay_enabled: bool,
 ) -> anyhow::Result<()> {
     if terminal_state.palette_open {
         palette_terminal.take();
@@ -2894,8 +2899,8 @@ fn close_palette(
                 .context("restoring primary and replaying borrowed-menu output")?;
             terminal_state.borrowed = None;
             terminal_state.palette_open = false;
-        } else if overlay_enabled {
-            terminal_state.close_palette(overlay_enabled)?;
+        } else if terminal_state.overlay_menu {
+            terminal_state.close_palette()?;
             deferred.clear();
             restore_terminal_model(terminal_model, terminal_state.covered_alternate)?;
             let mut stdout = io::stdout().lock();
@@ -2911,7 +2916,7 @@ fn close_palette(
                 .flush()
                 .context("flushing unfinished remote sequence")?;
         } else {
-            terminal_state.close_palette(overlay_enabled)?;
+            terminal_state.close_palette()?;
             let mut stdout = io::stdout().lock();
             let mut restore = Vec::new();
             if let Some(snapshot) = &terminal_state.menu_snapshot {
@@ -3038,6 +3043,10 @@ fn signal_watcher() -> anyhow::Result<(Receiver<i32>, SignalHandle, thread::Join
     Ok((rx, handle, thread))
 }
 
+const TAKEOVER_CLEANUP: &[u8] = b"\x18\x1b\\\x1b[?2026l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\
+    \x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?2004l\x1b[?1l\x1b>\
+    \x1b[?1049l\x1b[?47l\x1b[0m\x1b[?25h";
+
 struct TerminalState {
     raw: bool,
     managed: bool,
@@ -3052,7 +3061,20 @@ struct TerminalState {
     menu_prefix: Vec<u8>,
     menu_snapshot: Option<vt100::Screen>,
     covered_alternate: bool,
-    unavailable_notice: bool,
+    /// The open menu overlays the remote screen (true) or took it over.
+    overlay_menu: bool,
+    /// Entry probes ran, so cleanup restores observed settings. Otherwise
+    /// cleanup resets the ordinary shell input modes, as takeover always has.
+    probed: bool,
+    late_replies: Option<LateReplies>,
+}
+
+/// Entry probes the terminal had not finished answering when the probe
+/// window closed.
+struct LateReplies {
+    capture: baseline::Capture,
+    until: Instant,
+    last_input: Instant,
 }
 
 impl TerminalState {
@@ -3070,7 +3092,9 @@ impl TerminalState {
             menu_prefix: Vec::new(),
             menu_snapshot: None,
             covered_alternate: false,
-            unavailable_notice: false,
+            overlay_menu: false,
+            probed: false,
+            late_replies: None,
         })
     }
 
@@ -3079,9 +3103,10 @@ impl TerminalState {
         stdout.write_all(&baseline::Baseline::probes()).context("querying terminal baseline")?;
         stdout.flush().context("flushing terminal baseline probes")?;
         drop(stdout);
-        let deadline = Instant::now() + Duration::from_millis(200);
+        let started = Instant::now();
+        let deadline = started + PROBE_WINDOW;
         let mut capture = baseline::Capture::default();
-        while !capture.complete() && Instant::now() < deadline {
+        while !capture.finished() && Instant::now() < deadline {
             if stdin_ready(deadline.saturating_duration_since(Instant::now()).min(LOOP_TICK))? {
                 let mut bytes = [0u8; 4096];
                 let read = io::stdin().read(&mut bytes)?;
@@ -3092,19 +3117,77 @@ impl TerminalState {
                 }
             }
         }
-        let (baseline, input) = capture.finish();
-        self.baseline = baseline;
-        if input.len() > 8192 { bail!("terminal input exceeded the 8192-byte baseline capture budget"); }
-        self.initial_input = input;
+        self.probed = true;
+        if capture.finished() {
+            let (baseline, input) = capture.finish();
+            self.baseline = baseline;
+            if input.len() > 8192 { bail!("terminal input exceeded the 8192-byte baseline capture budget"); }
+            self.initial_input = input;
+        } else {
+            // A slow terminal: keep claiming replies to our own probes, so
+            // they never reach the remote as typed input. Entry evidence
+            // uses only what arrived in time.
+            self.initial_input = capture.take_input(false);
+            self.baseline = baseline::Baseline::default();
+            self.late_replies = Some(LateReplies {
+                capture,
+                until: started + LATE_REPLY_WINDOW,
+                last_input: Instant::now(),
+            });
+        }
         Ok(())
     }
 
-    fn open_palette(&mut self, screen: &vt100::Screen, borrow: bool) -> io::Result<()> {
+    /// The open menu leaves remote output flowing to the model (an overlay
+    /// or a borrowed buffer), rather than deferring it as takeover does.
+    fn menu_over_live_output(&self) -> bool {
+        self.overlay_menu || self.borrowed.is_some()
+    }
+
+    /// Remove late replies to the entry probes from terminal input.
+    fn filter_late_replies(&mut self, bytes: &[u8], now: Instant) -> Vec<u8> {
+        let Some(late) = self.late_replies.as_mut() else {
+            return bytes.to_vec();
+        };
+        late.capture.feed(bytes);
+        late.last_input = now;
+        let input = late.capture.take_input(false);
+        if late.capture.finished() {
+            self.end_late_replies();
+        }
+        input
+    }
+
+    /// Release a partial sequence that stopped arriving (a lone Escape
+    /// key), and stop claiming replies once the window ends.
+    fn expire_late_replies(&mut self, now: Instant) -> Vec<u8> {
+        let Some(late) = self.late_replies.as_mut() else {
+            return Vec::new();
+        };
+        let stalled = late.capture.has_partial()
+            && now.saturating_duration_since(late.last_input) >= INPUT_SEQUENCE_TIMEOUT;
+        let mut input = late.capture.take_input(stalled);
+        if now >= late.until {
+            input.extend(late.capture.take_input(true));
+            self.end_late_replies();
+        }
+        input
+    }
+
+    fn end_late_replies(&mut self) {
+        if let Some(late) = self.late_replies.take() {
+            // Late values still improve cleanup; evidence was already fixed.
+            self.baseline = late.capture.finish().0;
+        }
+    }
+
+    fn open_palette(&mut self, screen: &vt100::Screen, overlay: bool, borrow: bool) -> io::Result<()> {
         let mut stdout = io::stdout();
         self.menu_prefix = self.output.pending().to_vec();
         self.covered_alternate = screen.alternate_screen();
         self.menu_snapshot = Some(screen.clone());
         self.palette_open = true;
+        self.overlay_menu = overlay;
         if borrow {
             self.borrowed = Some(borrowed::BorrowedMenu::new(screen));
             // No implicit cursor saving; ordinary overlay/takeover stay in
@@ -3120,14 +3203,15 @@ impl TerminalState {
         Ok(())
     }
 
-    fn close_palette(&mut self, overlay_enabled: bool) -> io::Result<()> {
+    fn close_palette(&mut self) -> io::Result<()> {
         let mut stdout = io::stdout();
-        if overlay_enabled {
+        if self.overlay_menu {
             execute!(stdout, Show)?;
         } else {
             execute!(stdout, Clear(ClearType::All), MoveTo(0, 0), Show)?;
         }
         self.palette_open = false;
+        self.overlay_menu = false;
         Ok(())
     }
 
@@ -3135,6 +3219,7 @@ impl TerminalState {
         if !self.raw && !self.palette_open {
             return;
         }
+        self.end_late_replies();
         if self.managed {
             // Cancel an unfinished parser and restore only settings observed
             // before the first child output. Never clear an inherited buffer,
@@ -3152,7 +3237,14 @@ impl TerminalState {
                 self.palette_open = false;
             }
             let mut stdout = io::stdout().lock();
-            let _ = stdout.write_all(&self.baseline.restore(self.final_screen.as_ref()));
+            if self.probed {
+                let _ = stdout.write_all(&self.baseline.restore(self.final_screen.as_ref()));
+            } else {
+                // Nothing was observed: a killed SSH child cannot be relied
+                // on for its application's cleanup, so end any partial
+                // string/update and reset the ordinary shell input modes.
+                let _ = stdout.write_all(TAKEOVER_CLEANUP);
+            }
             let _ = stdout.flush();
         }
         if self.raw {
@@ -3197,6 +3289,14 @@ fn draw_palette(
     Ok(())
 }
 
+/// Borrowing a scratch alternate buffer for a menu closes on the first
+/// query, non-ASCII byte or buffer switch, so under a live redraw it can
+/// close before it is ever seen. Takeover covers the same cases; keep
+/// borrowing opt-in until it is reliable.
+fn borrow_enabled() -> bool {
+    std::env::var_os("BEAMS_OVERLAY_BORROW").is_some_and(|value| value == "1")
+}
+
 fn new_palette_terminal() -> anyhow::Result<PaletteTerminal> {
     Terminal::new(CrosstermBackend::new(io::stdout())).context("creating local menu terminal")
 }
@@ -3204,22 +3304,22 @@ fn new_palette_terminal() -> anyhow::Result<PaletteTerminal> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn unavailable_palette_cannot_consume_keys_as_unseen_approvals() {
-        let mut router = super::InputRouter {
-            palette_available: false,
-            ..Default::default()
-        };
+    fn prefix_always_opens_a_menu_before_later_keys() {
+        // Keys typed after the prefix belong to the menu the user asked
+        // for, never to the remote session behind it.
+        let mut router = super::InputRouter::default();
         let key = super::EscapeKey::default();
-        let mut on_key = |_| panic!("unseen palette received a key");
+        let mut keys = Vec::new();
+        let mut on_key = |key| {
+            keys.push(key);
+            false
+        };
         assert_eq!(
-            router.route(key, b"\x1dy", std::time::Instant::now(), &mut on_key),
-            vec![super::InputAction::PaletteUnavailable, super::InputAction::Remote(b"y".to_vec())],
+            router.route(key, b"ab\x1dy", std::time::Instant::now(), &mut on_key),
+            vec![super::InputAction::Remote(b"ab".to_vec()), super::InputAction::OpenPalette],
         );
-        assert_eq!(
-            router.route(key, b"\x1d\x1d", std::time::Instant::now(), &mut on_key),
-            vec![super::InputAction::PaletteUnavailable, super::InputAction::Remote(b"\x1d".to_vec())],
-        );
-        assert_eq!(router.mode, super::InputMode::Passthrough);
+        assert_eq!(router.mode, super::InputMode::Palette);
+        assert_eq!(keys.len(), 1, "the key after the prefix goes to the menu");
     }
 
     use super::*;
