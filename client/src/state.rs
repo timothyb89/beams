@@ -62,9 +62,5 @@ impl State {
 }
 
 fn state_path() -> anyhow::Result<PathBuf> {
-    let config_dir = match std::env::var("XDG_CONFIG_HOME") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var("HOME").context("HOME is not set")?).join(".config"),
-    };
-    Ok(config_dir.join("beams-client/state.json"))
+    Ok(crate::clientd::instance_dir()?.join("state.json"))
 }

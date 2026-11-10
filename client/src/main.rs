@@ -45,6 +45,12 @@ const REMOTE_REPO_PATH: &str = "beams";
 #[derive(Parser)]
 #[command(name = "beams")]
 struct Args {
+    /// Use the separate `dev` client instance: its own local daemon, daemon
+    /// state, launches and Beams, sharing only `config.toml` and profiles.
+    /// For testing a development build without touching the daemon your
+    /// sessions use. Same as `BEAMS_INSTANCE=dev`.
+    #[arg(long, global = true)]
+    dev: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -282,6 +288,12 @@ enum DaemonAction {
 fn main() -> anyhow::Result<ExitCode> {
     daemonctl::record_startup_exe();
     let args = Args::parse();
+    if args.dev {
+        // Before anything resolves a path; a daemon this process starts
+        // inherits it.
+        std::env::set_var(clientd::INSTANCE_ENV, "dev");
+    }
+    clientd::instance()?;
     let code = match args.command {
         Commands::Config { command } => config::run(command)?,
         Commands::Ssh {
@@ -688,6 +700,12 @@ fn ssh(
             (fresh, packed)
         }
     };
+
+    if let Some(instance) = clientd::instance()? {
+        // Its own state.json: it only ever reaches Beams it created, so two
+        // daemons never bridge (and contend for the agent relay of) one Beam.
+        eprintln!("beams: using the {instance:?} instance (separate local daemon and Beams)");
+    }
 
     let shell_command = format!(
         "{} launch start --launch-dir ~/{}/launches/{}",

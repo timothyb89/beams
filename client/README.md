@@ -558,6 +558,17 @@ desired state, and bounded diagnostic summaries, but never persisted PIDs.
 Auto-start diagnostics go to
 `~/.config/beams-client/daemon.log`.
 
+### Development instance
+
+`beams --dev <command>` (or `BEAMS_INSTANCE=<name>`) uses a separate client
+instance under `beams-client-dev/`: its own daemon socket, daemon state and
+log, packed launches and `state.json`. It only ever reaches Beams it created,
+so a development build never replaces or competes with the daemon your
+sessions use. Without it, a different build's `beams ssh` replaces an idle
+daemon. `config.toml`, profiles and recent paths stay shared in
+`beams-client/`. Dev Beams count toward the same `tsh beams` limit; remove
+them with `beams --dev rm` or `tsh beams rm`.
+
 The local protocol is typed, versioned newline-delimited JSON. It requires a
 frontend handshake, limits frames to 64 KiB, bounds event queues, rate-limits
 each connection, and times out incomplete handshakes. Frontends receive an

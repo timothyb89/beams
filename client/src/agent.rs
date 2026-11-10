@@ -67,7 +67,7 @@ struct ConfigFile {
 
 impl Config {
     pub fn path() -> anyhow::Result<PathBuf> {
-        Ok(crate::clientd::config_dir()?.join("beams-client/config.toml"))
+        Ok(crate::clientd::shared_dir()?.join("config.toml"))
     }
 
     /// Missing file: the default (disabled). A broken file is an error, so

@@ -37,8 +37,8 @@ impl RecentPaths {
     /// `~/.config/beams-client/recent-paths.json` (or under
     /// `$XDG_CONFIG_HOME`); in memory only if neither can be found.
     pub fn load_default() -> Self {
-        match crate::clientd::config_dir() {
-            Ok(dir) => Self::load(dir.join("beams-client/recent-paths.json")),
+        match crate::clientd::shared_dir() {
+            Ok(dir) => Self::load(dir.join("recent-paths.json")),
             Err(_) => Self::default(),
         }
     }

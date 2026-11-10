@@ -3692,27 +3692,74 @@ fn read_frame<R: BufRead>(reader: &mut R) -> anyhow::Result<Option<Vec<u8>>> {
     }
 }
 
+/// Selects a separate client instance (`beams --dev` sets `dev`). Each
+/// instance has its own daemon, daemon state and log, launches and
+/// purpose-to-Beam state; `config.toml` and profiles stay shared.
+pub const INSTANCE_ENV: &str = "BEAMS_INSTANCE";
+
+/// The selected instance, if not the default. Read once per lookup from the
+/// environment, which a daemon started by this process inherits.
+pub fn instance() -> anyhow::Result<Option<String>> {
+    parse_instance(std::env::var(INSTANCE_ENV).ok().as_deref())
+}
+
+fn parse_instance(value: Option<&str>) -> anyhow::Result<Option<String>> {
+    match value {
+        None | Some("") => Ok(None),
+        Some(name) => {
+            if name.len() > 32
+                || !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            {
+                bail!("{INSTANCE_ENV}={name:?}: use up to 32 lowercase letters, digits or dashes");
+            }
+            Ok(Some(name.to_string()))
+        }
+    }
+}
+
+/// `beams-client`, or `beams-client-<instance>`.
+fn instance_dir_name() -> anyhow::Result<String> {
+    Ok(dir_name(instance()?.as_deref()))
+}
+
+fn dir_name(instance: Option<&str>) -> String {
+    match instance {
+        Some(name) => format!("beams-client-{name}"),
+        None => "beams-client".to_string(),
+    }
+}
+
+/// Per-instance state under the config directory.
+pub(crate) fn instance_dir() -> anyhow::Result<PathBuf> {
+    Ok(config_dir()?.join(instance_dir_name()?))
+}
+
+/// Settings shared by every instance (`config.toml`, profiles, recents).
+pub(crate) fn shared_dir() -> anyhow::Result<PathBuf> {
+    Ok(config_dir()?.join("beams-client"))
+}
+
 pub fn default_socket_path() -> anyhow::Result<PathBuf> {
     if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
         if !runtime.is_empty() {
-            return Ok(PathBuf::from(runtime).join("beams-client/daemon.sock"));
+            return Ok(PathBuf::from(runtime).join(instance_dir_name()?).join("daemon.sock"));
         }
     }
-    Ok(config_dir()?.join("beams-client/daemon.sock"))
+    Ok(instance_dir()?.join("daemon.sock"))
 }
 
 fn default_state_path() -> anyhow::Result<PathBuf> {
-    Ok(config_dir()?.join("beams-client/daemon-state.json"))
+    Ok(instance_dir()?.join("daemon-state.json"))
 }
 
 fn default_log_path() -> anyhow::Result<PathBuf> {
-    Ok(config_dir()?.join("beams-client/daemon.log"))
+    Ok(instance_dir()?.join("daemon.log"))
 }
 
 /// Where `beams config launch` packs launches (kept: the daemon reads them
 /// until the launch finishes, and they are the record of what was sent).
 pub fn launches_dir() -> anyhow::Result<PathBuf> {
-    Ok(config_dir()?.join("beams-client/launches"))
+    Ok(instance_dir()?.join("launches"))
 }
 
 pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
@@ -3726,6 +3773,18 @@ pub(crate) fn config_dir() -> anyhow::Result<PathBuf> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn instances_get_their_own_directory_and_reject_path_like_names() {
+        assert_eq!(parse_instance(None).unwrap(), None);
+        assert_eq!(parse_instance(Some("")).unwrap(), None);
+        assert_eq!(parse_instance(Some("dev")).unwrap().as_deref(), Some("dev"));
+        assert_eq!(dir_name(None), "beams-client");
+        assert_eq!(dir_name(Some("dev")), "beams-client-dev");
+        for bad in ["../x", "Dev", "a/b", "dev.1", &"x".repeat(33)] {
+            assert!(parse_instance(Some(bad)).is_err(), "{bad:?} accepted");
+        }
+    }
     use std::os::unix::fs::PermissionsExt;
 
     fn temp_path(name: &str) -> PathBuf {
