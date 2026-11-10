@@ -150,6 +150,15 @@ impl Screen {
             .set_size(crate::grid::Size { rows, cols }, |_| {});
     }
 
+    /// Takes the cell damage recorded in both buffers since the last call.
+    /// Buffer switches and resets are not damage to either buffer's cells;
+    /// callers that care about what is displayed must track those too.
+    pub fn take_damage(&mut self) -> crate::Damage {
+        let mut damage = self.grid.take_damage();
+        damage.merge(&self.alternate_grid.take_damage());
+        damage
+    }
+
     /// Returns the current size of the terminal.
     ///
     /// The return value will be (rows, cols).

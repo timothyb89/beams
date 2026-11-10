@@ -203,9 +203,14 @@ escape sequences (the session tracks the remote stream's parser state,
 including OSC/DCS strings, split UTF-8, and the remote's own synchronized
 updates), inside a synchronized update of their own; afterwards the cursor and
 drawing attributes are restored from the model rather than with DECSC, whose
-single slot the remote may be using. A toast is repainted once remote output
-settles (or every 250 ms during a long burst), and the cells it covered are
-repainted from the model when it goes away or the session ends. Painting
+single slot the remote may be using. A toast stays up across remote output
+that doesn't touch it; output that overwrites it is passed through and
+repainted in the same synchronized update, and output that scrolls or shifts
+its rows is preceded by an erase so the move can't carry it into the remote's
+screen. Only when a read ends mid-sequence or inside the remote's own
+synchronized update is it taken down and repainted once output settles (or
+every 250 ms during a long burst). The cells it covered are repainted from the
+model when it goes away or the session ends. Painting
 suspends origin/insert modes, character mapping and OSC 8 hyperlinks, then
 restores current state without using the remote's save slot. Restored cells
 retain their hyperlink targets; local notices do not inherit them.

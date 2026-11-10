@@ -636,6 +636,94 @@ mod tests {
         (1..bytes.len()).filter(|&i| bytes[i] == 0x1b)
     }
 
+    /// Keep a toast up through a whole recording the way passthrough does:
+    /// each chunk goes through `ToastPainter::pass_output`, and the main
+    /// loop's `sync` puts the toast back whenever a chunk took it down.
+    /// After every chunk the terminal must match an unpainted one outside
+    /// the toast, and the toast must be whole: no fragments carried into the
+    /// remote's screen by a scroll, at any read size.
+    #[test]
+    fn a_toast_kept_up_through_recordings_never_leaves_fragments() {
+        use super::super::toast::{placement, OutputTracker, Toast, ToastPainter, Tone};
+        use std::time::{Duration, Instant};
+        let notice = Toast {
+            tone: Tone::Info,
+            title: "Beams".to_string(),
+            lines: vec![ratatui::text::Line::from("request pending approval")],
+        };
+        for recording in RECORDINGS {
+            let (bytes, rows, cols) = (recording.bytes, recording.rows, recording.cols);
+            let exit = exit_offset(bytes);
+            let rect = placement(&notice, rows, cols).unwrap();
+            let (_, replies) = &reply_sets(recording)[0];
+            let new_parser = || vt100::Parser::new(
+                std::num::NonZeroU16::new(rows).unwrap(),
+                std::num::NonZeroU16::new(cols).unwrap(),
+                0,
+            );
+            for size in [23, 509, 4096] {
+                let name = format!("{}, {size}-byte reads", recording.name);
+                let mut model = entry_model(replies, rows, cols);
+                let (mut physical, mut unpainted) = (new_parser(), new_parser());
+                let mut tracker = OutputTracker::default();
+                let mut painter = ToastPainter::default();
+                let mut now = Instant::now();
+                let (mut kept, mut repainted, mut erased) = (0, 0, 0);
+                for chunk in bytes[..exit].chunks(size) {
+                    model.take_damage();
+                    let erase = painter.prepare_output(&model);
+                    let shown = painter.is_shown();
+                    model.process(chunk);
+                    tracker.feed(chunk, now);
+                    let damage = model.take_damage();
+                    let out = painter.pass_output(erase, &damage, chunk, &model, &mut tracker, now);
+                    if shown {
+                        match (painter.is_shown(), out.as_ref() == chunk) {
+                            (true, true) => kept += 1,
+                            (true, false) => repainted += 1,
+                            (false, _) => erased += 1,
+                        }
+                    }
+                    physical.process(&out);
+                    unpainted.process(chunk);
+                    // The main loop, once output has settled.
+                    now += Duration::from_secs(1);
+                    painter.output_written();
+                    physical.process(&painter.sync(Some(&notice), &model, &mut tracker, now));
+
+                    let toast = painter.is_shown().then_some(rect);
+                    for row in 0..rows {
+                        for col in 0..cols {
+                            if toast.is_some_and(|rect| rect.contains((col, row).into())) {
+                                continue;
+                            }
+                            let text = |parser: &vt100::Parser| {
+                                let cell = parser.screen().cell(row, col).unwrap();
+                                if cell.has_contents() { cell.contents().to_string() } else { " ".into() }
+                            };
+                            assert_eq!(text(&physical), text(&unpainted), "{name}: ({row}, {col})");
+                        }
+                    }
+                    if toast.is_some() {
+                        let corner = physical.screen().cell(rect.top(), rect.left()).unwrap();
+                        assert_eq!(corner.contents(), "╭", "{name}: toast is whole");
+                    }
+                    assert_eq!(
+                        physical.screen().cursor_position(),
+                        unpainted.screen().cursor_position(),
+                        "{name}"
+                    );
+                }
+                assert!(kept + repainted > 0, "{name}: the toast stayed up across output");
+                eprintln!("{name}: kept {kept}, repainted {repainted}, erased {erased}");
+                physical.process(&painter.clear(&model));
+                physical.process(&bytes[exit..]);
+                unpainted.process(&bytes[exit..]);
+                assert_eq!(physical.screen().contents(), unpainted.screen().contents(), "{name}");
+            }
+        }
+    }
+
     /// Paint a toast at the first eligible boundary and a menu covering
     /// output from there to a later boundary; replay the rest. An unpainted
     /// terminal must end identical, including the workstation primary that

@@ -13,6 +13,77 @@ pub struct Grid {
     saved_origin_mode: bool,
     tabs_cleared: bool,
     scrollback: Option<ScrollbackState>,
+    damage: Damage,
+}
+
+/// What the drawing rows have had done to them since the last
+/// [`Screen::take_damage`](crate::Screen::take_damage): cells written in
+/// place, and rows whose existing contents moved (scrolling, line or cell
+/// insertion/deletion). Conservative: an access that may have changed a
+/// cell counts as a write.
+///
+/// An overlay drawn over the screen uses this to tell remote output that
+/// never touched it from output that overwrote it (repaint after) or moved
+/// it somewhere else (erase before the move).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Damage {
+    /// Inclusive range of rows whose contents moved.
+    moved: Option<(u16, u16)>,
+    /// Per drawing row, the inclusive column span written in place.
+    written: Vec<Option<(u16, u16)>>,
+}
+
+impl Damage {
+    /// The inclusive range of rows whose existing contents moved, if any.
+    pub fn moved_rows(&self) -> Option<(u16, u16)> {
+        self.moved
+    }
+
+    /// The inclusive column span of `row` written in place, if any.
+    pub fn written_cols(&self, row: u16) -> Option<(u16, u16)> {
+        self.written.get(usize::from(row)).copied().flatten()
+    }
+
+    /// Adds `other`'s damage to this one.
+    pub fn merge(&mut self, other: &Self) {
+        if let Some((top, bottom)) = other.moved {
+            self.mark_moved(top, bottom);
+        }
+        for (row, span) in other.written.iter().enumerate() {
+            if let Some((left, right)) = *span {
+                self.mark_written(row as u16, left, right);
+            }
+        }
+    }
+
+    pub(crate) fn mark_moved(&mut self, top: u16, bottom: u16) {
+        self.moved = Some(match self.moved {
+            Some((t, b)) => (t.min(top), b.max(bottom)),
+            None => (top, bottom),
+        });
+    }
+
+    pub(crate) fn mark_written(&mut self, row: u16, left: u16, right: u16) {
+        let index = usize::from(row);
+        if self.written.len() <= index {
+            self.written.resize(index + 1, None);
+        }
+        let span = &mut self.written[index];
+        *span = Some(match *span {
+            Some((l, r)) => (l.min(left), r.max(right)),
+            None => (left, right),
+        });
+    }
+
+    pub(crate) fn mark_all(&mut self, rows: u16, cols: u16) {
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        self.mark_moved(0, rows - 1);
+        for row in 0..rows {
+            self.mark_written(row, 0, cols - 1);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +124,18 @@ impl Grid {
             saved_origin_mode: false,
             tabs_cleared: false,
             scrollback,
+            damage: Damage::default(),
+        }
+    }
+
+    pub fn take_damage(&mut self) -> Damage {
+        core::mem::take(&mut self.damage)
+    }
+
+    fn mark_rows_written(&mut self, rows: core::ops::Range<u16>) {
+        let cols = self.size.cols();
+        for row in rows {
+            self.damage.mark_written(row, 0, cols - 1);
         }
     }
 
@@ -70,6 +153,7 @@ impl Grid {
         for row in self.drawing_rows_mut() {
             row.reset();
         }
+        self.mark_rows_written(0..self.rows.len() as u16);
         self.scroll_top = 0;
         self.scroll_bottom = self.size.rows() - 1;
         self.origin_mode = false;
@@ -88,6 +172,7 @@ impl Grid {
         if size == self.size {
             return;
         }
+        self.damage.mark_all(size.rows(), size.cols());
 
         // xterm always resets the scroll region and scrollback offset when the
         // screen is resized.
@@ -248,15 +333,32 @@ impl Grid {
         self.drawing_rows().nth(usize::from(row))
     }
 
+    /// Conservatively counts as writing the whole row; prefer a narrower
+    /// accessor where only some cells (or only the wrap flag) change.
     pub fn drawing_row_mut(
         &mut self,
         row: u16,
     ) -> Option<&mut crate::row::Row> {
-        self.drawing_rows_mut().nth(usize::from(row))
+        if row < self.rows.len() as u16 {
+            self.mark_rows_written(row..row + 1);
+        }
+        self.row_mut_untracked(row)
+    }
+
+    /// For changes that don't alter what a row displays (its wrap flag), or
+    /// whose damage the caller records itself.
+    fn row_mut_untracked(&mut self, row: u16) -> Option<&mut crate::row::Row> {
+        self.rows.get_mut(usize::from(row))
     }
 
     pub fn current_row_mut(&mut self) -> &mut crate::row::Row {
         self.drawing_row_mut(self.pos.row)
+            // we assume self.pos.row is always valid
+            .unwrap()
+    }
+
+    fn current_row_mut_untracked(&mut self) -> &mut crate::row::Row {
+        self.row_mut_untracked(self.pos.row)
             // we assume self.pos.row is always valid
             .unwrap()
     }
@@ -270,7 +372,10 @@ impl Grid {
     }
 
     pub fn drawing_cell_mut(&mut self, pos: Pos) -> Option<&mut crate::Cell> {
-        self.drawing_row_mut(pos.row)
+        if pos.row < self.rows.len() as u16 && pos.col < self.size.cols() {
+            self.damage.mark_written(pos.row, pos.col, pos.col);
+        }
+        self.row_mut_untracked(pos.row)
             .and_then(|r| r.get_mut(pos.col))
     }
 
@@ -600,6 +705,7 @@ impl Grid {
         for row in self.drawing_rows_mut() {
             row.clear(attrs);
         }
+        self.mark_rows_written(0..self.rows.len() as u16);
     }
 
     pub fn erase_all_forward(&mut self, attrs: crate::attrs::Attrs) {
@@ -607,6 +713,7 @@ impl Grid {
         for row in self.drawing_rows_mut().skip(usize::from(pos.row) + 1) {
             row.clear(attrs);
         }
+        self.mark_rows_written(pos.row + 1..self.rows.len() as u16);
 
         self.erase_row_forward(attrs);
     }
@@ -616,6 +723,7 @@ impl Grid {
         for row in self.drawing_rows_mut().take(usize::from(pos.row)) {
             row.clear(attrs);
         }
+        self.mark_rows_written(0..pos.row);
 
         self.erase_row_backward(attrs);
     }
@@ -640,7 +748,13 @@ impl Grid {
     pub fn erase_row_forward(&mut self, attrs: crate::attrs::Attrs) {
         let size = self.size;
         let pos = self.pos;
-        let row = self.current_row_mut();
+        // Erasing may also clear the other half of a wide glyph.
+        self.damage.mark_written(
+            pos.row,
+            pos.col.saturating_sub(1).min(size.cols() - 1),
+            size.cols() - 1,
+        );
+        let row = self.current_row_mut_untracked();
         for col in pos.col..size.cols() {
             row.erase(col, attrs);
         }
@@ -649,14 +763,22 @@ impl Grid {
     pub fn erase_row_backward(&mut self, attrs: crate::attrs::Attrs) {
         let size = self.size;
         let pos = self.pos;
-        let row = self.current_row_mut();
-        for col in 0..=pos.col.min(size.cols() - 1) {
+        let right = pos.col.min(size.cols() - 1);
+        self.damage.mark_written(
+            pos.row,
+            0,
+            right.saturating_add(1).min(size.cols() - 1),
+        );
+        let row = self.current_row_mut_untracked();
+        for col in 0..=right {
             row.erase(col, attrs);
         }
     }
 
     pub fn insert_cells(&mut self, count: u16) {
         let pos = self.pos;
+        // Cells shift sideways: anything drawn on this row moves.
+        self.damage.mark_moved(pos.row, pos.row);
         let row = self.current_row_mut();
         row.insert(pos.col, count);
     }
@@ -664,6 +786,7 @@ impl Grid {
     pub fn delete_cells(&mut self, count: u16) {
         let size = self.size;
         let pos = self.pos;
+        self.damage.mark_moved(pos.row, pos.row);
         let row = self.current_row_mut();
         row.remove(pos.col..pos.col.saturating_add(count).min(size.cols()));
     }
@@ -671,9 +794,17 @@ impl Grid {
     pub fn erase_cells(&mut self, count: u16, attrs: crate::attrs::Attrs) {
         let size = self.size;
         let pos = self.pos;
-        let row = self.current_row_mut();
-        for col in pos.col..((pos.col.saturating_add(count)).min(size.cols()))
-        {
+        let end = (pos.col.saturating_add(count)).min(size.cols());
+        if end > pos.col {
+            // Including the neighbours whose wide halves may be cleared.
+            self.damage.mark_written(
+                pos.row,
+                pos.col.saturating_sub(1),
+                end.min(size.cols() - 1),
+            );
+        }
+        let row = self.current_row_mut_untracked();
+        for col in pos.col..end {
             row.erase(col, attrs);
         }
     }
@@ -685,6 +816,7 @@ impl Grid {
         if !(self.scroll_top..=self.scroll_bottom).contains(&self.pos.row) {
             return;
         }
+        self.damage.mark_moved(self.pos.row, self.scroll_bottom);
         let between = &mut self.rows
             [usize::from(self.pos.row)..=usize::from(self.scroll_bottom)];
         let num_between = between.len();
@@ -700,6 +832,9 @@ impl Grid {
     pub fn delete_lines(&mut self, count: u16) {
         if !(self.scroll_top..=self.scroll_bottom).contains(&self.pos.row) {
             return;
+        }
+        if count > 0 {
+            self.damage.mark_moved(self.pos.row, self.scroll_bottom);
         }
         let between = &mut self.rows
             [usize::from(self.pos.row)..=usize::from(self.scroll_bottom)];
@@ -718,6 +853,9 @@ impl Grid {
         // This can be true even when `self.scrollback` is `None`; it controls
         // whether we call the `on_row` callback.
         let scrollback_enabled = self.scroll_top == 0;
+        if count > 0 && !self.rows.is_empty() {
+            self.damage.mark_moved(self.scroll_top, self.scroll_bottom);
+        }
         let between = &mut self.rows
             [usize::from(self.scroll_top)..=usize::from(self.scroll_bottom)];
         let num_between = between.len();
@@ -785,6 +923,7 @@ impl Grid {
         if count == 0 {
             return;
         }
+        self.damage.mark_moved(self.scroll_top, self.scroll_bottom);
         let between = &mut self.rows
             [usize::from(self.scroll_top)..=usize::from(self.scroll_bottom)];
         let num_between = between.len();
@@ -918,7 +1057,7 @@ impl Grid {
 
         prev_pos.row -= scrolled;
         let new_pos = self.pos;
-        self.drawing_row_mut(prev_pos.row)
+        self.row_mut_untracked(prev_pos.row)
             // we assume self.pos.row is always valid, and so prev_pos.row
             // must be valid because it is always less than or equal to
             // self.pos.row

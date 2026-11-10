@@ -2789,15 +2789,15 @@ fn drain_output(
                     }
                     continue;
                 }
-                if mode == InputMode::Passthrough {
-                    // Remove a toast using the last represented state before
-                    // new output can invalidate it. Raw output then stays raw.
-                    let clear = painter.clear(terminal_model);
-                    if !clear.is_empty() {
-                        stdout.write_all(&clear).context("removing toast before remote output")?;
-                        wrote = true;
-                    }
-                }
+                // A shown toast's restoration must come from the last
+                // represented state, before this chunk can invalidate it.
+                // Whether it's needed is known once the chunk is processed.
+                let erase = if mode == InputMode::Passthrough {
+                    terminal_model.take_damage();
+                    painter.prepare_output(terminal_model)
+                } else {
+                    None
+                };
                 let mut offset = 0;
                 while offset < bytes.len() {
                     let (consumed, rejected) =
@@ -2850,6 +2850,12 @@ fn drain_output(
                         deferred.push(&bytes);
                     }
                 } else {
+                    // Raw output stays raw; a toast is left alone, repainted
+                    // atomically with it, or erased ahead of it.
+                    let damage = terminal_model.take_damage();
+                    let bytes = painter.pass_output(
+                        erase, &damage, &bytes, terminal_model, tracker, Instant::now(),
+                    );
                     stdout
                         .write_all(&bytes)
                         .context("writing remote PTY output")?;

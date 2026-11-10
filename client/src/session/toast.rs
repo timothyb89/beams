@@ -13,13 +13,21 @@
 //! - **Restoring state.** The cursor position/visibility and the current
 //!   drawing attributes are restored from the shadow `TerminalModel` rather
 //!   than with DECSC/DECRC, whose single save slot the remote may be using.
-//! - **Being painted over.** Remote output can overwrite the toast, so it is
-//!   repainted once output settles (or periodically during a long burst).
+//! - **Being painted over.** The shadow model records which cells each
+//!   chunk of remote output writes and which rows it moves. Output that
+//!   misses the toast passes with the toast left up; output that overwrites
+//!   it is passed through and repainted in one synchronized update; output
+//!   that scrolls or shifts its rows is preceded by an erase, so the move
+//!   cannot carry toast cells into the remote's screen
+//!   (`ToastPainter::pass_output`). A chunk ending mid-sequence takes the
+//!   toast down first, and it is repainted once output settles (or
+//!   periodically during a long burst).
 //! - **Going away.** The cells under a toast are repainted from the model.
 //!
 //! Eligibility covers the restoration rows and current drawing state. A toast
 //! never needs the application's saved cursor or unknown cells elsewhere.
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -31,7 +39,7 @@ use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use super::ui::theme;
-use crate::terminal_model::TerminalModel;
+use crate::terminal_model::{Disturbance, OutputDamage, TerminalModel};
 use crate::terminal_paint;
 
 /// Output must have been quiet this long before painting, so a toast isn't
@@ -262,6 +270,99 @@ impl ToastPainter {
         out
     }
 
+    /// Before a passthrough chunk is processed: what would put back the
+    /// cells under the shown toast, from the model as it stands *now*. Only
+    /// the pre-chunk model matches the physical screen under the toast, so
+    /// this must be captured before the chunk reaches the model.
+    pub fn prepare_output(&self, model: &TerminalModel) -> Option<PreparedErase> {
+        let (rect, _) = self.shown.as_ref()?;
+        let area = restoration_area(*rect, model.screen().size().1.get());
+        if !model.can_paint_area(area) {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        restore_area(model.screen(), area, &mut bytes);
+        terminal_paint::restore(model.screen(), false, &mut bytes);
+        Some(PreparedErase(bytes))
+    }
+
+    /// The bytes to write for a passthrough `chunk`, already processed into
+    /// `model` and `tracker`, whose effect on the screen is `damage`.
+    /// `erase` is `prepare_output` from before the chunk.
+    ///
+    /// A toast stays up across output that never touches it, and output that
+    /// does is passed through in the same synchronized update as the
+    /// repaint, so the terminal never displays the toast missing or torn:
+    ///
+    /// - **Untouched**: the chunk as-is. Nothing to erase or repaint.
+    /// - **Overwritten**: chunk, then the toast again, in one update.
+    /// - **Moved** (scroll, line/cell shifts, buffer switch): erase from the
+    ///   pre-chunk model first, so the move cannot carry toast cells into
+    ///   the remote's screen, then chunk and toast, in one update.
+    ///
+    /// None of this needs the remote to be finished with a redraw: every
+    /// written state matches the model plus a complete toast on top. What
+    /// it needs is to be able to erase ahead of *any* future chunk, so the
+    /// toast only stays up across a chunk that ends at a stream boundary
+    /// (outside the remote's own synchronized update) in a still-paintable
+    /// area. Otherwise it is erased ahead of the chunk, as before, and
+    /// `sync` puts it back once output settles.
+    pub fn pass_output<'a>(
+        &mut self,
+        erase: Option<PreparedErase>,
+        damage: &OutputDamage,
+        chunk: &'a [u8],
+        model: &TerminalModel,
+        tracker: &mut OutputTracker,
+        now: Instant,
+    ) -> Cow<'a, [u8]> {
+        let Some((rect, toast)) = self.shown.clone() else {
+            return Cow::Borrowed(chunk);
+        };
+        let Some(PreparedErase(erase)) = erase else {
+            // The area wasn't restorable before this chunk (as in `clear`).
+            self.forget();
+            return Cow::Borrowed(chunk);
+        };
+        let (rows, cols) = model.screen().size();
+        let area = restoration_area(rect, cols.get());
+        let keep = tracker.at_boundary(now)
+            && placement(&toast, rows.get(), cols.get()) == Some(rect)
+            && model.can_paint_area(area);
+        let disturbance = damage.disturbance(area);
+        if keep && disturbance == Disturbance::Untouched {
+            return Cow::Borrowed(chunk);
+        }
+        let mut out = Vec::with_capacity(chunk.len() + erase.len() * 2 + 64);
+        if !keep {
+            out.extend_from_slice(terminal_paint::BEGIN);
+            out.extend_from_slice(&erase);
+            out.extend_from_slice(terminal_paint::END);
+            out.extend_from_slice(chunk);
+            self.forget();
+            return Cow::Owned(out);
+        }
+        if disturbance == Disturbance::Moved {
+            out.extend_from_slice(terminal_paint::BEGIN);
+            out.extend_from_slice(&erase);
+        } else {
+            out.extend_from_slice(SYNC_BEGIN);
+        }
+        // The chunk ends outside any remote synchronized update, so a remote
+        // frame end inside it can wait for ours, a few bytes later, instead of
+        // displaying the frame without the toast.
+        push_without_sync_end(chunk, &mut out);
+        out.extend_from_slice(terminal_paint::BEGIN);
+        let mut buf = Buffer::empty(rect);
+        render_toast(&toast, rect, &mut buf);
+        encode_area(&buf, rect, &mut out);
+        terminal_paint::restore(model.screen(), false, &mut out);
+        out.extend_from_slice(terminal_paint::END);
+        self.dirty = false;
+        self.last_paint = Some(now);
+        Cow::Owned(out)
+    }
+
     /// Paints immediately, regardless of the tracker. For tests.
     #[cfg(test)]
     fn sync_now(&mut self, desired: Option<&Toast>, model: &TerminalModel) -> Vec<u8> {
@@ -269,6 +370,25 @@ impl ToastPainter {
         self.last_paint = None;
         self.sync(desired, model, &mut tracker, Instant::now())
     }
+}
+
+/// Cell restoration captured by `ToastPainter::prepare_output`.
+#[derive(Debug)]
+pub struct PreparedErase(Vec<u8>);
+
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
+
+/// Copies `chunk` without its synchronized-update ends. ESC always starts a
+/// new sequence (it ends or aborts any string in progress), so a byte match
+/// is a real sequence, never string payload.
+fn push_without_sync_end(chunk: &[u8], out: &mut Vec<u8>) {
+    let mut rest = chunk;
+    while let Some(at) = rest.windows(SYNC_END.len()).position(|w| w == SYNC_END) {
+        out.extend_from_slice(&rest[..at]);
+        rest = &rest[at + SYNC_END.len()..];
+    }
+    out.extend_from_slice(rest);
 }
 
 fn restoration_area(area: Rect, cols: u16) -> Rect {
@@ -765,6 +885,178 @@ mod tests {
                 .is_empty(),
             "mid-sequence"
         );
+    }
+
+    /// One passthrough chunk the way `drain_output` handles it.
+    fn pass(
+        painter: &mut ToastPainter,
+        model: &mut TerminalModel,
+        tracker: &mut OutputTracker,
+        chunk: &[u8],
+    ) -> Vec<u8> {
+        let now = Instant::now();
+        model.take_damage();
+        let erase = painter.prepare_output(model);
+        model.process(chunk);
+        tracker.feed(chunk, now);
+        let damage = model.take_damage();
+        painter
+            .pass_output(erase, &damage, chunk, model, tracker, now)
+            .into_owned()
+    }
+
+    /// The physical screen is the model everywhere, except a whole toast in
+    /// `toast_at` (when given).
+    fn assert_physical(physical: &vt100::Parser, model: &TerminalModel, toast_at: Option<Rect>, what: &str) {
+        let (rows, cols) = model.screen().size();
+        for row in 0..rows.get() {
+            for col in 0..cols.get() {
+                if toast_at.is_some_and(|rect| rect.contains((col, row).into())) {
+                    continue;
+                }
+                // Written spaces and never-written cells look alike.
+                let text = |cell: &vt100::Cell| {
+                    if cell.has_contents() { cell.contents().to_string() } else { " ".to_string() }
+                };
+                let (actual, expected) = (
+                    text(physical.screen().cell(row, col).unwrap()),
+                    text(model.screen().cell(row, col).unwrap()),
+                );
+                assert_eq!(
+                    actual, expected,
+                    "{what}: cell ({row}, {col}) differs from the model"
+                );
+            }
+        }
+        if let Some(rect) = toast_at {
+            let screen = physical.screen();
+            for (row, col, corner) in [
+                (rect.top(), rect.left(), "╭"),
+                (rect.top(), rect.right() - 1, "╮"),
+                (rect.bottom() - 1, rect.left(), "╰"),
+                (rect.bottom() - 1, rect.right() - 1, "╯"),
+            ] {
+                assert_eq!(screen.cell(row, col).unwrap().contents(), corner, "{what}: toast is whole");
+            }
+        }
+        assert_eq!(
+            physical.screen().cursor_position(),
+            model.screen().cursor_position(),
+            "{what}: cursor"
+        );
+    }
+
+    fn filled_model() -> (TerminalModel, Vec<u8>) {
+        let mut model = model(10, 60);
+        let mut remote = b"\x1bc".to_vec();
+        for row in 0..10 {
+            write!(remote, "\x1b[{};1Hline {row} {}", row + 1, "x".repeat(40)).unwrap();
+        }
+        model.process(&remote);
+        (model, remote)
+    }
+
+    #[test]
+    fn a_toast_stays_up_untouched_and_repaints_atomically_when_overwritten_or_moved() {
+        let (mut model, remote) = filled_model();
+        let notice = toast("stays up");
+        let rect = placement(&notice, 10, 60).unwrap();
+        let mut painter = ToastPainter::default();
+        let mut tracker = OutputTracker::default();
+        tracker.feed(&remote, Instant::now());
+        let mut physical = screen_after(10, 60, &[&remote, &painter.sync_now(Some(&notice), &model)]);
+        assert_physical(&physical, &model, Some(rect), "painted");
+
+        // Output elsewhere, including a scroll confined above the toast: the
+        // chunk goes out untouched, no erase and no repaint.
+        for chunk in [b"\x1b[2;1Hhello".as_slice(), b"\x1b[1;3r\x1b[3;1H\n\n\x1b[r\x1b[5;5H"] {
+            let out = pass(&mut painter, &mut model, &mut tracker, chunk);
+            assert_eq!(out, chunk, "untouched output passes through as-is");
+            physical.process(&out);
+            assert_physical(&physical, &model, Some(rect), "untouched");
+        }
+
+        // Writing across the toast's rows: passed through and repainted in a
+        // single synchronized update, with no erase first.
+        let mut chunk = b"\x1b[8;1H".to_vec();
+        chunk.extend_from_slice("y".repeat(59).as_bytes());
+        let out = pass(&mut painter, &mut model, &mut tracker, &chunk);
+        assert!(out.starts_with(SYNC_BEGIN) && out.ends_with(SYNC_END));
+        assert_eq!(out.windows(SYNC_END.len()).filter(|w| *w == SYNC_END).count(), 1, "one update");
+        physical.process(&out);
+        assert_physical(&physical, &model, Some(rect), "overwritten");
+
+        // The reverted attempt's failure: a later chunk scrolls. The toast
+        // is erased ahead of the scroll, so nothing of it is carried up into
+        // the remote's rows, then drawn again at its place.
+        for chunk in [b"\x1b[10;1H\n\nnew bottom".as_slice(), b"\x1b[3;1H\x1b[2M", b"\x1b[9;1H\x1b[3P"] {
+            let out = pass(&mut painter, &mut model, &mut tracker, chunk);
+            physical.process(&out);
+            assert_physical(&physical, &model, Some(rect), "moved");
+            assert!(out.starts_with(terminal_paint::BEGIN) && out.ends_with(SYNC_END));
+            assert_eq!(out.windows(SYNC_END.len()).filter(|w| *w == SYNC_END).count(), 1, "one update");
+        }
+        assert!(painter.is_shown());
+        physical.process(&painter.clear(&model));
+        assert_physical(&physical, &model, None, "cleared");
+    }
+
+    #[test]
+    fn a_remote_frame_end_waits_for_the_toast_repaint() {
+        let (mut model, remote) = filled_model();
+        let notice = toast("frames");
+        let rect = placement(&notice, 10, 60).unwrap();
+        let mut painter = ToastPainter::default();
+        let mut tracker = OutputTracker::default();
+        tracker.feed(&remote, Instant::now());
+        let mut physical = screen_after(10, 60, &[&remote, &painter.sync_now(Some(&notice), &model)]);
+        let chunk = b"\x1b[?2026h\x1b[8;1H\x1b[2Kstatus\x1b[?2026l\x1b[?2026h\x1b[9;1H\x1b[2K\x1b[?2026l";
+        let out = pass(&mut painter, &mut model, &mut tracker, chunk);
+        assert_eq!(out.windows(SYNC_END.len()).filter(|w| *w == SYNC_END).count(), 1);
+        assert!(out.ends_with(SYNC_END), "the frame is displayed with the toast already on it");
+        physical.process(&out);
+        assert_physical(&physical, &model, Some(rect), "remote frames");
+    }
+
+    #[test]
+    fn a_chunk_ending_mid_sequence_or_mid_frame_takes_the_toast_down_first() {
+        for (first, rest) in [
+            (b"\x1b[8;1Hab\x1b[3".as_slice(), b"1mcd".as_slice()),
+            (b"\x1b[?2026h\x1b[2;1Hab".as_slice(), b"\x1b[?2026l".as_slice()),
+        ] {
+            let (mut model, remote) = filled_model();
+            let notice = toast("down");
+            let mut painter = ToastPainter::default();
+            let mut tracker = OutputTracker::default();
+            tracker.feed(&remote, Instant::now());
+            let mut physical = screen_after(10, 60, &[&remote, &painter.sync_now(Some(&notice), &model)]);
+            let out = pass(&mut painter, &mut model, &mut tracker, first);
+            assert!(out.starts_with(terminal_paint::BEGIN) && out.ends_with(first));
+            assert!(!painter.is_shown(), "sync puts it back once output settles");
+            physical.process(&out);
+            let out = pass(&mut painter, &mut model, &mut tracker, rest);
+            assert_eq!(out, rest);
+            physical.process(&out);
+            assert_physical(&physical, &model, None, "erased ahead of the chunk");
+        }
+    }
+
+    #[test]
+    fn switching_buffers_never_leaves_the_toast_behind() {
+        let (mut model, remote) = filled_model();
+        let notice = toast("buffers");
+        let mut painter = ToastPainter::default();
+        let mut tracker = OutputTracker::default();
+        tracker.feed(&remote, Instant::now());
+        let mut physical = screen_after(10, 60, &[&remote, &painter.sync_now(Some(&notice), &model)]);
+        for chunk in [b"\x1b[?1049h\x1b[2J\x1b[Halternate".as_slice(), b"\x1b[?1049l"] {
+            let out = pass(&mut painter, &mut model, &mut tracker, chunk);
+            physical.process(&out);
+            let shown = painter.is_shown().then(|| placement(&notice, 10, 60).unwrap());
+            assert_physical(&physical, &model, shown, "switch");
+        }
+        physical.process(&painter.clear(&model));
+        assert_physical(&physical, &model, None, "primary is clean");
     }
 
     #[test]

@@ -618,3 +618,52 @@ than through zellij's redraw happening to land first.
   integration tests, every managed-session smoke variant and the PTY
   harness pass (the xterm.js reference replay was not available in this
   environment to re-run). Real-session confirmation of this slice is next.
+
+Toast flicker, second attempt (2026-11-10): the first attempt (896f9c7,
+reverted in c35a84e) repainted after every chunk ending at a parser
+boundary, and a scroll in a *later* chunk dragged that toast into the
+remote's rows. This one stops asking *when* output is done and instead asks
+what each chunk *did* to the toast's area.
+
+- The vendored vt100 records `Damage` per grid: per-row written column spans
+  (`drawing_cell_mut`, erases, `clear`) and the union of rows whose contents
+  moved (`scroll_up`/`scroll_down`, IL/DL, ICH/DCH - including insert-mode
+  printing - and `set_size`). Wrap-flag-only changes don't count.
+  `Screen::take_damage` drains both buffers. `TerminalModel::take_damage`
+  adds buffer switches and RIS (which replaces the screen) as `displaced`,
+  and `OutputDamage::disturbance(area)` classifies an area as `Untouched`,
+  `Overwritten` or `Moved`.
+- `drain_output` captures `ToastPainter::prepare_output` (restoration from
+  the pre-chunk model, the only state matching what is physically under the
+  toast) before processing a passthrough chunk, then writes whatever
+  `pass_output` returns:
+  - untouched: the chunk unchanged, toast left up - no erase, no repaint;
+  - overwritten: `?2026h`, chunk, toast, `?2026l`;
+  - moved: erase, chunk, toast, all in one synchronized update.
+  The remote's own `CSI ? 2026 l` inside a wrapped chunk is dropped so its
+  frame is displayed with the toast already back on it (our end follows a
+  few bytes later; the chunk is known to end outside a remote sync block).
+- Invariant: the toast stays up across a chunk only if that chunk ends at
+  a boundary outside a remote synchronized update with the area still
+  paintable, so an erase can always be emitted ahead of the next chunk.
+  Otherwise it is erased ahead of the chunk and `sync`'s `SETTLE`/
+  `BURST_REPAINT` path puts it back, exactly as before. `output_written`
+  still marks it dirty, so `sync` also overpaints it once output settles -
+  invisible when nothing changed, and a backstop if damage ever misses a
+  write.
+- Painting mid-redraw is fine now: each written state is the model plus a
+  whole toast, and anything that would move it is preceded by an erase.
+  Not addressed: REP (`CSI b`) right after a toast paint repeats our last
+  glyph rather than the remote's - pre-existing for any toast paint.
+- Tests: `session/toast.rs` covers untouched output (including a scroll
+  confined above the toast), overwrite, the reverted attempt's later-chunk
+  scroll plus DL/DCH, remote frame ends, mid-sequence and mid-frame chunk
+  ends, and buffer switches; disabling the erase-before-move makes the
+  scroll test fail with a toast corner dragged into the remote's rows.
+  `baseline.rs`'s `a_toast_kept_up_through_recordings_never_leaves_fragments`
+  replays the zellij + claude recording at 23/509/4096-byte reads, running
+  `sync` between chunks, and checks the physical screen against an
+  unpainted one after every chunk (at 23-byte reads the toast stayed up
+  across 518 of 611 chunks it was shown for). That recording never scrolls
+  through the toast's rows while it's up, so the move path is exercised
+  only by the unit tests. Real-session confirmation in zellij is next.

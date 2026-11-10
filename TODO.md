@@ -997,7 +997,17 @@ bootstrap `Task`s.
   - [ ] Toast flicker over frequently redrawn rows (e.g. claude's input/status
     lines): erase, pass through and repaint in one synchronized update when a
     chunk ends at a boundary, instead of repainting after 30 ms of quiet.
-    Tried and reverted (2026-11-10, commit 896f9c7/c35a84e): repainting right
+    Second attempt (2026-11-10, damage tracking - needs real-session
+    confirmation in zellij before ticking): the vendored vt100 now records
+    per-chunk cell writes and row moves, so `ToastPainter::pass_output`
+    leaves the toast up across output that misses it, repaints it in the
+    same synchronized update as output that overwrites it (folding the
+    remote's own `?2026l` into ours), and erases it *before* output that
+    scrolls/shifts its rows or switches buffers - which is what makes
+    painting mid-redraw safe without an end-of-burst signal. Chunks ending
+    mid-sequence or inside a remote sync block still fall back to the
+    erase + settle path. See `docs/development/terminal-overlay.md`.
+    First attempt, tried and reverted (2026-11-10, commit 896f9c7/c35a84e): repainting right
     after every chunk that ends at a parser boundary is not safe - "at a
     boundary" only means we're not mid-escape-sequence, not that the remote
     is done with a multi-chunk redraw. zellij's tab-switch/selection redraws

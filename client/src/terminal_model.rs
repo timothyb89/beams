@@ -429,6 +429,55 @@ pub struct TerminalModel {
     integrity_lost: bool,
     evidence: Evidence,
     overlay_buffers: Option<[bool; 2]>,
+    /// A buffer switch, reset or resize since the last `take_damage`: what
+    /// is displayed changed wholesale, beyond any cell damage.
+    displaced: bool,
+}
+
+/// How processed output affected an area of the screen drawn over locally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disturbance {
+    /// No cell in the area was written, and nothing in its rows moved.
+    Untouched,
+    /// Cells in the area were written in place; nothing moved.
+    Overwritten,
+    /// Rows through the area scrolled or shifted (or the displayed buffer
+    /// changed): physical cells drawn there have been carried elsewhere.
+    Moved,
+}
+
+/// Damage recorded while processing output, from `TerminalModel::take_damage`.
+#[derive(Debug, Default)]
+pub struct OutputDamage {
+    cells: vt100::Damage,
+    displaced: bool,
+}
+
+impl OutputDamage {
+    pub fn disturbance(&self, area: Rect) -> Disturbance {
+        if area.is_empty() {
+            return Disturbance::Untouched;
+        }
+        let (top, bottom) = (area.top(), area.bottom() - 1);
+        if self.displaced
+            || self
+                .cells
+                .moved_rows()
+                .is_some_and(|(moved_top, moved_bottom)| moved_top <= bottom && top <= moved_bottom)
+        {
+            return Disturbance::Moved;
+        }
+        let (left, right) = (area.left(), area.right() - 1);
+        if (top..=bottom).any(|row| {
+            self.cells
+                .written_cols(row)
+                .is_some_and(|(l, r)| l <= right && left <= r)
+        }) {
+            Disturbance::Overwritten
+        } else {
+            Disturbance::Untouched
+        }
+    }
 }
 
 impl TerminalModel {
@@ -444,6 +493,16 @@ impl TerminalModel {
             integrity_lost: false,
             evidence: Evidence::default(),
             overlay_buffers: None,
+            displaced: false,
+        }
+    }
+
+    /// What output processed since the last call did to the screen, for a
+    /// local drawing that has to know whether it was disturbed.
+    pub fn take_damage(&mut self) -> OutputDamage {
+        OutputDamage {
+            cells: self.parser.screen_mut().take_damage(),
+            displaced: std::mem::take(&mut self.displaced),
         }
     }
 
@@ -540,7 +599,12 @@ impl TerminalModel {
                     .callbacks_mut()
                     .push(TerminalEvent::Query(original.to_vec()));
             }
+            if before_alternate != self.parser.screen().alternate_screen() {
+                self.displaced = true;
+            }
             if std::mem::take(&mut self.parser.callbacks_mut().reset_observed) {
+                // RIS replaces the screen (and its recorded damage) outright.
+                self.displaced = true;
                 self.integrity_lost = false;
                 self.evidence
                     .observe(b"\x1bc", false, before_cursor, self.parser.screen());
