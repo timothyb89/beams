@@ -209,6 +209,35 @@ pub fn remote_path(input: &str) -> anyhow::Result<String> {
     }
 }
 
+/// Fills `configure-git-identity`'s `name`/`email` from the
+/// workstation's own `git config` wherever a profile left them unset -
+/// a profile that sets either explicitly always wins. A workstation
+/// with no git identity of its own (or no `git`) just leaves the gap;
+/// `validate_params` treats both as optional, and the Beam-side task
+/// no-ops on whichever it never receives.
+fn default_git_identity(params: &mut BTreeMap<String, ManifestParam>) {
+    for (key, config_key) in [("name", "user.name"), ("email", "user.email")] {
+        if params.contains_key(key) {
+            continue;
+        }
+        if let Some(value) = local_git_config(config_key) {
+            params.insert(key.to_string(), ManifestParam::Str(value));
+        }
+    }
+}
+
+/// `git config --get <key>` on the workstation itself (not the Beam) -
+/// `None` on any failure (not installed, not set, not a repo default).
+fn local_git_config(key: &str) -> Option<String> {
+    let output = std::process::Command::new("git").args(["config", "--get", key]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
 fn validate_params(template: &str, params: &BTreeMap<String, ManifestParam>) -> anyhow::Result<()> {
     let schema = task_catalog::templates()
         .into_iter()
@@ -387,6 +416,7 @@ fn builtin_edges(task: &Task) -> anyhow::Result<(Vec<String>, Vec<String>, Vec<S
             resources.push("path:${beam.home}/.local/toolchains/code-server".into());
         }
         "wait-ssh-agent" => provides.push("ssh-agent-ready".into()),
+        "configure-git-identity" => {}
         "clone-git-repo" => {
             let dest = remote_path(param(task, "dest"))?;
             provides.push(format!("repo-cloned:{dest}"));
@@ -549,6 +579,9 @@ pub fn compile(selection: &str) -> anyhow::Result<Compilation> {
         let mut task =
             materialize_custom(task, &resolved).with_context(|| task.origin.context())?;
         if let Some(template) = &task.value.template {
+            if template == "configure-git-identity" {
+                default_git_identity(&mut task.value.params);
+            }
             validate_params(template, &task.value.params).with_context(|| task.origin.context())?;
             // Canonical remote params make providers independent of ~/ vs ${beam.home}.
             for key in ["dest", "base"] {

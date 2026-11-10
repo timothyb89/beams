@@ -66,12 +66,30 @@ path (runtime delivery, shell preparation, Zellij/TUI with
     an unknown host still fails, `~/.ssh` untouched. Remaining: pinned
     GitHub keys in the core profile for headless launches without a
     bridge; ssh queries twice per connection (harmless).
-  - git config: `user.name`/`user.email` defaulted from the workstation's
-    `git config` at compile time, overridable per profile, applied with
-    `git config --global` (idempotent; leaves other Beam settings alone).
-    Optional: SSH commit signing through the relay (`gpg.format = ssh`,
-    `user.signingkey = "key::<allowed key>"`); each signature then prompts
-    like any SSHSIG request.
+  - [x] git config: `user.name`/`user.email` defaulted from the
+    workstation's `git config` at compile time, overridable per profile,
+    applied with `git config --global` (idempotent; leaves other Beam
+    settings alone). Landed 2026-11-10: `configure-git-identity`
+    builtin task (`bootstrap/src/tasks/configure_git_identity.rs`),
+    `client/src/config/plan.rs`'s `default_git_identity` fills missing
+    `name`/`email` from the workstation's `git config --get` at compile
+    time, both params optional so a workstation with no git identity
+    doesn't block the launch. Wired into `builtin:core`'s pre phase so
+    every profile gets it unless overridden. Remaining: optional SSH
+    commit signing through the relay (`gpg.format = ssh`,
+    `user.signingkey = "key::<allowed key>"`); each signature then
+    prompts like any SSHSIG request.
+- [x] Zellij's terminal title showed `beams-<id prefix>` (the launch
+  uuid's first 8 hex chars - internal bookkeeping, not a git sha, not
+  meaningful to a user reading it there). Landed 2026-11-10:
+  `session_name` (`bootstrap/src/launch/session.rs`) now names the
+  session for the Beam (`$BEAM_ALIAS`, e.g. `beams-brave-ping`) instead,
+  falling back to the old id-based name without one (local dev outside
+  a Beam). Deliberately reused across every `beams ssh` attempt against
+  a Beam, not just per launch - a session only a user starts should be
+  a new one, never a second launch attempt; see
+  `docs/designs/LAUNCH_CONFIGURATION_DESIGN.md`'s "Zellij sessions" for
+  the staleness tradeoff this accepts.
 - [ ] Phase 1: record cold/warm launch milestones and transport counts;
   implement profile resolution/inheritance, validation, versioned plan,
   and `beams config init/validate/explain`. Bundled core/development

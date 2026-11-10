@@ -285,6 +285,14 @@ enum TaskCommand {
     /// Install the pinned starship release to /usr/local/bin (see
     /// `tasks::install_starship`). No params.
     InstallStarship,
+    /// Set `git config --global user.name`/`user.email` on the Beam
+    /// (see `tasks::configure_git_identity`). Either may be omitted.
+    ConfigureGitIdentity {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        email: Option<String>,
+    },
     /// Install the Go toolchain via the official release (see
     /// `tasks::install_toolchain_go`). No params.
     InstallToolchainGo,
@@ -622,6 +630,9 @@ fn task_command_to_instance(command: TaskCommand) -> (&'static str, Value) {
             (tasks::checkout_pr_worktree::CheckoutPrWorktree::NAME, json!({"base": base, "pr": pr, "dest": dest}))
         }
         TaskCommand::InstallStarship => ("install-starship", json!({})),
+        TaskCommand::ConfigureGitIdentity { name, email } => {
+            (tasks::configure_git_identity::ConfigureGitIdentity::NAME, json!({"name": name, "email": email}))
+        }
         TaskCommand::InstallToolchainGo => (tasks::install_toolchain_go::InstallToolchainGo::NAME, json!({})),
         TaskCommand::InstallToolchainRust => (tasks::install_toolchain_rust::InstallToolchainRust::NAME, json!({})),
         TaskCommand::InstallCodeServer => (tasks::install_code_server::InstallCodeServer::NAME, json!({})),

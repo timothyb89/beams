@@ -14,7 +14,7 @@
 //! interactive SSH command. That starts the daemon, submits the launch
 //! (idempotent: a reconnect finds it accepted), stages pre, installs
 //! Zellij alongside pre, prints pre progress, and then replaces itself
-//! with Zellij in a session named for the launch. Every pane's shell is
+//! with Zellij in a session named for the Beam. Every pane's shell is
 //! `launch shell`, which reports `shell` readiness and execs the plan's
 //! shell; the TUI pane reports `tui`. Post work starts once both have.
 
@@ -34,10 +34,20 @@ const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(15);
 /// Env var carrying the plan's shell to `launch shell`.
 pub const SHELL_ENV: &str = "BEAMS_SHELL";
 
-/// The Zellij session for a launch. One per launch, so attaching never
-/// lands in a session whose panes carry another launch's environment.
+/// The Zellij session a launch attaches to. Named for the Beam
+/// (`$BEAM_ALIAS`, e.g. `beams-brave-ping`) rather than the launch id:
+/// zellij shows this name as the terminal title, and the launch id
+/// (internal bookkeeping - see `BEAMS_LAUNCH_ID`) isn't meaningful to a
+/// user reading it there. Reusing one session per Beam across reconnects
+/// is also the point, not an accident - a session only a user starts
+/// should be a new one, never a second `beams ssh` attempt landing
+/// somewhere unexpected. Without `BEAM_ALIAS` (e.g. local dev outside a
+/// Beam), falls back to the launch id so sessions still stay distinct.
 pub fn session_name(launch_id: &str) -> String {
-    format!("beams-{}", launch_id.split('-').next().unwrap_or(launch_id))
+    match std::env::var("BEAM_ALIAS") {
+        Ok(alias) if !alias.is_empty() => format!("beams-{alias}"),
+        _ => format!("beams-{}", launch_id.split('-').next().unwrap_or(launch_id)),
+    }
 }
 
 pub fn start(launch_dir: &Path, socket: Option<String>) -> anyhow::Result<()> {
@@ -354,7 +364,23 @@ mod tests {
     }
 
     #[test]
-    fn session_names_are_per_launch() {
+    fn session_name_falls_back_to_launch_id_without_beam_alias() {
+        let prior = std::env::var("BEAM_ALIAS").ok();
+        std::env::remove_var("BEAM_ALIAS");
         assert_eq!(session_name("0a1b2c3d-1111-2222-3333-444455556666"), "beams-0a1b2c3d");
+        if let Some(prior) = prior {
+            std::env::set_var("BEAM_ALIAS", prior);
+        }
+    }
+
+    #[test]
+    fn session_name_prefers_beam_alias() {
+        let prior = std::env::var("BEAM_ALIAS").ok();
+        std::env::set_var("BEAM_ALIAS", "brave-ping");
+        assert_eq!(session_name("0a1b2c3d-1111-2222-3333-444455556666"), "beams-brave-ping");
+        match prior {
+            Some(prior) => std::env::set_var("BEAM_ALIAS", prior),
+            None => std::env::remove_var("BEAM_ALIAS"),
+        }
     }
 }
