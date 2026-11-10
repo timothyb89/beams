@@ -1024,7 +1024,7 @@ bootstrap `Task`s.
     the zellij reattach recording never scrolls through the toast's rows
     while it's up, so the erase-before-move and open-remote-frame paths are
     covered only by synthetic unit tests.
-  - [ ] Resizing during a zellij session, then detaching, leaves many copies
+  - [x] Resizing during a zellij session, then detaching, leaves many copies
     of the screen in the workstation terminal's scrollback (2026-11-10).
     Passthrough writes nothing on resize (same as `main`; only the child PTY
     is resized), so this is most likely the terminal saving alternate-screen
