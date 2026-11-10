@@ -31,6 +31,8 @@ cleanup() {
 trap cleanup EXIT
 
 cargo build --manifest-path "$CLIENT_DIR/Cargo.toml"
+# A profile launch stages the Beam runtime, even though the fake tsh drops it.
+cargo build -q --manifest-path "$CLIENT_DIR/../bootstrap/Cargo.toml"
 
 mkdir -p "$TEST_DIR/config/beams-client" "$TEST_DIR/runtime"
 cp "$CLIENT_DIR/tests/fixtures/config/beams-client/state.json" \

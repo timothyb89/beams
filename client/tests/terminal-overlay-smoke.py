@@ -34,6 +34,22 @@ def fake_tsh(args):
             "expires": "2099-01-01T00:00:00Z",
         }]))
         return 0
+    # Profile launches create a Beam, copy the runtime and launch to it, then
+    # open the daemon's bridge alongside the interactive session.
+    if args[:2] == ["beams", "add"]:
+        print(json.dumps({
+            "id": "managed-session-test",
+            "uuid": "11111111-2222-3333-4444-555555555555",
+            "owner": "test@example.com",
+            "expires": "2099-01-01T00:00:00Z",
+        }))
+        return 0
+    if args[:2] in (["beams", "exec"], ["beams", "scp"]):
+        return 0
+    if any("client-bridge" in arg for arg in args):
+        # No Beam daemon here: keep the bridge quiet until the test ends.
+        time.sleep(30)
+        return 1
     if not args or args[0] != "ssh":
         raise RuntimeError(f"unexpected fake tsh arguments: {args!r}")
     root = Path(os.environ["BEAMS_OVERLAY_FIXTURE"])
@@ -110,6 +126,27 @@ class Session:
         fake.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} "
                         f"{shlex.quote(str(Path(__file__).resolve()))} --fake-tsh \"$@\"\n")
         fake.chmod(0o755)
+        env = dict(os.environ)
+        env.pop("SSH_AUTH_SOCK", None)
+        env.update(
+            PATH=f"{bindir}:{env['PATH']}",
+            XDG_CONFIG_HOME=str(root / "config"),
+            XDG_RUNTIME_DIR=str(root / "runtime"),
+            BEAMS_OVERLAY_FIXTURE=str(root),
+            TERM="xterm-256color",
+            BEAMS_OVERLAY_INITIALIZED="1" if initialized else "0",
+        )
+        # Every launch needs the workstation daemon. Run one per session so
+        # it is isolated and reliably stopped.
+        self.daemon = subprocess.Popen([binary, "daemon"], env=env,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        socket = root / "runtime" / "beams-client" / "daemon.sock"
+        deadline = time.monotonic() + 5
+        while not socket.exists():
+            if time.monotonic() >= deadline:
+                self.daemon.kill()
+                raise AssertionError("local daemon did not create its socket")
+            time.sleep(0.02)
         self.pid, self.master = pty.fork()
         if self.pid == 0:
             try:
@@ -117,17 +154,7 @@ class Session:
                 fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
                 (root / "before-termios").write_text(
                     json.dumps(termios.tcgetattr(0), default=list))
-                env = dict(os.environ)
-                env.pop("SSH_AUTH_SOCK", None)
-                env.update(
-                    PATH=f"{bindir}:{env['PATH']}",
-                    XDG_CONFIG_HOME=str(root / "config"),
-                    XDG_RUNTIME_DIR=str(root / "runtime"),
-                    BEAMS_OVERLAY_FIXTURE=str(root),
-                    TERM="xterm-256color",
-                    BEAMS_OVERLAY_INITIALIZED="1" if initialized else "0",
-                )
-                command = [binary, "ssh", "--terminal-overlay", "--no-client-daemon",
+                command = [binary, "ssh", "--terminal-overlay",
                            "--purpose", "managed-session-test"]
                 if disabled:
                     command.extend(["--escape-key", "none"])
@@ -201,6 +228,9 @@ class Session:
         self.wait(lambda: label in self.output[offset:], "menu opening", timeout=2)
 
     def close(self):
+        if getattr(self, "daemon", None) is not None:
+            self.daemon.kill()
+            self.daemon.wait()
         for pid_file in ["remote-pid"]:
             try:
                 os.kill(int((self.root / pid_file).read_text()), signal.SIGKILL)

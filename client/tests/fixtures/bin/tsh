@@ -5,6 +5,21 @@ if [ "$1" = "beams" ] && [ "$2" = "ls" ]; then
     exit 0
 fi
 
+# Profile launches create a Beam, copy the runtime and launch to it, then
+# open the daemon's bridge alongside the interactive session.
+if [ "$1" = "beams" ] && [ "$2" = "add" ]; then
+    printf '%s\n' '{"id":"managed-session-test","uuid":"11111111-2222-3333-4444-555555555555","owner":"test@example.com","expires":"2099-01-01T00:00:00Z"}'
+    exit 0
+fi
+if [ "$1" = "beams" ] && { [ "$2" = "exec" ] || [ "$2" = "scp" ]; }; then
+    exit 0
+fi
+case " $* " in
+    *" client-bridge"*)
+        # No Beam daemon here: keep the bridge quiet until the test ends.
+        exec sleep 30 ;;
+esac
+
 if [ "$1" = "ssh" ]; then
     # Exercise terminal state that the managed-session relay must preserve:
     # title/clipboard OSCs plus bracketed paste and SGR mouse modes.
