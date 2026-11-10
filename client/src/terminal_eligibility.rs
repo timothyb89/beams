@@ -516,6 +516,21 @@ impl Evidence {
             } else {
                 NormalRows::default()
             },
+            // Origin mode is a pure flag resize never touches (the vendored
+            // model leaves it alone; DECOM has no size dependency on any
+            // target terminal). Margins are a resize-time invariant, not an
+            // explicit reset: the model's own `set_size` always recomputes
+            // them to the full new screen, matching "xterm always resets
+            // the scroll region... when the screen is resized" (see
+            // `vendor/vt100/src/grid.rs`). Known evidence for either stays
+            // valid; a later explicit `CSI r` still updates it normally.
+            // Cursor/cells/saved slot are not safe assumptions and reset
+            // below. A later ordinary CUP (now unblocked by origin/margins
+            // already being known) and the resize redraw pulse typically
+            // reestablish cursor and cells without any explicit remote
+            // reinitialization.
+            origin: buffer.origin,
+            margins: buffer.margins,
             ..BufferEvidence::default()
         });
     }

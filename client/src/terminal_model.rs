@@ -798,10 +798,20 @@ mod tests {
         model.resize(size());
         assert_eq!(model.unavailable_reason(), Some(Unavailable::Resize));
         assert!(!model.can_paint());
-        model.process(b"\x1b[2J\x1b[H");
+        // Resize still needs fresh cursor evidence, not just cells: ED 2
+        // alone is not enough.
+        model.process(b"\x1b[2J");
         assert!(
             !model.can_paint(),
             "resize needs drawing/saved-state evidence, not just cells"
+        );
+        // Origin mode and margins were already known (established default
+        // by the earlier RIS) and survive resize untouched, so an ordinary
+        // CUP is now enough to also establish the cursor.
+        model.process(b"\x1b[H");
+        assert!(
+            model.can_paint(),
+            "origin/margins survive resize; an ordinary redraw reestablishes the rest"
         );
         model.process(b"\x1bc");
         assert!(model.can_paint());
@@ -970,7 +980,17 @@ mod tests {
                     model.process(component);
                 }
             }
-            assert!(!model.can_borrow(), "missing {missing:?}");
+            if matches!(missing, b"\x1b[?6l" | b"\x1b[r") {
+                // Established default by the RIS above, origin/margins
+                // survive resize untouched; omitting a fresh reset of
+                // either no longer blocks borrowing.
+                assert!(
+                    model.can_borrow(),
+                    "origin/margins survive resize without a fresh reset: missing {missing:?}"
+                );
+            } else {
+                assert!(!model.can_borrow(), "missing {missing:?}");
+            }
         }
         model.process(b"\x1bc");
         model.discard_oversized_sequence();
@@ -1578,6 +1598,13 @@ mod tests {
 
     #[test]
     fn resized_buffer_requires_each_initialization_component_at_every_split() {
+        // Origin mode and margins are untouched by resize itself (the model
+        // never resets DECOM, and the vendored grid always recomputes
+        // margins to the full new screen - vendor/vt100/src/grid.rs's
+        // "xterm always resets the scroll region... when the screen is
+        // resized"). Known evidence for both survives resize without a new
+        // `CSI ?6l`/`CSI r`; only cursor and cell content still need fresh
+        // evidence, which an ordinary CUP and clear/redraw already supply.
         let components: [&[u8]; 5] = [b"\x1b[?6l", b"\x1b[r", b"\x1b[H", b"\x1b7", b"\x1b[2J"];
         for missing in 0..components.len() {
             let mut model = TerminalModel::new(size());
@@ -1592,6 +1619,11 @@ mod tests {
                 assert!(model.can_paint(), "the save slot is not needed to paint");
                 assert!(!model.evidence.saved_known(true));
                 assert_covered_rejects(&mut model, b"\x1b8", "restore of an unknown slot");
+            } else if matches!(components[missing], b"\x1b[?6l" | b"\x1b[r") {
+                assert!(
+                    model.can_paint(),
+                    "origin/margins survive resize without a fresh reset: missing {missing}"
+                );
             } else {
                 assert!(!model.can_paint(), "missing component {missing}");
                 assert_eq!(model.unavailable_reason(), Some(Unavailable::Resize));

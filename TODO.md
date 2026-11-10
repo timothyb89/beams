@@ -974,6 +974,14 @@ bootstrap `Task`s.
     when the overlay cannot paint); borrowing opt-in; probes only in overlay
     sessions, ended by a DA1 sentinel, late replies claimed one per probe;
     iTerm2's `1$rr` accepted; an unpaintable toast rings the bell once.
+  - [x] Resize recovery (2026-11-10): origin mode and margins now survive
+    resize when already known (a real resize never touches DECOM, and the
+    model always recomputes margins to the full new screen, matching
+    standard VT behavior); only cursor/cells need fresh evidence, via an
+    ordinary CUP and redraw. Real sessions previously lost the overlay on
+    every resize because the remote never resends an explicit reset of
+    either. The first Ctrl-] of a session still needs the fallback (the
+    launch-phase primary screen's unknown cells, unaddressed below).
   - [ ] Gate simplification: entry CPR + scrollback push and client-sent
     initialization; require known state, tolerate unknown cells; remote
     repaint pulse for doubtful restores. See the design doc's next work.

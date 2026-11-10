@@ -530,3 +530,31 @@ initialization (restoring default tab stops after TBC). Use the remote repaint
 pulse as the backstop for doubtful restores. Recordings become regression
 fixtures for that gate (iTerm2 plus Terminal.app), not per-terminal gates.
 UI and input stay entirely client-side; nothing relies on remote sequencing.
+
+Resize recovery (2026-11-10): the usability-reset build still fell back to
+takeover on the first Ctrl-] after every session start, and a real resize
+reliably *lost* the overlay rather than recovering it. Cause: resize wiped
+origin/margins evidence too, requiring the remote to resend an explicit
+`CSI ?6l` + `CSI r` before either could become known again - something
+neither the launch log nor a live Zellij session actually does on an ordinary
+SIGWINCH reflow (recorded iTerm2 replies confirmed the probes themselves were
+fine: `~/replies-iterm2.bin` parses cleanly, including iTerm2's `1$rr`).
+
+Origin mode is a pure flag resize never touches, in the model or in any real
+terminal - DECOM has no size dependency. Margins are a resize-time invariant,
+not a reset the application must repeat: the vendored grid always recomputes
+them to the full new screen on resize (`vendor/vt100/src/grid.rs`'s own
+"xterm always resets the scroll region... when the screen is resized"),
+matching standard VT behavior across terminals. Both now survive resize when
+already known; only cursor and cell content still need fresh evidence, and an
+ordinary CUP plus a redraw (which the resize pulse already provokes from a
+real TUI) now supplies it without any explicit remote reinitialization. This
+is a model-level change (`terminal_eligibility.rs`'s `Evidence::resize`), not
+a per-terminal special case. Three unit tests encoding the old, stricter
+policy were updated with the new one, and the PTY harness's resize scenario
+gained a check that the overlay recovers from an ordinary margins-reset+CUP+
+clear with no origin reset, and that closing an overlay (as opposed to
+takeover) never pulses the remote size. 270 unit tests and 3 integration
+tests, every managed-session variant, the PTY harness and the xterm.js replay
+pass. Real-session confirmation (does the first Ctrl-] still need the
+fallback, does resize now recover rather than lose eligibility) is next.

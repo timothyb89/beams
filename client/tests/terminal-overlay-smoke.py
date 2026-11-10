@@ -528,12 +528,27 @@ def run_resize_reinitialization(root, binary):
         fcntl.ioctl(session.master, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 60, 0, 0))
         session.wait(lambda: "12 60\n" in (root / "sizes").read_text(), "uncovered PTY resize")
 
-        # Margins, coordinates and a clear still lack known origin mode
-        # after resize. (A saved slot may stay unknown; painting never uses it.)
+        # Right after resize, with no redraw at all, nothing is known yet.
+        session.takeover(b"RIGHT AFTER RESIZE", b"Forward a Beam port", "bare resize")
+
+        # Origin mode and margins are untouched by resize itself (no real
+        # terminal or multiplexer resets DECOM on SIGWINCH, and the model's
+        # own resize always recomputes margins to the full new screen); they
+        # were already known from the session's opening RIS and survive
+        # without a fresh `CSI ?6l`/`CSI r`. An ordinary margins-reset + CUP
+        # + clear (no origin reset) is now enough to paint again.
+        offset = len(session.output)
         session.emit(b"\x1b[r\x1b[H\x1b[2JPARTIAL INITIALIZATION")
         session.wait(lambda: b"PARTIAL INITIALIZATION" in session.output, "partial initialization")
-        session.takeover(b"DEFERRED AFTER RESIZE", b"Forward a Beam port",
-                         "incomplete initialization")
+        pulses = (root / "sizes").read_text().count("\n")
+        session.open(b"Forward a Beam port")
+        session.wait(lambda: b"8080" in session.output[offset:],
+                     "overlay works without an origin reset, with the form preserved")
+        session.send(b"\x1dDEFERRED AFTER RESIZE")
+        session.wait(lambda: session.remote_input().endswith(b"DEFERRED AFTER RESIZE"),
+                     "overlay menu close")
+        assert (root / "sizes").read_text().count("\n") == pulses, \
+            "an overlay close must not also pulse the remote size"
 
         # No new RIS: the application explicitly initializes only this buffer.
         offset = len(session.output)
