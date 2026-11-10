@@ -220,16 +220,30 @@ fn default_git_identity(params: &mut BTreeMap<String, ManifestParam>) {
         if params.contains_key(key) {
             continue;
         }
-        if let Some(value) = local_git_config(config_key) {
+        if let Some(value) = local_git_config(config_key, None) {
             params.insert(key.to_string(), ManifestParam::Str(value));
         }
     }
 }
 
-/// `git config --get <key>` on the workstation itself (not the Beam) -
-/// `None` on any failure (not installed, not set, not a repo default).
-fn local_git_config(key: &str) -> Option<String> {
-    let output = std::process::Command::new("git").args(["config", "--get", key]).output().ok()?;
+/// `git config --global --get <key>` on the workstation itself (not the
+/// Beam) - `None` on any failure (not installed, not set). Scoped to
+/// `--global` deliberately: a plain `git config --get` resolves through
+/// whatever repo the client happens to be running from, so without it a
+/// local override in one project's `.git/config` (a different name, a
+/// work alias, anything) would leak into becoming the Beam's identity
+/// instead of the workstation's actual one - confirmed live: running
+/// from inside a repo with its own `user.name` picked that up over
+/// `~/.gitconfig`'s. `cwd` is only ever `Some` from a test proving that
+/// independence; the real caller always passes `None` (the process's
+/// own, ambient cwd - irrelevant now that `--global` ignores it).
+fn local_git_config(key: &str, cwd: Option<&Path>) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    command.args(["config", "--global", "--get", key]);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1156,4 +1170,41 @@ fn compile_grant(
         nodes: covered.iter().map(|n| n.id.clone()).collect(),
         phase: if covered.iter().any(|n| n.phase == Phase::Pre) { Phase::Pre } else { Phase::Post },
     }))
+}
+
+#[cfg(test)]
+mod git_identity_tests {
+    use super::local_git_config;
+    use std::process::Command;
+
+    /// A local repo's own `user.name` must never leak into the Beam's
+    /// identity - only `~/.gitconfig`'s does. Reproduces exactly what
+    /// was seen live: running from inside a repo with its own
+    /// `user.name` silently won over the workstation's real one before
+    /// `local_git_config` pinned the lookup to `--global`.
+    #[test]
+    fn ignores_a_local_repo_override_and_reads_only_the_global_value() {
+        let root = std::env::temp_dir().join(format!("git-identity-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let prior = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        Command::new("git").args(["config", "--global", "user.name", "Ada Lovelace"]).status().unwrap();
+        Command::new("git").args(["init", "-q"]).current_dir(&repo).status().unwrap();
+        Command::new("git").args(["config", "user.name", "Local Override"]).current_dir(&repo).status().unwrap();
+
+        let value = local_git_config("user.name", Some(&repo));
+
+        match prior {
+            Some(prior) => std::env::set_var("HOME", prior),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(value, Some("Ada Lovelace".to_string()));
+    }
 }

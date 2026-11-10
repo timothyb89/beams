@@ -443,7 +443,7 @@ tsh ssh -- …/beam-bootstrap launch start      → beamctl start beam-bootstrap
                                                 launch_submit (local, no owner)
                                                 launch receive pre   ‖ install Zellij
                                                 pre progress printed in the terminal
-                                                exec zellij attach beams-<alias> --create
+                                                exec zellij attach <alias> --create
 bridge: LaunchSubmit                          → existing: adopts the bridge client as owner
                                               ← LaunchCondition{interface-ready} (shell + tui)
 post packed and uploaded                      → … LaunchStatus{ok}
