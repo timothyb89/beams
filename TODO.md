@@ -997,6 +997,15 @@ bootstrap `Task`s.
   - [ ] Toast flicker over frequently redrawn rows (e.g. claude's input/status
     lines): erase, pass through and repaint in one synchronized update when a
     chunk ends at a boundary, instead of repainting after 30 ms of quiet.
+    Tried and reverted (2026-11-10, commit 896f9c7/c35a84e): repainting right
+    after every chunk that ends at a parser boundary is not safe - "at a
+    boundary" only means we're not mid-escape-sequence, not that the remote
+    is done with a multi-chunk redraw. zellij's tab-switch/selection redraws
+    span several PTY reads and can include a scroll in a later chunk; a
+    toast painted after an earlier chunk gets dragged by that scroll,
+    duplicating the status bar and leaving junk the next erase doesn't
+    target. Any real fix needs an actual end-of-burst signal (what
+    quiet/settle approximates), not just stream framing.
   - [ ] Guarded alternate-buffer menu fallback for unknown primary screens:
     preserve primary content and cursor/mode state, establish inactive-buffer
     ownership, close/replay before output overflow or a remote buffer switch,
