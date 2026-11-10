@@ -994,13 +994,9 @@ bootstrap `Task`s.
     priority over a doubtful overlay restore, since it never touches
     primary content at all. See the design doc's "Gate simplification"
     entry for the full writeup. Real-session confirmation is next.
-  - [x] Toast flicker over frequently redrawn rows (2026-11-10): erase ahead
-    of a passthrough chunk without forgetting the toast, then repaint it
-    immediately once that chunk ends at a safe boundary, instead of waiting
-    on 30ms of quiet or a 250ms burst interval. `SETTLE`/`BURST_REPAINT`
-    still govern a toast's first appearance and content changes; they're
-    now a fallback for chunks that end mid-sequence rather than the normal
-    path. See the design doc's "Toast flicker" entry.
+  - [ ] Toast flicker over frequently redrawn rows (e.g. claude's input/status
+    lines): erase, pass through and repaint in one synchronized update when a
+    chunk ends at a boundary, instead of repainting after 30 ms of quiet.
   - [ ] Guarded alternate-buffer menu fallback for unknown primary screens:
     preserve primary content and cursor/mode state, establish inactive-buffer
     ownership, close/replay before output overflow or a remote buffer switch,

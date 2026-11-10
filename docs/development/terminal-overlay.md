@@ -618,33 +618,3 @@ than through zellij's redraw happening to land first.
   integration tests, every managed-session smoke variant and the PTY
   harness pass (the xterm.js reference replay was not available in this
   environment to re-run). Real-session confirmation of this slice is next.
-
-Toast flicker over frequently-redrawn rows (2026-11-10): a toast sitting over
-a row an app repaints every few milliseconds (e.g. a status/input line) used
-to visibly flash, since `ToastPainter` erased it immediately ahead of each
-chunk of remote output but only repainted it later, gated on 30ms of quiet
-(`SETTLE`) or, during a sustained burst, every 250ms (`BURST_REPAINT`) - a
-real, visible gap whenever output arrived faster than that.
-
-- `ToastPainter::erase_for_output`/`repaint_shown` (`session/toast.rs`)
-  replace that two-phase, timer-gated cycle for live passthrough output.
-  `erase_for_output` erases the shown toast using the model's state just
-  before the chunk lands, without forgetting it (unlike `clear`). Once the
-  chunk has been passed through and the shadow model reflects it,
-  `repaint_shown` redraws the same toast immediately - no quiet period, no
-  burst interval, just the next safe stream boundary.
-- `drain_output` (`session.rs`) calls `erase_for_output` before passing a
-  passthrough chunk through, then `repaint_shown` right after, every time
-  the chunk ends at a boundary (`OutputTracker::at_boundary`, the same
-  framing check `sync` already relied on, so this is never done mid
-  escape-sequence, mid-OSC/DCS string, mid-UTF-8 character or inside the
-  remote's own synchronized-output block). If the chunk doesn't end at a
-  boundary, the toast is left erased and marked dirty, for the main loop's
-  existing `sync` (still `SETTLE`/`BURST_REPAINT`-gated) to pick back up -
-  unaffected, and now a rare fallback rather than the common path.
-  `SETTLE`/`BURST_REPAINT` otherwise remain exactly as they are, since they
-  still govern a toast's first appearance and content changes.
-- Added `erase_for_output_and_repaint_shown_survive_a_chunk_without_waiting_for_settle`
-  and `repaint_shown_defers_to_sync_when_the_chunk_ends_mid_sequence` to
-  `session/toast.rs`. 275 unit tests, 3 integration tests, both
-  `managed-session-smoke.sh` variants and the PTY harness pass.
