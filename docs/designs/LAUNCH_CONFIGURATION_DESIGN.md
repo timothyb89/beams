@@ -63,8 +63,8 @@ flags.
   the local daemon before its bridge, and runs `launch start`. That starts
   the daemon via `beamctl` from the runtime binary, submits locally (no
   owner), receives pre, installs Zellij alongside pre, and execs Zellij
-  in `beams-<alias>` (the Beam's own `$BEAM_ALIAS`, e.g. `beams-brave-
-  ping`; falls back to `beams-<id prefix>` without one). The bridge's
+  in `<alias>` (the Beam's own `$BEAM_ALIAS`, e.g. `brave-ping`; falls
+  back to `<id prefix>` without one). The bridge's
   resubmission adopts the launch as owner, so `interface-ready` reaches
   the workstation, which packs and uploads post.
 - Readiness: every pane's shell starts via `beams-shell` → `launch shell`
@@ -118,17 +118,18 @@ flags.
   launch ("no launch support") instead of waiting on the bridge.
   `beams ssh` always ships the current runtime to a new Beam,
   but a reattached Beam keeps the runtime it was launched with.
-- **Zellij sessions.** Named for the Beam (`beams-<alias>`), not the
-  launch, and deliberately reused across every `beams ssh` attempt
-  against that Beam - the terminal title showing `beams-<id prefix>`
-  (meaningless bookkeeping to a user) was worse than reusing one
-  session, and a session only a user starts should be a new one, never
-  a second launch attempt. The tradeoff: reattaching keeps the
-  session's original environment, so a later `beams ssh` with a new
+- **Zellij sessions.** Named for the Beam (`<alias>`, no `beams-`
+  prefix - nothing else matches on this name), not the launch, and
+  deliberately reused across every `beams ssh` attempt against that
+  Beam - the terminal title showing `beams-<id prefix>` (meaningless
+  bookkeeping to a user) was worse than reusing one session, and a
+  session only a user starts should be a new one, never a second
+  launch attempt. The tradeoff: reattaching keeps the session's
+  original environment, so a later `beams ssh` with a new
   `BEAMS_SESSION_TOKEN`/`BEAMS_LAUNCH_ID` (a reprofiled reattach) still
   doesn't reach panes already open in that session - only new panes in
   it do. Without `$BEAM_ALIAS` (local dev outside a Beam), falls back
-  to `beams-<id prefix>`, so sessions stay distinct there instead.
+  to `<id prefix>`, so sessions stay distinct there instead.
 - **Process matching.** Cleanup that matches `pkill -f` against a
   scratch path also matches the shell running the command; kill by PID.
 - **Beam TTL.** Beams now get at most 12h; `beams ssh` reuses a tracked

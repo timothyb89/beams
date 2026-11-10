@@ -83,9 +83,10 @@ path (runtime delivery, shell preparation, Zellij/TUI with
   uuid's first 8 hex chars - internal bookkeeping, not a git sha, not
   meaningful to a user reading it there). Landed 2026-11-10:
   `session_name` (`bootstrap/src/launch/session.rs`) now names the
-  session for the Beam (`$BEAM_ALIAS`, e.g. `beams-brave-ping`) instead,
-  falling back to the old id-based name without one (local dev outside
-  a Beam). Deliberately reused across every `beams ssh` attempt against
+  session for the Beam (`$BEAM_ALIAS`, e.g. `brave-ping`, no `beams-`
+  prefix - nothing else matches on this name) instead, falling back to
+  the bare id prefix without one (local dev outside a Beam).
+  Deliberately reused across every `beams ssh` attempt against
   a Beam, not just per launch - a session only a user starts should be
   a new one, never a second launch attempt; see
   `docs/designs/LAUNCH_CONFIGURATION_DESIGN.md`'s "Zellij sessions" for

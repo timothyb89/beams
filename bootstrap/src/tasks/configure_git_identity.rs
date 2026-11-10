@@ -92,6 +92,25 @@ mod tests {
     }
 
     #[test]
+    fn a_name_with_spaces_is_set_whole_not_split_on_whitespace() {
+        let (dir, _) = home_guard();
+        let prior = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &dir);
+
+        let task = ConfigureGitIdentity { name: Some("Ada Lovelace".into()), email: None };
+        task.run().unwrap();
+
+        let out = Command::new("git").args(["config", "--global", "user.name"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "Ada Lovelace");
+
+        match prior {
+            Some(prior) => std::env::set_var("HOME", prior),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn no_fields_is_a_no_op() {
         let task = ConfigureGitIdentity { name: None, email: None };
         assert_eq!(task.run().unwrap(), None);

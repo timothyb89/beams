@@ -35,18 +35,20 @@ const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(15);
 pub const SHELL_ENV: &str = "BEAMS_SHELL";
 
 /// The Zellij session a launch attaches to. Named for the Beam
-/// (`$BEAM_ALIAS`, e.g. `beams-brave-ping`) rather than the launch id:
-/// zellij shows this name as the terminal title, and the launch id
-/// (internal bookkeeping - see `BEAMS_LAUNCH_ID`) isn't meaningful to a
-/// user reading it there. Reusing one session per Beam across reconnects
-/// is also the point, not an accident - a session only a user starts
-/// should be a new one, never a second `beams ssh` attempt landing
-/// somewhere unexpected. Without `BEAM_ALIAS` (e.g. local dev outside a
-/// Beam), falls back to the launch id so sessions still stay distinct.
+/// (`$BEAM_ALIAS`, e.g. `brave-ping`) rather than the launch id: zellij
+/// shows this name as the terminal title, and the launch id (internal
+/// bookkeeping - see `BEAMS_LAUNCH_ID`) isn't meaningful to a user
+/// reading it there. No `beams-` prefix - nothing else matches on this
+/// name, so there's nothing a prefix would need to disambiguate.
+/// Reusing one session per Beam across reconnects is also the point,
+/// not an accident - a session only a user starts should be a new one,
+/// never a second `beams ssh` attempt landing somewhere unexpected.
+/// Without `BEAM_ALIAS` (e.g. local dev outside a Beam), falls back to
+/// the launch id so sessions still stay distinct.
 pub fn session_name(launch_id: &str) -> String {
     match std::env::var("BEAM_ALIAS") {
-        Ok(alias) if !alias.is_empty() => format!("beams-{alias}"),
-        _ => format!("beams-{}", launch_id.split('-').next().unwrap_or(launch_id)),
+        Ok(alias) if !alias.is_empty() => alias,
+        _ => launch_id.split('-').next().unwrap_or(launch_id).to_string(),
     }
 }
 
@@ -367,7 +369,7 @@ mod tests {
     fn session_name_falls_back_to_launch_id_without_beam_alias() {
         let prior = std::env::var("BEAM_ALIAS").ok();
         std::env::remove_var("BEAM_ALIAS");
-        assert_eq!(session_name("0a1b2c3d-1111-2222-3333-444455556666"), "beams-0a1b2c3d");
+        assert_eq!(session_name("0a1b2c3d-1111-2222-3333-444455556666"), "0a1b2c3d");
         if let Some(prior) = prior {
             std::env::set_var("BEAM_ALIAS", prior);
         }
@@ -377,7 +379,7 @@ mod tests {
     fn session_name_prefers_beam_alias() {
         let prior = std::env::var("BEAM_ALIAS").ok();
         std::env::set_var("BEAM_ALIAS", "brave-ping");
-        assert_eq!(session_name("0a1b2c3d-1111-2222-3333-444455556666"), "beams-brave-ping");
+        assert_eq!(session_name("0a1b2c3d-1111-2222-3333-444455556666"), "brave-ping");
         match prior {
             Some(prior) => std::env::set_var("BEAM_ALIAS", prior),
             None => std::env::remove_var("BEAM_ALIAS"),
