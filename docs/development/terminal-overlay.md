@@ -26,7 +26,7 @@ records the current commits, code entry points and concrete next steps.
 | Mouse encodings | Split-read fixtures cover X10, UTF-8/1005, SGR/1006 and urxvt reports. X10 payloads intentionally contain `q`/`y`; coordinates cannot close a menu or approve a request. Restoration disables obsolete mouse modes/encodings before applying the model's current state. |
 | Alternate screens | Emulator fixtures cover entering, leaving and round trips while the menu is open, selecting the final buffer and removing the menu from the buffer it covered. An ordinary alternate-screen overlay preserves the workstation main screen that the shadow model never observed. Updates to inactive buffers across more complex transitions remain a gap. |
 | Wide/combining text | Fixtures cover double-width cells, combining accents, Nerd Font private-use glyphs, RGB, inverse video with default colors, and pending right-margin wrap. Toast removal restores wide glyphs bisected by either edge. Actual font/emoji width differences still require visual testing. |
-| Resize | The controlling-PTY harness resizes an open dialog through ordinary and small sizes, checks the child sees each size and verifies overlay close does not inject the takeover mode's one-column pulse. |
+| Resize | The controlling-PTY harness resizes an open dialog through ordinary and small sizes, checks the child sees each size, that the menu survives (reopened as takeover) with an approval key after the resize still reaching it, and that a later overlay close does not inject the takeover mode's one-column pulse. A borrowed menu is checked the same way. |
 | Input/query replies | Model/PTY fixtures cover ordinary/private CPR, DSR, device queries, OSC clipboard replies and opaque DCS input replies. CPR, common DECRQM reports and complete DECRQSS SGR/margin requests use remote state at the request. Cancelled/oversized DCS never synthesize replies; unmodeled settings and hidden XTGETTCAP receive negative responses. Passthrough adds no model reply. Additional mode/advanced-keyboard probes remain gaps. |
 | Sustained output/lifecycle | A bounded 32-chunk output channel and 16-chunk drain budget give input, resize, signals and daemon events turns during output bursts. User input and replies share a 256 KiB worker queue including in-flight bytes; only the worker blocks on child writes. The PTY harness checks a 4 MiB burst, 8192 replies with child reads paused, exact subsequent input order, menu close, output/resize/SIGTERM responsiveness, explicit queue-exhaustion errors, exit status and termios cleanup. The burst fixture now reads input during nonblocking output. |
 | Chunk boundaries | The remote prefix is tracked across reads. Opening a menu cancels an unfinished sequence only in the physical terminal; closing replays the latest unfinished prefix before passthrough resumes. Fixtures cover CSI, OSC and split UTF-8. |
@@ -347,8 +347,11 @@ protocol/PTY smoke pass. The PTY smoke also passes with the independent
 xterm.js renderer comparison. Tests cover inherited-state refusal, rejection
 before model mutation at every frame split, exact replay of unsupported
 output, inactive-buffer round trips and reopening a preserved form. Only RIS
-establishes a complete baseline today. Covered resize closes the menu and
-invalidates eligibility, but restoring after the physical terminal has
+establishes a complete baseline today. Covered resize closes the overlay (or
+borrowed) menu and invalidates eligibility, then reopens it at once as
+takeover, so keys after the resize still reach the menu rather than the
+remote; the menu's state lives in `DaemonView` and survives. Restoring
+after the physical terminal has
 already reflowed remains best effort and a release gate.
 
 Common drawing-state pass (2026-11-07): 222 unit tests and 3 integration tests,

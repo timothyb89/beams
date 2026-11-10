@@ -1024,6 +1024,14 @@ bootstrap `Task`s.
     the zellij reattach recording never scrolls through the toast's rows
     while it's up, so the erase-before-move and open-remote-frame paths are
     covered only by synthetic unit tests.
+  - [ ] Resizing during a zellij session, then detaching, leaves many copies
+    of the screen in the workstation terminal's scrollback (2026-11-10).
+    Passthrough writes nothing on resize (same as `main`; only the child PTY
+    is resized), so this is most likely the terminal saving alternate-screen
+    lines to scrollback as it shrinks/redraws (iTerm2 has a profile option,
+    "Save lines to scrollback in alternate screen mode"). Next: A/B against
+    zellij outside beams and with that option off; only if beams-specific,
+    look at the entry scrollback push / resize pulses.
   - [ ] REP (`CSI b`) right after any local paint (toast, restore) repeats
     our last printed glyph physically, not the remote's. Pre-existing and
     rare (needs a remote that uses REP, e.g. ncurses with `rep` in terminfo,

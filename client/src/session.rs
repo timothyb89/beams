@@ -546,7 +546,9 @@ fn drive(
 
         if let Ok(size) = current_size() {
             if size != last_size {
-                if terminal_state.menu_over_live_output() && input_router.mode == InputMode::Palette {
+                let reopen = terminal_state.menu_over_live_output()
+                    && input_router.mode == InputMode::Palette;
+                if reopen {
                     // Close using the last represented snapshot. The outer
                     // terminal may already have reflowed it: fidelity during
                     // a covered resize remains an explicit compatibility gate.
@@ -560,6 +562,16 @@ fn drive(
                 // The remote repaints for the new size; don't "restore"
                 // cells at the old toast position.
                 painter.forget();
+                if reopen {
+                    // Keys after the prefix belong to the menu, never the
+                    // remote: bring it straight back. Nothing is known about
+                    // the remote's new screen yet, so take it over (closing
+                    // asks the remote to redraw). The menu's own state, e.g.
+                    // a half-typed form, lives in `daemon_view` and survives.
+                    terminal_state.open_palette(terminal_model.screen(), false, false)?;
+                    palette_terminal = Some(new_palette_terminal()?);
+                    input_router.mode = InputMode::Palette;
+                }
                 if input_router.mode == InputMode::Palette {
                     redraw_palette!();
                 }

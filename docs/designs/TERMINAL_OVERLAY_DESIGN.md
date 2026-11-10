@@ -750,6 +750,8 @@ switching, so this gate remains open rather than assuming a spare buffer.
 Covered resize remains a fidelity gate: the outer terminal may already have
 reflowed before the client sees SIGWINCH. Closing from the last snapshot is
 best effort; new painting is suppressed until explicit geometry recovery or RIS.
+The menu itself reopens immediately as takeover, so keys after the resize
+never reach the remote.
 This does not establish lossless
 resize/reflow support and must not enable the default switch. Safe borrowing
 and terminal-specific resize validation remain separate work.

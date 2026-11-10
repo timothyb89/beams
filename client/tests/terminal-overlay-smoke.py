@@ -352,12 +352,24 @@ def run_checks(root, binary):
         session.send(clipboard_reply)
         session.wait(lambda: session.remote_input().endswith(clipboard_reply), "clipboard reply routing")
 
-        # Resize several times while the dialog owns the terminal.
+        # Resize several times while the dialog owns the terminal. The menu
+        # stays up, taking the screen over (nothing is known about the
+        # remote's new screen), so keys after a resize still reach it.
         for rows, cols in [(30, 90), (8, 32), (24, 100)]:
             fcntl.ioctl(session.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
             session.wait(lambda: f"{rows} {cols}\n" in (root / "sizes").read_text(), "PTY resize")
+        resized_input = session.remote_input()
+        pulses = (root / "sizes").read_text().count("\n")
+        offset = len(session.output)
+        # An approval key, then output that takeover defers until it closes.
+        session.send(b"y")
         session.emit(b"\x1bc\x1b[?1049hREINITIALIZED AFTER RESIZE")
-        session.wait(lambda: b"REINITIALIZED AFTER RESIZE" in session.output, "resize recovery")
+        session.send(b"q")
+        session.wait(lambda: b"REINITIALIZED AFTER RESIZE" in session.output[offset:], "resize recovery")
+        assert session.remote_input() == resized_input, "keys after a resize reached the remote"
+        session.wait(lambda: (root / "sizes").read_text().count("\n") >= pulses + 2,
+                     "closing the taken-over menu redraws the remote")
+        sizes_after_resize = len((root / "sizes").read_text())
         session.open()
         session.emit("\x1b[H界e\u0301 \x1b[7mdefault inverse\x1b[0m".encode())
         # A partial remote CSI must be replayed before passthrough resumes.
@@ -377,7 +389,8 @@ def run_checks(root, binary):
         session.send(b"\x1bP1$r0m\x1b\\")
         session.wait(lambda: session.remote_input() == passthrough_baseline + b"\x1bP1$r0m\x1b\\",
                      "exactly one physical DECRQSS reply in passthrough")
-        assert "24 99\n" not in (root / "sizes").read_text(), "overlay injected a resize pulse"
+        assert "24 99\n" not in (root / "sizes").read_text()[sizes_after_resize:], \
+            "overlay injected a resize pulse"
         assert session.output.count(b"\x1b]52;c;SGVsbG8=\x1b\\") == 1, "clipboard effect duplicated"
 
         # Exercise the live menu under origin mode and restricted margins.
@@ -868,6 +881,12 @@ def run_owned_borrowing(root, binary, outcome):
         session.wait(lambda: "14 80\n" in (root / "sizes").read_text(), "covered borrowed resize")
         session.wait(lambda: resize_drawing in session.output[mark:], "resize relinquishes and replays")
         assert session.output[mark:].count(resize_drawing) == 1
+        # The menu comes straight back, taking the screen over, so keys
+        # after the resize still reach it; the prefix closes it.
+        replayed = session.output.index(resize_drawing, mark) + len(resize_drawing)
+        session.wait(lambda: b"Forward a Beam port" in session.output[replayed:], "menu survives resize")
+        session.send(b"\x1d")
+        session.wait(lambda: session.remote_input().endswith(b"\x1d"), "prefix closes the menu")
         session.emit(before)
         session.wait(lambda: before in session.output[mark:], "geometry after covered resize")
         session.open(b"Forward a Beam port")
