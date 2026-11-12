@@ -21,7 +21,7 @@ const HOME_ENV: &str = "TELEPORT_HOME";
 /// a stale one would only confuse diagnostics.
 const SITE_ENV: &str = "TELEPORT_SITE";
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Endpoint {
     /// Web proxy `host:port` of the profile.
     pub proxy: String,

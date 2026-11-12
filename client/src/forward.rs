@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::connection::{BeamConnection, Connection};
+use crate::connection::{BeamConnection, Connection, ForwardPlan};
 use anyhow::{bail, Context};
 use beams_protocol::{ServiceRequestKind, ServiceStatus};
 
@@ -25,6 +25,10 @@ const STARTUP_GRACE: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AUTO_PORT_ATTEMPTS: usize = 8;
 const DIAGNOSTIC_LINES: usize = 20;
+/// A forward that ran this long before losing its master counts as stable.
+const STABLE_FORWARD: Duration = Duration::from_secs(30);
+const MAX_QUICK_REOPENS: u32 = 3;
+const REOPEN_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -59,6 +63,7 @@ fn supervise(
     commands: Receiver<Action>,
 ) {
     let mut start_requested = true;
+    let mut reopen_failures = 0;
     loop {
         if start_requested {
             let _ = events.send(Event {
@@ -69,10 +74,11 @@ fn supervise(
             });
             match start_forward(connection.as_ref(), &requested_kind) {
                 Ok(StartedForward {
-                    mut child,
+                    running,
                     kind: running_kind,
                     diagnostics,
                 }) => {
+                    let started = Instant::now();
                     requested_kind = running_kind.clone();
                     let _ = events.send(Event {
                         service_id: service_id.clone(),
@@ -80,7 +86,7 @@ fn supervise(
                         status: ServiceStatus::Running,
                         message: Some(forward_label(&running_kind)),
                     });
-                    match monitor_running(&mut child, &commands) {
+                    match monitor_running(running, &commands) {
                         RunningOutcome::Stopped => {
                             let _ = events.send(Event {
                                 service_id: service_id.clone(),
@@ -109,6 +115,27 @@ fn supervise(
                             });
                             start_requested = false;
                         }
+                        RunningOutcome::ConnectionLost => {
+                            // Re-open on the replacement master (or a tsh
+                            // process), keeping the same local port. Give up
+                            // if connections keep dropping right away.
+                            reopen_failures = if started.elapsed() < STABLE_FORWARD { reopen_failures + 1 } else { 0 };
+                            let retry = reopen_failures <= MAX_QUICK_REOPENS;
+                            let _ = events.send(Event {
+                                service_id: service_id.clone(),
+                                kind: running_kind,
+                                status: if retry { ServiceStatus::Starting } else { ServiceStatus::Error },
+                                message: Some(if retry {
+                                    "SSH connection replaced; reopening".to_string()
+                                } else {
+                                    "SSH connection keeps dropping".to_string()
+                                }),
+                            });
+                            if retry {
+                                thread::sleep(REOPEN_DELAY);
+                            }
+                            start_requested = retry;
+                        }
                         RunningOutcome::OwnerGone => return,
                     }
                 }
@@ -136,9 +163,33 @@ fn supervise(
 
 #[derive(Debug)]
 struct StartedForward {
-    child: Child,
+    running: Running,
     kind: ServiceRequestKind,
     diagnostics: Arc<Mutex<VecDeque<String>>>,
+}
+
+/// A forward that's up: its own process (Tier C) or registered on a shared
+/// master (Tier B).
+#[derive(Debug)]
+enum Running {
+    Child(Child),
+    Master { cancel: Command, lease: crate::master::Lease },
+}
+
+impl Running {
+    fn stop(self) {
+        match self {
+            Running::Child(mut child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Running::Master { mut cancel, lease } => {
+                if lease.is_alive() {
+                    let _ = cancel.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+                }
+            }
+        }
+    }
 }
 
 fn start_forward(
@@ -171,29 +222,25 @@ fn start_forward(
             local_port: Some(selected_port),
         };
         let diagnostics = Arc::new(Mutex::new(VecDeque::new()));
-        let mut child = spawn_child(
-            connection,
-            remote_host,
-            *remote_port,
-            selected_port,
-            Arc::clone(&diagnostics),
-        )?;
-        let deadline = Instant::now() + STARTUP_GRACE;
-        loop {
-            match child.try_wait().context("checking port-forward startup")? {
-                Some(status) => {
-                    last_error = Some(child_failure(status, &diagnostics));
-                    break;
-                }
-                None if Instant::now() >= deadline => {
-                    return Ok(StartedForward {
-                        child,
-                        kind: running_kind,
-                        diagnostics,
-                    });
-                }
-                None => thread::sleep(POLL_INTERVAL),
+        let plan = connection.local_forward(selected_port, remote_host, *remote_port);
+        let attempt = match plan {
+            ForwardPlan::Process(command) => {
+                start_process(connection, command, Arc::clone(&diagnostics)).map(Running::Child)
             }
+            ForwardPlan::Master { open, cancel, lease } => {
+                open_on_master(open).map(|()| Running::Master { cancel, lease })
+            }
+        };
+        match attempt {
+            Ok(running) => {
+                return Ok(StartedForward {
+                    running,
+                    kind: running_kind,
+                    diagnostics,
+                })
+            }
+            Err(Attempt::Failed(message)) => last_error = Some(message),
+            Err(Attempt::Fatal(err)) => return Err(err),
         }
         if local_port.is_some() {
             break;
@@ -217,15 +264,19 @@ fn reserve_port(requested: Option<u16>) -> anyhow::Result<u16> {
     Ok(selected)
 }
 
-fn spawn_child(
+enum Attempt {
+    /// This port didn't work (bind conflict, startup failure); another may.
+    Failed(String),
+    Fatal(anyhow::Error),
+}
+
+/// Starts a forwarding process and waits out `STARTUP_GRACE` for it to fail.
+fn start_process(
     connection: &dyn BeamConnection,
-    remote_host: &str,
-    remote_port: u16,
-    local_port: u16,
+    mut command: Command,
     diagnostics: Arc<Mutex<VecDeque<String>>>,
-) -> anyhow::Result<Child> {
+) -> Result<Child, Attempt> {
     let destination = connection.target().destination();
-    let mut command = connection.local_forward(local_port, remote_host, remote_port);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -233,18 +284,48 @@ fn spawn_child(
     configure_parent_death_signal(&mut command);
     let mut child = command
         .spawn()
-        .with_context(|| format!("starting local forward to {destination}"))?;
-    let stderr = child.stderr.take().context("capturing port-forward diagnostics")?;
+        .with_context(|| format!("starting local forward to {destination}"))
+        .map_err(Attempt::Fatal)?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("capturing port-forward diagnostics")
+        .map_err(Attempt::Fatal)?;
+    let reader_diagnostics = Arc::clone(&diagnostics);
     thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            let mut lines = diagnostics.lock().unwrap();
+            let mut lines = reader_diagnostics.lock().unwrap();
             if lines.len() == DIAGNOSTIC_LINES {
                 lines.pop_front();
             }
             lines.push_back(line);
         }
     });
-    Ok(child)
+    let deadline = Instant::now() + STARTUP_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Err(Attempt::Failed(child_failure(status, &diagnostics))),
+            Ok(None) if Instant::now() >= deadline => return Ok(child),
+            Ok(None) => thread::sleep(POLL_INTERVAL),
+            Err(err) => return Err(Attempt::Fatal(anyhow::Error::new(err).context("checking port-forward startup"))),
+        }
+    }
+}
+
+/// Registers a forward on a master (`ssh -O forward`), which binds the port
+/// before answering.
+fn open_on_master(mut open: Command) -> Result<(), Attempt> {
+    let output = open
+        .stdin(Stdio::null())
+        .output()
+        .context("asking the SSH master to forward")
+        .map_err(Attempt::Fatal)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().replace('\n', " | ");
+        Err(Attempt::Failed(format!("SSH master refused the forward: {detail}")))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -279,35 +360,43 @@ enum RunningOutcome {
     Stopped,
     Restart,
     Exited(std::process::ExitStatus),
+    /// The shared master went away (replaced before certificate expiry, or
+    /// disconnected); the forward went with it and can be re-opened.
+    ConnectionLost,
     OwnerGone,
 }
 
-fn monitor_running(child: &mut Child, commands: &Receiver<Action>) -> RunningOutcome {
+fn monitor_running(running: Running, commands: &Receiver<Action>) -> RunningOutcome {
+    let mut running = running;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return RunningOutcome::Exited(status),
-            Ok(None) => {}
-            Err(_) => {
-                let _ = child.kill();
-                let status = child.wait().unwrap_or_else(|_| synthetic_failure());
-                return RunningOutcome::Exited(status);
+        match &mut running {
+            Running::Child(child) => match child.try_wait() {
+                Ok(Some(status)) => return RunningOutcome::Exited(status),
+                Ok(None) => {}
+                Err(_) => {
+                    let _ = child.kill();
+                    let status = child.wait().unwrap_or_else(|_| synthetic_failure());
+                    return RunningOutcome::Exited(status);
+                }
+            },
+            Running::Master { lease, .. } => {
+                if !lease.is_alive() {
+                    return RunningOutcome::ConnectionLost;
+                }
             }
         }
         match commands.recv_timeout(POLL_INTERVAL) {
             Ok(Action::Stop) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                running.stop();
                 return RunningOutcome::Stopped;
             }
             Ok(Action::Restart) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                running.stop();
                 return RunningOutcome::Restart;
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                running.stop();
                 return RunningOutcome::OwnerGone;
             }
         }

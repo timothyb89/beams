@@ -769,6 +769,38 @@ cluster no longer misroutes any of them.
 See `docs/designs/BEAM_TRANSPORT_DESIGN.md` for the transport work this is
 the first step of.
 
+## Multiplexed SSH: one connection per Beam
+
+The daemon keeps one OpenSSH ControlMaster per Beam and runs the bridge,
+port forwards, copies, fetches and Mutagen as channels on it, instead of a
+cold `tsh` process for each (~170 ms and ~90 MiB apiece). The master's
+transport is the `tsh proxy ssh --proxy=P --cluster=C` ProxyCommand from a
+private `tsh config --proxy=P`, so it's pinned like every other call,
+authenticates with the profile's own key and certificate, and checks the
+Beam against Teleport's host CA. `~/.ssh/config` is never read or changed.
+
+- **Fallback.** Anything the master can't serve uses the pinned per-call
+  `tsh` path, per operation: profiles with a hardware key (OpenSSH can't
+  sign with it), failed authentication (retried after the next
+  `tsh login`), `tsh config` failing (retried after a minute), a master
+  that won't start (retried with backoff) or `BEAMS_MULTIPLEX=0`.
+- **Forwards** are `ssh -O forward`/`-O cancel` on the master: no process
+  per forward. If the master goes away the forward re-opens on the same
+  local port on its replacement.
+- **Certificates.** A master never outlives its certificate: it's closed at
+  expiry, and long-lived channels (bridge, Mutagen, forwards) reconnect.
+  Within five minutes of expiry, once a `tsh login` has produced a newer
+  certificate, new work moves to a fresh master while the old one keeps its
+  channels.
+- **Files** live in `<instance dir>/ssh` (mode 0700): `cfg/` for the
+  generated configs and `m/` for control sockets, with `m/<hash>` a symlink
+  to the Beam's current master for the Mutagen wrappers. Masters left by a
+  crashed daemon are closed at the next start.
+- The interactive `beams ssh` session and the launch-time git push and
+  upload still use `tsh` directly.
+- The daemon log says which transport each Beam got ("multiplexed SSH
+  connection to UUID is up", or why not).
+
 ## Beam management wrappers
 
 The rest of `tsh beams ...` is wrapped too, so managing beams doesn't

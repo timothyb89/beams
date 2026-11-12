@@ -248,6 +248,61 @@ Never weaken host verification: Tier B uses `tsh config`'s
   this).
 - Interactive session: stage 3, below.
 
+### Tier B as implemented (2026-11-12)
+
+`client/src/master.rs`. Differences from the plan above, mostly from
+testing against a real unprivileged `sshd`:
+
+- **Forwards use `-O forward`/`-O cancel`.** A `ControlMaster=no` client
+  holding `-N -L` is not a usable handle: killing it leaves the forward
+  registered on the master. `BeamConnection::local_forward` returns a
+  `ForwardPlan` (a process for Tier C, open/cancel commands plus a `Lease`
+  for Tier B). The forward worker re-opens on the same port when the
+  lease's master goes away.
+- **Per-generation sockets, stable symlink.** Masters bind
+  `m/<beam hash>.<generation>`, and `m/<beam hash>` points at the current
+  one for Mutagen's wrappers (line 4 of their per-host record). The
+  wrappers `-O check` it on each connection and otherwise use pinned `tsh`.
+  An old generation stays reachable for `-O cancel` while it drains.
+  (`-O stop` would unlink the socket and refuse those cancels.)
+- **Rotation needs a renewed certificate.** Inside the five-minute window,
+  the master is replaced only once the profile's certificate (read with
+  `ssh-keygen -L`) outlives it. Otherwise every lease would start another
+  master on the same certificate. A master is killed at its certificate's
+  expiry either way, whether it's current or draining, which is stricter
+  than Tier C (a `tsh ssh` session isn't cut off at expiry unless the role
+  sets `disconnect_expired_cert`).
+- **Clients can't dial on their own.** Channel clients run
+  `ssh -F none -o ControlPath=... -o ControlMaster=no -o ProxyCommand=false
+  -o BatchMode=yes`, so a dead master makes them fail rather than open a
+  direct connection.
+- **Masters are spawned from one long-lived thread**: Linux's
+  `PR_SET_PDEATHSIG` fires when the spawning *thread* exits, and a master
+  must outlive the worker that first needed it.
+- **Selection** happens per operation (`MultiplexedConnection` asks the
+  pool for a lease each time), so a master that comes up or dies later is
+  picked up by the next operation. A lease blocks while the master starts
+  (up to 20 s), in the calling worker's thread.
+- **Probing** caches per endpoint, keyed on the mtime of
+  `<TELEPORT_HOME>/<proxy host>.yaml` (rewritten by `tsh login`).
+  Hardware-key profiles (`PIV`), publickey/host-key failures and a missing
+  `ssh` disable Tier B until that changes; a failing `tsh config` is
+  retried after a minute.
+- Not done yet: a second master when `max_sessions` refuses a channel
+  (default 10 session channels per connection; the bridge, each Mutagen
+  session and concurrent copies count). The git push and launch upload stay
+  on Tier C because the CLI does them before the daemon owns the Beam.
+  There's no UI yet for which tier a Beam uses; it's in the daemon log.
+
+Tested by `master::tests::multiplexes_against_a_local_sshd` (opt-in: set
+`BEAMS_TEST_SSHD` to an `sshd` binary, with `sshd-session`, `sshd-auth` and
+`sftp-server` in `../lib/openssh` next to it, e.g. extracted from the Debian
+`openssh-server` and `openssh-sftp-server` packages). It runs the real pool
+against that sshd, with a fake `tsh` that checks the pin and relays
+`proxy ssh`. It covers exec, copies, forwards, the Mutagen wrappers, a
+recursive fetch through the copy worker, forward re-open after master
+death, rotation on renewal, expiry parsing and shutdown fallback.
+
 ### 3. Rollout
 
 1. **Pinning (§1).** Endpoint in state, single `tsh` builder, per-endpoint

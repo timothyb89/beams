@@ -8,6 +8,7 @@ mod copy;
 mod config;
 mod daemonctl;
 mod connection;
+mod master;
 mod endpoint;
 mod forward;
 mod session;

@@ -3,9 +3,10 @@
 //! into commands. Callers never build `tsh ...` argv themselves, so a
 //! multiplexed transport can replace [`TshConnection`] in one place.
 //!
-//! Only Tier C exists today: every operation is its own pinned `tsh`
-//! process. Tier B (an OpenSSH ControlMaster over a pinned
-//! `tsh proxy ssh`) is designed in `docs/designs/BEAM_TRANSPORT_DESIGN.md`.
+//! [`TshConnection`] is Tier C: every operation is its own pinned `tsh`
+//! process. Tier B (an OpenSSH ControlMaster over a pinned `tsh proxy ssh`,
+//! falling back to Tier C per operation) is `crate::master`. See
+//! `docs/designs/BEAM_TRANSPORT_DESIGN.md`.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::Debug;
@@ -38,6 +39,18 @@ impl BeamTarget {
     }
 }
 
+/// How a local forward is held open.
+#[derive(Debug)]
+pub enum ForwardPlan {
+    /// A process that holds the forward until killed, and exits if the
+    /// forward can't be established or is lost.
+    Process(Command),
+    /// A forward registered on a shared master: run `open` (fails if the
+    /// port can't be bound), and `cancel` to remove it. It disappears with
+    /// the master, which `lease` reports.
+    Master { open: Command, cancel: Command, lease: crate::master::Lease },
+}
+
 /// Builds the commands that reach one Beam. Each returned [`Command`] has
 /// program and arguments set; callers add stdio, parent-death handling
 /// and spawn it.
@@ -49,9 +62,9 @@ pub trait BeamConnection: Send + Sync + Debug {
     /// result to the remote shell (see `tsh::prepare_git_target`).
     fn exec(&self, remote_command: &str) -> Command;
 
-    /// A process that holds `127.0.0.1:local_port -> remote_host:remote_port`
-    /// open until killed, and exits if the forward can't be established.
-    fn local_forward(&self, local_port: u16, remote_host: &str, remote_port: u16) -> Command;
+    /// Forwards `127.0.0.1:local_port` to `remote_host:remote_port` on the
+    /// Beam's side.
+    fn local_forward(&self, local_port: u16, remote_host: &str, remote_port: u16) -> ForwardPlan;
 
     /// Copies `source` to `destination`; exactly one of them is a
     /// [`BeamTarget::remote_path`].
@@ -100,7 +113,7 @@ impl BeamConnection for TshConnection {
         command
     }
 
-    fn local_forward(&self, local_port: u16, remote_host: &str, remote_port: u16) -> Command {
+    fn local_forward(&self, local_port: u16, remote_host: &str, remote_port: u16) -> ForwardPlan {
         let forward = format!("127.0.0.1:{local_port}:{remote_host}:{remote_port}");
         let mut command = self.tsh.command();
         command.args([
@@ -112,7 +125,7 @@ impl BeamConnection for TshConnection {
             &forward,
             &self.target.destination(),
         ]);
-        command
+        ForwardPlan::Process(command)
     }
 
     fn copy(&self, recursive: bool, source: &OsStr, destination: &OsStr) -> Command {
@@ -182,7 +195,9 @@ mod tests {
         assert_eq!(argv(&exec), ["tsh", "ssh", "beams@uuid-1", "--", "bash -lc 'true'"]);
         assert_eq!(env(&exec, "TELEPORT_PROXY").as_deref(), Some("a.example.com:443"));
 
-        let forward = connection.local_forward(8080, "localhost", 3000);
+        let ForwardPlan::Process(forward) = connection.local_forward(8080, "localhost", 3000) else {
+            panic!("tsh forwards are processes");
+        };
         assert_eq!(
             argv(&forward),
             ["tsh", "ssh", "-N", "-o", "ExitOnForwardFailure=yes", "-L", "127.0.0.1:8080:localhost:3000", "beams@uuid-1"]

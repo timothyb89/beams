@@ -435,6 +435,9 @@ struct Hub {
     tsh_program: String,
     mutagen_program: String,
     mutagen_root: PathBuf,
+    /// Tier B SSH masters; `None` uses per-operation `tsh` throughout
+    /// (tests, `BEAMS_MULTIPLEX=0`, or the pool couldn't be set up).
+    masters: Option<Arc<crate::master::Pool>>,
     beam_lister: BeamLister,
     /// Set by a termination signal or the `shutdown` control op.
     terminating: Arc<AtomicBool>,
@@ -574,6 +577,7 @@ impl Hub {
             tsh_program,
             mutagen_program,
             mutagen_root,
+            masters: None,
             beam_lister: Box::new(list_beam_uuids),
             terminating: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
@@ -871,6 +875,9 @@ impl Hub {
                 return;
             }
             let mut bridge = bridges.remove(beam_uuid).expect("checked above");
+            if let Some(pool) = &self.masters {
+                pool.close(beam_uuid);
+            }
             bridge.record.status = "retired".to_string();
             bridge.record.bridge_id = None;
             bridge.record.message = Some("Beam no longer exists; bridge stopped".to_string());
@@ -1351,7 +1358,10 @@ impl Hub {
     /// worker goes through here, so a multiplexed transport can be chosen
     /// per Beam in one place.
     fn connection(&self, target: &crate::connection::BeamTarget) -> crate::connection::Connection {
-        crate::connection::TshConnection::shared(self.tsh_program.clone(), target.clone())
+        match &self.masters {
+            Some(pool) if target.endpoint.is_some() => pool.connection(&self.tsh_program, target.clone()),
+            _ => crate::connection::TshConnection::shared(self.tsh_program.clone(), target.clone()),
+        }
     }
 
     fn spawn_service_worker(
@@ -1726,6 +1736,10 @@ impl Hub {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
+        }
+        // Last: stopping forwards above cancels them on their masters.
+        if let Some(pool) = &self.masters {
+            pool.shutdown();
         }
     }
 
@@ -3282,13 +3296,24 @@ pub fn serve(socket_path: Option<PathBuf>) -> anyhow::Result<()> {
         .parent()
         .context("daemon state path has no parent")?
         .join("mutagen");
-    let hub = Arc::new(Hub::with_programs(
+    let ssh_root = state_path
+        .parent()
+        .context("daemon state path has no parent")?
+        .join("ssh");
+    let mut hub = Hub::with_programs(
         state,
         Some(state_path),
-        tsh_program,
+        tsh_program.clone(),
         mutagen_program,
         mutagen_root,
-    ));
+    );
+    if crate::master::enabled_by_env() {
+        match crate::master::Pool::new(ssh_root, tsh_program) {
+            Ok(pool) => hub.masters = Some(pool),
+            Err(err) => eprintln!("beams daemon: SSH multiplexing disabled: {err:#}"),
+        }
+    }
+    let hub = Arc::new(hub);
     hub.recover_folder_syncs();
     if restore_services {
         eprintln!("beams daemon: restarted after an update; restoring forwards");

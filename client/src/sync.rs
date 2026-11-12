@@ -19,8 +19,52 @@ const COMMAND_QUEUE_CAPACITY: usize = 8;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LIST_TEMPLATE: &str = "{{ json . }}";
 
-const SSH_WRAPPER: &str = r#"#!/bin/sh
-set -eu
+/// Shared by both wrappers: the per-host record `beams` writes (proxy,
+/// cluster, `TELEPORT_HOME`, and optionally the Beam's SSH master socket),
+/// because the long-lived Mutagen daemon's environment can't be relied on.
+macro_rules! wrapper_common {
+    () => {
+        r#"
+record() {
+    proxy= cluster= home= socket=
+    case "$1" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+    file="$(dirname "$0")/../endpoints/$1"
+    [ -f "$file" ] || return 1
+    { IFS= read -r proxy; IFS= read -r cluster; IFS= read -r home; IFS= read -r socket; } <"$file" || true
+}
+# Succeeds when the host's daemon-owned master is up; sets $socket.
+use_master() {
+    record "$1" || return 1
+    [ -n "$socket" ] || return 1
+    "${BEAMS_SSH:-ssh}" -F none -S "$socket" -O check beams-master 2>/dev/null
+}
+# Otherwise pin `tsh` to the host's Teleport endpoint.
+pin_endpoint() {
+    record "$1" || return 0
+    [ -n "$proxy" ] && [ -n "$cluster" ] || return 0
+    export TELEPORT_PROXY="$proxy" TELEPORT_CLUSTER="$cluster"
+    unset TELEPORT_SITE
+    if [ -n "$home" ]; then export TELEPORT_HOME="$home"; else unset TELEPORT_HOME; fi
+}
+"#
+    };
+}
+
+const SSH_WRAPPER: &str = concat!(
+    "#!/bin/sh\nset -eu\n",
+    wrapper_common!(),
+    r#"destination= skip=
+for arg do
+    if [ -n "$skip" ]; then skip=; continue; fi
+    case "$arg" in
+        -o|-p|-l|-i|-F|-J|-S) skip=1 ;;
+        -*) ;;
+        *) destination=$arg; break ;;
+    esac
+done
+if use_master "${destination#*@}"; then
+    exec "${BEAMS_SSH:-ssh}" -F none -o "ControlPath=$socket" -o ControlMaster=no -o ProxyCommand=false -o BatchMode=yes "$@"
+fi
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --) shift; break ;;
@@ -33,24 +77,24 @@ done
 [ "$#" -ge 1 ] || { echo "beams Mutagen ssh wrapper: missing destination" >&2; exit 2; }
 destination=$1
 shift
-# Pin `tsh` to the Beam's Teleport endpoint (written per host by beams):
-# the long-lived Mutagen daemon's environment can't be relied on for this.
-pin_endpoint() {
-    case "$1" in ''|*[!A-Za-z0-9._-]*) return 0 ;; esac
-    file="$(dirname "$0")/../endpoints/$1"
-    [ -f "$file" ] || return 0
-    { IFS= read -r proxy; IFS= read -r cluster; IFS= read -r home; } <"$file" || true
-    [ -n "$proxy" ] && [ -n "$cluster" ] || return 0
-    export TELEPORT_PROXY="$proxy" TELEPORT_CLUSTER="$cluster"
-    unset TELEPORT_SITE
-    if [ -n "$home" ]; then export TELEPORT_HOME="$home"; else unset TELEPORT_HOME; fi
-}
 pin_endpoint "${destination#*@}"
 exec "${BEAMS_TSH:-tsh}" ssh "$destination" -- "$@"
-"#;
+"#
+);
 
-const SCP_WRAPPER: &str = r#"#!/bin/sh
-set -eu
+const SCP_WRAPPER: &str = concat!(
+    "#!/bin/sh\nset -eu\n",
+    wrapper_common!(),
+    r#"host=
+for operand do
+    case "$operand" in
+        */*:*) ;;
+        *@*:*) host=${operand#*@}; host=${host%%:*}; break ;;
+    esac
+done
+if use_master "$host"; then
+    exec "${BEAMS_SCP:-scp}" -F none -o "ControlPath=$socket" -o ControlMaster=no -o ProxyCommand=false -o BatchMode=yes "$@"
+fi
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --) shift; break ;;
@@ -62,26 +106,10 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 [ "$#" -ge 2 ] || { echo "beams Mutagen scp wrapper: missing endpoints" >&2; exit 2; }
-# Pin `tsh` to the Beam's Teleport endpoint (written per host by beams):
-# the long-lived Mutagen daemon's environment can't be relied on for this.
-pin_endpoint() {
-    case "$1" in ''|*[!A-Za-z0-9._-]*) return 0 ;; esac
-    file="$(dirname "$0")/../endpoints/$1"
-    [ -f "$file" ] || return 0
-    { IFS= read -r proxy; IFS= read -r cluster; IFS= read -r home; } <"$file" || true
-    [ -n "$proxy" ] && [ -n "$cluster" ] || return 0
-    export TELEPORT_PROXY="$proxy" TELEPORT_CLUSTER="$cluster"
-    unset TELEPORT_SITE
-    if [ -n "$home" ]; then export TELEPORT_HOME="$home"; else unset TELEPORT_HOME; fi
-}
-for operand do
-    case "$operand" in
-        */*:*) ;;
-        *@*:*) host=${operand#*@}; pin_endpoint "${host%%:*}"; break ;;
-    esac
-done
+pin_endpoint "$host"
 exec "${BEAMS_TSH:-tsh}" scp "$@"
-"#;
+"#
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -308,18 +336,19 @@ fn run(
     }
 }
 
-struct Transport {
+pub(crate) struct Transport {
     data: PathBuf,
-    bin: PathBuf,
+    pub(crate) bin: PathBuf,
     /// One file per Beam host, read by the wrappers (`pin_endpoint`).
     endpoints: PathBuf,
 }
 
 /// Records how the wrappers reach `connection`'s Beam
 /// ([`BeamConnection::mutagen_host_entry`]): for Tier C, proxy, cluster and
-/// `TELEPORT_HOME` (blank for the default) on three lines. Unpinned targets
-/// leave no file, so their transport follows the current profile.
-fn write_endpoint(transport: &Transport, connection: &dyn BeamConnection) -> anyhow::Result<()> {
+/// `TELEPORT_HOME` (blank for the default) on three lines, plus a fourth
+/// with the master socket for Tier B. Unpinned targets leave no file, so
+/// their transport follows the current profile.
+pub(crate) fn write_endpoint(transport: &Transport, connection: &dyn BeamConnection) -> anyhow::Result<()> {
     let Some(entry) = connection.mutagen_host_entry() else {
         return Ok(());
     };
@@ -329,13 +358,13 @@ fn write_endpoint(transport: &Transport, connection: &dyn BeamConnection) -> any
     {
         bail!("unexpected Beam host {:?} for the Mutagen transport", target.beam_uuid);
     }
-    if entry.matches('\n').count() != 3 || !entry.ends_with('\n') {
+    if !(3..=4).contains(&entry.matches('\n').count()) || !entry.ends_with('\n') {
         bail!("unexpected newline in the Beam's Teleport endpoint");
     }
     write_wrapper(&transport.endpoints.join(&target.beam_uuid), &entry)
 }
 
-fn prepare_transport(root: &Path) -> anyhow::Result<Transport> {
+pub(crate) fn prepare_transport(root: &Path) -> anyhow::Result<Transport> {
     let data = root.join("data");
     let bin = root.join("bin");
     let endpoints = root.join("endpoints");

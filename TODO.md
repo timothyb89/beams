@@ -1260,9 +1260,19 @@ bootstrap `Task`s.
   - [x] `BeamConnection` trait with the pinned-`tsh` tier only
     (`client/src/connection.rs`; one `BeamTarget` replaces the per-module
     `Target`s; `Hub::connection` is the daemon's single source).
-  - [ ] Tier B (ControlMaster over pinned `tsh proxy ssh`) for daemon-owned
-    work, with capability probing and Tier C fallback; workstation runs of
-    the harness. (VNet SSH tier deferred: no MFA/hardware-key roles here.)
+  - [x] Tier B (ControlMaster over pinned `tsh proxy ssh`) for daemon-owned
+    work, with capability probing and Tier C fallback (`client/src/master.rs`;
+    tested against a local sshd). (VNet SSH tier deferred: no MFA/hardware-key
+    roles here.)
+  - [ ] Verify Tier B from a workstation (macOS and Linux): daemon log shows
+    "multiplexed SSH connection ... is up"; bridge, forward, copy, fetch and
+    Mutagen work; `ps` shows one `tsh proxy ssh` per Beam; `tsh login`
+    near expiry moves to a new master; Teleport audit/session events look
+    right for channels on one connection; then
+    `tests/openssh-controlmaster-spike.sh` against `tsh config --proxy=P`.
+  - [ ] Tier B: start a second master when `max_sessions` refuses a channel.
+  - [ ] Show each Beam's transport (multiplexed or why not) in the menu or
+    `beams daemon status`.
   - [ ] Raise upstream: from inside a Beam, `tsh ssh beams@<own uuid>` is
     denied by the node's access checker (`bot-beam-<id> is not authorized to
     login as beams`), while SSH to other Beams and from a workstation works.
