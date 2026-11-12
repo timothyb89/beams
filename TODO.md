@@ -1246,6 +1246,19 @@ bootstrap `Task`s.
   - [ ] Run the final laptop-to-Beam acceptance check (including macOS) and
     add an automated fake-Mutagen fixture for disconnected transport and
     expired-Beam regression coverage.
+- [ ] Beam transport (see `docs/designs/BEAM_TRANSPORT_DESIGN.md`):
+  - [ ] Pin every `tsh` call to the Beam's recorded proxy/cluster
+    (`BeamEndpoint` in `state.json`, one `tsh` command builder,
+    per-endpoint `beams ls`/`--prune`, fail-closed "log in again"). Today a
+    `tsh login` to another cluster misroutes bridge reconnects, forwards,
+    copies and Mutagen, and can make `rm --prune` forget live Beams.
+  - [ ] `BeamConnection` trait in `beamsd` with the pinned-`tsh` tier only
+    (no behavior change), replacing the per-module `Target`s.
+  - [ ] Tier A (ControlMaster over VNet SSH) and Tier B (ControlMaster over
+    pinned `tsh proxy ssh`) for daemon-owned work, with capability probing;
+    workstation runs of the harness incl. hardware-key and per-session MFA.
+  - [ ] Interactive session over the master; pre-warm the master; launch
+    uploads over it (Phase 6 above).
 - [ ] Phase 7: run the isolated OpenSSH `ControlMaster`/`tsh proxy ssh`
   compatibility spike and add a multiplexed backend only if it passes
   Teleport auth renewal, MFA, recording, reconnect, PTY, forward, copy, and

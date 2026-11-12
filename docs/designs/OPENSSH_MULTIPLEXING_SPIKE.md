@@ -5,6 +5,11 @@ Date: 2026-10-28. This is the Phase 7 follow-up to
 carry the interactive shell, client bridge, forwards, copies, and Mutagen
 transport instead of starting a separate `tsh` process for each.
 
+> **Superseded (2026-11-12)** by `docs/designs/BEAM_TRANSPORT_DESIGN.md`,
+> which adds profile pinning, VNet SSH as the hardware-key/MFA-capable
+> master transport, measurements, and the tbot multiplexer comparison. The
+> harness and background below still apply.
+
 ## Recommendation
 
 Proceed with an optional `OpenSshTransport`, but keep `TshTransport` as the

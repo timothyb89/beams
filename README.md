@@ -57,7 +57,8 @@ daemon, etc).
 - `TODO.md` — live task list.
 - `docs/designs/` — design docs and exploratory spikes for specific
   subsystems (the daemon/task-graph architecture, client-owned services,
-  the SSH agent proxy, folder sync, OpenSSH multiplexing).
+  the SSH agent proxy, folder sync, OpenSSH multiplexing, the Beam
+  transport).
 - [Configurable launches](docs/designs/LAUNCH_CONFIGURATION_DESIGN.md) —
   client-side profiles, batched uploads/packages, and pre/post tasks;
   offline `beams config validate/explain` is implemented, runtime wiring
