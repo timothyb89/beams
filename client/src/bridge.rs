@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
@@ -28,6 +28,15 @@ pub struct Target {
     pub beam_id: String,
     pub beam_uuid: String,
     pub login: String,
+    /// Where the Beam lives; `None` only for records from before pinning.
+    pub endpoint: Option<crate::endpoint::Endpoint>,
+}
+
+impl Target {
+    /// `program` pinned to this Beam's endpoint.
+    pub fn tsh(&self, program: &str) -> crate::endpoint::Tsh {
+        crate::endpoint::Tsh::new(program, self.endpoint.clone())
+    }
 }
 
 #[derive(Debug)]
@@ -149,7 +158,9 @@ fn start_child(
     target: &Target,
 ) -> anyhow::Result<(std::process::Child, ChildStdin)> {
     let ssh_target = format!("{}@{}", target.login, target.beam_uuid);
-    let mut child = Command::new(program)
+    let mut child = target
+        .tsh(program)
+        .command()
         .args(["ssh", &ssh_target, "--", BRIDGE_COMMAND])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -405,6 +416,7 @@ exit 1
                 beam_id: "test-beam".to_string(),
                 beam_uuid: "test-uuid".to_string(),
                 login: "beams".to_string(),
+                endpoint: None,
             },
             "client-id".to_string(),
             "session-token".to_string(),
@@ -460,6 +472,7 @@ exit 1
                 beam_id: "gone-beam".to_string(),
                 beam_uuid: "gone-uuid".to_string(),
                 login: "beams".to_string(),
+                endpoint: None,
             },
             "client-id".to_string(),
             "session-token".to_string(),

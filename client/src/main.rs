@@ -7,6 +7,7 @@ mod clientd;
 mod copy;
 mod config;
 mod daemonctl;
+mod endpoint;
 mod forward;
 mod session;
 mod stage;
@@ -400,21 +401,64 @@ fn main() -> anyhow::Result<ExitCode> {
 }
 
 fn tracked_target(purpose: &str, login: &str) -> anyhow::Result<bridge::Target> {
-    let state = state::State::load()?;
-    let tracked = state.purposes.get(purpose).with_context(|| {
-        format!(
-            "no Beam is tracked for purpose {purpose:?}; run `beams ssh --purpose {purpose}` first"
-        )
-    })?;
-    let beam = tsh::list_beams()?
-        .into_iter()
-        .find(|beam| beam.uuid == tracked.uuid)
-        .with_context(|| format!("the Beam tracked for purpose {purpose:?} is no longer active"))?;
+    let mut state = state::State::load()?;
+    if !state.purposes.contains_key(purpose) {
+        bail!("no Beam is tracked for purpose {purpose:?}; run `beams ssh --purpose {purpose}` first");
+    }
+    let located = beamcmd::locate(purpose, &mut state)
+        .with_context(|| format!("the Beam tracked for purpose {purpose:?} is not reachable"))?;
     Ok(bridge::Target {
-        beam_id: beam.id,
-        beam_uuid: beam.uuid,
+        beam_id: located.beam.id,
+        beam_uuid: located.beam.uuid,
         login: login.to_string(),
+        endpoint: Some(located.endpoint),
     })
+}
+
+/// The Beam tracked for `purpose`, looked up on the endpoint it lives on,
+/// if it can be reused. A purpose pinned to another cluster whose profile
+/// has since been logged out is reported and treated as unusable, so the
+/// caller spawns a fresh Beam where the user is logged in now; any other
+/// listing failure is an error.
+fn reusable_for_purpose(
+    state: &mut state::State,
+    purpose: &str,
+) -> anyhow::Result<Option<(endpoint::Endpoint, tsh::BeamInfo, state::PurposeLaunch)>> {
+    let Some(entry) = state.purposes.get(purpose) else {
+        return Ok(None);
+    };
+    let (endpoint, pinned) = match &entry.endpoint {
+        Some(endpoint) => (endpoint.clone(), true),
+        None => (endpoint::Endpoint::current()?, false),
+    };
+    let beams = match tsh::list_beams(&endpoint) {
+        Ok(beams) => beams,
+        Err(err) => {
+            let logged_out = endpoint.login_hint(&format!("{err:#}")).is_some();
+            let elsewhere = pinned && endpoint::Endpoint::current().is_ok_and(|current| current != endpoint);
+            if logged_out && elsewhere {
+                eprintln!(
+                    "beams: not reusing {} for purpose {purpose:?}: its cluster {} is logged out ({})",
+                    entry.beam_id,
+                    endpoint.label(),
+                    endpoint.login_hint("not logged in").unwrap_or_default()
+                );
+                return Ok(None);
+            }
+            return Err(err.context(format!("checking purpose {purpose:?}'s Beam on {}", endpoint.label())));
+        }
+    };
+    let Some(beam) = beams.iter().find(|b| b.uuid == entry.uuid).cloned() else {
+        return Ok(None);
+    };
+    let Some(launch) = entry.launch.clone() else {
+        eprintln!("beams: not reusing {} for purpose {purpose:?}: it predates profile launches", beam.id);
+        return Ok(None);
+    };
+    if beamcmd::adopt_endpoint(state, &beam.uuid, &endpoint) {
+        state.save()?;
+    }
+    Ok(has_ttl_remaining(&beam, MIN_TTL_HOURS).then_some((endpoint, beam, launch)))
 }
 
 fn create_folder_sync(
@@ -573,12 +617,11 @@ fn ssh(
         None => config::default_profile()?,
     };
     let mut state = state::State::load()?;
-    let beams = tsh::list_beams()?;
 
     let existing = match &options.beam {
         Some(target) => {
-            let beam = beamcmd::resolve(target, &state, &beams)?;
-            if !has_ttl_remaining(beam, 0) {
+            let beamcmd::Located { endpoint, beam, .. } = beamcmd::locate(target, &mut state)?;
+            if !has_ttl_remaining(&beam, 0) {
                 bail!("beam {} has expired", beam.id);
             }
             // A launch recorded under any purpose tracking this Beam.
@@ -592,26 +635,13 @@ fn ssh(
                     beam.id
                 );
             };
-            Some((beam, launch))
+            Some((endpoint, beam, launch))
         }
-        None => state
-            .purposes
-            .get(purpose)
-            .and_then(|entry| {
-                let beam = beams.iter().find(|b| b.uuid == entry.uuid)?;
-                if entry.launch.is_none() {
-                    eprintln!(
-                        "beams: not reusing {} for purpose {purpose:?}: it predates profile launches",
-                        beam.id
-                    );
-                }
-                Some((beam, entry.launch.clone()?))
-            })
-            .filter(|(beam, _)| has_ttl_remaining(beam, MIN_TTL_HOURS)),
+        None => reusable_for_purpose(&mut state, purpose)?,
     };
 
-    let (beam, launch) = match existing {
-        Some((beam, launch)) => {
+    let (endpoint, beam, launch) = match existing {
+        Some((endpoint, beam, launch)) => {
             let label = match &options.beam {
                 Some(_) => "as requested".to_string(),
                 None => format!("for purpose {purpose:?}"),
@@ -628,12 +658,20 @@ fn ssh(
                 );
             }
             eprintln!(
-                "beams: reusing beam {} ({}) {label}, launch {} ({})",
-                beam.id, beam.uuid, launch.launch_id, launch.profile
+                "beams: reusing beam {} ({}) {label} on {}, launch {} ({})",
+                beam.id,
+                beam.uuid,
+                endpoint.label(),
+                launch.launch_id,
+                launch.profile
             );
-            (beam.clone(), launch)
+            (endpoint, beam, launch)
         }
         None => {
+            // New Beams go wherever the user is logged in now, and stay
+            // pinned there.
+            let endpoint = endpoint::Endpoint::current()?;
+            let beams = tsh::list_beams(&endpoint)?;
             if beams.len() >= MAX_CONCURRENT_BEAMS {
                 bail!(
                     "already at the {MAX_CONCURRENT_BEAMS}-beam limit ({} active) - clean one up \
@@ -652,32 +690,36 @@ fn ssh(
                 launch_dir,
             };
 
-            eprintln!("beams: no usable beam for purpose {purpose:?}, spawning a new one...");
-            let fresh = tsh::add_beam(region.as_deref())?;
+            eprintln!(
+                "beams: no usable beam for purpose {purpose:?}, spawning a new one on {}...",
+                endpoint.label()
+            );
+            let fresh = tsh::add_beam(&endpoint, region.as_deref())?;
 
             eprintln!(
                 "beams: waiting for {} to accept SSH connections...",
                 fresh.id
             );
-            tsh::wait_until_ready(&fresh.id, login, READY_TIMEOUT)?;
+            tsh::wait_until_ready(&endpoint, &fresh.id, login, READY_TIMEOUT)?;
 
             if options.push_repo {
                 eprintln!("beams: pushing {} to {}...", repo.display(), fresh.id);
                 let branch = tsh::current_branch(repo)?;
                 let origin_url = tsh::origin_url(repo)?;
                 tsh::prepare_git_target(
+                    &endpoint,
                     login,
                     &fresh.uuid,
                     REMOTE_REPO_PATH,
                     &branch,
                     origin_url.as_deref(),
                 )?;
-                tsh::push_repo(repo, login, &fresh.uuid, REMOTE_REPO_PATH, &branch)?;
+                tsh::push_repo(&endpoint, repo, login, &fresh.uuid, REMOTE_REPO_PATH, &branch)?;
             }
 
             eprintln!("beams: copying the runtime and launch {} to {}...", packed.launch_id, fresh.id);
             let staging = stage::build_launch(repo, &packed.launch_dir, &packed.launch_id)?;
-            let result = tsh::scp_dir(&staging.join(stage::LAUNCH_ROOT), &fresh.id);
+            let result = tsh::scp_dir(&endpoint, &staging.join(stage::LAUNCH_ROOT), &fresh.id);
             let _ = std::fs::remove_dir_all(&staging);
             result?;
 
@@ -693,11 +735,12 @@ fn ssh(
                     uuid: fresh.uuid.clone(),
                     created_at: Utc::now().to_rfc3339(),
                     launch: Some(packed.clone()),
+                    endpoint: Some(endpoint.clone()),
                 },
             );
             state.save()?;
 
-            (fresh, packed)
+            (endpoint, fresh, packed)
         }
     };
 
@@ -717,7 +760,12 @@ fn ssh(
     // A launch needs the daemon: readiness and post work go over its bridge.
     let mut frontend = clientd::connect_or_start().context("the local service daemon is needed for a launch")?;
     let session_token = Uuid::new_v4().to_string();
-    let target = bridge::Target { beam_id: beam.id.clone(), beam_uuid: beam.uuid.clone(), login: login.to_string() };
+    let target = bridge::Target {
+        beam_id: beam.id.clone(),
+        beam_uuid: beam.uuid.clone(),
+        login: login.to_string(),
+        endpoint: Some(endpoint.clone()),
+    };
     // Before the bridge, so the daemon knows the launch by the time it connects.
     frontend.start_launch(&target, &launch.launch_dir, beams_protocol::launch::Gate::Interactive)?;
     frontend.ensure_bridge(&target, &session_token)?;
@@ -725,6 +773,7 @@ fn ssh(
         format!("env BEAMS_CLIENT_ID={} BEAMS_SESSION_TOKEN={session_token} {shell_command}", frontend.client_id);
     let local_daemon = session::LocalDaemon::connected(frontend, target, session_token);
     tsh::ssh_interactive(
+        &endpoint,
         login,
         &beam.id,
         &beam.uuid,

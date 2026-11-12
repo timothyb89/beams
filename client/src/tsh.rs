@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context};
 use serde::Deserialize;
 
+use crate::endpoint::{Endpoint, Tsh};
 use crate::session;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -18,44 +19,50 @@ pub struct BeamInfo {
     pub region: Option<String>,
 }
 
-/// `tsh beams ls --format=json`. Only lists beams owned by the current
-/// user (tsh's default; we never pass --all).
-pub fn list_beams() -> anyhow::Result<Vec<BeamInfo>> {
-    list_beams_with(&[])
+/// `tsh beams ls --format=json` on `endpoint`. Only lists beams owned by
+/// the user (tsh's default; we never pass --all).
+pub fn list_beams(endpoint: &Endpoint) -> anyhow::Result<Vec<BeamInfo>> {
+    list_beams_on(&Tsh::pinned(endpoint), &[])
 }
 
 /// `tsh beams ls --all --format=json` - every beam visible to the
-/// current user, not just their own.
-pub fn list_all_beams() -> anyhow::Result<Vec<BeamInfo>> {
-    list_beams_with(&["--all"])
+/// user, not just their own.
+pub fn list_all_beams(endpoint: &Endpoint) -> anyhow::Result<Vec<BeamInfo>> {
+    list_beams_on(&Tsh::pinned(endpoint), &["--all"])
 }
 
-fn list_beams_with(extra: &[&str]) -> anyhow::Result<Vec<BeamInfo>> {
-    let output = Command::new("tsh")
+pub fn list_beams_on(tsh: &Tsh, extra: &[&str]) -> anyhow::Result<Vec<BeamInfo>> {
+    let output = tsh
+        .command()
         .args(["beams", "ls", "--format=json"])
         .args(extra)
         .output()
         .context("running tsh beams ls")?;
     if !output.status.success() {
-        bail!(
-            "tsh beams ls failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        let stderr = crate::endpoint::plain(&String::from_utf8_lossy(&output.stderr));
+        let stderr = stderr.as_str();
+        let hint = tsh
+            .endpoint
+            .as_ref()
+            .and_then(|endpoint| endpoint.login_hint(stderr))
+            .map(|hint| format!("; {hint}"))
+            .unwrap_or_default();
+        bail!("tsh beams ls failed ({}): {stderr}{hint}", output.status);
     }
     serde_json::from_slice(&output.stdout).context("parsing tsh beams ls output")
 }
 
 /// `tsh beams add --no-console --format=json`, optionally pinned to a
 /// region.
-pub fn add_beam(region: Option<&str>) -> anyhow::Result<BeamInfo> {
+pub fn add_beam(endpoint: &Endpoint, region: Option<&str>) -> anyhow::Result<BeamInfo> {
     let mut args = vec!["beams", "add", "--no-console", "--format=json"];
     let region_flag;
     if let Some(region) = region {
         region_flag = format!("--region={region}");
         args.push(&region_flag);
     }
-    let output = Command::new("tsh")
+    let output = Tsh::pinned(endpoint)
+        .command()
         .args(&args)
         .output()
         .context("running tsh beams add")?;
@@ -74,11 +81,12 @@ pub fn add_beam(region: Option<&str>) -> anyhow::Result<BeamInfo> {
 /// beams ls` immediately, but sshd isn't necessarily reachable yet -
 /// `scp`/`ssh` fail outright ("not ready to accept SSH connections")
 /// rather than retrying themselves, so the caller has to.
-pub fn wait_until_ready(beam_id: &str, login: &str, timeout: Duration) -> anyhow::Result<()> {
+pub fn wait_until_ready(endpoint: &Endpoint, beam_id: &str, login: &str, timeout: Duration) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
     let mut delay = Duration::from_secs(1);
     loop {
-        let status = Command::new("tsh")
+        let status = Tsh::pinned(endpoint)
+            .command()
             .args(["beams", "exec", "-l", login, beam_id, "--", "true"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -102,9 +110,10 @@ pub fn wait_until_ready(beam_id: &str, login: &str, timeout: Duration) -> anyhow
 /// `~/<local_dir-basename>` on the beam (scp's usual recursive-copy
 /// semantics: the destination directory is created/merged under the given
 /// remote path, here the beam's home directory).
-pub fn scp_dir(local_dir: &Path, beam_id: &str) -> anyhow::Result<()> {
+pub fn scp_dir(endpoint: &Endpoint, local_dir: &Path, beam_id: &str) -> anyhow::Result<()> {
     let dest = format!("{beam_id}:");
-    let status = Command::new("tsh")
+    let status = Tsh::pinned(endpoint)
+        .command()
         .args(["beams", "scp", "-r", "-q"])
         .arg(local_dir)
         .arg(&dest)
@@ -122,6 +131,7 @@ pub fn scp_dir(local_dir: &Path, beam_id: &str) -> anyhow::Result<()> {
 /// leaves `beams` alive to intercept the local menu prefix and, later, service
 /// approval requests.
 pub fn ssh_interactive(
+    endpoint: &Endpoint,
     login: &str,
     beam_id: &str,
     uuid: &str,
@@ -141,6 +151,7 @@ pub fn ssh_interactive(
     session::run(
         "tsh",
         &args,
+        &endpoint.env(),
         session::ConnectionInfo {
             beam_id,
             login,
@@ -164,6 +175,8 @@ pub fn ssh_interactive(
 /// `ext::` is disabled by default in modern git (`protocol.ext.allow`) -
 /// callers must set `GIT_ALLOW_PROTOCOL=ext` on the invoking `git`
 /// process, not something settable via the URL itself.
+/// The pinned endpoint reaches the `ext::` command through `git`'s own
+/// environment (see `push_repo`).
 fn git_ext_url(login: &str, uuid: &str, remote_path: &str) -> String {
     format!("ext::tsh ssh {login}@{uuid} -- %S '{remote_path}'")
 }
@@ -240,6 +253,7 @@ pub fn origin_url(repo: &Path) -> anyhow::Result<Option<String>> {
 /// prior call - so safe to call again (e.g. for a future "push again to
 /// sync" command, not just the initial copy).
 pub fn prepare_git_target(
+    endpoint: &Endpoint,
     login: &str,
     uuid: &str,
     remote_path: &str,
@@ -261,7 +275,8 @@ pub fn prepare_git_target(
     // nothing left for ssh to join.
     let remote_command = format!("bash -lc {}", shell_quote(&script));
     let target = format!("{login}@{uuid}");
-    let status = Command::new("tsh")
+    let status = Tsh::pinned(endpoint)
+        .command()
         .args(["ssh", &target, "--", &remote_command])
         .status()
         .context("preparing git push target on beam")?;
@@ -307,9 +322,18 @@ pub(crate) fn shell_quote(s: &str) -> String {
 /// `prepare_git_target`), over the `ext::` transport `git_ext_url`
 /// builds. Only transfers committed history - uncommitted local changes
 /// don't make the trip, same caveat any git push has.
-pub fn push_repo(repo: &Path, login: &str, uuid: &str, remote_path: &str, branch: &str) -> anyhow::Result<()> {
+pub fn push_repo(
+    endpoint: &Endpoint,
+    repo: &Path,
+    login: &str,
+    uuid: &str,
+    remote_path: &str,
+    branch: &str,
+) -> anyhow::Result<()> {
     let url = git_ext_url(login, uuid, remote_path);
-    let status = Command::new("git")
+    let mut command = Command::new("git");
+    endpoint.apply(&mut command);
+    let status = command
         .current_dir(repo)
         .env("GIT_ALLOW_PROTOCOL", "ext")
         .args(["push", &url, branch])

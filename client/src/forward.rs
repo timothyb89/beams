@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::endpoint::Tsh;
 use anyhow::{bail, Context};
 use beams_protocol::{ServiceRequestKind, ServiceStatus};
 
@@ -28,6 +29,7 @@ const DIAGNOSTIC_LINES: usize = 20;
 pub struct Target {
     pub beam_uuid: String,
     pub login: String,
+    pub endpoint: Option<crate::endpoint::Endpoint>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +66,7 @@ fn supervise(
     events: SyncSender<Event>,
     commands: Receiver<Action>,
 ) {
+    let program = Tsh::new(program, target.endpoint.clone());
     let mut start_requested = true;
     loop {
         if start_requested {
@@ -148,7 +151,7 @@ struct StartedForward {
 }
 
 fn start_forward(
-    program: &str,
+    program: &Tsh,
     target: &Target,
     kind: &ServiceRequestKind,
 ) -> anyhow::Result<StartedForward> {
@@ -226,7 +229,7 @@ fn reserve_port(requested: Option<u16>) -> anyhow::Result<u16> {
 }
 
 fn spawn_child(
-    program: &str,
+    program: &Tsh,
     target: &Target,
     remote_host: &str,
     remote_port: u16,
@@ -235,7 +238,7 @@ fn spawn_child(
 ) -> anyhow::Result<Child> {
     let forward = format!("127.0.0.1:{local_port}:{remote_host}:{remote_port}");
     let destination = format!("{}@{}", target.login, target.beam_uuid);
-    let mut command = Command::new(program);
+    let mut command = program.command();
     command
         .args([
             "ssh",
@@ -417,6 +420,7 @@ mod tests {
             Target {
                 beam_uuid: "beam-uuid".to_string(),
                 login: "beams".to_string(),
+                endpoint: None,
             },
             "service-1".to_string(),
             request(None),
@@ -457,10 +461,11 @@ mod tests {
     fn startup_failure_includes_captured_diagnostics() {
         let program = fake_program("#!/bin/sh\necho 'bind failed for test' >&2\nexit 23\n");
         let err = start_forward(
-            &program.display().to_string(),
+            &Tsh::new(program.display().to_string(), None),
             &Target {
                 beam_uuid: "beam-uuid".to_string(),
                 login: "beams".to_string(),
+                endpoint: None,
             },
             &request(Some(32123)),
         )

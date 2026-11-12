@@ -89,6 +89,17 @@ tsh process start ─► proxy TLS/gRPC ─► node dial ─► SSH kex+auth ─
 
 ### 1. Pinned Beam endpoints (do first; fixes problem 1 by itself)
 
+**Implemented 2026-11-12** in `client/src/endpoint.rs`. Differences from
+the sketch below: the type is `Endpoint` (proxy, cluster, user,
+`TELEPORT_HOME`), while login and UUID stay on the existing per-module
+targets. Only `TELEPORT_SITE` is cleared; `TELEPORT_USER` doesn't affect
+routing and is left alone. A purpose pinned to a logged-out cluster
+other than the current one is reported, and `beams ssh` spawns a fresh
+Beam on the current cluster instead of getting stuck. Mutagen's wrappers
+read a per-host endpoint file, because the shared `mutagen daemon`
+doesn't take environment from our calls. User-facing behavior is in
+`client/README.md` ("Teleport profiles").
+
 Record which Teleport endpoint each Beam belongs to when it's created or
 first adopted, and route every call through it:
 

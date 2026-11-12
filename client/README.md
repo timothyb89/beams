@@ -737,6 +737,38 @@ beams sync terminate SERVICE_ID
 or degraded state. Pass `--include-vcs` to synchronize `.git` and other VCS
 metadata; otherwise Mutagen's VCS ignore is enabled.
 
+## Teleport profiles: each Beam is pinned to its cluster
+
+`tsh` acts on whichever profile is current (`~/.tsh/current-profile`), and
+any `tsh login --proxy=...` changes it. So `beams` records the proxy and
+cluster a Beam was created on (from `tsh status`, in its purpose entry) and
+runs every `tsh` call for that Beam with `TELEPORT_PROXY`/`TELEPORT_CLUSTER`
+(and `TELEPORT_HOME`, if one was set) pointing there. That covers the
+interactive session, `tsh beams add/ls/exec/scp/rm/...`, the git `ext::`
+push, and the daemon's bridge, port forwards, copies, fetches and Mutagen
+transport, including after a daemon restart. Logging in to another
+cluster no longer misroutes any of them.
+
+- New Beams are created on the current profile and stay pinned to it.
+- A Beam whose profile has been logged out fails with "log in to CLUSTER
+  again with `tsh login --proxy=PROXY`" (on the bridge status, too)
+  rather than reaching another cluster. If plain `beams ssh`'s purpose is
+  pinned to a logged-out cluster other than the current one, it says so
+  and spawns a fresh Beam on the current one.
+- Targets that aren't tracked (`--beam ID` for a Beam this workstation
+  didn't create, `beams exec ID`, ...) are looked up on the current
+  profile.
+- Entries from before pinning follow the current profile until their Beam
+  is first found there, then record it.
+- The daemon only retires a failing bridge as "Beam gone" after asking the
+  Beam's own cluster.
+- The Mutagen wrappers read `endpoints/<beam uuid>` (next to their `bin/`)
+  because the long-lived `mutagen daemon` keeps whatever environment it
+  started with.
+
+See `docs/designs/BEAM_TRANSPORT_DESIGN.md` for the transport work this is
+the first step of.
+
 ## Beam management wrappers
 
 The rest of `tsh beams ...` is wrapped too, so managing beams doesn't
@@ -746,9 +778,9 @@ need copy-pasted ids. Anywhere tsh wants a beam id, these accept a
 given. `rm` never defaults, since it's destructive.
 
 ```sh
-beams ls [--all]                    # beams + tracked purpose(s) + time left; flags stale purposes
+beams ls [--all]                    # current profile's beams + purposes + time left; flags stale ones
 beams rm <target>... [--prune]      # tsh beams rm, then forget purposes tracking it
-beams rm --prune                    # just forget purposes whose beam is already gone
+beams rm --prune                    # forget purposes whose beam is gone from the current profile
 beams exec [target] [--login beams] -- <command>...
 beams scp [-r] [-q] <src> <dest>    # remote operands are TARGET:PATH, or :PATH for `default`
 beams publish [target] [--tcp]
@@ -757,7 +789,10 @@ beams ide [target] [--ide vscode|cursor|zed]
 ```
 
 `rm` resolves every target before deleting anything, so a typo in one
-doesn't leave the others half-done. `tsh beams add` isn't wrapped:
+doesn't leave the others half-done. Each command runs against its target's
+pinned cluster (see above). `ls` and `--prune` only judge purposes that live
+on the current profile; purposes pinned to other clusters are listed
+separately and never pruned from here. `tsh beams add` isn't wrapped:
 `beams ssh` (or `beams ssh --purpose <name>`) is the spawn path, since
 it also tracks the purpose and launches the profile.
 
@@ -831,7 +866,8 @@ jq -c 'select(.event == "signed" or .event == "granted") | [.time, .operation, .
 ## State
 
 No server-side way exists to label a beam, so `~/.config/beams-client/state.json`
-tracks which beam id serves which `--purpose` locally. `default` is what
+tracks which beam id serves which `--purpose` locally, along with the
+launch it runs and the Teleport proxy/cluster it lives on. `default` is what
 plain `beams ssh` reuses; pass `--purpose` to track a separate beam for a
 side task (e.g. reviewing a specific PR) without it being mistaken for your
 default one. This is a simple heuristic, not a full design - revisit if

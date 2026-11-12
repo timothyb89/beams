@@ -4,12 +4,13 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::endpoint::Tsh;
 use anyhow::{bail, Context};
 use beams_protocol::{
     FetchSource, FileCopyDirection, OverwritePolicy, ServiceRequestKind, ServiceStatus,
@@ -27,6 +28,7 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 pub struct Target {
     pub beam_uuid: String,
     pub login: String,
+    pub endpoint: Option<crate::endpoint::Endpoint>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +54,7 @@ pub fn spawn(
     events: SyncSender<Event>,
 ) -> SyncSender<Action> {
     let (commands, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
+    let program = Tsh::new(program, target.endpoint.clone());
     thread::spawn(move || {
         supervise(
             &program,
@@ -67,7 +70,7 @@ pub fn spawn(
 }
 
 fn supervise(
-    program: &str,
+    program: &Tsh,
     target: &Target,
     service_id: &str,
     kind: &ServiceRequestKind,
@@ -105,7 +108,7 @@ enum CopyOutcome {
 }
 
 fn run_copy(
-    program: &str,
+    program: &Tsh,
     target: &Target,
     kind: &ServiceRequestKind,
     local_path: &Path,
@@ -218,7 +221,7 @@ fn announce_running(
 }
 
 fn spawn_scp(
-    program: &str,
+    program: &Tsh,
     source: &std::ffi::OsStr,
     destination: &std::ffi::OsStr,
     diagnostics: Arc<Mutex<VecDeque<String>>>,
@@ -227,13 +230,13 @@ fn spawn_scp(
 }
 
 fn spawn_scp_with(
-    program: &str,
+    program: &Tsh,
     recursive: bool,
     source: &std::ffi::OsStr,
     destination: &std::ffi::OsStr,
     diagnostics: Arc<Mutex<VecDeque<String>>>,
 ) -> anyhow::Result<Child> {
-    let mut command = Command::new(program);
+    let mut command = program.command();
     command.arg("scp");
     if recursive {
         command.arg("-r");
@@ -298,7 +301,7 @@ fn install_download(
 }
 
 fn finalize_remote(
-    program: &str,
+    program: &Tsh,
     destination: &str,
     temp: &str,
     final_path: &str,
@@ -315,7 +318,7 @@ fn finalize_remote(
     run_remote(program, destination, &script, "finalizing remote upload")
 }
 
-fn remove_remote(program: &str, destination: &str, path: &str) -> anyhow::Result<()> {
+fn remove_remote(program: &Tsh, destination: &str, path: &str) -> anyhow::Result<()> {
     run_remote(
         program,
         destination,
@@ -325,13 +328,13 @@ fn remove_remote(program: &str, destination: &str, path: &str) -> anyhow::Result
 }
 
 fn run_remote(
-    program: &str,
+    program: &Tsh,
     destination: &str,
     script: &str,
     operation: &str,
 ) -> anyhow::Result<()> {
     let remote_command = format!("bash -lc {}", crate::tsh::shell_quote(script));
-    let mut command = Command::new(program);
+    let mut command = program.command();
     command
         .args(["ssh", destination, "--", &remote_command])
         .stdin(Stdio::null())
@@ -405,6 +408,7 @@ mod tests {
             Target {
                 beam_uuid: "beam".to_string(),
                 login: "beams".to_string(),
+                endpoint: None,
             },
             "copy".to_string(),
             ServiceRequestKind::FileCopy {
@@ -455,6 +459,7 @@ mod tests {
             Target {
                 beam_uuid: "beam".to_string(),
                 login: "beams".to_string(),
+                endpoint: None,
             },
             "copy".to_string(),
             ServiceRequestKind::FileCopy {
@@ -511,6 +516,7 @@ mod tests {
             Target {
                 beam_uuid: "beam".to_string(),
                 login: "beams".to_string(),
+                endpoint: None,
             },
             "copy".to_string(),
             ServiceRequestKind::FileCopy {
@@ -558,6 +564,7 @@ pub fn spawn_fetch(
     events: SyncSender<Event>,
 ) -> SyncSender<Action> {
     let (commands, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
+    let program = Tsh::new(program, target.endpoint.clone());
     thread::spawn(move || {
         let reporter = Reporter {
             events: &events,
@@ -680,7 +687,7 @@ pub fn fetch_layout(
 }
 
 fn run_fetch(
-    program: &str,
+    program: &Tsh,
     target: &Target,
     kind: &ServiceRequestKind,
     destination: &Path,

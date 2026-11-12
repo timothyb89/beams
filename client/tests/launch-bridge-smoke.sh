@@ -44,6 +44,14 @@ mkdir -p "$T/ws-config/beams-client"
 
 cat >"$T/bin/tsh" <<EOF
 #!/bin/sh
+if [ "\$1" = status ]; then
+    echo '{"active":{"profile_url":"https://fixture.example.com:443","username":"me","cluster":"fixture.example.com"}}'
+    exit 0
+fi
+if [ "\${TELEPORT_PROXY:-}" != fixture.example.com:443 ]; then
+    echo "fake tsh: unpinned call: \$*" >&2
+    exit 98
+fi
 case " \$* " in
     *" beams ls "*)
         echo '[{"id": "beam-a", "uuid": "beam-uuid", "owner": "me", "expires": "2099-01-01T00:00:00Z"}]'

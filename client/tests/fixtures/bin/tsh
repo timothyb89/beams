@@ -1,5 +1,18 @@
 #!/bin/sh
 
+# The client pins every call to the endpoint `tsh status` reported, whatever
+# profile the surrounding environment selects (see client/src/endpoint.rs).
+if [ "$1" = "status" ]; then
+    printf '%s\n' '{"active":{"profile_url":"https://fixture.example.com:443","username":"me@example.com","cluster":"fixture.example.com"}}'
+    exit 0
+fi
+if [ "${TELEPORT_PROXY:-}" != fixture.example.com:443 ] || [ "${TELEPORT_CLUSTER:-}" != fixture.example.com ]; then
+    printf 'fake tsh: unpinned call (TELEPORT_PROXY=%s):' "${TELEPORT_PROXY:-}" >&2
+    printf ' %s' "$@" >&2
+    printf '\n' >&2
+    exit 98
+fi
+
 if [ "$1" = "beams" ] && [ "$2" = "ls" ]; then
     printf '%s\n' '[{"id":"managed-session-test","uuid":"11111111-2222-3333-4444-555555555555","owner":"test@example.com","expires":"2099-01-01T00:00:00Z"}]'
     exit 0

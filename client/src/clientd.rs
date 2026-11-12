@@ -102,6 +102,10 @@ pub struct ServiceRecord {
     pub beam_uuid: String,
     #[serde(default = "default_login")]
     pub login: String,
+    /// The Teleport endpoint the Beam lives on (absent from older records,
+    /// which follow the current profile).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<crate::endpoint::Endpoint>,
     pub kind: String,
     #[serde(default)]
     pub spec: Option<ServiceRequestKind>,
@@ -130,6 +134,10 @@ pub struct BridgeRecord {
     pub beam_id: String,
     pub beam_uuid: String,
     pub login: String,
+    /// The Teleport endpoint the Beam lives on (absent from older records,
+    /// which follow the current profile).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<crate::endpoint::Endpoint>,
     pub status: String,
     pub session_count: usize,
     #[serde(default)]
@@ -152,6 +160,8 @@ enum ClientMessage {
         beam_id: String,
         beam_uuid: String,
         login: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint: Option<crate::endpoint::Endpoint>,
         session_token: String,
         /// The frontend's own `SSH_AUTH_SOCK`: the agent that signs the SSH
         /// agent requests this frontend approves.
@@ -168,6 +178,8 @@ enum ClientMessage {
         beam_id: String,
         beam_uuid: String,
         login: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint: Option<crate::endpoint::Endpoint>,
         remote_host: String,
         remote_port: u16,
         local_port: Option<u16>,
@@ -177,6 +189,8 @@ enum ClientMessage {
         beam_id: String,
         beam_uuid: String,
         login: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint: Option<crate::endpoint::Endpoint>,
         direction: beams_protocol::FileCopyDirection,
         local_path: String,
         remote_path: String,
@@ -187,6 +201,8 @@ enum ClientMessage {
         beam_id: String,
         beam_uuid: String,
         login: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint: Option<crate::endpoint::Endpoint>,
         local_path: String,
         remote_path: String,
         mode: beams_protocol::FolderSyncMode,
@@ -210,6 +226,8 @@ enum ClientMessage {
         beam_id: String,
         beam_uuid: String,
         login: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint: Option<crate::endpoint::Endpoint>,
         launch_dir: String,
         #[serde(default)]
         gate: beams_protocol::launch::Gate,
@@ -472,6 +490,9 @@ struct BridgeRuntime {
     /// When the current run of failed connection attempts began.
     failing_since: Option<Instant>,
     last_existence_check: Option<Instant>,
+    /// "Log in again" advice from the last failed existence check, kept on
+    /// the reconnecting status until the bridge connects.
+    login_hint: Option<String>,
 }
 
 impl BridgeRuntime {
@@ -481,16 +502,20 @@ impl BridgeRuntime {
             commands,
             failing_since: None,
             last_existence_check: None,
+            login_hint: None,
         }
     }
 }
 
-/// Lists the UUIDs of the Beams that currently exist. `Err` means "can't
-/// tell right now" (offline, logged out), never "none exist".
-type BeamLister = Box<dyn Fn() -> anyhow::Result<Vec<String>> + Send + Sync>;
+/// Lists the UUIDs of the Beams that currently exist on an endpoint (`None`:
+/// the current profile, for records from before pinning). `Err` means
+/// "can't tell right now" (offline, logged out), never "none exist".
+type BeamLister =
+    Box<dyn Fn(Option<&crate::endpoint::Endpoint>) -> anyhow::Result<Vec<String>> + Send + Sync>;
 
-fn list_beam_uuids() -> anyhow::Result<Vec<String>> {
-    Ok(crate::tsh::list_beams()?
+fn list_beam_uuids(endpoint: Option<&crate::endpoint::Endpoint>) -> anyhow::Result<Vec<String>> {
+    let tsh = crate::endpoint::Tsh::new("tsh", endpoint.cloned());
+    Ok(crate::tsh::list_beams_on(&tsh, &[])?
         .into_iter()
         .map(|beam| beam.uuid)
         .collect())
@@ -638,6 +663,7 @@ impl Hub {
                 beam_id: service.beam_id.clone(),
                 beam_uuid: service.beam_uuid.clone(),
                 login: service.login.clone(),
+                endpoint: service.endpoint.clone(),
             })
             .collect::<Vec<_>>();
         let mut seen = std::collections::BTreeSet::new();
@@ -684,6 +710,7 @@ impl Hub {
                 beam_id: service.beam_id.clone(),
                 beam_uuid: service.beam_uuid.clone(),
                 login: service.login.clone(),
+                endpoint: service.endpoint.clone(),
             };
             if let Err(err) = self.spawn_service_worker(&service, &target) {
                 handle_service_update(
@@ -790,6 +817,7 @@ impl Hub {
             beam_id: target.beam_id.clone(),
             beam_uuid: target.beam_uuid.clone(),
             login: target.login.clone(),
+            endpoint: target.endpoint.clone(),
             status: "connecting".to_string(),
             session_count: 1,
             bridge_id: None,
@@ -817,8 +845,18 @@ impl Hub {
     /// (pausing is reversible). A later `beams ssh` to the same Beam simply
     /// creates a fresh bridge, so a wrong call here heals itself.
     fn retire_bridge_if_beam_gone(self: &Arc<Self>, beam_uuid: &str) {
-        let Ok(existing) = (self.beam_lister)() else {
-            return;
+        // Asked of the cluster the Beam lives on: after a `tsh login`
+        // elsewhere, the current profile's list wouldn't contain it.
+        let endpoint = match self.bridges.lock().unwrap().get(beam_uuid) {
+            Some(bridge) => bridge.record.endpoint.clone(),
+            None => return,
+        };
+        let existing = match (self.beam_lister)(endpoint.as_ref()) {
+            Ok(existing) => existing,
+            Err(err) => {
+                self.note_bridge_listing_failure(beam_uuid, endpoint.as_ref(), &err);
+                return;
+            }
         };
         if existing.iter().any(|uuid| uuid == beam_uuid) {
             return;
@@ -860,6 +898,30 @@ impl Hub {
         for (service_id, action) in services {
             let _ = self.control_service(&service_id, action);
         }
+    }
+
+    /// A failing bridge whose Beam can't be listed because its profile is
+    /// logged out: say so on the bridge status, instead of only showing
+    /// `tsh ssh` exit codes.
+    fn note_bridge_listing_failure(
+        &self,
+        beam_uuid: &str,
+        endpoint: Option<&crate::endpoint::Endpoint>,
+        err: &anyhow::Error,
+    ) {
+        let Some(hint) = endpoint.and_then(|endpoint| endpoint.login_hint(&format!("{err:#}"))) else {
+            return;
+        };
+        let record = {
+            let mut bridges = self.bridges.lock().unwrap();
+            let Some(bridge) = bridges.get_mut(beam_uuid).filter(|bridge| bridge.failing_since.is_some()) else {
+                return;
+            };
+            bridge.record.message = Some(hint.clone());
+            bridge.login_hint = Some(hint);
+            bridge.record.clone()
+        };
+        self.broadcast(ServerEvent::BridgeStatus { bridge: record });
     }
 
     fn recover_services(self: &Arc<Self>, target: &crate::bridge::Target) {
@@ -1222,6 +1284,7 @@ impl Hub {
                 beam_id: bridge.record.beam_id.clone(),
                 beam_uuid: bridge.record.beam_uuid.clone(),
                 login: bridge.record.login.clone(),
+                endpoint: bridge.record.endpoint.clone(),
             }
         };
         self.start_service_request_with_target(request_id, target)
@@ -1262,6 +1325,7 @@ impl Hub {
                 beam_id: target.beam_id.clone(),
                 beam_uuid: target.beam_uuid.clone(),
                 login: target.login.clone(),
+                endpoint: target.endpoint.clone(),
                 kind: service_request.kind.label().to_string(),
                 spec: Some(service_request.kind),
                 status: ServiceStatus::Starting,
@@ -1300,6 +1364,7 @@ impl Hub {
                     crate::forward::Target {
                         beam_uuid: target.beam_uuid.clone(),
                         login: target.login.clone(),
+                        endpoint: target.endpoint.clone(),
                     },
                     service.service_id.clone(),
                     spec,
@@ -1325,6 +1390,7 @@ impl Hub {
                     crate::copy::Target {
                         beam_uuid: target.beam_uuid.clone(),
                         login: target.login.clone(),
+                        endpoint: target.endpoint.clone(),
                     },
                     service.service_id.clone(),
                     spec,
@@ -1351,6 +1417,7 @@ impl Hub {
                     crate::copy::Target {
                         beam_uuid: target.beam_uuid.clone(),
                         login: target.login.clone(),
+                        endpoint: target.endpoint.clone(),
                     },
                     service.service_id.clone(),
                     spec,
@@ -1383,6 +1450,7 @@ impl Hub {
                     crate::sync::Target {
                         beam_uuid: target.beam_uuid.clone(),
                         login: target.login.clone(),
+                        endpoint: target.endpoint.clone(),
                     },
                     service.service_id.clone(),
                     session_name,
@@ -2624,6 +2692,7 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                 bridge.record.message = None;
                 bridge.failing_since = None;
                 bridge.last_existence_check = None;
+                bridge.login_hint = None;
                 (bridge.record.clone(), bridge.commands.clone())
             };
             let requests = hub
@@ -2693,7 +2762,10 @@ fn handle_bridge_event(hub: &Arc<Hub>, event: crate::bridge::Event) {
                 };
                 bridge.record.status = "reconnecting".to_string();
                 bridge.record.bridge_id = None;
-                bridge.record.message = Some(message);
+                bridge.record.message = Some(match &bridge.login_hint {
+                    Some(hint) => format!("{message}; {hint}"),
+                    None => message,
+                });
                 let now = Instant::now();
                 let since = *bridge.failing_since.get_or_insert(now);
                 let check = now.duration_since(since) >= BRIDGE_GONE_CHECK_AFTER
@@ -2934,6 +3006,7 @@ impl Frontend {
                 beam_id: target.beam_id.clone(),
                 beam_uuid: target.beam_uuid.clone(),
                 login: target.login.clone(),
+                endpoint: target.endpoint.clone(),
                 session_token: session_token.to_string(),
                 ssh_auth_sock: std::env::var("SSH_AUTH_SOCK").ok().filter(|sock| !sock.is_empty()),
             },
@@ -2953,6 +3026,7 @@ impl Frontend {
                 beam_id: target.beam_id.clone(),
                 beam_uuid: target.beam_uuid.clone(),
                 login: target.login.clone(),
+                endpoint: target.endpoint.clone(),
                 launch_dir: std::path::absolute(launch_dir)?.display().to_string(),
                 gate,
             },
@@ -3019,6 +3093,7 @@ impl Frontend {
                 beam_id: target.beam_id.clone(),
                 beam_uuid: target.beam_uuid.clone(),
                 login: target.login.clone(),
+                endpoint: target.endpoint.clone(),
                 remote_host: remote_host.to_string(),
                 remote_port,
                 local_port,
@@ -3043,6 +3118,7 @@ impl Frontend {
                 beam_id: target.beam_id.clone(),
                 beam_uuid: target.beam_uuid.clone(),
                 login: target.login.clone(),
+                endpoint: target.endpoint.clone(),
                 direction,
                 local_path: local_path.to_string(),
                 remote_path: remote_path.to_string(),
@@ -3071,6 +3147,7 @@ impl Frontend {
                 beam_id: target.beam_id.clone(),
                 beam_uuid: target.beam_uuid.clone(),
                 login: target.login.clone(),
+                endpoint: target.endpoint.clone(),
                 local_path: local_path.to_string(),
                 remote_path: remote_path.to_string(),
                 mode,
@@ -3468,6 +3545,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                         beam_id,
                         beam_uuid,
                         login,
+                        endpoint,
                         session_token,
                         ssh_auth_sock,
                     } => {
@@ -3475,6 +3553,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                             beam_id,
                             beam_uuid: beam_uuid.clone(),
                             login,
+                            endpoint,
                         };
                         match hub.ensure_bridge(target, session_token) {
                             Ok(()) => hub.agent_frontend_attached(frontend_id, &beam_uuid, ssh_auth_sock),
@@ -3506,6 +3585,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                         beam_id,
                         beam_uuid,
                         login,
+                        endpoint,
                         direction,
                         local_path,
                         remote_path,
@@ -3515,6 +3595,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                             beam_id,
                             beam_uuid,
                             login,
+                            endpoint,
                         };
                         if let Err(err) = hub.create_file_copy(
                             request_id,
@@ -3534,6 +3615,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                         beam_id,
                         beam_uuid,
                         login,
+                        endpoint,
                         local_path,
                         remote_path,
                         mode,
@@ -3544,6 +3626,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                             beam_id,
                             beam_uuid,
                             login,
+                            endpoint,
                         };
                         if let Err(err) = hub.create_folder_sync(
                             request_id,
@@ -3563,6 +3646,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                         beam_id,
                         beam_uuid,
                         login,
+                        endpoint,
                         remote_host,
                         remote_port,
                         local_port,
@@ -3571,6 +3655,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                             beam_id,
                             beam_uuid,
                             login,
+                            endpoint,
                         };
                         if let Err(err) =
                             hub.create_port_forward(target, remote_host, remote_port, local_port)
@@ -3590,8 +3675,8 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                     ClientMessage::RevokeGrant { grant_id } => {
                         hub.end_grants_where(|g| g.grant_id == grant_id, "revoked by local user");
                     }
-                    ClientMessage::StartLaunch { beam_id, beam_uuid, login, launch_dir, gate } => {
-                        let target = crate::bridge::Target { beam_id, beam_uuid, login };
+                    ClientMessage::StartLaunch { beam_id, beam_uuid, login, endpoint, launch_dir, gate } => {
+                        let target = crate::bridge::Target { beam_id, beam_uuid, login, endpoint };
                         if let Err(err) = hub.start_launch(&target, Path::new(&launch_dir), gate) {
                             let _ = tx.try_send(ServerEvent::Error { message: format!("starting launch: {err:#}") });
                         }
@@ -3812,6 +3897,7 @@ mod tests {
                     beam_id: "beam-name".to_string(),
                     beam_uuid: beam_uuid.to_string(),
                     login: "beams".to_string(),
+                    endpoint: None,
                     status: "connected".to_string(),
                     session_count: 1,
                     bridge_id: Some("bridge-id".to_string()),
@@ -3950,6 +4036,7 @@ mod tests {
                 beam_id: "beam".to_string(),
                 beam_uuid: "beam-uuid".to_string(),
                 login: "beams".to_string(),
+                endpoint: None,
                 kind: "file_copy".to_string(),
                 spec: Some(ServiceRequestKind::FileCopy {
                     direction: beams_protocol::FileCopyDirection::Download,
@@ -3983,6 +4070,7 @@ mod tests {
                 beam_id: "beam".to_string(),
                 beam_uuid: "beam-uuid".to_string(),
                 login: "beams".to_string(),
+                endpoint: None,
                 kind: "folder_sync".to_string(),
                 spec: Some(ServiceRequestKind::FolderSync {
                     remote_path: "/home/beams/project".to_string(),
@@ -4018,6 +4106,7 @@ mod tests {
             beam_id: "beam".to_string(),
             beam_uuid: "beam-uuid".to_string(),
             login: "beams".to_string(),
+            endpoint: None,
             kind: "folder_sync".to_string(),
             spec: Some(ServiceRequestKind::FolderSync {
                 remote_path: "/home/beams/project".to_string(),
@@ -4252,6 +4341,7 @@ mod tests {
                 beam_id: "beam-name".to_string(),
                 beam_uuid: "beam-uuid".to_string(),
                 login: "beams".to_string(),
+                endpoint: None,
             },
             "second-token".to_string(),
         )
@@ -4435,7 +4525,7 @@ mod tests {
     fn failing_bridge(beam_uuid: &str, existing: Vec<&'static str>) -> (Arc<Hub>, Receiver<ClientToBeam>) {
         let (mut hub, command_rx) = hub_with_bridge(beam_uuid);
         let existing: Vec<String> = existing.into_iter().map(str::to_string).collect();
-        Arc::get_mut(&mut hub).unwrap().beam_lister = Box::new(move || Ok(existing.clone()));
+        Arc::get_mut(&mut hub).unwrap().beam_lister = Box::new(move |_| Ok(existing.clone()));
         let failed_at = Instant::now() - BRIDGE_GONE_CHECK_AFTER - Duration::from_secs(1);
         hub.bridges.lock().unwrap().get_mut(beam_uuid).unwrap().failing_since = Some(failed_at);
         (hub, command_rx)
@@ -4464,13 +4554,41 @@ mod tests {
     }
 
     #[test]
+    fn existence_checks_ask_the_bridges_own_cluster() {
+        let endpoint = crate::endpoint::Endpoint {
+            proxy: "home.example.com:443".into(),
+            cluster: "home.example.com".into(),
+            user: String::new(),
+            teleport_home: None,
+        };
+        let (mut hub, _rx) = failing_bridge("pinned-uuid", vec![]);
+        hub.bridges.lock().unwrap().get_mut("pinned-uuid").unwrap().record.endpoint = Some(endpoint.clone());
+        // Only the Beam's own cluster has it; the current profile (`None`) doesn't.
+        let expected = endpoint.clone();
+        Arc::get_mut(&mut hub).unwrap().beam_lister = Box::new(move |asked| {
+            Ok(if asked == Some(&expected) { vec!["pinned-uuid".to_string()] } else { vec![] })
+        });
+        hub.retire_bridge_if_beam_gone("pinned-uuid");
+        assert!(hub.bridges.lock().unwrap().contains_key("pinned-uuid"));
+
+        // Logged out of that cluster: kept, with a "log in again" hint.
+        Arc::get_mut(&mut hub).unwrap().beam_lister =
+            Box::new(|_| anyhow::bail!("tsh beams ls failed: ERROR: Not logged in."));
+        hub.retire_bridge_if_beam_gone("pinned-uuid");
+        let bridges = hub.bridges.lock().unwrap();
+        let bridge = bridges.get("pinned-uuid").expect("kept");
+        let message = bridge.record.message.as_deref().unwrap_or_default();
+        assert!(message.contains("tsh login --proxy=home.example.com:443"), "{message}");
+    }
+
+    #[test]
     fn bridges_are_kept_when_the_beam_exists_or_existence_is_unknown() {
         let (hub, _rx) = failing_bridge("live-uuid", vec!["live-uuid"]);
         hub.retire_bridge_if_beam_gone("live-uuid");
         assert!(hub.bridges.lock().unwrap().contains_key("live-uuid"));
 
         let (mut hub, _rx) = failing_bridge("unknown-uuid", vec![]);
-        Arc::get_mut(&mut hub).unwrap().beam_lister = Box::new(|| anyhow::bail!("not logged in"));
+        Arc::get_mut(&mut hub).unwrap().beam_lister = Box::new(|_| anyhow::bail!("not logged in"));
         hub.retire_bridge_if_beam_gone("unknown-uuid");
         assert!(hub.bridges.lock().unwrap().contains_key("unknown-uuid"));
 
@@ -4642,6 +4760,7 @@ mod tests {
                     beam_id: "beam-name".to_string(),
                     beam_uuid: "beam-uuid".to_string(),
                     login: "beams".to_string(),
+                    endpoint: None,
                     status: "connecting".to_string(),
                     session_count: 1,
                     bridge_id: None,
@@ -4801,6 +4920,7 @@ mod tests {
                     beam_id: "beam-name".to_string(),
                     beam_uuid: "beam-uuid".to_string(),
                     login: "beams".to_string(),
+                    endpoint: None,
                     status: "connecting".to_string(),
                     session_count: 1,
                     bridge_id: None,
@@ -5148,6 +5268,7 @@ mod tests {
             beam_id: "beam-name".into(),
             beam_uuid: "beam-uuid".into(),
             login: "beams".into(),
+            endpoint: None,
         };
         let say = |message: BeamToClient| hub.launch_message("beam-uuid", message);
         let record = || hub.state.lock().unwrap().launches[&id].clone();

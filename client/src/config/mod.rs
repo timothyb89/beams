@@ -157,10 +157,14 @@ fn launch(
     use crate::clientd::{LaunchStage, ServerEvent};
     use beams_protocol::launch::{Gate, LaunchStatus};
 
-    let state = crate::state::State::load()?;
-    let beams = crate::tsh::list_beams()?;
-    let beam = crate::beamcmd::resolve(target.unwrap_or(crate::DEFAULT_PURPOSE), &state, &beams)?;
-    let target = crate::bridge::Target { beam_id: beam.id.clone(), beam_uuid: beam.uuid.clone(), login: login.to_string() };
+    let mut state = crate::state::State::load()?;
+    let located = crate::beamcmd::locate(target.unwrap_or(crate::DEFAULT_PURPOSE), &mut state)?;
+    let target = crate::bridge::Target {
+        beam_id: located.beam.id.clone(),
+        beam_uuid: located.beam.uuid.clone(),
+        login: login.to_string(),
+        endpoint: Some(located.endpoint),
+    };
     let output = crate::clientd::launches_dir()?.join(uuid::Uuid::new_v4().to_string());
     std::fs::create_dir_all(output.parent().expect("has a parent"))?;
     let declaration = pack::prepare(profile, &output, compression)?;

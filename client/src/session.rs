@@ -233,6 +233,7 @@ impl LocalDaemon {
 pub fn run(
     program: &str,
     args: &[String],
+    env: &[(&'static str, Option<std::ffi::OsString>)],
     info: ConnectionInfo<'_>,
     escape_key: EscapeKey,
     mut local_daemon: LocalDaemon,
@@ -250,6 +251,12 @@ pub fn run(
 
     let mut command = CommandBuilder::new(program);
     command.args(args);
+    for (key, value) in env {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        }
+    }
     let mut child = child::ChildGuard::new(
         slave.spawn_command(command)
             .with_context(|| format!("spawning {program} under local PTY"))?,
@@ -3776,6 +3783,7 @@ mod tests {
                     beam_id: "beam-a".to_string(),
                     beam_uuid: "beam-a-uuid".to_string(),
                     login: "beams".to_string(),
+                    endpoint: None,
                 },
                 session_token: "token".to_string(),
             }),
@@ -4004,6 +4012,7 @@ mod tests {
                     beam_id: "beam-a".to_string(),
                     beam_uuid: "beam-a-uuid".to_string(),
                     login: "beams".to_string(),
+                    endpoint: None,
                 },
                 session_token: "token".to_string(),
             }),
@@ -4394,6 +4403,7 @@ mod tests {
             beam_id: beam_id.to_string(),
             beam_uuid: beam_uuid.to_string(),
             login: "beams".to_string(),
+            endpoint: None,
             status: status.to_string(),
             session_count: 1,
             bridge_id: None,

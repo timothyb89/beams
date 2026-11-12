@@ -105,6 +105,14 @@ EOF
 # --- fake tsh: only the bridge is needed ---------------------------------------
 cat >"$W/bin/tsh" <<EOF
 #!/bin/sh
+if [ "\$1" = status ]; then
+    echo '{"active":{"profile_url":"https://fixture.example.com:443","username":"me","cluster":"fixture.example.com"}}'
+    exit 0
+fi
+if [ "\${TELEPORT_PROXY:-}" != fixture.example.com:443 ]; then
+    echo "fake tsh: unpinned call: \$*" >&2
+    exit 98
+fi
 case " \$* " in
     *" beams ls "*)
         echo '[{"id": "smoke", "uuid": "smoke-uuid", "owner": "me", "expires": "2099-01-01T00:00:00Z"}]'
@@ -130,6 +138,7 @@ r, w = s.makefile("r"), s.makefile("w")
 def send(v): w.write(json.dumps(v) + "\n"); w.flush()
 send({"op": "hello", "protocol": "beams-client-services", "version": 1, "role": "frontend"})
 send({"op": "ensure_bridge", "beam_id": "smoke", "beam_uuid": "smoke-uuid", "login": "beams",
+      "endpoint": {"proxy": "fixture.example.com:443", "cluster": "fixture.example.com"},
       "session_token": "smoke-token", "ssh_auth_sock": sock_for_agent})
 log = open(log_path, "a")
 for line in r:

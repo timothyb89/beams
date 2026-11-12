@@ -25,6 +25,11 @@ pub struct PurposeEntry {
     /// before profile launches, which `beams ssh` no longer reuses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<PurposeLaunch>,
+    /// The Teleport proxy/cluster the Beam was created on; every `tsh` call
+    /// for it is pinned there (`endpoint.rs`). Absent in entries from before
+    /// pinning: those follow the current profile until first seen there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<crate::endpoint::Endpoint>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

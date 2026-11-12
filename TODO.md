@@ -1247,11 +1247,16 @@ bootstrap `Task`s.
     add an automated fake-Mutagen fixture for disconnected transport and
     expired-Beam regression coverage.
 - [ ] Beam transport (see `docs/designs/BEAM_TRANSPORT_DESIGN.md`):
-  - [ ] Pin every `tsh` call to the Beam's recorded proxy/cluster
-    (`BeamEndpoint` in `state.json`, one `tsh` command builder,
-    per-endpoint `beams ls`/`--prune`, fail-closed "log in again"). Today a
-    `tsh login` to another cluster misroutes bridge reconnects, forwards,
-    copies and Mutagen, and can make `rm --prune` forget live Beams.
+  - [x] Pin every `tsh` call to the Beam's recorded proxy/cluster
+    (`client/src/endpoint.rs`: `Endpoint` in `state.json` and daemon
+    records/messages, `Tsh` command builder, per-endpoint `beams ls`/
+    `--prune` and daemon existence checks, per-host Mutagen wrapper pins,
+    "log in again" hints). Previously a `tsh login` to another cluster
+    misrouted bridge reconnects, forwards, copies and Mutagen, and could
+    make `rm --prune` or a failing bridge treat live Beams as gone.
+  - [ ] Verify pinning from a workstation: start `beams ssh`, `tsh login`
+    to a second cluster, then reconnect the bridge, add a forward, copy a
+    file and let Mutagen reconnect; `beams ls` on each cluster.
   - [ ] `BeamConnection` trait in `beamsd` with the pinned-`tsh` tier only
     (no behavior change), replacing the per-module `Target`s.
   - [ ] Tier B (ControlMaster over pinned `tsh proxy ssh`) for daemon-owned

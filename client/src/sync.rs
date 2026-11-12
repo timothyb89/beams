@@ -31,6 +31,19 @@ done
 [ "$#" -ge 1 ] || { echo "beams Mutagen ssh wrapper: missing destination" >&2; exit 2; }
 destination=$1
 shift
+# Pin `tsh` to the Beam's Teleport endpoint (written per host by beams):
+# the long-lived Mutagen daemon's environment can't be relied on for this.
+pin_endpoint() {
+    case "$1" in ''|*[!A-Za-z0-9._-]*) return 0 ;; esac
+    file="$(dirname "$0")/../endpoints/$1"
+    [ -f "$file" ] || return 0
+    { IFS= read -r proxy; IFS= read -r cluster; IFS= read -r home; } <"$file" || true
+    [ -n "$proxy" ] && [ -n "$cluster" ] || return 0
+    export TELEPORT_PROXY="$proxy" TELEPORT_CLUSTER="$cluster"
+    unset TELEPORT_SITE
+    if [ -n "$home" ]; then export TELEPORT_HOME="$home"; else unset TELEPORT_HOME; fi
+}
+pin_endpoint "${destination#*@}"
 exec "${BEAMS_TSH:-tsh}" ssh "$destination" -- "$@"
 "#;
 
@@ -47,6 +60,24 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 [ "$#" -ge 2 ] || { echo "beams Mutagen scp wrapper: missing endpoints" >&2; exit 2; }
+# Pin `tsh` to the Beam's Teleport endpoint (written per host by beams):
+# the long-lived Mutagen daemon's environment can't be relied on for this.
+pin_endpoint() {
+    case "$1" in ''|*[!A-Za-z0-9._-]*) return 0 ;; esac
+    file="$(dirname "$0")/../endpoints/$1"
+    [ -f "$file" ] || return 0
+    { IFS= read -r proxy; IFS= read -r cluster; IFS= read -r home; } <"$file" || true
+    [ -n "$proxy" ] && [ -n "$cluster" ] || return 0
+    export TELEPORT_PROXY="$proxy" TELEPORT_CLUSTER="$cluster"
+    unset TELEPORT_SITE
+    if [ -n "$home" ]; then export TELEPORT_HOME="$home"; else unset TELEPORT_HOME; fi
+}
+for operand do
+    case "$operand" in
+        */*:*) ;;
+        *@*:*) host=${operand#*@}; pin_endpoint "${host%%:*}"; break ;;
+    esac
+done
 exec "${BEAMS_TSH:-tsh}" scp "$@"
 "#;
 
@@ -54,6 +85,7 @@ exec "${BEAMS_TSH:-tsh}" scp "$@"
 pub struct Target {
     pub beam_uuid: String,
     pub login: String,
+    pub endpoint: Option<crate::endpoint::Endpoint>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +213,7 @@ fn run(
     }
     validate_remote_directory(tsh_program, target, remote_path)?;
     let transport = prepare_transport(root)?;
+    write_endpoint(&transport, target)?;
 
     match inspect_session(mutagen_program, tsh_program, &transport, session_name)? {
         Some(session) => validate_session(
@@ -282,13 +315,43 @@ fn run(
 struct Transport {
     data: PathBuf,
     bin: PathBuf,
+    /// One file per Beam host, read by the wrappers (`pin_endpoint`).
+    endpoints: PathBuf,
+}
+
+/// Records `target`'s endpoint for the wrappers: proxy, cluster and
+/// `TELEPORT_HOME` (blank for the default) on three lines. Unpinned targets
+/// leave no file, so their transport follows the current profile.
+fn write_endpoint(transport: &Transport, target: &Target) -> anyhow::Result<()> {
+    let Some(endpoint) = &target.endpoint else {
+        return Ok(());
+    };
+    if target.beam_uuid.is_empty()
+        || !target.beam_uuid.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!("unexpected Beam host {:?} for the Mutagen transport", target.beam_uuid);
+    }
+    let home = endpoint.teleport_home.as_ref().map(|home| home.display().to_string()).unwrap_or_default();
+    for value in [&endpoint.proxy, &endpoint.cluster, &home] {
+        if value.contains('\n') {
+            bail!("unexpected newline in the Beam's Teleport endpoint");
+        }
+    }
+    write_wrapper(
+        &transport.endpoints.join(&target.beam_uuid),
+        &format!("{}\n{}\n{home}\n", endpoint.proxy, endpoint.cluster),
+    )
 }
 
 fn prepare_transport(root: &Path) -> anyhow::Result<Transport> {
     let data = root.join("data");
     let bin = root.join("bin");
+    let endpoints = root.join("endpoints");
     fs::create_dir_all(&data).with_context(|| format!("creating {}", data.display()))?;
     fs::create_dir_all(&bin).with_context(|| format!("creating {}", bin.display()))?;
+    fs::create_dir_all(&endpoints).with_context(|| format!("creating {}", endpoints.display()))?;
+    fs::set_permissions(&endpoints, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("protecting {}", endpoints.display()))?;
     fs::set_permissions(root, fs::Permissions::from_mode(0o700))
         .with_context(|| format!("protecting {}", root.display()))?;
     fs::set_permissions(&data, fs::Permissions::from_mode(0o700))
@@ -297,7 +360,7 @@ fn prepare_transport(root: &Path) -> anyhow::Result<Transport> {
         .with_context(|| format!("protecting {}", bin.display()))?;
     write_wrapper(&bin.join("ssh"), SSH_WRAPPER)?;
     write_wrapper(&bin.join("scp"), SCP_WRAPPER)?;
-    Ok(Transport { data, bin })
+    Ok(Transport { data, bin, endpoints })
 }
 
 fn write_wrapper(path: &Path, contents: &str) -> anyhow::Result<()> {
@@ -352,7 +415,8 @@ fn validate_remote_directory(
     // begins with `-`.
     let test = format!("test -d {}", crate::tsh::shell_quote(remote_path));
     let remote_command = format!("bash -lc {}", crate::tsh::shell_quote(&test));
-    let status = Command::new(tsh_program)
+    let status = crate::endpoint::Tsh::new(tsh_program, target.endpoint.clone())
+        .command()
         .args(["ssh", &destination, "--", &remote_command])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -657,11 +721,51 @@ mod tests {
     }
 
     #[test]
+    fn wrappers_pin_tsh_to_the_hosts_recorded_endpoint() {
+        let root = std::env::temp_dir().join(format!("beams-sync-pin-{}", Uuid::new_v4()));
+        let transport = prepare_transport(&root).unwrap();
+        let target = Target {
+            beam_uuid: "beam-uuid".to_string(),
+            login: "beams".to_string(),
+            endpoint: Some(crate::endpoint::Endpoint {
+                proxy: "home.example.com:443".into(),
+                cluster: "home.example.com".into(),
+                user: String::new(),
+                teleport_home: None,
+            }),
+        };
+        write_endpoint(&transport, &target).unwrap();
+        let fake_tsh = root.join("tsh");
+        write_wrapper(&fake_tsh, "#!/bin/sh\nprintf '%s|%s|%s' \"$TELEPORT_PROXY\" \"$TELEPORT_CLUSTER\" \"${TELEPORT_HOME-unset}\"\n").unwrap();
+        let run = |wrapper: &str, args: &[&str]| {
+            let output = Command::new(transport.bin.join(wrapper))
+                .args(args)
+                .env("BEAMS_TSH", &fake_tsh)
+                .env("TELEPORT_PROXY", "elsewhere.example.com:443")
+                .env("TELEPORT_CLUSTER", "elsewhere.example.com")
+                .env("TELEPORT_HOME", "/elsewhere")
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).to_string()
+        };
+        let pinned = "home.example.com:443|home.example.com|unset";
+        assert_eq!(run("ssh", &["-o", "ControlMaster=no", "beams@beam-uuid", "true"]), pinned);
+        assert_eq!(run("scp", &["-q", "./agent", "beams@beam-uuid:.mutagen/agent"]), pinned);
+        // Hosts without a record keep the inherited profile.
+        assert_eq!(
+            run("ssh", &["beams@other-uuid", "true"]),
+            "elsewhere.example.com:443|elsewhere.example.com|/elsewhere"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn adoption_validation_rejects_endpoint_drift() {
         let local = Path::new("/tmp/project");
         let target = Target {
             beam_uuid: "beam-uuid".to_string(),
             login: "beams".to_string(),
+            endpoint: None,
         };
         let mut session = json!({
             "name": "name",
