@@ -197,14 +197,14 @@ pub struct LocalDaemon {
 }
 
 struct ManagedBridge {
-    target: crate::bridge::Target,
+    target: crate::connection::BeamTarget,
     session_token: String,
 }
 
 impl LocalDaemon {
     pub fn connected(
         frontend: Frontend,
-        target: crate::bridge::Target,
+        target: crate::connection::BeamTarget,
         session_token: String,
     ) -> Self {
         Self {
@@ -1303,7 +1303,7 @@ fn port(form: &mut Form, id: &str, optional: bool) -> Option<u16> {
 
 fn session_target(
     local_daemon: &mut LocalDaemon,
-) -> Result<(&crate::bridge::Target, &mut Frontend), String> {
+) -> Result<(&crate::connection::BeamTarget, &mut Frontend), String> {
     let managed = local_daemon
         .managed_bridge
         .as_ref()
@@ -3779,7 +3779,7 @@ mod tests {
             frontend: None,
             unavailable: None,
             managed_bridge: Some(ManagedBridge {
-                target: crate::bridge::Target {
+                target: crate::connection::BeamTarget {
                     beam_id: "beam-a".to_string(),
                     beam_uuid: "beam-a-uuid".to_string(),
                     login: "beams".to_string(),
@@ -4008,7 +4008,7 @@ mod tests {
             frontend: None,
             unavailable: None,
             managed_bridge: Some(ManagedBridge {
-                target: crate::bridge::Target {
+                target: crate::connection::BeamTarget {
                     beam_id: "beam-a".to_string(),
                     beam_uuid: "beam-a-uuid".to_string(),
                     login: "beams".to_string(),

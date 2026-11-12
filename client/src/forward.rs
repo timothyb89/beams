@@ -1,6 +1,7 @@
 //! Supervision for workstation-owned local SSH port forwards.
 //!
-//! A worker owns exactly one `tsh ssh -N -L` child for its full lifetime.
+//! A worker owns exactly one forwarding child (`BeamConnection::local_forward`,
+//! today `tsh ssh -N -L`) for its full lifetime.
 //! The daemon owns the worker through a command channel; no child PID is
 //! persisted or exposed across the local UDS.
 
@@ -15,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::endpoint::Tsh;
+use crate::connection::{BeamConnection, Connection};
 use anyhow::{bail, Context};
 use beams_protocol::{ServiceRequestKind, ServiceStatus};
 
@@ -24,13 +25,6 @@ const STARTUP_GRACE: Duration = Duration::from_millis(500);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AUTO_PORT_ATTEMPTS: usize = 8;
 const DIAGNOSTIC_LINES: usize = 20;
-
-#[derive(Clone, Debug)]
-pub struct Target {
-    pub beam_uuid: String,
-    pub login: String,
-    pub endpoint: Option<crate::endpoint::Endpoint>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -47,26 +41,23 @@ pub struct Event {
 }
 
 pub fn spawn(
-    program: String,
-    target: Target,
+    connection: Connection,
     service_id: String,
     kind: ServiceRequestKind,
     events: SyncSender<Event>,
 ) -> SyncSender<Action> {
     let (commands, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
-    thread::spawn(move || supervise(program, target, service_id, kind, events, command_rx));
+    thread::spawn(move || supervise(connection, service_id, kind, events, command_rx));
     commands
 }
 
 fn supervise(
-    program: String,
-    target: Target,
+    connection: Connection,
     service_id: String,
     mut requested_kind: ServiceRequestKind,
     events: SyncSender<Event>,
     commands: Receiver<Action>,
 ) {
-    let program = Tsh::new(program, target.endpoint.clone());
     let mut start_requested = true;
     loop {
         if start_requested {
@@ -76,7 +67,7 @@ fn supervise(
                 status: ServiceStatus::Starting,
                 message: Some("starting SSH local forward".to_string()),
             });
-            match start_forward(&program, &target, &requested_kind) {
+            match start_forward(connection.as_ref(), &requested_kind) {
                 Ok(StartedForward {
                     mut child,
                     kind: running_kind,
@@ -151,8 +142,7 @@ struct StartedForward {
 }
 
 fn start_forward(
-    program: &Tsh,
-    target: &Target,
+    connection: &dyn BeamConnection,
     kind: &ServiceRequestKind,
 ) -> anyhow::Result<StartedForward> {
     let ServiceRequestKind::LocalPortForward {
@@ -182,8 +172,7 @@ fn start_forward(
         };
         let diagnostics = Arc::new(Mutex::new(VecDeque::new()));
         let mut child = spawn_child(
-            program,
-            target,
+            connection,
             remote_host,
             *remote_port,
             selected_port,
@@ -229,26 +218,15 @@ fn reserve_port(requested: Option<u16>) -> anyhow::Result<u16> {
 }
 
 fn spawn_child(
-    program: &Tsh,
-    target: &Target,
+    connection: &dyn BeamConnection,
     remote_host: &str,
     remote_port: u16,
     local_port: u16,
     diagnostics: Arc<Mutex<VecDeque<String>>>,
 ) -> anyhow::Result<Child> {
-    let forward = format!("127.0.0.1:{local_port}:{remote_host}:{remote_port}");
-    let destination = format!("{}@{}", target.login, target.beam_uuid);
-    let mut command = program.command();
+    let destination = connection.target().destination();
+    let mut command = connection.local_forward(local_port, remote_host, remote_port);
     command
-        .args([
-            "ssh",
-            "-N",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-L",
-            &forward,
-            &destination,
-        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -395,6 +373,18 @@ mod tests {
         path
     }
 
+    fn test_connection(program: &std::path::Path) -> Connection {
+        crate::connection::TshConnection::shared(
+            program.display().to_string(),
+            crate::connection::BeamTarget {
+                beam_id: "beam".to_string(),
+                beam_uuid: "beam-uuid".to_string(),
+                login: "beams".to_string(),
+                endpoint: None,
+            },
+        )
+    }
+
     fn request(local_port: Option<u16>) -> ServiceRequestKind {
         ServiceRequestKind::LocalPortForward {
             remote_host: "127.0.0.1".to_string(),
@@ -416,12 +406,7 @@ mod tests {
         let program = fake_program("#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n");
         let (events, event_rx) = mpsc::sync_channel(16);
         let commands = spawn(
-            program.display().to_string(),
-            Target {
-                beam_uuid: "beam-uuid".to_string(),
-                login: "beams".to_string(),
-                endpoint: None,
-            },
+            test_connection(&program),
             "service-1".to_string(),
             request(None),
             events,
@@ -461,12 +446,7 @@ mod tests {
     fn startup_failure_includes_captured_diagnostics() {
         let program = fake_program("#!/bin/sh\necho 'bind failed for test' >&2\nexit 23\n");
         let err = start_forward(
-            &Tsh::new(program.display().to_string(), None),
-            &Target {
-                beam_uuid: "beam-uuid".to_string(),
-                login: "beams".to_string(),
-                endpoint: None,
-            },
+            test_connection(&program).as_ref(),
             &request(Some(32123)),
         )
         .unwrap_err()

@@ -5,6 +5,8 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+
+use crate::connection::{BeamConnection, BeamTarget, Connection};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread;
 use std::time::Duration;
@@ -81,13 +83,6 @@ done
 exec "${BEAMS_TSH:-tsh}" scp "$@"
 "#;
 
-#[derive(Clone, Debug)]
-pub struct Target {
-    pub beam_uuid: String,
-    pub login: String,
-    pub endpoint: Option<crate::endpoint::Endpoint>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Pause,
@@ -113,7 +108,7 @@ pub fn spawn(
     mutagen_program: String,
     tsh_program: String,
     root: PathBuf,
-    target: Target,
+    connection: Connection,
     service_id: String,
     session_name: String,
     kind: ServiceRequestKind,
@@ -126,7 +121,7 @@ pub fn spawn(
             &mutagen_program,
             &tsh_program,
             &root,
-            &target,
+            &connection,
             &service_id,
             &session_name,
             &kind,
@@ -143,7 +138,7 @@ fn supervise(
     mutagen_program: &str,
     tsh_program: &str,
     root: &Path,
-    target: &Target,
+    connection: &Connection,
     service_id: &str,
     session_name: &str,
     kind: &ServiceRequestKind,
@@ -162,7 +157,7 @@ fn supervise(
         mutagen_program,
         tsh_program,
         root,
-        target,
+        connection,
         service_id,
         session_name,
         kind,
@@ -186,7 +181,7 @@ fn run(
     mutagen_program: &str,
     tsh_program: &str,
     root: &Path,
-    target: &Target,
+    connection: &Connection,
     service_id: &str,
     session_name: &str,
     kind: &ServiceRequestKind,
@@ -211,9 +206,10 @@ fn run(
             local_path.display()
         );
     }
-    validate_remote_directory(tsh_program, target, remote_path)?;
+    validate_remote_directory(connection.as_ref(), remote_path)?;
     let transport = prepare_transport(root)?;
-    write_endpoint(&transport, target)?;
+    write_endpoint(&transport, connection.as_ref())?;
+    let target = connection.target();
 
     match inspect_session(mutagen_program, tsh_program, &transport, session_name)? {
         Some(session) => validate_session(
@@ -319,28 +315,24 @@ struct Transport {
     endpoints: PathBuf,
 }
 
-/// Records `target`'s endpoint for the wrappers: proxy, cluster and
+/// Records how the wrappers reach `connection`'s Beam
+/// ([`BeamConnection::mutagen_host_entry`]): for Tier C, proxy, cluster and
 /// `TELEPORT_HOME` (blank for the default) on three lines. Unpinned targets
 /// leave no file, so their transport follows the current profile.
-fn write_endpoint(transport: &Transport, target: &Target) -> anyhow::Result<()> {
-    let Some(endpoint) = &target.endpoint else {
+fn write_endpoint(transport: &Transport, connection: &dyn BeamConnection) -> anyhow::Result<()> {
+    let Some(entry) = connection.mutagen_host_entry() else {
         return Ok(());
     };
+    let target = connection.target();
     if target.beam_uuid.is_empty()
         || !target.beam_uuid.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     {
         bail!("unexpected Beam host {:?} for the Mutagen transport", target.beam_uuid);
     }
-    let home = endpoint.teleport_home.as_ref().map(|home| home.display().to_string()).unwrap_or_default();
-    for value in [&endpoint.proxy, &endpoint.cluster, &home] {
-        if value.contains('\n') {
-            bail!("unexpected newline in the Beam's Teleport endpoint");
-        }
+    if entry.matches('\n').count() != 3 || !entry.ends_with('\n') {
+        bail!("unexpected newline in the Beam's Teleport endpoint");
     }
-    write_wrapper(
-        &transport.endpoints.join(&target.beam_uuid),
-        &format!("{}\n{}\n{home}\n", endpoint.proxy, endpoint.cluster),
-    )
+    write_wrapper(&transport.endpoints.join(&target.beam_uuid), &entry)
 }
 
 fn prepare_transport(root: &Path) -> anyhow::Result<Transport> {
@@ -401,23 +393,17 @@ fn check_version(program: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_remote_directory(
-    tsh_program: &str,
-    target: &Target,
-    remote_path: &str,
-) -> anyhow::Result<()> {
+fn validate_remote_directory(connection: &dyn BeamConnection, remote_path: &str) -> anyhow::Result<()> {
     if remote_path.is_empty() {
         bail!("remote synchronization path must not be empty");
     }
-    let destination = format!("{}@{}", target.login, target.beam_uuid);
     // Bash's `test` builtin does not consistently accept `--`; the path is
     // shell-quoted, so it cannot be interpreted as an operator even if it
     // begins with `-`.
     let test = format!("test -d {}", crate::tsh::shell_quote(remote_path));
     let remote_command = format!("bash -lc {}", crate::tsh::shell_quote(&test));
-    let status = crate::endpoint::Tsh::new(tsh_program, target.endpoint.clone())
-        .command()
-        .args(["ssh", &destination, "--", &remote_command])
+    let status = connection
+        .exec(&remote_command)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -435,7 +421,7 @@ fn create_session(
     tsh_program: &str,
     transport: &Transport,
     name: &str,
-    target: &Target,
+    target: &BeamTarget,
     local_path: &Path,
     remote_path: &str,
     mode: FolderSyncMode,
@@ -506,7 +492,7 @@ fn inspect_session(
 fn validate_session(
     session: &Value,
     name: &str,
-    target: &Target,
+    target: &BeamTarget,
     local_path: &Path,
     remote_path: &str,
     mode: FolderSyncMode,
@@ -724,7 +710,8 @@ mod tests {
     fn wrappers_pin_tsh_to_the_hosts_recorded_endpoint() {
         let root = std::env::temp_dir().join(format!("beams-sync-pin-{}", Uuid::new_v4()));
         let transport = prepare_transport(&root).unwrap();
-        let target = Target {
+        let target = BeamTarget {
+            beam_id: "beam".to_string(),
             beam_uuid: "beam-uuid".to_string(),
             login: "beams".to_string(),
             endpoint: Some(crate::endpoint::Endpoint {
@@ -734,7 +721,7 @@ mod tests {
                 teleport_home: None,
             }),
         };
-        write_endpoint(&transport, &target).unwrap();
+        write_endpoint(&transport, &crate::connection::TshConnection::new("tsh", target)).unwrap();
         let fake_tsh = root.join("tsh");
         write_wrapper(&fake_tsh, "#!/bin/sh\nprintf '%s|%s|%s' \"$TELEPORT_PROXY\" \"$TELEPORT_CLUSTER\" \"${TELEPORT_HOME-unset}\"\n").unwrap();
         let run = |wrapper: &str, args: &[&str]| {
@@ -762,7 +749,8 @@ mod tests {
     #[test]
     fn adoption_validation_rejects_endpoint_drift() {
         let local = Path::new("/tmp/project");
-        let target = Target {
+        let target = BeamTarget {
+            beam_id: "beam".to_string(),
             beam_uuid: "beam-uuid".to_string(),
             login: "beams".to_string(),
             endpoint: None,

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crate::connection::{BeamConnection, BeamTarget, Connection};
 use anyhow::Context;
 use beams_protocol::{BeamToClient, ClientToBeam, MAX_FRAME_BYTES, PROTOCOL, PROTOCOL_VERSION};
 use serde::Serialize;
@@ -22,22 +23,6 @@ const COMMAND_QUEUE_CAPACITY: usize = 256;
 const RETRY_MIN: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Target {
-    pub beam_id: String,
-    pub beam_uuid: String,
-    pub login: String,
-    /// Where the Beam lives; `None` only for records from before pinning.
-    pub endpoint: Option<crate::endpoint::Endpoint>,
-}
-
-impl Target {
-    /// `program` pinned to this Beam's endpoint.
-    pub fn tsh(&self, program: &str) -> crate::endpoint::Tsh {
-        crate::endpoint::Tsh::new(program, self.endpoint.clone())
-    }
-}
 
 #[derive(Debug)]
 pub enum Event {
@@ -58,26 +43,15 @@ pub enum Event {
 }
 
 pub fn spawn(
-    target: Target,
+    connection: Connection,
     client_id: String,
     initial_token: String,
     events: SyncSender<Event>,
-) -> SyncSender<ClientToBeam> {
-    spawn_with_program(target, client_id, initial_token, events, "tsh".to_string())
-}
-
-fn spawn_with_program(
-    target: Target,
-    client_id: String,
-    initial_token: String,
-    events: SyncSender<Event>,
-    program: String,
 ) -> SyncSender<ClientToBeam> {
     let (commands, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
     thread::spawn(move || {
         supervise(
-            program,
-            target,
+            connection,
             client_id,
             initial_token,
             events,
@@ -88,20 +62,20 @@ fn spawn_with_program(
 }
 
 fn supervise(
-    program: String,
-    target: Target,
+    connection: Connection,
     client_id: String,
     initial_token: String,
     events: SyncSender<Event>,
     commands: Receiver<ClientToBeam>,
 ) {
+    let target = connection.target();
     let mut tokens = BTreeSet::from([initial_token]);
     let mut retry = RETRY_MIN;
 
     loop {
         drain_disconnected_commands(&commands, &mut tokens);
         let bridge_id = Uuid::new_v4().to_string();
-        match start_child(&program, &target) {
+        match start_child(connection.as_ref()) {
             Ok((mut child, mut input)) => {
                 let hello = ClientToBeam::hello(
                     client_id.clone(),
@@ -113,7 +87,7 @@ fn supervise(
                     let _ = child.wait();
                 } else {
                     let outcome = drive_child(
-                        &target,
+                        target,
                         &commands,
                         &mut tokens,
                         &events,
@@ -153,15 +127,10 @@ fn supervise(
 /// `~` expands in both sh and fish login shells.
 const BRIDGE_COMMAND: &str = "~/.beams/runtime/bin/beam-bootstrap client-bridge";
 
-fn start_child(
-    program: &str,
-    target: &Target,
-) -> anyhow::Result<(std::process::Child, ChildStdin)> {
-    let ssh_target = format!("{}@{}", target.login, target.beam_uuid);
-    let mut child = target
-        .tsh(program)
-        .command()
-        .args(["ssh", &ssh_target, "--", BRIDGE_COMMAND])
+fn start_child(connection: &dyn BeamConnection) -> anyhow::Result<(std::process::Child, ChildStdin)> {
+    let target = connection.target();
+    let mut child = connection
+        .exec(BRIDGE_COMMAND)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -184,7 +153,7 @@ struct ChildOutcome {
 }
 
 fn drive_child(
-    target: &Target,
+    target: &BeamTarget,
     commands: &Receiver<ClientToBeam>,
     tokens: &mut BTreeSet<String>,
     events: &SyncSender<Event>,
@@ -411,17 +380,19 @@ exit 1
         std::fs::set_permissions(&fake_tsh, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let (event_tx, event_rx) = mpsc::sync_channel(32);
-        let commands = spawn_with_program(
-            Target {
-                beam_id: "test-beam".to_string(),
-                beam_uuid: "test-uuid".to_string(),
-                login: "beams".to_string(),
-                endpoint: None,
-            },
+        let commands = spawn(
+            crate::connection::TshConnection::shared(
+                fake_tsh.display().to_string(),
+                BeamTarget {
+                    beam_id: "test-beam".to_string(),
+                    beam_uuid: "test-uuid".to_string(),
+                    login: "beams".to_string(),
+                    endpoint: None,
+                },
+            ),
             "client-id".to_string(),
             "session-token".to_string(),
             event_tx,
-            fake_tsh.display().to_string(),
         );
 
         let deadline = Instant::now() + Duration::from_secs(4);
@@ -467,17 +438,19 @@ exit 1
         std::fs::set_permissions(&fake_tsh, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let (event_tx, _event_rx) = mpsc::sync_channel(256);
-        let commands = spawn_with_program(
-            Target {
-                beam_id: "gone-beam".to_string(),
-                beam_uuid: "gone-uuid".to_string(),
-                login: "beams".to_string(),
-                endpoint: None,
-            },
+        let commands = spawn(
+            crate::connection::TshConnection::shared(
+                fake_tsh.display().to_string(),
+                BeamTarget {
+                    beam_id: "gone-beam".to_string(),
+                    beam_uuid: "gone-uuid".to_string(),
+                    login: "beams".to_string(),
+                    endpoint: None,
+                },
+            ),
             "client-id".to_string(),
             "session-token".to_string(),
             event_tx,
-            fake_tsh.display().to_string(),
         );
         // Backoff 250ms, 500ms, 1s, 2s: about four starts in 2.5s. Without
         // backoff it would be eight or more.

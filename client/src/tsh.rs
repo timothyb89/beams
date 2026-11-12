@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context};
 use serde::Deserialize;
 
+use crate::connection::BeamConnection;
 use crate::endpoint::{Endpoint, Tsh};
 use crate::session;
 
@@ -175,10 +176,10 @@ pub fn ssh_interactive(
 /// `ext::` is disabled by default in modern git (`protocol.ext.allow`) -
 /// callers must set `GIT_ALLOW_PROTOCOL=ext` on the invoking `git`
 /// process, not something settable via the URL itself.
-/// The pinned endpoint reaches the `ext::` command through `git`'s own
-/// environment (see `push_repo`).
-fn git_ext_url(login: &str, uuid: &str, remote_path: &str) -> String {
-    format!("ext::tsh ssh {login}@{uuid} -- %S '{remote_path}'")
+/// The URL itself comes from [`BeamConnection::git_remote`], which also
+/// pins the `git` process's environment for the `ext::` command it runs.
+pub(crate) fn git_ext_url(ssh: &str, destination: &str, remote_path: &str) -> String {
+    format!("ext::{ssh} {destination} -- %S '{remote_path}'")
 }
 
 /// The local repo's current branch (e.g. `"main"`) - what `push_repo`
@@ -253,9 +254,7 @@ pub fn origin_url(repo: &Path) -> anyhow::Result<Option<String>> {
 /// prior call - so safe to call again (e.g. for a future "push again to
 /// sync" command, not just the initial copy).
 pub fn prepare_git_target(
-    endpoint: &Endpoint,
-    login: &str,
-    uuid: &str,
+    connection: &dyn BeamConnection,
     remote_path: &str,
     branch: &str,
     origin_url: Option<&str>,
@@ -274,10 +273,8 @@ pub fn prepare_git_target(
     // passing exactly one already-fully-quoted argv element, so there's
     // nothing left for ssh to join.
     let remote_command = format!("bash -lc {}", shell_quote(&script));
-    let target = format!("{login}@{uuid}");
-    let status = Tsh::pinned(endpoint)
-        .command()
-        .args(["ssh", &target, "--", &remote_command])
+    let status = connection
+        .exec(&remote_command)
         .status()
         .context("preparing git push target on beam")?;
     if !status.success() {
@@ -323,16 +320,13 @@ pub(crate) fn shell_quote(s: &str) -> String {
 /// builds. Only transfers committed history - uncommitted local changes
 /// don't make the trip, same caveat any git push has.
 pub fn push_repo(
-    endpoint: &Endpoint,
+    connection: &dyn BeamConnection,
     repo: &Path,
-    login: &str,
-    uuid: &str,
     remote_path: &str,
     branch: &str,
 ) -> anyhow::Result<()> {
-    let url = git_ext_url(login, uuid, remote_path);
     let mut command = Command::new("git");
-    endpoint.apply(&mut command);
+    let url = connection.git_remote(&mut command, remote_path);
     let status = command
         .current_dir(repo)
         .env("GIT_ALLOW_PROTOCOL", "ext")

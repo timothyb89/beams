@@ -166,7 +166,7 @@ impl Hub {
     /// (idempotent: the same launch again just drives it again).
     pub(super) fn start_launch(
         self: &Arc<Self>,
-        target: &crate::bridge::Target,
+        target: &crate::connection::BeamTarget,
         launch_dir: &Path,
         gate: Gate,
     ) -> anyhow::Result<LaunchRecord> {

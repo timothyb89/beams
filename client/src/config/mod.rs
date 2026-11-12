@@ -159,7 +159,7 @@ fn launch(
 
     let mut state = crate::state::State::load()?;
     let located = crate::beamcmd::locate(target.unwrap_or(crate::DEFAULT_PURPOSE), &mut state)?;
-    let target = crate::bridge::Target {
+    let target = crate::connection::BeamTarget {
         beam_id: located.beam.id.clone(),
         beam_uuid: located.beam.uuid.clone(),
         login: login.to_string(),

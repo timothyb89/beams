@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::endpoint::Tsh;
+use crate::connection::{BeamConnection, Connection};
 use anyhow::{bail, Context};
 use beams_protocol::{
     FetchSource, FileCopyDirection, OverwritePolicy, ServiceRequestKind, ServiceStatus,
@@ -23,13 +23,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const DIAGNOSTIC_LINES: usize = 20;
 /// How often a running fetch reports byte progress.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
-
-#[derive(Clone, Debug)]
-pub struct Target {
-    pub beam_uuid: String,
-    pub login: String,
-    pub endpoint: Option<crate::endpoint::Endpoint>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -46,19 +39,16 @@ pub struct Event {
 }
 
 pub fn spawn(
-    program: String,
-    target: Target,
+    connection: Connection,
     service_id: String,
     kind: ServiceRequestKind,
     local_path: PathBuf,
     events: SyncSender<Event>,
 ) -> SyncSender<Action> {
     let (commands, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
-    let program = Tsh::new(program, target.endpoint.clone());
     thread::spawn(move || {
         supervise(
-            &program,
-            &target,
+            connection.as_ref(),
             &service_id,
             &kind,
             &local_path,
@@ -70,8 +60,7 @@ pub fn spawn(
 }
 
 fn supervise(
-    program: &Tsh,
-    target: &Target,
+    connection: &dyn BeamConnection,
     service_id: &str,
     kind: &ServiceRequestKind,
     local_path: &Path,
@@ -86,7 +75,7 @@ fn supervise(
         progress: None,
     });
     let result = run_copy(
-        program, target, kind, local_path, events, service_id, commands,
+        connection, kind, local_path, events, service_id, commands,
     );
     let (status, message) = match result {
         Ok(CopyOutcome::Completed(message)) => (ServiceStatus::Stopped, message),
@@ -108,8 +97,7 @@ enum CopyOutcome {
 }
 
 fn run_copy(
-    program: &Tsh,
-    target: &Target,
+    connection: &dyn BeamConnection,
     kind: &ServiceRequestKind,
     local_path: &Path,
     events: &SyncSender<Event>,
@@ -128,7 +116,7 @@ fn run_copy(
     if remote_path.is_empty() {
         bail!("remote path must not be empty");
     }
-    let destination = format!("{}@{}", target.login, target.beam_uuid);
+    let target = connection.target();
     let diagnostics = Arc::new(Mutex::new(VecDeque::new()));
 
     match direction {
@@ -140,24 +128,24 @@ fn run_copy(
                 );
             }
             let remote_temp = format!("{remote_path}.beams-copy-{}.part", Uuid::new_v4());
-            let remote = format!("{destination}:{remote_temp}");
+            let remote = target.remote_path(&remote_temp);
             let mut child = spawn_scp(
-                program,
+                connection,
                 local_path.as_os_str(),
-                remote.as_ref(),
+                &remote,
                 Arc::clone(&diagnostics),
             )?;
             announce_running(events, service_id, kind, local_path, remote_path);
             if monitor(&mut child, commands)? {
-                let _ = remove_remote(program, &destination, &remote_temp);
+                let _ = remove_remote(connection, &remote_temp);
                 return Ok(CopyOutcome::Cancelled);
             }
             let status = child.wait().context("waiting for upload")?;
             if !status.success() {
-                let _ = remove_remote(program, &destination, &remote_temp);
+                let _ = remove_remote(connection, &remote_temp);
                 bail!("{}", child_failure("upload", status, &diagnostics));
             }
-            finalize_remote(program, &destination, &remote_temp, remote_path, *overwrite)?;
+            finalize_remote(connection, &remote_temp, remote_path, *overwrite)?;
             Ok(CopyOutcome::Completed(format!(
                 "uploaded {} to {remote_path}",
                 local_path.display()
@@ -178,10 +166,10 @@ fn run_copy(
                 bail!("local destination {} already exists", local_path.display());
             }
             let temp = parent.join(format!(".beams-copy-{}.part", Uuid::new_v4()));
-            let remote = format!("{destination}:{remote_path}");
+            let remote = target.remote_path(remote_path);
             let mut child = spawn_scp(
-                program,
-                remote.as_ref(),
+                connection,
+                &remote,
                 temp.as_os_str(),
                 Arc::clone(&diagnostics),
             )?;
@@ -221,34 +209,28 @@ fn announce_running(
 }
 
 fn spawn_scp(
-    program: &Tsh,
+    connection: &dyn BeamConnection,
     source: &std::ffi::OsStr,
     destination: &std::ffi::OsStr,
     diagnostics: Arc<Mutex<VecDeque<String>>>,
 ) -> anyhow::Result<Child> {
-    spawn_scp_with(program, false, source, destination, diagnostics)
+    spawn_scp_with(connection, false, source, destination, diagnostics)
 }
 
 fn spawn_scp_with(
-    program: &Tsh,
+    connection: &dyn BeamConnection,
     recursive: bool,
     source: &std::ffi::OsStr,
     destination: &std::ffi::OsStr,
     diagnostics: Arc<Mutex<VecDeque<String>>>,
 ) -> anyhow::Result<Child> {
-    let mut command = program.command();
-    command.arg("scp");
-    if recursive {
-        command.arg("-r");
-    }
+    let mut command = connection.copy(recursive, source, destination);
     command
-        .arg(source)
-        .arg(destination)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     crate::forward::configure_parent_death_signal(&mut command);
-    let mut child = command.spawn().context("starting tsh scp")?;
+    let mut child = command.spawn().context("starting copy")?;
     let stderr = child.stderr.take().context("capturing copy diagnostics")?;
     thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
@@ -301,8 +283,7 @@ fn install_download(
 }
 
 fn finalize_remote(
-    program: &Tsh,
-    destination: &str,
+    connection: &dyn BeamConnection,
     temp: &str,
     final_path: &str,
     overwrite: OverwritePolicy,
@@ -315,28 +296,25 @@ fn finalize_remote(
             format!("ln -- {temp} {final_path} && rm -f -- {temp}")
         }
     };
-    run_remote(program, destination, &script, "finalizing remote upload")
+    run_remote(connection, &script, "finalizing remote upload")
 }
 
-fn remove_remote(program: &Tsh, destination: &str, path: &str) -> anyhow::Result<()> {
+fn remove_remote(connection: &dyn BeamConnection, path: &str) -> anyhow::Result<()> {
     run_remote(
-        program,
-        destination,
+        connection,
         &format!("rm -f -- {}", crate::tsh::shell_quote(path)),
         "removing remote upload temporary file",
     )
 }
 
 fn run_remote(
-    program: &Tsh,
-    destination: &str,
+    connection: &dyn BeamConnection,
     script: &str,
     operation: &str,
 ) -> anyhow::Result<()> {
     let remote_command = format!("bash -lc {}", crate::tsh::shell_quote(script));
-    let mut command = program.command();
+    let mut command = connection.exec(&remote_command);
     command
-        .args(["ssh", destination, "--", &remote_command])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -374,6 +352,18 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
+    fn test_connection(program: &Path) -> Connection {
+        crate::connection::TshConnection::shared(
+            program.display().to_string(),
+            crate::connection::BeamTarget {
+                beam_id: "beam".to_string(),
+                beam_uuid: "beam-uuid".to_string(),
+                login: "beams".to_string(),
+                endpoint: None,
+            },
+        )
+    }
+
     fn fake_program(script: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("beams-copy-test-{}", Uuid::new_v4()));
         let mut file = fs::File::create(&path).unwrap();
@@ -404,12 +394,7 @@ mod tests {
         fs::write(&source, "data").unwrap();
         let (events, event_rx) = mpsc::sync_channel(8);
         let _actions = spawn(
-            program.display().to_string(),
-            Target {
-                beam_uuid: "beam".to_string(),
-                login: "beams".to_string(),
-                endpoint: None,
-            },
+            test_connection(&program),
             "copy".to_string(),
             ServiceRequestKind::FileCopy {
                 direction: FileCopyDirection::Upload,
@@ -455,12 +440,7 @@ mod tests {
         let destination = dir.join("destination");
         let (events, event_rx) = mpsc::sync_channel(8);
         let _actions = spawn(
-            program.display().to_string(),
-            Target {
-                beam_uuid: "beam".to_string(),
-                login: "beams".to_string(),
-                endpoint: None,
-            },
+            test_connection(&program),
             "copy".to_string(),
             ServiceRequestKind::FileCopy {
                 direction: FileCopyDirection::Download,
@@ -512,12 +492,7 @@ mod tests {
         let destination = dir.join("destination");
         let (events, event_rx) = mpsc::sync_channel(8);
         let actions = spawn(
-            program.display().to_string(),
-            Target {
-                beam_uuid: "beam".to_string(),
-                login: "beams".to_string(),
-                endpoint: None,
-            },
+            test_connection(&program),
             "copy".to_string(),
             ServiceRequestKind::FileCopy {
                 direction: FileCopyDirection::Download,
@@ -556,15 +531,13 @@ mod tests {
 /// Starts a supervised `beams fetch`: every source copied from the Beam into
 /// the approved workstation `destination`.
 pub fn spawn_fetch(
-    program: String,
-    target: Target,
+    connection: Connection,
     service_id: String,
     kind: ServiceRequestKind,
     destination: PathBuf,
     events: SyncSender<Event>,
 ) -> SyncSender<Action> {
     let (commands, command_rx) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
-    let program = Tsh::new(program, target.endpoint.clone());
     thread::spawn(move || {
         let reporter = Reporter {
             events: &events,
@@ -574,8 +547,7 @@ pub fn spawn_fetch(
         reporter.send(ServiceStatus::Starting, "preparing fetch".to_string(), None);
         let mut progress = TransferProgress::default();
         let result = run_fetch(
-            &program,
-            &target,
+            connection.as_ref(),
             &kind,
             &destination,
             &reporter,
@@ -687,8 +659,7 @@ pub fn fetch_layout(
 }
 
 fn run_fetch(
-    program: &Tsh,
-    target: &Target,
+    connection: &dyn BeamConnection,
     kind: &ServiceRequestKind,
     destination: &Path,
     reporter: &Reporter<'_>,
@@ -711,7 +682,7 @@ fn run_fetch(
     if let Some(dir) = &layout.create_dir {
         fs::create_dir(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let remote_host = format!("{}@{}", target.login, target.beam_uuid);
+    let target = connection.target();
     reporter.send(
         ServiceStatus::Running,
         format!("fetching into {}", destination.display()),
@@ -734,11 +705,11 @@ fn run_fetch(
             (temp.clone(), temp.clone())
         };
         let diagnostics = Arc::new(Mutex::new(VecDeque::new()));
-        let remote = format!("{remote_host}:{}", source.path);
+        let remote = target.remote_path(&source.path);
         let mut child = match spawn_scp_with(
-            program,
+            connection,
             source.is_dir,
-            remote.as_ref(),
+            &remote,
             copy_to.as_os_str(),
             Arc::clone(&diagnostics),
         ) {

@@ -7,6 +7,7 @@ mod clientd;
 mod copy;
 mod config;
 mod daemonctl;
+mod connection;
 mod endpoint;
 mod forward;
 mod session;
@@ -400,14 +401,14 @@ fn main() -> anyhow::Result<ExitCode> {
     Ok(ExitCode::from(code))
 }
 
-fn tracked_target(purpose: &str, login: &str) -> anyhow::Result<bridge::Target> {
+fn tracked_target(purpose: &str, login: &str) -> anyhow::Result<connection::BeamTarget> {
     let mut state = state::State::load()?;
     if !state.purposes.contains_key(purpose) {
         bail!("no Beam is tracked for purpose {purpose:?}; run `beams ssh --purpose {purpose}` first");
     }
     let located = beamcmd::locate(purpose, &mut state)
         .with_context(|| format!("the Beam tracked for purpose {purpose:?} is not reachable"))?;
-    Ok(bridge::Target {
+    Ok(connection::BeamTarget {
         beam_id: located.beam.id,
         beam_uuid: located.beam.uuid,
         login: login.to_string(),
@@ -706,15 +707,22 @@ fn ssh(
                 eprintln!("beams: pushing {} to {}...", repo.display(), fresh.id);
                 let branch = tsh::current_branch(repo)?;
                 let origin_url = tsh::origin_url(repo)?;
+                let beam = connection::TshConnection::new(
+                    "tsh",
+                    connection::BeamTarget {
+                        beam_id: fresh.id.clone(),
+                        beam_uuid: fresh.uuid.clone(),
+                        login: login.to_string(),
+                        endpoint: Some(endpoint.clone()),
+                    },
+                );
                 tsh::prepare_git_target(
-                    &endpoint,
-                    login,
-                    &fresh.uuid,
+                    &beam,
                     REMOTE_REPO_PATH,
                     &branch,
                     origin_url.as_deref(),
                 )?;
-                tsh::push_repo(&endpoint, repo, login, &fresh.uuid, REMOTE_REPO_PATH, &branch)?;
+                tsh::push_repo(&beam, repo, REMOTE_REPO_PATH, &branch)?;
             }
 
             eprintln!("beams: copying the runtime and launch {} to {}...", packed.launch_id, fresh.id);
@@ -760,7 +768,7 @@ fn ssh(
     // A launch needs the daemon: readiness and post work go over its bridge.
     let mut frontend = clientd::connect_or_start().context("the local service daemon is needed for a launch")?;
     let session_token = Uuid::new_v4().to_string();
-    let target = bridge::Target {
+    let target = connection::BeamTarget {
         beam_id: beam.id.clone(),
         beam_uuid: beam.uuid.clone(),
         login: login.to_string(),

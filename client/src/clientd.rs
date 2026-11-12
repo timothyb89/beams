@@ -432,7 +432,7 @@ struct Hub {
     frontends: AtomicUsize,
     bridges: Mutex<BTreeMap<String, BridgeRuntime>>,
     service_runtimes: Mutex<BTreeMap<String, ServiceRuntime>>,
-    forward_program: String,
+    tsh_program: String,
     mutagen_program: String,
     mutagen_root: PathBuf,
     beam_lister: BeamLister,
@@ -541,13 +541,13 @@ impl Hub {
     fn with_state_path_and_program(
         state: PersistedState,
         state_path: Option<PathBuf>,
-        forward_program: String,
+        tsh_program: String,
     ) -> Self {
         let mutagen_root = std::env::temp_dir().join(format!("beams-mutagen-{}", Uuid::new_v4()));
         let mut hub = Self::with_programs(
             state,
             state_path,
-            forward_program,
+            tsh_program,
             "mutagen".to_string(),
             mutagen_root,
         );
@@ -560,7 +560,7 @@ impl Hub {
     fn with_programs(
         state: PersistedState,
         state_path: Option<PathBuf>,
-        forward_program: String,
+        tsh_program: String,
         mutagen_program: String,
         mutagen_root: PathBuf,
     ) -> Self {
@@ -571,7 +571,7 @@ impl Hub {
             frontends: AtomicUsize::new(0),
             bridges: Mutex::new(BTreeMap::new()),
             service_runtimes: Mutex::new(BTreeMap::new()),
-            forward_program,
+            tsh_program,
             mutagen_program,
             mutagen_root,
             beam_lister: Box::new(list_beam_uuids),
@@ -659,7 +659,7 @@ impl Hub {
                 service.desired_running
                     && matches!(service.spec, Some(ServiceRequestKind::LocalPortForward { .. }))
             })
-            .map(|service| crate::bridge::Target {
+            .map(|service| crate::connection::BeamTarget {
                 beam_id: service.beam_id.clone(),
                 beam_uuid: service.beam_uuid.clone(),
                 login: service.login.clone(),
@@ -706,7 +706,7 @@ impl Hub {
                 .insert(service.service_id.clone(), service.clone());
             let _ = self.save_state();
             self.publish_service(&service);
-            let target = crate::bridge::Target {
+            let target = crate::connection::BeamTarget {
                 beam_id: service.beam_id.clone(),
                 beam_uuid: service.beam_uuid.clone(),
                 login: service.login.clone(),
@@ -781,7 +781,7 @@ impl Hub {
 
     fn ensure_bridge(
         self: &Arc<Self>,
-        target: crate::bridge::Target,
+        target: crate::connection::BeamTarget,
         session_token: String,
     ) -> anyhow::Result<()> {
         if target.beam_uuid.is_empty() || target.login.is_empty() || session_token.is_empty() {
@@ -812,7 +812,7 @@ impl Hub {
 
         let client_id = self.state.lock().unwrap().client_id.clone();
         let (event_tx, event_rx) = mpsc::sync_channel(BRIDGE_EVENT_QUEUE_CAPACITY);
-        let commands = crate::bridge::spawn(target.clone(), client_id, session_token, event_tx);
+        let commands = crate::bridge::spawn(self.connection(&target), client_id, session_token, event_tx);
         let record = BridgeRecord {
             beam_id: target.beam_id.clone(),
             beam_uuid: target.beam_uuid.clone(),
@@ -924,7 +924,7 @@ impl Hub {
         self.broadcast(ServerEvent::BridgeStatus { bridge: record });
     }
 
-    fn recover_services(self: &Arc<Self>, target: &crate::bridge::Target) {
+    fn recover_services(self: &Arc<Self>, target: &crate::connection::BeamTarget) {
         let services = self
             .state
             .lock()
@@ -1095,7 +1095,7 @@ impl Hub {
 
     fn create_port_forward(
         self: &Arc<Self>,
-        target: crate::bridge::Target,
+        target: crate::connection::BeamTarget,
         remote_host: String,
         remote_port: u16,
         local_port: Option<u16>,
@@ -1143,7 +1143,7 @@ impl Hub {
     fn create_file_copy(
         self: &Arc<Self>,
         request_id: String,
-        target: crate::bridge::Target,
+        target: crate::connection::BeamTarget,
         direction: beams_protocol::FileCopyDirection,
         local_path: String,
         remote_path: String,
@@ -1204,7 +1204,7 @@ impl Hub {
     fn create_folder_sync(
         self: &Arc<Self>,
         request_id: String,
-        target: crate::bridge::Target,
+        target: crate::connection::BeamTarget,
         local_path: String,
         remote_path: String,
         mode: beams_protocol::FolderSyncMode,
@@ -1280,7 +1280,7 @@ impl Hub {
             let bridge = bridges
                 .get(&beam_uuid)
                 .with_context(|| format!("no bridge target for Beam {beam_uuid}"))?;
-            crate::bridge::Target {
+            crate::connection::BeamTarget {
                 beam_id: bridge.record.beam_id.clone(),
                 beam_uuid: bridge.record.beam_uuid.clone(),
                 login: bridge.record.login.clone(),
@@ -1293,7 +1293,7 @@ impl Hub {
     fn start_service_request_with_target(
         self: &Arc<Self>,
         request_id: &str,
-        target: crate::bridge::Target,
+        target: crate::connection::BeamTarget,
     ) -> anyhow::Result<()> {
         let (request, service) = {
             let mut state = self.state.lock().unwrap();
@@ -1347,10 +1347,17 @@ impl Hub {
         self.spawn_service_worker(&service, &target)
     }
 
+    /// How this daemon reaches `target`'s Beam. Every bridge and service
+    /// worker goes through here, so a multiplexed transport can be chosen
+    /// per Beam in one place.
+    fn connection(&self, target: &crate::connection::BeamTarget) -> crate::connection::Connection {
+        crate::connection::TshConnection::shared(self.tsh_program.clone(), target.clone())
+    }
+
     fn spawn_service_worker(
         self: &Arc<Self>,
         service: &ServiceRecord,
-        target: &crate::bridge::Target,
+        target: &crate::connection::BeamTarget,
     ) -> anyhow::Result<()> {
         let spec = service
             .spec
@@ -1360,12 +1367,7 @@ impl Hub {
             ServiceRequestKind::LocalPortForward { .. } => {
                 let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
                 let actions = crate::forward::spawn(
-                    self.forward_program.clone(),
-                    crate::forward::Target {
-                        beam_uuid: target.beam_uuid.clone(),
-                        login: target.login.clone(),
-                        endpoint: target.endpoint.clone(),
-                    },
+                    self.connection(target),
                     service.service_id.clone(),
                     spec,
                     event_tx,
@@ -1386,12 +1388,7 @@ impl Hub {
                     .context("file-copy service has no approved workstation path")?;
                 let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
                 let actions = crate::copy::spawn(
-                    self.forward_program.clone(),
-                    crate::copy::Target {
-                        beam_uuid: target.beam_uuid.clone(),
-                        login: target.login.clone(),
-                        endpoint: target.endpoint.clone(),
-                    },
+                    self.connection(target),
                     service.service_id.clone(),
                     spec,
                     PathBuf::from(local_path),
@@ -1413,12 +1410,7 @@ impl Hub {
                     .context("fetch has no approved workstation destination")?;
                 let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
                 let actions = crate::copy::spawn_fetch(
-                    self.forward_program.clone(),
-                    crate::copy::Target {
-                        beam_uuid: target.beam_uuid.clone(),
-                        login: target.login.clone(),
-                        endpoint: target.endpoint.clone(),
-                    },
+                    self.connection(target),
                     service.service_id.clone(),
                     spec,
                     PathBuf::from(local_path),
@@ -1445,13 +1437,9 @@ impl Hub {
                 let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
                 let actions = crate::sync::spawn(
                     self.mutagen_program.clone(),
-                    self.forward_program.clone(),
+                    self.tsh_program.clone(),
                     self.mutagen_root.clone(),
-                    crate::sync::Target {
-                        beam_uuid: target.beam_uuid.clone(),
-                        login: target.login.clone(),
-                        endpoint: target.endpoint.clone(),
-                    },
+                    self.connection(target),
                     service.service_id.clone(),
                     session_name,
                     spec,
@@ -2997,7 +2985,7 @@ impl Frontend {
 
     pub fn ensure_bridge(
         &mut self,
-        target: &crate::bridge::Target,
+        target: &crate::connection::BeamTarget,
         session_token: &str,
     ) -> anyhow::Result<()> {
         write_json(
@@ -3016,7 +3004,7 @@ impl Frontend {
 
     pub fn start_launch(
         &mut self,
-        target: &crate::bridge::Target,
+        target: &crate::connection::BeamTarget,
         launch_dir: &Path,
         gate: beams_protocol::launch::Gate,
     ) -> anyhow::Result<()> {
@@ -3082,7 +3070,7 @@ impl Frontend {
 
     pub fn create_port_forward(
         &mut self,
-        target: &crate::bridge::Target,
+        target: &crate::connection::BeamTarget,
         remote_host: &str,
         remote_port: u16,
         local_port: Option<u16>,
@@ -3104,7 +3092,7 @@ impl Frontend {
 
     pub fn create_file_copy(
         &mut self,
-        target: &crate::bridge::Target,
+        target: &crate::connection::BeamTarget,
         direction: beams_protocol::FileCopyDirection,
         local_path: &str,
         remote_path: &str,
@@ -3132,7 +3120,7 @@ impl Frontend {
     #[allow(clippy::too_many_arguments)]
     pub fn create_folder_sync(
         &mut self,
-        target: &crate::bridge::Target,
+        target: &crate::connection::BeamTarget,
         local_path: &str,
         remote_path: &str,
         mode: beams_protocol::FolderSyncMode,
@@ -3288,7 +3276,7 @@ pub fn serve(socket_path: Option<PathBuf>) -> anyhow::Result<()> {
     listener
         .set_nonblocking(true)
         .context("making daemon listener nonblocking")?;
-    let forward_program = std::env::var("BEAMS_TSH").unwrap_or_else(|_| "tsh".to_string());
+    let tsh_program = std::env::var("BEAMS_TSH").unwrap_or_else(|_| "tsh".to_string());
     let mutagen_program = std::env::var("BEAMS_MUTAGEN").unwrap_or_else(|_| "mutagen".to_string());
     let mutagen_root = state_path
         .parent()
@@ -3297,7 +3285,7 @@ pub fn serve(socket_path: Option<PathBuf>) -> anyhow::Result<()> {
     let hub = Arc::new(Hub::with_programs(
         state,
         Some(state_path),
-        forward_program,
+        tsh_program,
         mutagen_program,
         mutagen_root,
     ));
@@ -3549,7 +3537,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                         session_token,
                         ssh_auth_sock,
                     } => {
-                        let target = crate::bridge::Target {
+                        let target = crate::connection::BeamTarget {
                             beam_id,
                             beam_uuid: beam_uuid.clone(),
                             login,
@@ -3591,7 +3579,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                         remote_path,
                         overwrite,
                     } => {
-                        let target = crate::bridge::Target {
+                        let target = crate::connection::BeamTarget {
                             beam_id,
                             beam_uuid,
                             login,
@@ -3622,7 +3610,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                         ignore_vcs,
                         ignores,
                     } => {
-                        let target = crate::bridge::Target {
+                        let target = crate::connection::BeamTarget {
                             beam_id,
                             beam_uuid,
                             login,
@@ -3651,7 +3639,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                         remote_port,
                         local_port,
                     } => {
-                        let target = crate::bridge::Target {
+                        let target = crate::connection::BeamTarget {
                             beam_id,
                             beam_uuid,
                             login,
@@ -3676,7 +3664,7 @@ fn handle_connection(hub: &Arc<Hub>, mut stream: UnixStream) -> anyhow::Result<(
                         hub.end_grants_where(|g| g.grant_id == grant_id, "revoked by local user");
                     }
                     ClientMessage::StartLaunch { beam_id, beam_uuid, login, endpoint, launch_dir, gate } => {
-                        let target = crate::bridge::Target { beam_id, beam_uuid, login, endpoint };
+                        let target = crate::connection::BeamTarget { beam_id, beam_uuid, login, endpoint };
                         if let Err(err) = hub.start_launch(&target, Path::new(&launch_dir), gate) {
                             let _ = tx.try_send(ServerEvent::Error { message: format!("starting launch: {err:#}") });
                         }
@@ -3909,7 +3897,7 @@ mod tests {
         (hub, command_rx)
     }
 
-    fn fake_forward_program() -> PathBuf {
+    fn fake_tsh_program() -> PathBuf {
         let path = temp_path("beams-clientd-fake-forward");
         fs::write(
             &path,
@@ -4337,7 +4325,7 @@ mod tests {
     fn second_frontend_for_the_same_beam_reuses_one_bridge_and_adds_its_token() {
         let (hub, commands) = hub_with_bridge("beam-uuid");
         hub.ensure_bridge(
-            crate::bridge::Target {
+            crate::connection::BeamTarget {
                 beam_id: "beam-name".to_string(),
                 beam_uuid: "beam-uuid".to_string(),
                 login: "beams".to_string(),
@@ -4465,7 +4453,7 @@ mod tests {
 
     #[test]
     fn approving_remote_forward_runs_and_local_stop_restart_controls_it() {
-        let program = fake_forward_program();
+        let program = fake_tsh_program();
         let (hub, _commands) =
             hub_with_bridge_and_program("beam-uuid", program.display().to_string());
         handle_bridge_event(
@@ -4672,7 +4660,7 @@ mod tests {
 
     #[test]
     fn a_self_restarted_daemon_restores_running_forwards_without_a_session() {
-        let program = fake_forward_program();
+        let program = fake_tsh_program();
         let (hub, _commands) =
             hub_with_bridge_and_program("beam-uuid", program.display().to_string());
         submit_forward_request(&hub, "beam-uuid", "request-forward");
@@ -5264,7 +5252,7 @@ mod tests {
         let id = declaration.launch_id.clone();
         let (hub, rx) = hub_with_bridge("beam-uuid");
         let next = || rx.recv_timeout(Duration::from_secs(5)).expect("a message to the Beam");
-        let target = crate::bridge::Target {
+        let target = crate::connection::BeamTarget {
             beam_id: "beam-name".into(),
             beam_uuid: "beam-uuid".into(),
             login: "beams".into(),

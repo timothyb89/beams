@@ -1254,11 +1254,12 @@ bootstrap `Task`s.
     "log in again" hints). Previously a `tsh login` to another cluster
     misrouted bridge reconnects, forwards, copies and Mutagen, and could
     make `rm --prune` or a failing bridge treat live Beams as gone.
-  - [ ] Verify pinning from a workstation: start `beams ssh`, `tsh login`
-    to a second cluster, then reconnect the bridge, add a forward, copy a
-    file and let Mutagen reconnect; `beams ls` on each cluster.
-  - [ ] `BeamConnection` trait in `beamsd` with the pinned-`tsh` tier only
-    (no behavior change), replacing the per-module `Target`s.
+  - [x] Verify pinning from a workstation (2026-11-12): after a `tsh login`
+    to a second cluster, bridge reconnects and fetches stayed on the
+    original cluster with no extra prompts or failed transfers.
+  - [x] `BeamConnection` trait with the pinned-`tsh` tier only
+    (`client/src/connection.rs`; one `BeamTarget` replaces the per-module
+    `Target`s; `Hub::connection` is the daemon's single source).
   - [ ] Tier B (ControlMaster over pinned `tsh proxy ssh`) for daemon-owned
     work, with capability probing and Tier C fallback; workstation runs of
     the harness. (VNet SSH tier deferred: no MFA/hardware-key roles here.)

@@ -146,6 +146,20 @@ change to the process model.
 
 ### 2. A daemon-owned `BeamConnection` per endpoint
 
+**Seam implemented 2026-11-12** (rollout step 2) in
+`client/src/connection.rs`: one `BeamTarget` (ID, UUID, login,
+endpoint) replaces the bridge/forward/copy/sync targets, and
+`BeamConnection` has `exec`, `local_forward`, `copy`, `git_remote` and
+`mutagen_host_entry`, with `TshConnection` (Tier C) as the only
+implementation. `Hub::connection` in `clientd.rs` is the single place a
+daemon worker gets one, which is where Tier B selection and the
+per-endpoint master cache go. The CLI's git target preparation and push
+use it too; `tsh beams add/exec/scp/ls` stay in `tsh.rs`, since they're
+Beams management calls by Beam ID rather than SSH operations. Not yet in
+the trait: `pty` (stage 4) and `health`/tier reporting (with Tier B).
+`local_forward` still returns a long-lived process; Tier B can satisfy
+it with a `ControlMaster=no` mux client or change it to `-O forward`.
+
 `beamsd` owns one `BeamConnection` per `BeamEndpoint`, keyed by
 `(proxy, cluster, user, login, beam_uuid)`. Every operation asks the
 connection for a command instead of building `tsh ...` itself:
