@@ -1254,9 +1254,12 @@ bootstrap `Task`s.
     copies and Mutagen, and can make `rm --prune` forget live Beams.
   - [ ] `BeamConnection` trait in `beamsd` with the pinned-`tsh` tier only
     (no behavior change), replacing the per-module `Target`s.
-  - [ ] Tier A (ControlMaster over VNet SSH) and Tier B (ControlMaster over
-    pinned `tsh proxy ssh`) for daemon-owned work, with capability probing;
-    workstation runs of the harness incl. hardware-key and per-session MFA.
+  - [ ] Tier B (ControlMaster over pinned `tsh proxy ssh`) for daemon-owned
+    work, with capability probing and Tier C fallback; workstation runs of
+    the harness. (VNet SSH tier deferred: no MFA/hardware-key roles here.)
+  - [ ] Raise upstream: from inside a Beam, `tsh ssh beams@<own uuid>` is
+    denied by the node's access checker (`bot-beam-<id> is not authorized to
+    login as beams`), while SSH to other Beams and from a workstation works.
   - [ ] Interactive session over the master; pre-warm the master; launch
     uploads over it (Phase 6 above).
 - [ ] Phase 7: run the isolated OpenSSH `ControlMaster`/`tsh proxy ssh`

@@ -150,31 +150,31 @@ trait BeamConnection {
 }
 ```
 
-Three implementations, chosen in this order by capability probing:
+Two implementations, chosen by capability probing (decided 2026-11-12):
 
 | Tier | Transport | Works with | Notes |
 |---|---|---|---|
-| A | OpenSSH ControlMaster → **VNet SSH** (`beams@<uuid>.<cluster>`) | file keys, hardware keys, per-session MFA | Needs VNet running. No relay process of ours; MFA/touch once per master. |
-| B | OpenSSH ControlMaster → `tsh proxy ssh --proxy=P --cluster=C` ProxyCommand, profile file key | file keys without per-session MFA | One ~93 MiB relay per Beam. |
+| B | OpenSSH ControlMaster → `tsh proxy ssh --proxy=P --cluster=C` ProxyCommand, profile file key | file keys without per-session MFA | The fast path. One ~93 MiB relay per Beam. |
 | C | pinned `tsh ssh`/`tsh scp` per operation (today's behavior, plus §1) | everything `tsh` supports | Always available; the fallback. |
+
+The maintainer's cluster has no per-session MFA (login MFA only) and
+VNet isn't in use, so Tier B covers the normal case. A VNet SSH tier
+(called Tier A in the first draft) is deferred; see "Rejected or
+deferred".
 
 **Selection.** For each endpoint at master start:
 
-1. **Tier A** if `$TELEPORT_HOME/vnet_ssh_config` exists. VNet writes it
-   while running and removes it on shutdown. Start the master
-   noninteractively and confirm with `ssh -O check`.
-2. **Tier B** otherwise, using a config generated from
-   `tsh config --proxy=P` into the daemon's runtime directory. Never
-   touch `~/.ssh/config`. Skip it immediately if the profile key file is
-   a hardware-key reference (`PIV YUBIKEY PRIVATE KEY` header), or if a
-   prior attempt for this endpoint failed at publickey auth or an MFA
-   requirement. Cache that result until the next `tsh login` changes the
-   profile's mtime.
-3. **Tier C** otherwise. Record the tier and the reason a better tier
-   wasn't used, so `beams` can show it (`beams status`/the menu).
+1. **Tier B**, using a config generated from `tsh config --proxy=P` into
+   the daemon's runtime directory. Never touch `~/.ssh/config`. Skip it
+   immediately if the profile key file is a hardware-key reference
+   (`PIV YUBIKEY PRIVATE KEY` header), or if a prior attempt for this
+   endpoint failed at publickey auth or an MFA requirement. Cache that
+   result until the next `tsh login` changes the profile's mtime. Start
+   the master noninteractively and confirm with `ssh -O check`.
+2. **Tier C** otherwise. Record the tier and the reason Tier B wasn't
+   used, so `beams` can show it (`beams status`/the menu).
 
-Never weaken host verification. Tier A uses VNet's `vnet_known_hosts`
-with `StrictHostKeyChecking yes`; Tier B uses `tsh config`'s
+Never weaken host verification: Tier B uses `tsh config`'s
 `UserKnownHostsFile` (Teleport host CA).
 
 **Master lifecycle.**
@@ -196,8 +196,7 @@ with `StrictHostKeyChecking yes`; Tier B uses `tsh config`'s
   Shortly before it, stop handing out channels on the old master and
   start a new one; existing channels finish on the old master. If the
   new master can't authenticate (not re-logged in), report "log in
-  again" just like §1 does. Tier A's re-authentication goes through
-  Connect/VNet's own prompts.
+  again" just like §1 does.
 - **Session caps.** Role option `max_sessions` limits sessions per
   connection. If a channel open is refused for that reason, start a
   second master for the endpoint instead of failing the operation.
@@ -235,10 +234,9 @@ with `StrictHostKeyChecking yes`; Tier B uses `tsh config`'s
    sync and git through the trait with no behavior change. This is the
    seam the other tiers need, and it keeps the four separate `Target`
    structs from drifting.
-3. **Tiers A and B for daemon-owned work** (bridge, forwards, copies,
-   Mutagen, finalizers, git). Extend `openssh-controlmaster-spike.sh`
-   with a `--vnet` mode and run it from a workstation, including a
-   hardware-key profile and a per-session-MFA role.
+3. **Tier B for daemon-owned work** (bridge, forwards, copies,
+   Mutagen, finalizers, git). Run `openssh-controlmaster-spike.sh` from
+   macOS and Linux workstations against a pinned `tsh config --proxy=P`.
 4. **Interactive session over the master** (`ssh -t -S sock`, with
    `EscapeChar none`) once recording, resize, signals, zellij and MFA
    behavior are verified. Until then it stays `tsh ssh -t`, pinned.
@@ -249,13 +247,20 @@ with `StrictHostKeyChecking yes`; Tier B uses `tsh config`'s
 
 ## Rejected or deferred
 
+- **ControlMaster over VNet SSH.** It's Teleport's supported way to use
+  OpenSSH with hardware keys and per-session MFA, and it routes by
+  hostname rather than current profile. Deferred because neither applies
+  to the maintainer's cluster and it means running VNet on the
+  workstation. It would slot in ahead of Tier B behind the same probing
+  (`$TELEPORT_HOME/vnet_ssh_config` exists only while VNet runs) if
+  hardware-key or MFA roles appear.
+
 - **A tbot-style fdpass multiplexer for user profiles.** It needs a Go
   helper linking Teleport's AGPL `lib/client` to hold the user's
   credentials. It would roughly match `tsh`'s size, and still
   re-authenticate every SSH connection. Against ControlMaster it would
   save only the master's own startup and its relay process. Reconsider
-  only if Tier B's relay memory matters in practice; Tier A already has
-  no relay of ours.
+  only if Tier B's relay memory matters in practice.
 - **Application-level multiplexing over the bridge's `tsh ssh` stdio.**
   Fast, and it works with any credential, but tunnelling TCP and files
   inside an exec session bypasses Teleport's port-forwarding RBAC, file
@@ -264,26 +269,22 @@ with `StrictHostKeyChecking yes`; Tier B uses `tsh config`'s
 - **An ssh-agent shim that signs through Teleport's hardware-key agent
   (`tsh piv agent` gRPC `Sign`).** It would make Tier B work with PIV
   keys, but it's unsupported territory with touch/PIN edge cases. VNet
-  SSH is Teleport's supported answer for exactly this.
+  SSH (above) is Teleport's supported answer for exactly this.
 - **`russh`.** Unchanged from the spike: it doesn't remove the
   Teleport-specific credential work.
 
 ## Testing limits on a Beam
 
-Inside a Beam the profile key is a hardware-key reference (Tier B is
-impossible) and VNet SSH isn't available (the platform's VNet serves
-apps/databases only). So development here only exercises Tier C plus
-the fake-`tsh` smokes. `tsh ssh` to another Beam works from here, but
-the delegated identity is denied SSH into its *own* Beam (not reproduced
-from a workstation). Benchmarks and the end-to-end checks for Tiers A
-and B must run from a workstation.
+Inside a Beam the profile key is a hardware-key reference, so Tier B is
+impossible there and development only exercises Tier C plus the
+fake-`tsh` smokes. Benchmarks and Tier B's end-to-end checks must run
+from a workstation.
 
-## Open questions
-
-- Is VNet (Connect or `tsh vnet`) normally running on the maintainer's
-  workstations, and do they use hardware-key or per-session-MFA roles?
-  This decides whether Tier A or B is the main fast path. Both stay
-  behind probing either way.
-- Should Tier A start VNet when it isn't running (Connect's
-  `tsh vnet`/system service), or only use it opportunistically? Default:
-  opportunistic, plus a one-line hint about the speedup in `beams status`.
+`tsh ssh` from a Beam to *another* Beam works, but the delegated identity
+is denied SSH into its *own* Beam. That works from a workstation. The
+node logs (`component: node:forward`, `srv/authhandlers.go`) show the
+node's access checker refusing the `beams` login:
+`user bot-beam-<id>@<cluster> is not authorized to login as
+beams@<cluster>: access to node denied`. It looks like a Beams
+self-access quirk with the flattened delegated identity, worth raising
+upstream (`TODO.md`).
