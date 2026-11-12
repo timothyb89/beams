@@ -819,6 +819,17 @@ mod tests {
         )
         .unwrap();
         run(&[sshd.to_str().unwrap(), "-f", &format!("{d}/sshd_config"), "-E", &format!("{d}/sshd.log")]);
+        // Stops sshd and removes the scratch directory even if an assertion fails.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Ok(pid) = fs::read_to_string(self.0.join("sshd.pid")) {
+                    let _ = Command::new("kill").arg(pid.trim()).status();
+                }
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
         let host_key = fs::read_to_string(dir.join("host.pub")).unwrap();
         fs::write(dir.join("known_hosts"), format!("*.test.example.com {host_key}")).unwrap();
         let tsh = dir.join("tsh");
@@ -1019,7 +1030,5 @@ esac
         pool.shutdown();
         assert!(!lease.is_alive());
         assert_eq!(connection.exec("true").get_program(), tsh.as_os_str(), "falls back to tsh");
-        let _ = Command::new("sh").arg("-c").arg(format!("kill $(cat {d}/sshd.pid)")).status();
-        let _ = fs::remove_dir_all(&dir);
     }
 }
